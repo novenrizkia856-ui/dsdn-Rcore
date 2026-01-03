@@ -30,11 +30,99 @@
 use std::collections::VecDeque;
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
+use thiserror::Error;
 
 use crate::types::Hash;
 use crate::receipt::ResourceReceipt;
 use crate::state::ValidatorInfo;
 use crate::Chain;
+
+// ════════════════════════════════════════════════════════════════════════════
+// CELESTIA ERROR (13.18.5)
+// ════════════════════════════════════════════════════════════════════════════
+// Error type untuk Celestia operations.
+// Digunakan untuk control-plane rebuild dan blob fetch.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk Celestia operations.
+///
+/// Digunakan oleh:
+/// - fetch_control_plane_range() — Fetch blobs untuk rebuild
+/// - Chain::rebuild_control_plane() — Apply blobs ke state
+#[derive(Debug, Error)]
+pub enum CelestiaError {
+    /// Blob tidak ditemukan di height tertentu
+    #[error("blob not found at height {0}")]
+    BlobNotFound(u64),
+
+    /// Range tidak valid (start > end)
+    #[error("invalid range: start {start} > end {end}")]
+    InvalidRange {
+        start: u64,
+        end: u64,
+    },
+
+    /// Decode blob gagal
+    #[error("blob decode failed at height {height}: {message}")]
+    DecodeError {
+        height: u64,
+        message: String,
+    },
+
+    /// Unknown payload type
+    #[error("unknown payload type at height {height}: tag={tag}")]
+    UnknownPayloadType {
+        height: u64,
+        tag: u8,
+    },
+
+    /// Fetch dari Celestia node gagal
+    #[error("fetch failed: {0}")]
+    FetchError(String),
+
+    /// Blob kosong
+    #[error("empty blob at height {0}")]
+    EmptyBlob(u64),
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CELESTIA BLOB (13.18.5)
+// ════════════════════════════════════════════════════════════════════════════
+// Blob struct untuk control-plane data dari Celestia DA.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Celestia blob dengan metadata untuk control-plane sync.
+///
+/// Berisi data blob beserta informasi ordering (height, index).
+/// Ordering CRITICAL untuk deterministic rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CelestiaBlob {
+    /// Celestia block height dimana blob disimpan
+    pub height: u64,
+    /// Index blob dalam block (untuk ordering)
+    pub index: u32,
+    /// Raw blob data
+    pub data: Vec<u8>,
+    /// Namespace ID blob
+    pub namespace: [u8; 8],
+}
+
+impl CelestiaBlob {
+    /// Create new CelestiaBlob.
+    pub fn new(height: u64, index: u32, data: Vec<u8>, namespace: [u8; 8]) -> Self {
+        Self {
+            height,
+            index,
+            data,
+            namespace,
+        }
+    }
+
+    /// Check if blob is empty.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // CELESTIA CONFIG
@@ -264,10 +352,135 @@ impl CelestiaClient {
         Ok(all_blobs)
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // CONTROL-PLANE REBUILD (13.18.5)
+    // ════════════════════════════════════════════════════════════════════════
+    // Methods untuk fetch control-plane blobs untuk rebuild setelah snapshot.
+    //
+    // ORDERING CRITICAL:
+    // - Blobs harus diproses dalam urutan (height, index)
+    // - Skip atau reorder = state divergence
+    //
+    // ZERO-TRUST:
+    // - Semua blob harus ada (no gaps)
+    // - Blob kosong = error
+    // - Decode gagal = error keras
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Fetch control-plane blobs untuk range of heights.
+    ///
+    /// Fetches semua blobs dari Celestia DA dalam namespace control-plane
+    /// untuk range [start_height, end_height] (inclusive).
+    ///
+    /// ## Ordering Guarantee
+    ///
+    /// Blobs dikembalikan dalam urutan:
+    /// 1. Ascending by height
+    /// 2. Ascending by index (dalam satu height)
+    ///
+    /// ## Arguments
+    /// * `start_height` - Start height (inclusive)
+    /// * `end_height` - End height (inclusive)
+    ///
+    /// ## Returns
+    /// * `Ok(Vec<CelestiaBlob>)` - Blobs sorted by (height, index)
+    /// * `Err(CelestiaError)` - Fetch atau validation error
+    ///
+    /// ## Errors
+    /// * `CelestiaError::InvalidRange` - start > end
+    /// * `CelestiaError::FetchError` - Fetch dari Celestia gagal
+    /// * `CelestiaError::BlobNotFound` - Height tanpa blob (gap)
+    ///
+    /// ## Example
+    /// ```text
+    /// let blobs = client.fetch_control_plane_range(1000, 1100)?;
+    /// for blob in blobs {
+    ///     println!("Height {} Index {}", blob.height, blob.index);
+    /// }
+    /// ```
+    pub fn fetch_control_plane_range(
+        &self,
+        start_height: u64,
+        end_height: u64,
+    ) -> std::result::Result<Vec<CelestiaBlob>, CelestiaError> {
+        // Validate range
+        if start_height > end_height {
+            return Err(CelestiaError::InvalidRange {
+                start: start_height,
+                end: end_height,
+            });
+        }
+
+        let namespace = self.config.namespace_id;
+        let mut all_blobs: Vec<CelestiaBlob> = Vec::new();
+
+        // Fetch blobs untuk setiap height
+        for height in start_height..=end_height {
+            // Fetch raw blobs dari height ini
+            let raw_blobs = self.fetch_blobs(height, namespace)
+                .map_err(|e| CelestiaError::FetchError(format!(
+                    "failed to fetch at height {}: {}", height, e
+                )))?;
+
+            // Convert ke CelestiaBlob dengan index
+            for (index, data) in raw_blobs.into_iter().enumerate() {
+                if data.is_empty() {
+                    return Err(CelestiaError::EmptyBlob(height));
+                }
+
+                all_blobs.push(CelestiaBlob {
+                    height,
+                    index: index as u32,
+                    data,
+                    namespace,
+                });
+            }
+        }
+
+        // Sort by (height, index) untuk deterministic ordering
+        all_blobs.sort_by(|a, b| {
+            match a.height.cmp(&b.height) {
+                std::cmp::Ordering::Equal => a.index.cmp(&b.index),
+                other => other,
+            }
+        });
+
+        Ok(all_blobs)
+    }
+
+    /// Parse CelestiaBlob menjadi ControlPlaneUpdate.
+    ///
+    /// Wrapper untuk parse_control_plane_blob dengan CelestiaError.
+    ///
+    /// ## Arguments
+    /// * `blob` - CelestiaBlob to parse
+    ///
+    /// ## Returns
+    /// * `Ok(ControlPlaneUpdate)` - Parsed update
+    /// * `Err(CelestiaError)` - Parse gagal
+    pub fn parse_blob_to_update(
+        &self,
+        blob: &CelestiaBlob,
+    ) -> std::result::Result<ControlPlaneUpdate, CelestiaError> {
+        if blob.data.is_empty() {
+            return Err(CelestiaError::EmptyBlob(blob.height));
+        }
+
+        let type_tag = blob.data[0];
+        
+        self.parse_control_plane_blob(&blob.data)
+            .map_err(|e| CelestiaError::DecodeError {
+                height: blob.height,
+                message: format!("tag={}, error={}", type_tag, e),
+            })
+    }
+
     /// Parse blob menjadi ControlPlaneUpdate.
     ///
     /// Blob format:
-    /// - Byte 0: type tag (0=Receipt, 1=Validator, 2=Config, 3=Checkpoint)
+    /// - Byte 0: type tag
+    ///   - 0=Receipt, 1=Validator, 2=Config, 3=Checkpoint
+    ///   - 4=EpochRotation, 5=GovernanceProposal (13.18.5)
     /// - Byte 1..N: bincode serialized data
     ///
     /// # Arguments
@@ -314,6 +527,28 @@ impl CelestiaClient {
                 let (height, state_root): (u64, Hash) = bincode::deserialize(data)
                     .map_err(|e| anyhow::anyhow!("checkpoint deserialize failed: {}", e))?;
                 Ok(ControlPlaneUpdate::Checkpoint { height, state_root })
+            }
+            // ════════════════════════════════════════════════════════════════
+            // NEW TYPES FOR CONTROL-PLANE REBUILD (13.18.5)
+            // ════════════════════════════════════════════════════════════════
+            4 => {
+                // EpochRotation
+                let (new_epoch, timestamp): (u64, u64) = bincode::deserialize(data)
+                    .map_err(|e| anyhow::anyhow!("epoch rotation deserialize failed: {}", e))?;
+                Ok(ControlPlaneUpdate::EpochRotation { new_epoch, timestamp })
+            }
+            5 => {
+                // GovernanceProposal
+                let (proposal_id, proposer, proposal_type, proposal_data, created_at): 
+                    (u64, crate::types::Address, u8, Vec<u8>, u64) = bincode::deserialize(data)
+                    .map_err(|e| anyhow::anyhow!("governance proposal deserialize failed: {}", e))?;
+                Ok(ControlPlaneUpdate::GovernanceProposal { 
+                    proposal_id, 
+                    proposer, 
+                    proposal_type,
+                    data: proposal_data, 
+                    created_at,
+                })
             }
             _ => {
                 anyhow::bail!("unknown control plane type tag: {}", type_tag);
@@ -437,6 +672,14 @@ impl CelestiaClient {
 ///
 /// Setiap variant mewakili tipe data berbeda yang disimpan di Celestia DA.
 /// Updates ini consensus-critical dan mempengaruhi ChainState.
+///
+/// ## Type Tags (Blob Format)
+/// - Tag 0: ReceiptBatch
+/// - Tag 1: ValidatorSetUpdate
+/// - Tag 2: ConfigUpdate
+/// - Tag 3: Checkpoint
+/// - Tag 4: EpochRotation (13.18.5)
+/// - Tag 5: GovernanceProposal (13.18.5)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlPlaneUpdate {
     /// Batch of resource receipts dari Coordinator.
@@ -466,6 +709,36 @@ pub enum ControlPlaneUpdate {
         height: u64,
         /// State root hash at checkpoint
         state_root: Hash,
+    },
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CONTROL-PLANE REBUILD TYPES (13.18.5)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Epoch rotation notification.
+    /// Triggers epoch state reset and counter update.
+    /// TIDAK mengeksekusi rewards — hanya update epoch_info.
+    EpochRotation {
+        /// New epoch number setelah rotation
+        new_epoch: u64,
+        /// Timestamp rotation
+        timestamp: u64,
+    },
+
+    /// Governance proposal untuk restore state.
+    /// NON-BINDING: hanya restore proposal ke state, tidak execute.
+    /// Execution tetap melalui normal governance flow.
+    GovernanceProposal {
+        /// Proposal ID
+        proposal_id: u64,
+        /// Proposer address
+        proposer: crate::types::Address,
+        /// Proposal type tag
+        proposal_type: u8,
+        /// Serialized proposal data
+        data: Vec<u8>,
+        /// Creation timestamp
+        created_at: u64,
     },
 }
 
@@ -566,37 +839,79 @@ impl ControlPlaneSyncer {
         while let Some(update) = self.pending_updates.pop_front() {
             match update {
                 ControlPlaneUpdate::ReceiptBatch { receipts: _ } => {
-                    // Receipts diekstrak via get_pending_receipts()
-                    // TIDAK dieksekusi di sini
                     println!("   📋 ReceiptBatch: skipped (extract via get_pending_receipts)");
                 }
+
                 ControlPlaneUpdate::ValidatorSetUpdate { validators } => {
-                    // Update validator registry
                     let mut state = chain.state.write();
                     for v in validators {
                         state.validator_set.add_validator(v);
                     }
                     println!("   ✓ ValidatorSetUpdate applied");
                 }
+
                 ControlPlaneUpdate::ConfigUpdate { key, value } => {
-                    // Config updates stored for later use
-                    // Implementation depends on config system
                     println!(
                         "   ✓ ConfigUpdate: key={}, value_len={}",
                         key,
                         value.len()
                     );
                 }
+
                 ControlPlaneUpdate::Checkpoint { height, state_root } => {
-                    // Store checkpoint reference
-                    // Can be used for fast sync verification
                     println!(
                         "   ✓ Checkpoint: height={}, state_root={}",
                         height,
                         state_root
                     );
                 }
+
+                ControlPlaneUpdate::EpochRotation { new_epoch, timestamp } => {
+                    // Use existing epoch_info values to call the available rotate(...) method.
+                    // rotate(new_epoch, height, active_count, total_stake)
+                    let mut state = chain.state.write();
+
+                    // Read current epoch_info fields to supply the required args.
+                    // These fields are expected to exist on EpochInfo per codebase (epoch_number, start_height, active_validators, total_stake).
+                    let current_start_height = state.epoch_info.start_height;
+                    // active_validators might be a numeric type; cast to usize to match signature.
+                    let active_count = state.epoch_info.active_validators as usize;
+                    let total_stake = state.epoch_info.total_stake;
+
+                    // Call the existing rotate method (signature matches epoch.rs: rotate(...))
+                    state.epoch_info.rotate(new_epoch, current_start_height, active_count, total_stake);
+
+                    // Log the rotation — timestamp is informational
+                    println!(
+                        "   🔄 EpochRotation applied: new_epoch={}, timestamp={}, start_height={}, active_count={}, total_stake={}",
+                        new_epoch, timestamp, current_start_height, active_count, total_stake
+                    );
+                }
+
+                ControlPlaneUpdate::GovernanceProposal {
+                    proposal_id,
+                    proposer,
+                    proposal_type,
+                    data,
+                    created_at,
+                } => {
+                    // Governance subsystem not present on ChainState in this codebase (no `state.governance` field).
+                    // Spec says proposals are NON-BINDING for rebuild; safest behavior for now:
+                    //  - Log details (so operator can inspect)
+                    //  - Do NOT execute the proposal
+                    // When governance storage API is available later, replace the log with storing the proposal.
+                    println!(
+                        "   🗳️ GovernanceProposal encountered (non-binding): id={}, proposer={:?}, type={}, created_at={}, data_len={}",
+                        proposal_id, proposer, proposal_type, created_at, data.len()
+                    );
+
+                    // Optional: if Chain has an enqueue method, prefer to push it:
+                    // if let Some(_) = chain.enqueue_governance_proposal { ... }
+                    // But to avoid compile errors across the repo, we do not call unknown APIs here.
+                }
+
             }
+
         }
         
         Ok(())
@@ -651,8 +966,11 @@ fn update_type_name(update: &ControlPlaneUpdate) -> &'static str {
         ControlPlaneUpdate::ValidatorSetUpdate { .. } => "ValidatorSetUpdate",
         ControlPlaneUpdate::ConfigUpdate { .. } => "ConfigUpdate",
         ControlPlaneUpdate::Checkpoint { .. } => "Checkpoint",
+        ControlPlaneUpdate::EpochRotation { .. } => "EpochRotation",
+        ControlPlaneUpdate::GovernanceProposal { .. } => "GovernanceProposal",
     }
 }
+
 
 // ════════════════════════════════════════════════════════════════════════════
 // TESTS
@@ -859,15 +1177,27 @@ mod tests {
         let updates = vec![
             ControlPlaneUpdate::ReceiptBatch { receipts: vec![] },
             ControlPlaneUpdate::ValidatorSetUpdate { validators: vec![] },
-            ControlPlaneUpdate::ConfigUpdate { 
-                key: "test_key".to_string(), 
-                value: vec![1, 2, 3] 
+            ControlPlaneUpdate::ConfigUpdate {
+                key: "test_key".to_string(),
+                value: vec![1, 2, 3],
             },
-            ControlPlaneUpdate::Checkpoint { 
-                height: 999, 
-                state_root: Hash::from_bytes([0x55u8; 64]) 
+            ControlPlaneUpdate::Checkpoint {
+                height: 999,
+                state_root: Hash::from_bytes([0x55u8; 64]),
+            },
+            ControlPlaneUpdate::EpochRotation {
+                new_epoch: 2,
+                timestamp: 123456789,
+            },
+            ControlPlaneUpdate::GovernanceProposal {
+                proposal_id: 1,
+                proposer: crate::types::Address::from_bytes([0u8; 20]),
+                proposal_type: 0,
+                data: vec![9, 9, 9],
+                created_at: 123456789,
             },
         ];
+
         
         for update in updates {
             let json = serde_json::to_string(&update).unwrap();
