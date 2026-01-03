@@ -1,0 +1,40 @@
+﻿[package]
+name = "dsdn-chain"
+version = "0.1.0"
+edition = "2021"
+authors = ["INEVA / DSDN Team"]
+
+[features]
+default = ["dev_mode"]
+dev_mode = []
+pos_mode = []
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha3 = "0.10"
+rand = "0.7"
+rand_core = "0.5"
+
+hex = "0.4"
+anyhow = "1.0"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+uuid = { version = "1.4", features = ["v4"] }
+clap = { version = "4.5.4", features = ["derive"] }
+lmdb = "0.8"
+bincode = "1.3"
+tempfile = "3"
+# crypto crate
+ed25519-dalek = "1.0" 
+aes-gcm = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# dev dependency for tests
+[dev-dependencies]
+tempfile = "3.6"
+
+[[bin]]
+name = "dsdn-chain"
+path = "src/bin/dsdn-chain.rs"

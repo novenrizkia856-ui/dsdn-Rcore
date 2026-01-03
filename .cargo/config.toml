@@ -1,0 +1,34 @@
+# RUSTC — STRICT CORE SAFETY
+[build]
+rustflags = [
+  "-Dunsafe_code",                # unsafe = ERROR
+  "-Coverflow-checks=yes",         # integer overflow = ERROR
+]
+
+
+[target.'cfg(all())']
+rustflags = []
+
+[alias]
+clippy-strict = [
+  "clippy",
+  "--",
+  "-Dclippy::unwrap_used",
+  "-Dclippy::expect_used",
+  "-Dclippy::panic",
+  "-Dclippy::todo",
+  "-Dclippy::unimplemented",
+  "-Dclippy::dbg_macro",
+
+  "-Dclippy::indexing_slicing",
+  "-Dclippy::arithmetic_side_effects",
+  "-Dclippy::integer_division",
+  "-Dclippy::float_arithmetic",
+
+  "-Dclippy::multiple_crate_versions",
+  "-Dclippy::cargo_common_metadata",
+
+  "-Wclippy::all",
+  "-Wclippy::pedantic",
+  "-Wclippy::nursery"
+]

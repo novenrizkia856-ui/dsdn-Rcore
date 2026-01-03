@@ -1,0 +1,150 @@
+13.18.1 — Snapshot Types & Configuration
+Tujuan: Definisi tipe data dan konfigurasi untuk snapshot system
+Yang dibuat:
+
+SnapshotConfig struct: interval blocks, path, max snapshots to keep
+SnapshotMetadata struct: height, state_root, timestamp, block_hash
+SnapshotStatus enum: Creating, Ready, Corrupted
+Konstanta: DEFAULT_SNAPSHOT_INTERVAL (misal 1000 blocks)
+
+File yang diubah:
+
+state/mod.rs — Tambah dokumentasi 13.18.1, export types
+Buat file baru: state/internal_snapshot.rs — Snapshot types & config
+
+
+13.18.2 — Snapshot Creation (LMDB Copy)
+Tujuan: Implementasi pembuatan snapshot LMDB
+Yang dibuat:
+
+Method ChainDb::create_snapshot(height, target_path) — Copy LMDB ke folder baru
+Method ChainDb::write_snapshot_metadata(path, metadata) — Tulis metadata.json
+Struktur folder: snapshots/checkpoint_{height}/data.mdb, metadata.json
+Atomic copy dengan LMDB copy_to_path() atau manual copy
+
+File yang diubah:
+
+db.rs — Method create_snapshot, write_snapshot_metadata
+state/mod.rs — Update dokumentasi 13.18.2
+
+
+13.18.3 — Snapshot Loading & Validation
+Tujuan: Load snapshot dan validasi integritas
+Yang dibuat:
+
+Method ChainDb::load_snapshot(snapshot_path) — Load LMDB dari snapshot
+Method ChainDb::read_snapshot_metadata(path) — Baca metadata.json
+Method ChainDb::validate_snapshot(path) — Validate state_root matches metadata
+Method ChainDb::list_available_snapshots(base_path) — List semua snapshot
+
+File yang diubah:
+
+db.rs — Method load_snapshot, read_snapshot_metadata, validate_snapshot, list_available_snapshots
+state/mod.rs — Update dokumentasi 13.18.3
+
+
+13.18.4 — Block Replay After Snapshot
+Tujuan: Replay blocks dari snapshot height ke current tip
+Yang dibuat:
+
+Method Chain::replay_blocks_from(start_height, end_height) — Replay blocks
+Method Chain::get_blocks_range(start, end) — Fetch blocks dari DB atau peer
+Progress callback untuk tracking
+Validate state_root setelah setiap block
+
+File yang diubah:
+
+lib.rs — Method replay_blocks_from, get_blocks_range
+sync.rs — Integrasi dengan StateReplay untuk block fetch
+state/mod.rs — Update dokumentasi 13.18.4
+
+
+13.18.5 — Celestia Control-Plane Rebuild
+Tujuan: Rebuild control-plane state dari Celestia blobs
+Yang dibuat:
+
+Method CelestiaClient::fetch_control_plane_range(start_height, end_height) — Fetch blobs
+Method Chain::rebuild_control_plane(celestia_blobs) — Apply control-plane updates
+Handle: ValidatorSetUpdate, EpochRotation, GovernanceProposal
+
+File yang diubah:
+
+celestia.rs — Method fetch_control_plane_range
+lib.rs — Method rebuild_control_plane
+state/mod.rs — Update dokumentasi 13.18.5
+
+
+13.18.6 — Automatic Checkpoint Trigger
+Tujuan: Trigger checkpoint otomatis setiap N blocks
+Yang dibuat:
+
+Field Chain::snapshot_config: SnapshotConfig
+Method Chain::maybe_create_checkpoint(height) — Check dan create snapshot
+Method Chain::cleanup_old_snapshots(keep_count) — Hapus snapshot lama
+Hook di mine_block_and_apply() untuk trigger checkpoint
+
+File yang diubah:
+
+lib.rs — Field snapshot_config, method maybe_create_checkpoint, cleanup_old_snapshots, update mine_block_and_apply
+state/mod.rs — Update dokumentasi 13.18.6
+
+
+13.18.7 — Fast Sync Integration (RPC & CLI)
+Tujuan: RPC dan CLI untuk snapshot operations
+Yang dibuat:
+
+RPC: get_snapshot_list(), get_snapshot_metadata(height), create_snapshot(), fast_sync_from_snapshot(height)
+CLI: snapshot list, snapshot create, snapshot info --height, sync fast --from-snapshot
+Response structs: SnapshotListRes, SnapshotMetadataRes, FastSyncStatusRes
+
+File yang diubah:
+
+rpc.rs — RPC endpoints untuk snapshot
+cli.rs — CLI commands untuk snapshot dan fast sync
+state/mod.rs — Update dokumentasi 13.18.7
+
+
+13.18.8 — Documentation Update
+Tujuan: Update dokumentasi lengkap di mod.rs
+Yang dibuat:
+
+Dokumentasi arsitektur snapshot system
+Diagram flow: Create → Store → Load → Replay
+API reference table untuk semua methods
+Consensus-critical notes
+Testing checklist
+Update implementation status table
+
+File yang diubah:
+
+state/mod.rs — Dokumentasi lengkap 13.18
+
+
+13.18.9 — E2E Testing
+Tujuan: End-to-end tests untuk snapshot system
+Yang dibuat:
+
+test_snapshot_create — Create snapshot dan verify metadata
+test_snapshot_load — Load snapshot dan verify state
+test_snapshot_validate — Validate state_root match
+test_block_replay — Replay blocks dan verify final state
+test_fast_sync_flow — Full fast sync dari snapshot
+test_cleanup_old_snapshots — Cleanup logic
+Integration dengan test runner: "snapshot" case
+
+File yang diubah:
+
+e2e_tests.rs — Semua test cases untuk 13.18
+state/mod.rs — Update testing checklist
+---------------------------------------------=============================================
+prompt untuk memecahkan tahap:
+""
+oke, ayo kita lanjut development yuk bro sekarang sudah sampai tahap 1513. gw mau lu pecah tahapan jadi sub tahapan kecil masing masing tahapan, lu beri tau Semua hal yang harus dibuat di sub tahapan, jangan kodenya, dan file yang diubah (misal db.rs atau file yang ada di state, lu bilang aja) atau buat file baru kalo memang dibutuhkan dan harus dipisah, pastikan jika sudah melakukan sub tahapan, tahap 13.15 full terimplementasi, dan gw mau tiap sub tahapan akan mengupdate dokumentasi atau komentar di mod.rs agar selalu diperbarui dan tetap relevan, dokumentasi tetap harus dalam berbentuk komentar di mod.rs, bukan file md atau buat file baru, dan sub tahapan terakhir adalah testing tahapan ini, pastikan yang lu tulis itu pasti, gak ambigu, gak ada kata "jika belum" dan sebagainya, mangkanya lu baca kedua kode nya dengan detail biar lu gak ambigu dan paham  untuk lu tau file mana yang diubah, lu cukup liat file utama aja yaitu lib.rs dan state.rs(mod.rs), lu tidak perlu membuat tahapas pas 10 atau berapapun, tidak ada angka jumlah sub tahapan tetap, buat secukupnya sesuai kebutuhan: 
+
+""
+
+prompt untuk buat prompt ke claude:
+buat prompt ke claude Ai bahasa indonesia untuk tahap development dsdn ini, buat prompt yang berkualitas, instruksi jelas dan claude benar benar mengimplementasikan tahap ini dengan baik, dan hanya ngepatch kode dan memberi tau nya dengan jelas dan eksplisit bagian kode yang harus di path(contoh:claude memberikan kode sebelum dan sesudah di patch), ditambah atau diubah prompt harus bersifat langsung, imperatif dan tidak opini saja, buat promptnya keras, dan claude berhati hati agar benar benar menghindari error dan bug sedikitpun, walaupun sangat hati hati tetapi semua tahapan tetap 100% dibuat dan diimplementasikan, buat prompt yang bener bener bagus, bahkan jika claude atau Ai nya bodoh pun, dia tetap bisa membuat dengan sangat baik
+
+buat prompt berdasarkan tahapan:
+"

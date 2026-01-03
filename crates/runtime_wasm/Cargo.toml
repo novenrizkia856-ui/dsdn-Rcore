@@ -1,0 +1,12 @@
+﻿[package]
+name = "dsdn-runtime-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmtime = "15"
+wasmtime-wasi = "15"
+wat = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }

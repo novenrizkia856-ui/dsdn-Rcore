@@ -1,0 +1,20 @@
+﻿[package]
+name = "dsdn-runtime-vm"
+version = "0.1.0"
+edition = "2021"
+authors = ["INEVA team"]
+
+[lib]
+name = "dsdn_runtime_vm"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
+tracing = "0.1"
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }

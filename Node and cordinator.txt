@@ -1,0 +1,14 @@
+/run a cordinator
+cargo run -p dsdn-coordinator
+
+//run node
+cargo run -p dsdn-node --bin dsdn-node -- auto zone-a 50051 http://127.0.0.1:8080 ./data/nodeA
+cargo run -p dsdn-node --bin dsdn-node -- auto zone-b 50052 http://127.0.0.1:8080 ./data/nodeB
+cargo run -p dsdn-node --bin dsdn-node -- auto zone-c 50053 http://127.0.0.1:8080 ./data/nodeC
+
+//run a wasm
+cargo run -p runtime-cli -- 127.0.0.1:xxxxx <hash>
+
+//ingress
+cargo run -p dsdn-ingress
+

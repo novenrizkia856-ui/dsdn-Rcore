@@ -1,0 +1,45 @@
+syntax = "proto3";
+package dsdn.api;
+
+// Put a chunk (client may send computed hash to verify)
+message PutRequest {
+  string hash = 1;
+  bytes data = 2;
+}
+message PutResponse {
+  string hash = 1;
+  string status = 2;
+}
+
+// Get a chunk by hash
+message GetRequest {
+  string hash = 1;
+}
+message GetResponse {
+  bytes data = 1;
+  string status = 2;
+}
+
+// Storage service
+service Storage {
+  rpc Put (PutRequest) returns (PutResponse);
+  rpc Get (GetRequest) returns (GetResponse);
+}
+
+// Runtime service to execute WASM modules stored by hash
+message RunWasmRequest {
+  string module_hash = 1;       // content-addressed hash of module stored in storage
+  bytes input = 2;             // input bytes for module (optional)
+  uint32 timeout_ms = 3;       // override timeout (ms); 0 = use server default
+  uint32 max_mem_bytes = 4;    // override max memory bank (bytes); 0 = use server default
+}
+
+message RunWasmResponse {
+  bytes output = 1;           // data written by guest via host write callback
+  string status = 2;          // "ok" or error msg
+}
+
+// Runtime service
+service Runtime {
+  rpc RunWasm (RunWasmRequest) returns (RunWasmResponse);
+}

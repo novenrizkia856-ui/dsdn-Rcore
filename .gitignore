@@ -1,0 +1,28 @@
+# === Rust ===
+/target/
+**/*.rs.bk
+
+# === Environment & Secrets ===
+.env
+.env.*
+*.key
+*.pem
+*.secret
+secrets/
+private/
+keys/
+
+# === Local Config ===
+config.local.*
+node_config.toml
+wallet.json
+
+# === OS / Editor ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# === Logs ===
+*.log
+logs/

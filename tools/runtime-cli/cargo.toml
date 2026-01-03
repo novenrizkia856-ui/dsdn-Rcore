@@ -1,0 +1,13 @@
+[package]
+name = "runtime-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.28", features = ["rt-multi-thread", "macros"] }
+
+tonic = "0.9"
+prost = "0.11"
+
+# Pakai proto yang digenerate oleh dsdn-storage
+dsdn-storage = { path = "../../crates/storage" }

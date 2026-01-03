@@ -1,0 +1,26 @@
+cargo run -p dsdn-chain -- init --genesis-account 0x283891d0a9333ca24511083cdd670d42f2c58dcc --amount 1000000000
+cargo run -p dsdn-chain -- status
+cargo run -p dsdn-chain -- balance --address 0x283891d0a9333ca24511083cdd670d42f2c58dcc
+
+cargo run -p dsdn-chain -- submit-transfer --from 0x283891d0a9333ca24511083cdd670d42f2c58dcc --to 0x1111111111111111111111111111111111111111 --amount 1000 --fee 10 --gas-limit 21000 --priv-key 3f879913d0d64a712f7d941e20dc06be3ae29c2153996e6185d18940f9be9202
+cargo run -p dsdn-chain -- mine --miner-addr 0x283891d0a9333ca24511083cdd670d42f2c58dcc
+
+cargo run -p dsdn-chain -- balance --address 0x1111111111111111111111111111111111111111
+cargo run -p dsdn-chain -- balance --address 0x283891d0a9333ca24511083cdd670d42f2c58dcc
+
+cargo run -p dsdn-chain -- submit-stake --delegator 0x283891d0a9333ca24511083cdd670d42f2c58dcc --validator 0x283891d0a9333ca24511083cdd670d42f2c58dcc --amount 50000 --fee 10 --bond --gas-limit 50000 --priv-key 3f879913d0d64a712f7d941e20dc06be3ae29c2153996e6185d18940f9be9202
+cargo run -p dsdn-chain -- mine --miner-addr 0x283891d0a9333ca24511083cdd670d42f2c58dcc
+
+cargo run -p dsdn-chain -- submit-storage-op --from 0x283891d0a9333ca24511083cdd670d42f2c58dcc --to-node 0x2222222222222222222222222222222222222222 --amount 2000 --operation-id op_chunk_01 --fee 10 --gas-limit 50000 --priv-key 3f879913d0d64a712f7d941e20dc06be3ae29c2153996e6185d18940f9be9202
+
+cargo run -p dsdn-chain -- submit-compute-exec --from 0x283891d0a9333ca24511083cdd670d42f2c58dcc --to-node 0x3333333333333333333333333333333333333333 --amount 3000 --execution-id job_01 --fee 10 --gas-limit 60000 --priv-key 3f879913d0d64a712f7d941e20dc06be3ae29c2153996e6185d18940f9be9202
+
+cargo run -p dsdn-chain -- submit-validator-reg --from 0x283891d0a9333ca24511083cdd670d42f2c58dcc --pubkey c490a86c7784a4d67e058a2026f101edec41671ed34b4bd8182f21863642efd6 --min-stake 100000000 --fee 10 --gas-limit 80000 --priv-key 3f879913d0d64a712f7d941e20dc06be3ae29c2153996e6185d18940f9be9202
+
+cargo run -p dsdn-chain -- mine --miner-addr 0x283891d0a9333ca24511083cdd670d42f2c58dcc
+cargo run -p dsdn-chain -- status
+
+cargo run -p dsdn-chain -- balance --address 0x283891d0a9333ca24511083cdd670d42f2c58dcc
+cargo run -p dsdn-chain -- balance --address 0x1111111111111111111111111111111111111111
+cargo run -p dsdn-chain -- balance --address 0x2222222222222222222222222222222222222222
+cargo run -p dsdn-chain -- balance --address 0x3333333333333333333333333333333333333333

@@ -1,0 +1,20 @@
+﻿[package]
+name = "dsdn-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["INEVA team"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.2", features = ["derive"] }
+tokio = { version = "1.28", features = ["macros", "rt-multi-thread"] }
+rand = "0.8"
+aes-gcm = "0.10"       # AES-GCM (AEAD)
+aead = "0.5"
+base64 = "0.21"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+dsdn-common = { path = "../common" }   # use sha256 helper
+dsdn-storage = { path = "../storage" } # rpc client helpers
+futures = "0.3"
