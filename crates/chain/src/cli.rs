@@ -375,6 +375,17 @@ pub enum Commands {
         #[command(subcommand)]
         command: DACommand,
     },
+
+    // ═══════════════════════════════════════════════════════════
+    // SNAPSHOT MANAGEMENT (13.18.7)
+    // ═══════════════════════════════════════════════════════════
+
+    /// Snapshot management commands
+    /// List, create, and inspect state snapshots for fast sync
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
 }
 
 /// Wallet commands (13.17.8)
@@ -449,6 +460,28 @@ pub enum DACommand {
     },
 }
 
+/// Snapshot management commands (13.18.7)
+/// 
+/// Perintah untuk mengelola state snapshots:
+/// - list: Tampilkan semua snapshot yang tersedia
+/// - create: Buat snapshot di height saat ini
+/// - info: Tampilkan detail metadata snapshot
+#[derive(Subcommand)]
+pub enum SnapshotCommand {
+    /// List all available snapshots
+    /// Displays height, timestamp, and state_root for each
+    List,
+    /// Create a snapshot at current height
+    /// Respects retention policy (max_snapshots)
+    Create,
+    /// Show detailed info for a specific snapshot
+    /// Displays full metadata including state_root
+    Info {
+        #[arg(long, help = "Snapshot height to inspect")]
+        height: u64,
+    },
+}
+
 /// Node Cost Index management commands
 /// 
 /// Perintah ini digunakan oleh Governance module atau Admin CLI untuk
@@ -519,6 +552,7 @@ pub enum ReceiptCommand {
 /// - status: Tampilkan status sync saat ini
 /// - progress: Tampilkan progress bar dan ETA
 /// - reset: Reset state dan mulai ulang dari genesis
+/// - fast: Fast sync dari snapshot (13.18.7)
 #[derive(Subcommand)]
 pub enum SyncCommand {
     /// Start sync process to network tip
@@ -531,6 +565,12 @@ pub enum SyncCommand {
     Progress,
 /// Reset sync state (clear metadata, restart from genesis)
     Reset,
+    /// Fast sync from a snapshot (13.18.7)
+    /// Loads snapshot, replays blocks, rebuilds control-plane
+    Fast {
+        #[arg(long, help = "Snapshot height to sync from")]
+        from_snapshot: u64,
+    },
 }
 
 /// Governance management commands (13.12.8)
@@ -707,6 +747,55 @@ fn calculate_eta(current: u64, target: u64) -> String {
     let hours = minutes / 60;
     let mins = minutes % 60;
     format!("{:02}:{:02}", hours, mins)
+}
+
+/// Format Unix timestamp to human-readable string (13.18.7)
+fn format_timestamp(timestamp: u64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    
+    let datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
+    match datetime.duration_since(UNIX_EPOCH) {
+        Ok(d) => {
+            let secs = d.as_secs();
+            let days_since_epoch = secs / 86400;
+            let time_of_day = secs % 86400;
+            let hours = time_of_day / 3600;
+            let minutes = (time_of_day % 3600) / 60;
+            let seconds = time_of_day % 60;
+            
+            // Rough date calculation
+            let mut year = 1970u64;
+            let mut remaining_days = days_since_epoch;
+            
+            loop {
+                let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                    366
+                } else {
+                    365
+                };
+                if remaining_days < days_in_year {
+                    break;
+                }
+                remaining_days -= days_in_year;
+                year += 1;
+            }
+            
+            let days_in_months: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut month = 1u64;
+            for &days in &days_in_months {
+                if remaining_days < days {
+                    break;
+                }
+                remaining_days -= days;
+                month += 1;
+            }
+            let day = remaining_days + 1;
+            
+            format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                year, month, day, hours, minutes, seconds)
+        }
+        Err(_) => "Invalid timestamp".to_string(),
+    }
 }
 
 use crate::types::{DECIMALS, SCALE};
@@ -1911,6 +2000,113 @@ SyncCommand::Reset => {
                     println!("   ✅ Sync state reset complete");
                     println!("═══════════════════════════════════════════════════════════");
                 }
+
+                SyncCommand::Fast { from_snapshot } => {
+                    use crate::db::ChainDb;
+
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("⚡ FAST SYNC FROM SNAPSHOT");
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("   Snapshot height: {}", from_snapshot);
+
+                    // ─────────────────────────────────────────────────────────
+                    // Construct snapshot path
+                    // ─────────────────────────────────────────────────────────
+                    let snapshot_path = format!(
+                        "{}/checkpoint_{}",
+                        chain.snapshot_config.path,
+                        from_snapshot
+                    );
+                    let path = std::path::Path::new(&snapshot_path);
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 1: Read snapshot metadata (existence check)
+                    // ─────────────────────────────────────────────────────────
+                    println!("   [1/5] Checking snapshot exists...");
+                    let metadata = ChainDb::read_snapshot_metadata(path)
+                        .map_err(|e| anyhow::anyhow!(
+                            "snapshot not found at height {}: {}",
+                            from_snapshot,
+                            e
+                        ))?;
+
+                    println!(
+                        "   ✓ Snapshot found: height={}, state_root={}",
+                        metadata.height,
+                        metadata.state_root
+                    );
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 2: Validate snapshot integrity
+                    // validate_snapshot -> Result<(), DbError>
+                    // ─────────────────────────────────────────────────────────
+                    println!("   [2/5] Validating snapshot integrity...");
+                    ChainDb::validate_snapshot(path)
+                        .map_err(|e| anyhow::anyhow!(
+                            "snapshot validation failed: {}",
+                            e
+                        ))?;
+                    println!("   ✓ Snapshot integrity verified");
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 3: Get current chain tip
+                    // ─────────────────────────────────────────────────────────
+                    println!("   [3/5] Getting current chain tip...");
+                    let (tip_height, _) = chain.get_chain_tip()
+                        .map_err(|e| anyhow::anyhow!(
+                            "failed to get chain tip: {}",
+                            e
+                        ))?;
+                    println!("   ✓ Current tip: {}", tip_height);
+
+                    if *from_snapshot > tip_height {
+                        println!(
+                            "   ❌ Snapshot height {} is ahead of tip {}",
+                            from_snapshot,
+                            tip_height
+                        );
+                        return Err(anyhow::anyhow!("snapshot height is ahead of chain tip"));
+                    }
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 4: Load snapshot (SIDE EFFECT)
+                    // ─────────────────────────────────────────────────────────
+                    println!("   [4/5] Loading snapshot...");
+                    ChainDb::load_snapshot(path)
+                        .map_err(|e| anyhow::anyhow!(
+                            "failed to load snapshot: {}",
+                            e
+                        ))?;
+                    println!("   ✓ Snapshot loaded");
+
+                    // ─────────────────────────────────────────────────────────
+                    // Step 5: Replay blocks from snapshot height → tip
+                    // ─────────────────────────────────────────────────────────
+                    if *from_snapshot < tip_height {
+                        println!(
+                            "   [5/5] Replaying blocks {} to {}...",
+                            from_snapshot + 1,
+                            tip_height
+                        );
+
+                        chain.replay_blocks_from(
+                            *from_snapshot + 1,
+                            tip_height,
+                            None, // ← progress callback (optional)
+                        )?;
+
+                        println!("   ✓ Block replay complete");
+                    } else {
+                        println!("   [5/5] No blocks to replay (snapshot at tip)");
+                    }
+
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("   ✅ FAST SYNC COMPLETE");
+                    println!("   From snapshot: {}", from_snapshot);
+                    println!("   Current height: {}", tip_height);
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
             }
         }
 
@@ -2581,6 +2777,130 @@ println!("   Bootstrap Mode: {}", if config.bootstrap_mode { "YES ⚠️" } else
         }
         Commands::Da { .. } => {
             // Already handled above, this is unreachable
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // SNAPSHOT COMMANDS (13.18.7)
+        // ═══════════════════════════════════════════════════════════
+        Commands::Snapshot { command } => {
+            match command {
+                SnapshotCommand::List => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("📸 AVAILABLE SNAPSHOTS");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let base_path = std::path::Path::new(&chain.snapshot_config.path);
+                    let snapshots = crate::db::ChainDb::list_available_snapshots(base_path)?;
+
+                    if snapshots.is_empty() {
+                        println!("   No snapshots available");
+                    } else {
+                        // Sort by height ascending
+                        let mut sorted = snapshots;
+                        sorted.sort_by(|a, b| a.height.cmp(&b.height));
+
+                        println!("   {:>10} | {:>20} | {}", "Height", "Timestamp", "State Root");
+                        println!("   {}", "-".repeat(70));
+                        for s in sorted {
+                            let datetime = format_timestamp(s.timestamp);
+                            println!("   {:>10} | {:>20} | {}",
+                                s.height,
+                                datetime,
+                                &s.state_root.to_hex()[..16]
+                            );
+                        }
+                    }
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
+                SnapshotCommand::Create => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("📸 CREATING SNAPSHOT");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let (tip_height, _) = chain.get_chain_tip()?;
+                    println!("   Creating snapshot at height {}...", tip_height);
+
+                    // Create snapshot path
+                    let snapshot_path = format!(
+                        "{}/checkpoint_{}",
+                        chain.snapshot_config.path,
+                        tip_height
+                    );
+                    let path = std::path::Path::new(&snapshot_path);
+
+                    // Create snapshot
+                    chain.db.create_snapshot(tip_height, path)?;
+
+                    // Get state_root for metadata
+                    let state_root = {
+                        let state = chain.state.read();
+                        state.compute_state_root()?
+                    };
+
+                    // Get block hash
+                    let block_hash = chain.db.get_block(tip_height)?
+                        .map(|b| crate::block::Block::compute_hash(&b.header))
+                        .ok_or_else(|| anyhow::anyhow!("block not found"))?;
+
+                    // Write metadata
+                    let metadata = crate::state::SnapshotMetadata {
+                        height: tip_height,
+                        state_root,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        block_hash,
+                    };
+                    chain.db.write_snapshot_metadata(path, &metadata)?;
+
+                    // Cleanup old snapshots
+                    let keep_count = chain.snapshot_config.max_snapshots as usize;
+                    chain.cleanup_old_snapshots(keep_count)?;
+
+                    println!("   ✅ Snapshot created successfully");
+                    println!("   Height: {}", tip_height);
+                    println!("   Path: {}", snapshot_path);
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
+                SnapshotCommand::Info { height } => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("📸 SNAPSHOT INFO");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let snapshot_path = format!(
+                        "{}/checkpoint_{}",
+                        chain.snapshot_config.path,
+                        height
+                    );
+                    let path = std::path::Path::new(&snapshot_path);
+
+                    use crate::db::ChainDb;
+
+                    match ChainDb::read_snapshot_metadata(path) {
+                        Ok(metadata) => {
+                            println!("   Height:     {}", metadata.height);
+                            println!("   State Root: {}", metadata.state_root);
+                            println!("   Block Hash: {}", metadata.block_hash);
+                            println!(
+                                "   Timestamp:  {} ({})",
+                                metadata.timestamp,
+                                format_timestamp(metadata.timestamp)
+                            );
+                            println!("   Path:       {}", snapshot_path);
+
+                            let valid = ChainDb::validate_snapshot(path).is_ok();
+                            println!("   Valid:      {}", if valid { "✅ Yes" } else { "❌ No" });
+                        }
+                        Err(e) => {
+                            println!("   ❌ Snapshot not found at height {}: {}", height, e);
+                        }
+                    }
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+            }
         }
     }
     
