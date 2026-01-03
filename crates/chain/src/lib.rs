@@ -675,6 +675,21 @@ pub enum ChainError {
     /// Control-plane rebuild failed
     #[error("control-plane rebuild failed: {0}")]
     ControlPlaneRebuildFailed(String),
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT ERRORS (13.18.6)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Snapshot creation failed
+    #[error("snapshot creation failed at height {height}: {message}")]
+    SnapshotCreationFailed {
+        height: u64,
+        message: String,
+    },
+
+    /// Snapshot cleanup failed
+    #[error("snapshot cleanup failed: {0}")]
+    SnapshotCleanupFailed(String),
 }
 
 /// Top-level Chain struct combining DB, state, mempool and miner.
@@ -702,6 +717,17 @@ pub struct Chain {
     /// Timestamp of last successful Celestia sync (0 = never synced)
     /// Observability only, not consensus-critical
     pub last_celestia_sync: Arc<std::sync::atomic::AtomicU64>,
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT CONFIGURATION (13.18.6)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Konfigurasi untuk automatic checkpoint/snapshot system.
+    // Snapshot dibuat otomatis setiap N blocks sesuai config.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Snapshot configuration untuk automatic checkpoint
+    /// Menentukan interval, path, dan retention policy
+    pub snapshot_config: crate::state::SnapshotConfig,
 }
 
 impl Chain {
@@ -736,6 +762,8 @@ impl Chain {
             // Initialize Celestia tracking with "not synced" state
             last_celestia_height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_celestia_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Initialize snapshot config with defaults (13.18.6)
+            snapshot_config: crate::state::SnapshotConfig::default(),
         })
     }
 
@@ -931,6 +959,17 @@ impl Chain {
             }
         }
 
+        // ============================================================
+        // AUTOMATIC CHECKPOINT (13.18.6)
+        // ============================================================
+        // Create snapshot if this is a checkpoint height.
+        // MUST be called AFTER block is finalized and state is persisted.
+        // MUST NOT be called during replay, sync, or recovery.
+        // ============================================================
+        if let Err(e) = self.maybe_create_checkpoint(height) {
+            // Log but don't fail block production
+            eprintln!("⚠️  Checkpoint creation error: {}", e);
+        }
 
         // BROADCAST BLOCK 
        // Legacy broadcast (logs only)
@@ -1683,6 +1722,194 @@ impl Chain {
                     );
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // AUTOMATIC CHECKPOINT (13.18.6)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Methods untuk automatic snapshot/checkpoint creation.
+    //
+    // TRIGGER: Setiap N blocks sesuai snapshot_config.interval_blocks
+    // CLEANUP: FIFO deletion saat melebihi max_snapshots
+    //
+    // DIPANGGIL DARI: mine_block_and_apply() setelah block final
+    // TIDAK DIPANGGIL SAAT: replay, sync, atau recovery
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Maybe create checkpoint at given height.
+    ///
+    /// Checks if height matches snapshot interval and creates checkpoint if so.
+    /// Called after each block is finalized in mine_block_and_apply().
+    ///
+    /// ## Behavior
+    ///
+    /// 1. If interval_blocks == 0 → snapshot disabled, return Ok
+    /// 2. If height % interval_blocks != 0 → not checkpoint height, return Ok
+    /// 3. Create snapshot via ChainDb::create_snapshot()
+    /// 4. Write metadata via ChainDb::write_snapshot_metadata()
+    /// 5. Cleanup old snapshots via cleanup_old_snapshots()
+    ///
+    /// ## Arguments
+    /// * `height` - Current block height
+    ///
+    /// ## Returns
+    /// * `Ok(())` - Checkpoint created (or skipped)
+    /// * `Err(ChainError)` - Checkpoint creation failed
+    pub fn maybe_create_checkpoint(
+        &self,
+        height: u64,
+    ) -> Result<(), ChainError> {
+        let interval = self.snapshot_config.interval_blocks;
+
+        // Interval 0 = snapshot disabled
+        if interval == 0 {
+            return Ok(());
+        }
+
+        // Check if this height is a checkpoint height
+        if height % interval != 0 {
+            return Ok(());
+        }
+
+        // Determine snapshot height (current height)
+        let snapshot_height = height;
+
+        // Create snapshot directory path
+        let snapshot_path = format!(
+            "{}/checkpoint_{}",
+            self.snapshot_config.path,
+            snapshot_height
+        );
+
+        println!("═══════════════════════════════════════════════════════════");
+        println!("📸 AUTOMATIC CHECKPOINT at height {}", snapshot_height);
+        println!("   Path: {}", snapshot_path);
+        println!("═══════════════════════════════════════════════════════════");
+
+        // Step 1: Create snapshot via ChainDb
+        let snapshot_path_ref = std::path::Path::new(&snapshot_path);
+        self.db.create_snapshot(snapshot_height, snapshot_path_ref)
+            .map_err(|e| ChainError::SnapshotCreationFailed {
+                height: snapshot_height,
+                message: format!("create_snapshot failed: {}", e),
+            })?;
+
+        // Step 2: Get state_root for metadata
+        let state_root = {
+            let state = self.state.read();
+            state.compute_state_root()
+                .map_err(|e| ChainError::SnapshotCreationFailed {
+                    height: snapshot_height,
+                    message: format!("compute_state_root failed: {}", e),
+                })?
+        };
+
+        // Step 3: Get block hash
+        let block_hash = self.db.get_block(snapshot_height)
+            .map_err(|e| ChainError::SnapshotCreationFailed {
+                height: snapshot_height,
+                message: format!("get_block failed: {}", e),
+            })?
+            .map(|b| crate::block::Block::compute_hash(&b.header))
+            .ok_or_else(|| ChainError::SnapshotCreationFailed {
+                height: snapshot_height,
+                message: "block not found".to_string(),
+            })?;
+
+        // Step 4: Create and write metadata
+        let metadata = crate::state::SnapshotMetadata {
+            height: snapshot_height,
+            state_root,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            block_hash,
+        };
+
+        self.db.write_snapshot_metadata(snapshot_path_ref, &metadata)
+            .map_err(|e| ChainError::SnapshotCreationFailed {
+                height: snapshot_height,
+                message: format!("write_metadata failed: {}", e),
+            })?;
+
+        println!("   ✓ Snapshot created successfully");
+
+        // Step 5: Cleanup old snapshots
+        let keep_count = self.snapshot_config.max_snapshots as usize;
+        self.cleanup_old_snapshots(keep_count)?;
+
+        Ok(())
+    }
+
+    /// Cleanup old snapshots keeping only the most recent ones.
+    ///
+    /// Lists all snapshots, sorts by height ascending, and deletes
+    /// the oldest ones until only keep_count remain.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. List all snapshots via ChainDb::list_available_snapshots()
+    /// 2. Sort by height ASCENDING (oldest first)
+    /// 3. If count <= keep_count → return Ok (nothing to delete)
+    /// 4. Delete (count - keep_count) oldest snapshots
+    /// 5. Never delete the newest snapshot
+    ///
+    /// ## Arguments
+    /// * `keep_count` - Number of snapshots to keep
+    ///
+    /// ## Returns
+    /// * `Ok(())` - Cleanup successful
+    /// * `Err(ChainError)` - Cleanup failed
+    pub fn cleanup_old_snapshots(
+        &self,
+        keep_count: usize,
+    ) -> Result<(), ChainError> {
+        // Minimum keep 1 (never delete all snapshots)
+        let keep_count = keep_count.max(1);
+
+        // List available snapshots (associated function, not method)
+        let base_path = std::path::Path::new(&self.snapshot_config.path);
+        let snapshots = ChainDb::list_available_snapshots(base_path)
+            .map_err(|e| ChainError::SnapshotCleanupFailed(format!(
+                "list_available_snapshots failed: {}", e
+            )))?;
+
+        // If we have fewer or equal snapshots, nothing to delete
+        if snapshots.len() <= keep_count {
+            return Ok(());
+        }
+
+        // Sort by height ascending (oldest first)
+        let mut sorted: Vec<_> = snapshots;
+        sorted.sort_by(|a, b| a.height.cmp(&b.height));
+
+        // Calculate how many to delete
+        let delete_count = sorted.len() - keep_count;
+
+        println!("   🗑️ Cleaning up {} old snapshot(s)...", delete_count);
+
+        // Delete oldest snapshots (never delete the newest)
+        for metadata in sorted.into_iter().take(delete_count) {
+            let snapshot_path = format!(
+                "{}/checkpoint_{}",
+                self.snapshot_config.path,
+                metadata.height
+            );
+
+            // Remove directory and contents
+            if let Err(e) = std::fs::remove_dir_all(&snapshot_path) {
+                // Return error on failure
+                return Err(ChainError::SnapshotCleanupFailed(format!(
+                    "failed to delete snapshot at height {}: {}",
+                    metadata.height, e
+                )));
+            }
+            
+            println!("   ✓ Deleted snapshot at height {}", metadata.height);
         }
 
         Ok(())
