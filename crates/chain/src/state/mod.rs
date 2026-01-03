@@ -3795,6 +3795,129 @@
 //! crates/chain/src/state/mod.rs                      — ChainState fields & wrapper methods
 //! crates/chain/src/state/internal_storage_payment.rs — Storage payment structures & logic (13.17.3-4)
 //! ```
+//!
+//! ════════════════════════════════════════════════════════════════════════════════
+//! ## 13.18 — State Snapshots & Checkpoints
+//! ════════════════════════════════════════════════════════════════════════════════
+//!
+//! ### Overview
+//!
+//! Snapshot system memungkinkan:
+//! - **Fast Sync**: Node baru download snapshot, replay blocks setelahnya
+//! - **Recovery**: Rollback ke checkpoint saat terjadi corruption
+//! - **Audit**: Verifikasi state historis untuk compliance
+//!
+//! ### Arsitektur
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    SNAPSHOT SYSTEM                              │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  AUTOMATIC TRIGGER                                              │
+//! │  ──────────────────                                             │
+//! │  Setiap N blocks (default 1000):                               │
+//! │    1. Copy LMDB database                                        │
+//! │    2. Write metadata.json                                       │
+//! │    3. Cleanup old snapshots (FIFO)                             │
+//! │                                                                 │
+//! │  STORAGE LAYOUT                                                 │
+//! │  ──────────────────                                             │
+//! │  snapshots/                                                     │
+//! │  ├── checkpoint_1000/                                           │
+//! │  │   ├── data.mdb        ← LMDB database copy                  │
+//! │  │   └── metadata.json   ← SnapshotMetadata                    │
+//! │  ├── checkpoint_2000/                                           │
+//! │  │   ├── data.mdb                                              │
+//! │  │   └── metadata.json                                         │
+//! │  └── ...                                                        │
+//! │                                                                 │
+//! │  FAST SYNC FLOW                                                 │
+//! │  ──────────────────                                             │
+//! │  1. Download snapshot dari peer                                 │
+//! │  2. Validate: compute state_root == metadata.state_root        │
+//! │  3. Replay blocks dari snapshot height ke tip                   │
+//! │  4. Rebuild control-plane dari Celestia blobs                   │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### 13.18.1 — Snapshot Types & Configuration
+//!
+//! Sub-tahap ini mendefinisikan tipe data fondasi untuk snapshot system.
+//! **TIDAK ADA logic eksekusi** - hanya definisi tipe.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    SNAPSHOT TYPES                               │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  SnapshotConfig                                                 │
+//! │  ─────────────────                                              │
+//! │  - interval_blocks: u64    → Snapshot setiap N blocks          │
+//! │  - path: String            → Direktori penyimpanan             │
+//! │  - max_snapshots: u32      → Max snapshots (FIFO cleanup)      │
+//! │                                                                 │
+//! │  SnapshotMetadata                                               │
+//! │  ─────────────────                                              │
+//! │  - height: u64             → Block height snapshot             │
+//! │  - state_root: Hash        → State root untuk verifikasi       │
+//! │  - timestamp: u64          → Unix timestamp pembuatan          │
+//! │  - block_hash: Hash        → Hash block untuk cross-ref        │
+//! │                                                                 │
+//! │  SnapshotStatus                                                 │
+//! │  ─────────────────                                              │
+//! │  - Creating                → Snapshot sedang dibuat            │
+//! │  - Ready                   → Snapshot valid & siap pakai       │
+//! │  - Corrupted               → Snapshot rusak / gagal verify     │
+//! │                                                                 │
+//! │  Constants                                                      │
+//! │  ─────────────────                                              │
+//! │  - DEFAULT_SNAPSHOT_INTERVAL = 1000 blocks                     │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Implementation Status (13.18)
+//!
+//! ```text
+//! | Sub-tahap | Deskripsi                      | Status |
+//! |-----------|--------------------------------|--------|
+//! | 13.18.1   | Snapshot Types & Configuration | ✅     |
+//! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ⏳     |
+//! | 13.18.3   | Snapshot Loading & Validation  | ⏳     |
+//! | 13.18.4   | Block Replay After Snapshot    | ⏳     |
+//! | 13.18.5   | Celestia Control-Plane Rebuild | ⏳     |
+//! | 13.18.6   | Automatic Checkpoint Trigger   | ⏳     |
+//! | 13.18.7   | Fast Sync RPC & CLI            | ⏳     |
+//! | 13.18.8   | Documentation Update           | ⏳     |
+//! | 13.18.9   | E2E Testing                    | ⏳     |
+//! ```
+//!
+//! ### Lokasi File (13.18)
+//!
+//! ```text
+//! crates/chain/src/state/internal_snapshot.rs — Snapshot types & config (13.18.1)
+//! crates/chain/src/state/mod.rs               — Re-exports & documentation
+//! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2-3) [PENDING]
+//! crates/chain/src/lib.rs                     — Chain snapshot integration (13.18.4-6) [PENDING]
+//! ```
+//!
+//! ### Catatan Penting
+//!
+//! ```text
+//! ⚠️ SNAPSHOT ADALAH CONSENSUS-CRITICAL UNTUK RECOVERY:
+//!
+//! 1. state_root di metadata HARUS match dengan computed state_root
+//! 2. Snapshot yang corrupted HARUS dihapus, tidak boleh dipakai
+//! 3. Fast sync HARUS verify state setelah replay
+//! 4. Celestia control-plane HARUS di-rebuild untuk governance state
+//!
+//! KEGAGALAN MENGAKIBATKAN:
+//! - Node tidak bisa sync
+//! - State inconsistency
+//! - Recovery gagal
+//! ```
 
 use crate::types::{Address, Hash};
 use serde::{Serialize, Deserialize};
@@ -3872,6 +3995,10 @@ mod internal_economic;
 
 /// Storage payment schedule: StorageContract, StorageContractStatus, PaymentSchedule (13.17.3)
 mod internal_storage_payment;
+
+/// Snapshot types & configuration: SnapshotConfig, SnapshotMetadata, SnapshotStatus (13.18.1)
+mod internal_snapshot;
+
 // ════════════════════════════════════════════════════════════════════════════
 // PUBLIC RE-EXPORTS
 // ════════════════════════════════════════════════════════════════════════════
@@ -3988,6 +4115,24 @@ pub use internal_storage_payment::{
     GRACE_PERIOD_SECONDS,
     PAYMENT_INTERVAL_SECONDS,
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// SNAPSHOT RE-EXPORTS (13.18.1)
+// ════════════════════════════════════════════════════════════════════════════
+// Types untuk state snapshot & checkpoint system.
+// Digunakan untuk fast sync dan recovery.
+// ════════════════════════════════════════════════════════════════════════════
+pub use internal_snapshot::{
+    // Konfigurasi snapshot: interval, path, max count
+    SnapshotConfig,
+    // Metadata snapshot: height, state_root, timestamp, block_hash
+    SnapshotMetadata,
+    // Status snapshot: Creating, Ready, Corrupted
+    SnapshotStatus,
+    // Default interval: 1000 blocks
+    DEFAULT_SNAPSHOT_INTERVAL,
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 // CHAINSTATE - STRUCT UTAMA
 // ════════════════════════════════════════════════════════════════════════════
