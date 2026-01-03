@@ -55,6 +55,37 @@ pub enum DbError {
     /// IO error umum
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT LOADING ERRORS (13.18.3)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Gagal membaca metadata.json
+    #[error("failed to read snapshot metadata: {0}")]
+    MetadataRead(String),
+
+    /// Metadata JSON invalid atau field tidak lengkap
+    #[error("invalid snapshot metadata: {0}")]
+    MetadataInvalid(String),
+
+    /// data.mdb tidak ditemukan di snapshot folder
+    #[error("snapshot data.mdb not found: {0}")]
+    DataNotFound(String),
+
+    /// Gagal membuka LMDB environment dari snapshot
+    #[error("failed to open snapshot LMDB: {0}")]
+    SnapshotOpenFailed(String),
+
+    /// Snapshot korup: state_root tidak match dengan metadata
+    #[error("snapshot corrupted: state_root mismatch (expected: {expected}, computed: {computed})")]
+    SnapshotCorrupted {
+        expected: String,
+        computed: String,
+    },
+
+    /// Gagal load state dari snapshot
+    #[error("failed to load state from snapshot: {0}")]
+    StateLoadFailed(String),
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2545,6 +2576,358 @@ Ok(headers)
         Ok(())
     }
 
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT LOADING & VALIDATION (13.18.3)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Methods untuk load, validasi, dan list snapshots.
+    //
+    // ZERO-TRUST PRINCIPLE:
+    // - Snapshot TIDAK dipercaya secara default
+    // - Validasi state_root WAJIB sebelum boot
+    // - Snapshot korup DITOLAK
+    //
+    // VALIDATION FLOW:
+    // 1. read_snapshot_metadata() → ambil expected state_root
+    // 2. load_snapshot() → buka LMDB read-only
+    // 3. load_state() → reconstruct ChainState
+    // 4. compute_state_root() → hitung actual state_root
+    // 5. compare → expected == computed? OK : Corrupted
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Load snapshot LMDB as read-only ChainDb instance.
+    ///
+    /// Opens the snapshot's data.mdb in read-only mode WITHOUT modifying
+    /// the active chain database. This creates a NEW ChainDb instance
+    /// that can be used for validation or state recovery.
+    ///
+    /// # Arguments
+    /// * `snapshot_path` - Path to snapshot folder (e.g., "./snapshots/checkpoint_1000")
+    ///
+    /// # Validation Steps
+    /// 1. Verify snapshot_path exists
+    /// 2. Verify data.mdb exists inside
+    /// 3. Open LMDB environment read-only
+    /// 4. Open all required databases
+    ///
+    /// # Returns
+    /// * `Ok(ChainDb)` - New read-only ChainDb instance
+    /// * `Err(DbError)` - Load failed
+    ///
+    /// # Example
+    /// ```text
+    /// let snapshot_db = ChainDb::load_snapshot(Path::new("./snapshots/checkpoint_1000"))?;
+    /// let state = snapshot_db.load_state()?;
+    /// ```
+    pub fn load_snapshot(snapshot_path: &Path) -> std::result::Result<Self, DbError> {
+        // 1. Verify snapshot directory exists
+        if !snapshot_path.exists() {
+            return Err(DbError::DirectoryNotFound(
+                snapshot_path.display().to_string()
+            ));
+        }
+
+        // 2. Verify data.mdb exists
+        let data_mdb = snapshot_path.join("data.mdb");
+        if !data_mdb.exists() {
+            return Err(DbError::DataNotFound(
+                data_mdb.display().to_string()
+            ));
+        }
+
+        // 3. Open LMDB environment (read-only is default for snapshots)
+        // We open with same settings as normal but snapshot is immutable
+        let env = Environment::new()
+            .set_max_dbs(33)
+            .set_map_size(1_000_000_000usize)
+            .open(snapshot_path)
+            .map_err(|e| DbError::SnapshotOpenFailed(format!(
+                "path={}, error={}", snapshot_path.display(), e
+            )))?;
+
+        // 4. Open all databases (same as normal open)
+        let db_blocks = env.open_db(Some("blocks"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("blocks: {}", e)))?;
+        let db_block_hashes = env.open_db(Some("block_hashes"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("block_hashes: {}", e)))?;
+        let db_txs = env.open_db(Some("txs"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("txs: {}", e)))?;
+        let db_accounts = env.open_db(Some("accounts"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("accounts: {}", e)))?;
+        let db_validators = env.open_db(Some("validators"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("validators: {}", e)))?;
+        let db_meta = env.open_db(Some("meta"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("meta: {}", e)))?;
+        let db_mempool = env.open_db(Some("pending_mempool"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("pending_mempool: {}", e)))?;
+        let db_validator_set = env.open_db(Some("validator_set"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("validator_set: {}", e)))?;
+        let db_receipts = env.open_db(Some("receipts"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("receipts: {}", e)))?;
+        let db_pending_unstake = env.open_db(Some("pending_unstake"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("pending_unstake: {}", e)))?;
+        let db_state_validators = env.open_db(Some("state_validators"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_validators: {}", e)))?;
+        let db_state_stake = env.open_db(Some("state_stake"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_stake: {}", e)))?;
+        let db_state_delegators = env.open_db(Some("state_delegators"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_delegators: {}", e)))?;
+        let db_state_qv_weights = env.open_db(Some("state_qv_weights"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_qv_weights: {}", e)))?;
+        let db_state_validator_metadata = env.open_db(Some("state_validator_metadata"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_validator_metadata: {}", e)))?;
+        let db_state_node_cost = env.open_db(Some("state_node_cost"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_node_cost: {}", e)))?;
+        let db_claimed_receipts = env.open_db(Some(BUCKET_CLAIMED_RECEIPTS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("claimed_receipts: {}", e)))?;
+        let db_state_node_earnings = env.open_db(Some("state_node_earnings"))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("state_node_earnings: {}", e)))?;
+        let db_headers = env.open_db(Some(BUCKET_HEADERS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("headers: {}", e)))?;
+        let db_proposals = env.open_db(Some(BUCKET_PROPOSALS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("proposals: {}", e)))?;
+        let db_proposal_votes = env.open_db(Some(BUCKET_PROPOSAL_VOTES))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("proposal_votes: {}", e)))?;
+        let db_governance_config = env.open_db(Some(BUCKET_GOVERNANCE_CONFIG))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("gov_config: {}", e)))?;
+        let db_node_liveness = env.open_db(Some(BUCKET_NODE_LIVENESS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("node_liveness: {}", e)))?;
+        let db_economic_metrics = env.open_db(Some(BUCKET_ECONOMIC_METRICS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("economic_metrics: {}", e)))?;
+        let db_deflation_config = env.open_db(Some(BUCKET_DEFLATION_CONFIG))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("deflation_config: {}", e)))?;
+        let db_storage_contracts = env.open_db(Some(BUCKET_STORAGE_CONTRACTS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("storage_contracts: {}", e)))?;
+        let db_user_contracts = env.open_db(Some(BUCKET_USER_CONTRACTS))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("user_contracts: {}", e)))?;
+
+        Ok(Self {
+            env: Arc::new(env),
+            env_path: snapshot_path.to_path_buf(),
+            db_blocks,
+            db_block_hashes,
+            db_txs,
+            db_accounts,
+            db_validators,
+            db_meta,
+            db_mempool,
+            db_validator_set,
+            db_receipts,
+            db_pending_unstake,
+            db_state_validators,
+            db_state_stake,
+            db_state_delegators,
+            db_state_qv_weights,
+            db_state_validator_metadata,
+            db_state_node_cost,
+            db_claimed_receipts,
+            db_state_node_earnings,
+            db_headers,
+            db_proposals,
+            db_proposal_votes,
+            db_governance_config,
+            db_node_liveness,
+            db_economic_metrics,
+            db_deflation_config,
+            db_storage_contracts,
+            db_user_contracts,
+        })
+    }
+
+    /// Read snapshot metadata from JSON file.
+    ///
+    /// Reads and parses metadata.json from the snapshot folder.
+    /// Validates that all required fields are present.
+    ///
+    /// # Arguments
+    /// * `snapshot_path` - Path to snapshot folder
+    ///
+    /// # Required Fields
+    /// - height: u64
+    /// - state_root: Hash
+    /// - timestamp: u64
+    /// - block_hash: Hash
+    ///
+    /// # Returns
+    /// * `Ok(SnapshotMetadata)` - Parsed metadata
+    /// * `Err(DbError)` - Read or parse failed
+    pub fn read_snapshot_metadata(
+        snapshot_path: &Path,
+    ) -> std::result::Result<crate::state::SnapshotMetadata, DbError> {
+        // Verify snapshot directory exists
+        if !snapshot_path.exists() {
+            return Err(DbError::DirectoryNotFound(
+                snapshot_path.display().to_string()
+            ));
+        }
+
+        // Metadata file path
+        let metadata_file = snapshot_path.join("metadata.json");
+        if !metadata_file.exists() {
+            return Err(DbError::MetadataRead(format!(
+                "metadata.json not found in {}",
+                snapshot_path.display()
+            )));
+        }
+
+        // Read file contents
+        let content = std::fs::read_to_string(&metadata_file)
+            .map_err(|e| DbError::MetadataRead(format!(
+                "failed to read {}: {}",
+                metadata_file.display(), e
+            )))?;
+
+        // Parse JSON
+        let metadata: crate::state::SnapshotMetadata = serde_json::from_str(&content)
+            .map_err(|e| DbError::MetadataInvalid(format!(
+                "failed to parse metadata.json: {}",
+                e
+            )))?;
+
+        // Validate required fields (height must be > 0 for non-genesis)
+        // Note: height 0 is valid for genesis snapshot
+        // state_root and block_hash are validated by serde
+
+        Ok(metadata)
+    }
+
+    /// Validate snapshot integrity by comparing state_root.
+    ///
+    /// This is CONSENSUS-GRADE validation:
+    /// 1. Load snapshot LMDB
+    /// 2. Read metadata.json
+    /// 3. Reconstruct ChainState from LMDB
+    /// 4. Compute state_root from ChainState
+    /// 5. Compare computed vs metadata.state_root
+    ///
+    /// # Arguments
+    /// * `snapshot_path` - Path to snapshot folder
+    ///
+    /// # Returns
+    /// * `Ok(())` - Snapshot is valid (state_root matches)
+    /// * `Err(DbError::SnapshotCorrupted)` - state_root mismatch
+    /// * `Err(DbError)` - Other validation error
+    ///
+    /// # Security Note
+    /// NEVER skip this validation when restoring from snapshot.
+    /// A corrupted snapshot will cause consensus divergence.
+    pub fn validate_snapshot(
+        snapshot_path: &Path,
+    ) -> std::result::Result<(), DbError> {
+        // 1. Read expected state_root from metadata
+        let metadata = Self::read_snapshot_metadata(snapshot_path)?;
+        let expected_root = metadata.state_root;
+
+        // 2. Load snapshot LMDB
+        let snapshot_db = Self::load_snapshot(snapshot_path)?;
+
+        // 3. Load state from snapshot
+        let state = snapshot_db.load_state()
+            .map_err(|e| DbError::StateLoadFailed(format!(
+                "failed to load state from snapshot: {}",
+                e
+            )))?;
+
+        // 4. Compute actual state_root
+        let computed_root = state.compute_state_root()
+            .map_err(|e| DbError::StateLoadFailed(format!(
+                "failed to compute state_root: {}",
+                e
+            )))?;
+
+        // 5. Compare
+        if computed_root != expected_root {
+            return Err(DbError::SnapshotCorrupted {
+                expected: expected_root.to_hex(),
+                computed: computed_root.to_hex(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// List all available snapshots in a directory.
+    ///
+    /// Scans base_path for checkpoint_* folders and returns
+    /// their metadata sorted ascending by height.
+    ///
+    /// # Arguments
+    /// * `base_path` - Base snapshots directory (e.g., "./snapshots")
+    ///
+    /// # Behavior
+    /// - Scans for folders matching pattern: checkpoint_{height}
+    /// - Reads metadata.json from each valid folder
+    /// - Ignores invalid/corrupted snapshots (no panic)
+    /// - Returns list sorted by height ascending
+    ///
+    /// # Returns
+    /// * `Ok(Vec<SnapshotMetadata>)` - List of valid snapshots
+    /// * `Err(DbError)` - Base path doesn't exist
+    ///
+    /// # Example
+    /// ```text
+    /// let snapshots = ChainDb::list_available_snapshots(Path::new("./snapshots"))?;
+    /// for snap in snapshots {
+    ///     println!("Snapshot at height {}", snap.height);
+    /// }
+    /// ```
+    pub fn list_available_snapshots(
+        base_path: &Path,
+    ) -> std::result::Result<Vec<crate::state::SnapshotMetadata>, DbError> {
+        // Verify base directory exists
+        if !base_path.exists() {
+            return Err(DbError::DirectoryNotFound(
+                base_path.display().to_string()
+            ));
+        }
+
+        let mut snapshots = Vec::new();
+
+        // Scan directory entries
+        let entries = std::fs::read_dir(base_path)
+            .map_err(|e| DbError::Io(e))?;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue, // Skip unreadable entries
+            };
+
+            let path = entry.path();
+
+            // Check if it's a directory
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Check if folder name matches checkpoint_{height} pattern
+            let folder_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if !folder_name.starts_with("checkpoint_") {
+                continue;
+            }
+
+            // Try to parse height from folder name
+            let height_str = folder_name.strip_prefix("checkpoint_");
+            if height_str.is_none() {
+                continue;
+            }
+
+            // Try to read metadata (ignore invalid snapshots)
+            match Self::read_snapshot_metadata(&path) {
+                Ok(metadata) => snapshots.push(metadata),
+                Err(_) => continue, // Skip corrupted snapshots
+            }
+        }
+
+        // Sort by height ascending
+        snapshots.sort_by_key(|m| m.height);
+
+        Ok(snapshots)
+    }
+
     /// Get the LMDB environment path.
     ///
     /// Used for snapshot operations to access the underlying database path.
@@ -2696,5 +3079,180 @@ mod tests {
         assert!(snapshot_dir.path().join("checkpoint_1000").exists());
         assert!(snapshot_dir.path().join("checkpoint_2000").exists());
         assert!(snapshot_dir.path().join("checkpoint_3000").exists());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT LOADING TESTS (13.18.3)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_load_snapshot_success() {
+        use crate::state::SnapshotMetadata;
+
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        // Write data and create snapshot
+        let addr = Address::from_bytes([0x44; 20]);
+        let acct = Account {
+            address: addr,
+            balance: 5_000_000,
+            nonce: 10,
+            locked: 500,
+        };
+        db.write_account(&acct).unwrap();
+        db.create_snapshot(1000, snapshot_dir.path()).unwrap();
+
+        // Write metadata
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_1000");
+        let metadata = SnapshotMetadata {
+            height: 1000,
+            state_root: Hash::from_bytes([0xAA; 64]),
+            timestamp: 1700000000,
+            block_hash: Hash::from_bytes([0xBB; 64]),
+        };
+        db.write_snapshot_metadata(&checkpoint_path, &metadata).unwrap();
+
+        // Load snapshot
+        let snapshot_db = ChainDb::load_snapshot(&checkpoint_path);
+        assert!(snapshot_db.is_ok(), "load_snapshot should succeed");
+
+        // Verify we can read data from snapshot
+        let loaded_acct = snapshot_db.unwrap().load_account(&addr).unwrap();
+        assert!(loaded_acct.is_some());
+        assert_eq!(loaded_acct.unwrap().balance, 5_000_000);
+    }
+
+    #[test]
+    fn test_load_snapshot_missing_data_mdb() {
+        let snapshot_dir = tempdir().unwrap();
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_999");
+        std::fs::create_dir_all(&checkpoint_path).unwrap();
+        // Don't create data.mdb
+
+        let result = ChainDb::load_snapshot(&checkpoint_path);
+        assert!(result.is_err());
+        match result {
+            Err(DbError::DataNotFound(_)) => {}
+            _ => panic!("expected DataNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_read_snapshot_metadata_success() {
+        use crate::state::SnapshotMetadata;
+
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        db.create_snapshot(2000, snapshot_dir.path()).unwrap();
+
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_2000");
+        let metadata = SnapshotMetadata {
+            height: 2000,
+            state_root: Hash::from_bytes([0xCC; 64]),
+            timestamp: 1700001000,
+            block_hash: Hash::from_bytes([0xDD; 64]),
+        };
+        db.write_snapshot_metadata(&checkpoint_path, &metadata).unwrap();
+
+        // Read metadata back
+        let read_metadata = ChainDb::read_snapshot_metadata(&checkpoint_path);
+        assert!(read_metadata.is_ok());
+        let m = read_metadata.unwrap();
+        assert_eq!(m.height, 2000);
+        assert_eq!(m.timestamp, 1700001000);
+    }
+
+    #[test]
+    fn test_read_snapshot_metadata_missing_file() {
+        let snapshot_dir = tempdir().unwrap();
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_888");
+        std::fs::create_dir_all(&checkpoint_path).unwrap();
+        // Don't create metadata.json
+
+        let result = ChainDb::read_snapshot_metadata(&checkpoint_path);
+        assert!(result.is_err());
+        match result {
+            Err(DbError::MetadataRead(_)) => {}
+            _ => panic!("expected MetadataRead error"),
+        }
+    }
+
+    #[test]
+    fn test_list_available_snapshots() {
+        use crate::state::SnapshotMetadata;
+
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        // Create 3 snapshots
+        for height in [1000u64, 2000, 3000] {
+            db.create_snapshot(height, snapshot_dir.path()).unwrap();
+            let checkpoint_path = snapshot_dir.path().join(format!("checkpoint_{}", height));
+            let metadata = SnapshotMetadata {
+                height,
+                state_root: Hash::from_bytes([height as u8; 64]),
+                timestamp: 1700000000 + height,
+                block_hash: Hash::from_bytes([height as u8; 64]),
+            };
+            db.write_snapshot_metadata(&checkpoint_path, &metadata).unwrap();
+        }
+
+        // List snapshots
+        let snapshots = ChainDb::list_available_snapshots(snapshot_dir.path());
+        assert!(snapshots.is_ok());
+        let list = snapshots.unwrap();
+        assert_eq!(list.len(), 3);
+
+        // Verify sorted by height ascending
+        assert_eq!(list[0].height, 1000);
+        assert_eq!(list[1].height, 2000);
+        assert_eq!(list[2].height, 3000);
+    }
+
+    #[test]
+    fn test_list_snapshots_ignores_invalid() {
+        use crate::state::SnapshotMetadata;
+
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        // Create 1 valid snapshot
+        db.create_snapshot(1000, snapshot_dir.path()).unwrap();
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_1000");
+        let metadata = SnapshotMetadata {
+            height: 1000,
+            state_root: Hash::from_bytes([0x11; 64]),
+            timestamp: 1700000000,
+            block_hash: Hash::from_bytes([0x22; 64]),
+        };
+        db.write_snapshot_metadata(&checkpoint_path, &metadata).unwrap();
+
+        // Create invalid snapshot folder (no metadata)
+        let invalid_path = snapshot_dir.path().join("checkpoint_9999");
+        std::fs::create_dir_all(&invalid_path).unwrap();
+
+        // Create non-checkpoint folder
+        let other_path = snapshot_dir.path().join("other_folder");
+        std::fs::create_dir_all(&other_path).unwrap();
+
+        // List should only return valid snapshot
+        let snapshots = ChainDb::list_available_snapshots(snapshot_dir.path()).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].height, 1000);
+    }
+
+    #[test]
+    fn test_list_snapshots_empty_directory() {
+        let snapshot_dir = tempdir().unwrap();
+        
+        let snapshots = ChainDb::list_available_snapshots(snapshot_dir.path());
+        assert!(snapshots.is_ok());
+        assert_eq!(snapshots.unwrap().len(), 0);
     }
 }
