@@ -4188,34 +4188,6 @@
 //! - Modify block production
 //! - Compute stake ulang
 //! ```
-//!
-//! ### Implementation Status (13.18)
-//!
-//! ```text
-//! | Sub-tahap | Deskripsi                      | Status |
-//! |-----------|--------------------------------|--------|
-//! | 13.18.1   | Snapshot Types & Configuration | ✅     |
-//! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ✅     |
-//! | 13.18.3   | Snapshot Loading & Validation  | ✅     |
-//! | 13.18.4   | Block Replay After Snapshot    | ✅     |
-//! | 13.18.5   | Celestia Control-Plane Rebuild | ✅     |
-//! | 13.18.6   | Automatic Checkpoint Trigger   | ⏳     |
-//! | 13.18.7   | Fast Sync RPC & CLI            | ⏳     |
-//! | 13.18.8   | Documentation Update           | ⏳     |
-//! | 13.18.9   | E2E Testing                    | ⏳     |
-//! ```
-//!
-//! ### Lokasi File (13.18)
-//!
-//! ```text
-//! crates/chain/src/state/internal_snapshot.rs — Snapshot types & config (13.18.1)
-//! crates/chain/src/state/mod.rs               — Re-exports & documentation
-//! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2-3) ✅
-//! crates/chain/src/lib.rs                     — Block replay (13.18.4), Control-plane rebuild (13.18.5) ✅
-//! crates/chain/src/sync.rs                    — StateReplayEngine integration (13.18.4) ✅
-//! crates/chain/src/celestia.rs                — Control-plane fetch & types (13.18.5) ✅
-//! ```
-//!
 //! ### Catatan Penting
 //!
 //! ```text
@@ -4231,7 +4203,86 @@
 //! - State inconsistency
 //! - Recovery gagal
 //! ```
-
+//! ### 13.18.6 — Automatic Checkpoint Trigger
+//!
+//! Sub-tahap ini mengimplementasikan automatic checkpoint system yang
+//! membuat snapshot otomatis setiap N blocks dan cleanup snapshot lama.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │              AUTOMATIC CHECKPOINT FLOW                          │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  TRIGGER POINT (mine_block_and_apply)                           │
+//! │  ────────────────────────────────────                           │
+//! │  apply_block()                                                  │
+//! │    └── state_root valid                                         │
+//! │         └── epoch rotation                                      │
+//! │              └── maybe_create_checkpoint(height) ← HOOK         │
+//! │                   └── broadcast block                           │
+//! │                        └── finalize                             │
+//! │                                                                 │
+//! │  CHECKPOINT LOGIC                                               │
+//! │  ─────────────────                                              │
+//! │  maybe_create_checkpoint(height):                               │
+//! │    1. if interval == 0 → return (disabled)                      │
+//! │    2. if height % interval != 0 → return (not checkpoint)       │
+//! │    3. create_snapshot(height, path)                             │
+//! │    4. write_snapshot_metadata(path, metadata)                   │
+//! │    5. cleanup_old_snapshots(max_snapshots)                      │
+//! │                                                                 │
+//! │  CLEANUP LOGIC                                                  │
+//! │  ─────────────                                                  │
+//! │  cleanup_old_snapshots(keep_count):                             │
+//! │    1. list_available_snapshots()                                │
+//! │    2. sort by height ASCENDING                                  │
+//! │    3. if count <= keep_count → return                           │
+//! │    4. delete (count - keep_count) OLDEST snapshots              │
+//! │    5. NEVER delete newest snapshot                              │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### Chain Fields (13.18.6)
+//!
+//! | Field | Type | Description |
+//! |-------|------|-------------|
+//! | `snapshot_config` | `SnapshotConfig` | Konfigurasi interval, path, retention |
+//!
+//! #### Chain Methods (13.18.6)
+//!
+//! | Method | Signature | Description |
+//! |--------|-----------|-------------|
+//! | `maybe_create_checkpoint` | `(&self, height: u64) -> Result<(), ChainError>` | Create checkpoint if interval match |
+//! | `cleanup_old_snapshots` | `(&self, keep_count: usize) -> Result<(), ChainError>` | FIFO cleanup oldest snapshots |
+//!
+//! #### ChainError Variants (13.18.6)
+//!
+//! | Variant | Description |
+//! |---------|-------------|
+//! | `SnapshotCreationFailed { height, message }` | Snapshot creation error |
+//! | `SnapshotCleanupFailed(String)` | Snapshot cleanup error |
+//!
+//! #### Behavior Notes
+//!
+//! ```text
+//! CHECKPOINT TRIGGERING:
+//! - Snapshot dibuat setiap (height % interval_blocks == 0)
+//! - interval_blocks = 0 berarti snapshot DISABLED
+//! - Snapshot dibuat SETELAH block final, SEBELUM broadcast
+//! - Error checkpoint TIDAK menggagalkan block production
+//!
+//! CLEANUP POLICY:
+//! - Cleanup berjalan SETELAH setiap snapshot baru
+//! - Snapshot tertua dihapus dulu (FIFO)
+//! - Minimum 1 snapshot selalu dipertahankan
+//! - Snapshot terbaru TIDAK PERNAH dihapus
+//!
+//! TIDAK DIPANGGIL SAAT:
+//! - Block replay (replay_blocks_from)
+//! - Fast sync (fast_sync_from_snapshot)
+//! - Recovery operations
+//! ```
 use crate::types::{Address, Hash};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
