@@ -4013,6 +4013,90 @@
 //! - list_available_snapshots() bersifat read-only & safe
 //! ```
 //!
+//! ### 13.18.4 — Block Replay After Snapshot
+//!
+//! Sub-tahap ini mengimplementasikan block replay untuk recovery dan fast sync.
+//! **REPLAY ADALAH RE-EKSEKUSI KONSENSUS** — harus deterministik.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    BLOCK REPLAY FLOW                            │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  INPUT                                                          │
+//! │  ─────                                                          │
+//! │  - start_height: Height snapshot (replay dari start+1)          │
+//! │  - end_height: Target height (tip)                              │
+//! │  - progress: Optional callback                                  │
+//! │                                                                 │
+//! │  REPLAY LOOP (for each block)                                   │
+//! │  ───────────────────────────                                    │
+//! │  1. Verify block signature                                      │
+//! │  2. Execute all transactions (apply_payload)                   │
+//! │  3. Process automatic slashing (13.14.6)                       │
+//! │  4. Process economic job (13.15.6)                             │
+//! │  5. Compute state_root                                         │
+//! │  6. VERIFY: computed == block.header.state_root                │
+//! │     ├── MATCH → Continue to next block                         │
+//! │     └── MISMATCH → Error (ChainError::StateRootMismatch)       │
+//! │  7. Call progress callback if provided                          │
+//! │                                                                 │
+//! │  OUTPUT                                                         │
+//! │  ──────                                                         │
+//! │  - State di chain.state sudah di-update                        │
+//! │  - Semua blocks terverifikasi                                   │
+//! │  - Ready untuk normal operation                                 │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### Chain Methods (13.18.4)
+//!
+//! | Method | Signature | Description |
+//! |--------|-----------|-------------|
+//! | `replay_blocks_from` | `(&self, start: u64, end: u64, progress: Option<&dyn Fn(u64,u64)>) -> Result<(), ChainError>` | Replay blocks dari snapshot ke tip |
+//! | `get_blocks_range` | `(&self, start: u64, end: u64) -> Result<Vec<Block>, ChainError>` | Fetch blocks dari DB |
+//!
+//! #### ChainError (13.18.4)
+//!
+//! | Variant | Description |
+//! |---------|-------------|
+//! | `BlockNotFound` | Block tidak ada di DB |
+//! | `InvalidRange` | start > end |
+//! | `StateRootMismatch` | computed != expected state_root |
+//! | `SignatureVerificationFailed` | Block signature invalid |
+//! | `TransactionError` | TX execution error |
+//! | `DatabaseError` | DB access error |
+//! | `ReplayInterrupted` | Replay dihentikan |
+//!
+//! #### StateReplayEngine Integration (sync.rs)
+//!
+//! | Method | Description |
+//! |--------|-------------|
+//! | `replay_using_chain` | Wrapper untuk Chain::replay_blocks_from |
+//! | `fast_sync_from_snapshot` | Load snapshot → set state → replay |
+//!
+//! #### Consensus-Critical Notes
+//!
+//! ```text
+//! ⚠️ REPLAY ADALAH KONSENSUS-GRADE:
+//!
+//! 1. Replay HARUS deterministik (same input → same output)
+//! 2. state_root WAJIB diverifikasi setiap block
+//! 3. Block TIDAK boleh di-skip
+//! 4. Mismatch state_root = replay GAGAL TOTAL
+//!
+//! USE CASES:
+//! - Fast sync: download snapshot → replay blocks → catch up
+//! - Recovery: restore checkpoint → replay → rebuild state
+//! - Audit: verify historical state transitions
+//!
+//! PENTING:
+//! - Replay TIDAK broadcast blocks
+//! - Replay TIDAK modify chain tip
+//! - Replay HANYA execute dan verify
+//! ```
+//!
 //! ### Implementation Status (13.18)
 //!
 //! ```text
@@ -4021,7 +4105,7 @@
 //! | 13.18.1   | Snapshot Types & Configuration | ✅     |
 //! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ✅     |
 //! | 13.18.3   | Snapshot Loading & Validation  | ✅     |
-//! | 13.18.4   | Block Replay After Snapshot    | ⏳     |
+//! | 13.18.4   | Block Replay After Snapshot    | ✅     |
 //! | 13.18.5   | Celestia Control-Plane Rebuild | ⏳     |
 //! | 13.18.6   | Automatic Checkpoint Trigger   | ⏳     |
 //! | 13.18.7   | Fast Sync RPC & CLI            | ⏳     |
@@ -4035,7 +4119,8 @@
 //! crates/chain/src/state/internal_snapshot.rs — Snapshot types & config (13.18.1)
 //! crates/chain/src/state/mod.rs               — Re-exports & documentation
 //! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2-3) ✅
-//! crates/chain/src/lib.rs                     — Chain snapshot integration (13.18.4-6) [PENDING]
+//! crates/chain/src/lib.rs                     — Block replay (13.18.4) ✅
+//! crates/chain/src/sync.rs                    — StateReplayEngine integration (13.18.4) ✅
 //! ```
 //!
 //! ### Catatan Penting
