@@ -4283,6 +4283,65 @@
 //! - Fast sync (fast_sync_from_snapshot)
 //! - Recovery operations
 //! ```
+//! //! ### 13.18.7 — Fast Sync Integration (RPC & CLI)
+//!
+//! Sub-tahap ini menyediakan interface RPC dan CLI untuk mengakses
+//! snapshot system dan melakukan fast sync.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │              SNAPSHOT & FAST SYNC INTERFACE                     │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  RPC ENDPOINTS                                                  │
+//! │  ─────────────                                                  │
+//! │  get_snapshot_list()           → List semua snapshot            │
+//! │  get_snapshot_metadata(height) → Metadata snapshot spesifik     │
+//! │  create_snapshot()             → Create snapshot di current tip │
+//! │  fast_sync_from_snapshot(h)    → Fast sync dari snapshot        │
+//! │                                                                 │
+//! │  CLI COMMANDS                                                   │
+//! │  ────────────                                                   │
+//! │  snapshot list                 → List semua snapshot            │
+//! │  snapshot create               → Create snapshot manual         │
+//! │  snapshot info --height <h>    → Inspect snapshot metadata      │
+//! │  sync fast --from-snapshot <h> → Fast sync dari snapshot        │
+//! │                                                                 │
+//! │  FAST SYNC FLOW                                                 │
+//! │  ───────────────                                                │
+//! │  1. Validate snapshot exists                                    │
+//! │  2. Validate snapshot integrity (state_root match)              │
+//! │  3. Load snapshot state                                         │
+//! │  4. Replay blocks from snapshot to tip                          │
+//! │  5. Rebuild control-plane dari Celestia (if configured)         │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### RPC Response Types (13.18.7)
+//!
+//! | Type | Fields | Description |
+//! |------|--------|-------------|
+//! | `SnapshotListRes` | `snapshots: Vec<SnapshotMetadataRes>` | List snapshot |
+//! | `SnapshotMetadataRes` | `height, state_root, timestamp` | Metadata snapshot |
+//! | `FastSyncStatusRes` | `started, from_height, message` | Fast sync status |
+//!
+//! #### Security Notes
+//!
+//! ```text
+//! ZERO-TRUST TERHADAP USER INPUT:
+//! - Snapshot height WAJIB divalidasi sebelum digunakan
+//! - Snapshot integrity WAJIB di-check (state_root match)
+//! - Fast sync TIDAK bypass consensus rules
+//! - Invalid snapshot = explicit error (tidak ada fallback)
+//! - Tidak ada auto-create atau implicit behavior
+//!
+//! CLI BEHAVIOR:
+//! - Error messages jelas dan informatif
+//! - Tidak ada silent failure
+//! - Progress ditampilkan step-by-step
+//! - Validasi dilakukan sebelum operasi berat
+//! ```
 use crate::types::{Address, Hash};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
