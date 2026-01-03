@@ -3878,13 +3878,76 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! ### 13.18.2 — Snapshot Creation (LMDB Copy)
+//!
+//! Sub-tahap ini mengimplementasikan pembuatan snapshot LMDB.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                 SNAPSHOT CREATION FLOW                          │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  1. CREATE FOLDER                                               │
+//! │     └── {target_path}/checkpoint_{height}/                      │
+//! │                                                                 │
+//! │  2. COPY LMDB (ATOMIC)                                          │
+//! │     └── env.copy_to_path() → data.mdb                          │
+//! │     └── Read-only copy, tidak block writers                     │
+//! │     └── Jika gagal → cleanup folder (rollback)                  │
+//! │                                                                 │
+//! │  3. WRITE METADATA                                              │
+//! │     └── serialize(SnapshotMetadata) → metadata.json            │
+//! │     └── Contains: height, state_root, timestamp, block_hash    │
+//! │                                                                 │
+//! │  RESULT                                                         │
+//! │  ──────                                                         │
+//! │  snapshots/checkpoint_{height}/                                 │
+//! │  ├── data.mdb        ← Complete LMDB copy                      │
+//! │  └── metadata.json   ← Verification data                       │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### ChainDb Methods (13.18.2)
+//!
+//! | Method | Signature | Description |
+//! |--------|-----------|-------------|
+//! | `create_snapshot` | `(&self, height: u64, target_path: &Path) -> Result<(), DbError>` | Copy LMDB ke folder snapshot |
+//! | `write_snapshot_metadata` | `(&self, snapshot_path: &Path, metadata: &SnapshotMetadata) -> Result<(), DbError>` | Tulis metadata.json |
+//!
+//! #### DbError (13.18.2)
+//!
+//! Error type untuk snapshot operations:
+//! - `DirectoryCreation` — Gagal buat folder
+//! - `LmdbCopy` — Gagal copy database
+//! - `MetadataWrite` — Gagal tulis metadata
+//! - `Serialization` — Gagal serialize JSON
+//! - `DirectoryNotFound` — Folder tidak ada
+//! - `Cleanup` — Gagal rollback
+//!
+//! #### Atomicity & Crash Safety
+//!
+//! ```text
+//! ⚠️ ATOMICITY GUARANTEE:
+//!
+//! - Jika LMDB copy gagal → folder dihapus
+//! - Tidak ada snapshot parsial
+//! - Snapshot yang sukses selalu lengkap
+//!
+//! ⚠️ CRASH SAFETY:
+//!
+//! - LMDB copy menggunakan internal transaction
+//! - Copy bersifat read-only, tidak block writers
+//! - Chain dapat terus berjalan saat snapshot dibuat
+//! ```
+//!
 //! ### Implementation Status (13.18)
 //!
 //! ```text
 //! | Sub-tahap | Deskripsi                      | Status |
 //! |-----------|--------------------------------|--------|
 //! | 13.18.1   | Snapshot Types & Configuration | ✅     |
-//! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ⏳     |
+//! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ✅     |
 //! | 13.18.3   | Snapshot Loading & Validation  | ⏳     |
 //! | 13.18.4   | Block Replay After Snapshot    | ⏳     |
 //! | 13.18.5   | Celestia Control-Plane Rebuild | ⏳     |
@@ -3899,7 +3962,7 @@
 //! ```text
 //! crates/chain/src/state/internal_snapshot.rs — Snapshot types & config (13.18.1)
 //! crates/chain/src/state/mod.rs               — Re-exports & documentation
-//! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2-3) [PENDING]
+//! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2) ✅
 //! crates/chain/src/lib.rs                     — Chain snapshot integration (13.18.4-6) [PENDING]
 //! ```
 //!
