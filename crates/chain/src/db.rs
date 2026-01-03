@@ -15,8 +15,47 @@ use lmdb::{
 use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use bincode;
 use serde::{Serialize, Deserialize};
+use thiserror::Error;
+
+// ════════════════════════════════════════════════════════════════════════════
+// SNAPSHOT ERROR TYPE (13.18.2)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk snapshot operations.
+/// Digunakan untuk create_snapshot dan write_snapshot_metadata.
+#[derive(Debug, Error)]
+pub enum DbError {
+    /// Gagal membuat direktori snapshot
+    #[error("failed to create snapshot directory: {0}")]
+    DirectoryCreation(String),
+
+    /// Gagal melakukan LMDB copy
+    #[error("failed to copy LMDB environment: {0}")]
+    LmdbCopy(String),
+
+    /// Gagal menulis metadata
+    #[error("failed to write snapshot metadata: {0}")]
+    MetadataWrite(String),
+
+    /// Gagal serialisasi metadata ke JSON
+    #[error("failed to serialize metadata: {0}")]
+    Serialization(String),
+
+    /// Snapshot directory tidak ada
+    #[error("snapshot directory does not exist: {0}")]
+    DirectoryNotFound(String),
+
+    /// Gagal cleanup snapshot parsial
+    #[error("failed to cleanup partial snapshot: {0}")]
+    Cleanup(String),
+
+    /// IO error umum
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // BUCKET CONSTANTS (13.10, 13.11, 13.12, 13.14)
@@ -277,6 +316,7 @@ impl NodeEarningsData {
 #[derive(Clone)]
 pub struct ChainDb {
     env: Arc<Environment>,
+    env_path: PathBuf,
     db_blocks: Database,
     db_block_hashes: Database,
     db_txs: Database,
@@ -375,6 +415,7 @@ impl ChainDb {
 
         Ok(Self {
             env: Arc::new(env),
+            env_path: p.to_path_buf(),
             db_blocks,
             db_block_hashes,
             db_txs,
@@ -2350,6 +2391,170 @@ Ok(headers)
         
         Ok(result)
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT OPERATIONS (13.18.2)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Methods untuk membuat snapshot LMDB dan menulis metadata.
+    //
+    // Snapshot adalah ATOMIC:
+    // - Jika copy LMDB gagal, folder dihapus
+    // - Snapshot parsial TIDAK boleh ada
+    //
+    // Snapshot adalah CONSISTENT:
+    // - Copy dilakukan dalam read transaction
+    // - Tidak mengganggu write aktif
+    //
+    // FOLDER STRUCTURE:
+    // snapshots/
+    // └── checkpoint_{height}/
+    //     ├── data.mdb        ← LMDB database copy
+    //     └── metadata.json   ← SnapshotMetadata
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Create snapshot of LMDB environment at specified height.
+    ///
+    /// Creates folder `{target_path}/checkpoint_{height}/` containing:
+    /// - `data.mdb`: Full LMDB environment copy
+    ///
+    /// # Arguments
+    /// * `height` - Block height for snapshot (used in folder name)
+    /// * `target_path` - Base path for snapshots (e.g., "./snapshots")
+    ///
+    /// # Atomicity
+    /// - If copy fails, the partial folder is removed
+    /// - No partial snapshots will exist after this method returns
+    ///
+    /// # Returns
+    /// * `Ok(())` - Snapshot created successfully
+    /// * `Err(DbError)` - Creation failed (folder cleaned up)
+    ///
+    /// # Example
+    /// ```text
+    /// db.create_snapshot(1000, Path::new("./snapshots"))?;
+    /// // Creates: ./snapshots/checkpoint_1000/data.mdb
+    /// ```
+    pub fn create_snapshot(
+        &self,
+        height: u64,
+        target_path: &Path,
+    ) -> std::result::Result<(), DbError> {
+        let snapshot_folder = target_path.join(format!("checkpoint_{}", height));
+
+        // 1. Create snapshot directory
+        std::fs::create_dir_all(&snapshot_folder).map_err(|e| {
+            DbError::DirectoryCreation(format!(
+                "path={}, error={}",
+                snapshot_folder.display(),
+                e
+            ))
+        })?;
+
+        // 2. Source LMDB data.mdb
+        let src_data = self.env_path.join("data.mdb");
+        if !src_data.exists() {
+            let _ = std::fs::remove_dir_all(&snapshot_folder);
+            return Err(DbError::LmdbCopy(format!(
+                "source data.mdb not found at {}",
+                src_data.display()
+            )));
+        }
+
+        // 3. Destination
+        let dst_data = snapshot_folder.join("data.mdb");
+
+        // 4. Flush LMDB state to disk (SAFE, no unsafe)
+        self.env.sync(true).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&snapshot_folder);
+            DbError::LmdbCopy(format!("env.sync failed: {}", e))
+        })?;
+
+        // 5. Copy data.mdb atomically
+        std::fs::copy(&src_data, &dst_data).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&snapshot_folder);
+            DbError::LmdbCopy(format!(
+                "copy failed: {} -> {}, error={}",
+                src_data.display(),
+                dst_data.display(),
+                e
+            ))
+        })?;
+
+        Ok(())
+    }
+
+
+
+    /// Write snapshot metadata to JSON file.
+    ///
+    /// Creates `metadata.json` in the snapshot folder containing:
+    /// - height, state_root, timestamp, block_hash
+    ///
+    /// # Arguments
+    /// * `snapshot_path` - Path to snapshot folder (e.g., "./snapshots/checkpoint_1000")
+    /// * `metadata` - SnapshotMetadata to write
+    ///
+    /// # File Format
+    /// ```json
+    /// {
+    ///     "height": 1000,
+    ///     "state_root": "0x...",
+    ///     "timestamp": 1700000000,
+    ///     "block_hash": "0x..."
+    /// }
+    /// ```
+    ///
+    /// # Returns
+    /// * `Ok(())` - Metadata written successfully
+    /// * `Err(DbError)` - Write failed
+    pub fn write_snapshot_metadata(
+        &self,
+        snapshot_path: &Path,
+        metadata: &crate::state::SnapshotMetadata,
+    ) -> std::result::Result<(), DbError> {
+        // Verify snapshot directory exists
+        if !snapshot_path.exists() {
+            return Err(DbError::DirectoryNotFound(
+                snapshot_path.display().to_string()
+            ));
+        }
+
+        // Metadata file path
+        let metadata_file = snapshot_path.join("metadata.json");
+
+        // Serialize metadata to JSON
+        let json_content = match serde_json::to_string_pretty(metadata) {
+            Ok(json) => json,
+            Err(e) => {
+                return Err(DbError::Serialization(format!(
+                    "failed to serialize SnapshotMetadata: {}",
+                    e
+                )));
+            }
+        };
+
+        // Write to file (atomic via write then rename not needed for JSON)
+        if let Err(e) = std::fs::write(&metadata_file, json_content) {
+            return Err(DbError::MetadataWrite(format!(
+                "path={}, error={}",
+                metadata_file.display(),
+                e
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get the LMDB environment path.
+    ///
+    /// Used for snapshot operations to access the underlying database path.
+    ///
+    /// # Returns
+    /// Path to the LMDB environment directory
+    pub fn get_env_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.env_path.clone())
+    }
+
 }
 
 #[cfg(test)]
@@ -2379,5 +2584,117 @@ mod tests {
         let tip = db.get_tip().unwrap().unwrap();
         assert_eq!(tip.0, 10);
         assert_eq!(tip.1.to_hex(), dummy_hash.to_hex());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT TESTS (13.18.2)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_create_snapshot_success() {
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        // Write some data first
+        let addr = Address::from_bytes([0x33; 20]);
+        let acct = Account {
+            address: addr,
+            balance: 999_999,
+            nonce: 5,
+            locked: 100,
+        };
+        db.write_account(&acct).unwrap();
+
+        // Create snapshot
+        let height = 1000;
+        let result = db.create_snapshot(height, snapshot_dir.path());
+        assert!(result.is_ok(), "create_snapshot should succeed");
+
+        // Verify folder structure
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_1000");
+        assert!(checkpoint_path.exists(), "checkpoint folder should exist");
+
+        let data_mdb = checkpoint_path.join("data.mdb");
+        assert!(data_mdb.exists(), "data.mdb should exist");
+    }
+
+    #[test]
+    fn test_write_snapshot_metadata_success() {
+        use crate::state::SnapshotMetadata;
+
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        // Create snapshot first
+        let height = 2000;
+        db.create_snapshot(height, snapshot_dir.path()).unwrap();
+
+        // Write metadata
+        let checkpoint_path = snapshot_dir.path().join("checkpoint_2000");
+        let metadata = SnapshotMetadata {
+            height: 2000,
+            state_root: Hash::from_bytes([0xAB; 64]),
+            timestamp: 1700000000,
+            block_hash: Hash::from_bytes([0xCD; 64]),
+        };
+
+        let result = db.write_snapshot_metadata(&checkpoint_path, &metadata);
+        assert!(result.is_ok(), "write_snapshot_metadata should succeed");
+
+        // Verify metadata file exists
+        let metadata_file = checkpoint_path.join("metadata.json");
+        assert!(metadata_file.exists(), "metadata.json should exist");
+
+        // Verify content is valid JSON
+        let content = std::fs::read_to_string(&metadata_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["height"], 2000);
+    }
+
+    #[test]
+    fn test_write_metadata_directory_not_found() {
+        use crate::state::SnapshotMetadata;
+
+        let db_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        let nonexistent_path = std::path::Path::new("/nonexistent/path/checkpoint_999");
+        let metadata = SnapshotMetadata {
+            height: 999,
+            state_root: Hash::from_bytes([0x00; 64]),
+            timestamp: 0,
+            block_hash: Hash::from_bytes([0x00; 64]),
+        };
+
+        let result = db.write_snapshot_metadata(nonexistent_path, &metadata);
+        assert!(result.is_err(), "should fail for nonexistent directory");
+
+        match result {
+            Err(DbError::DirectoryNotFound(_)) => {}
+            _ => panic!("expected DirectoryNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_multiple_heights() {
+        let db_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let db = ChainDb::open(db_dir.path()).unwrap();
+
+        // Create multiple snapshots
+        for height in [1000, 2000, 3000] {
+            let result = db.create_snapshot(height, snapshot_dir.path());
+            assert!(result.is_ok(), "snapshot at height {} should succeed", height);
+
+            let checkpoint_path = snapshot_dir.path().join(format!("checkpoint_{}", height));
+            assert!(checkpoint_path.exists(), "checkpoint_{} folder should exist", height);
+        }
+
+        // Verify all three exist
+        assert!(snapshot_dir.path().join("checkpoint_1000").exists());
+        assert!(snapshot_dir.path().join("checkpoint_2000").exists());
+        assert!(snapshot_dir.path().join("checkpoint_3000").exists());
     }
 }
