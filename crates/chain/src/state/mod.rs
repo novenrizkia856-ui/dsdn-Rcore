@@ -3941,6 +3941,78 @@
 //! - Chain dapat terus berjalan saat snapshot dibuat
 //! ```
 //!
+//! ### 13.18.3 — Snapshot Loading & Validation
+//!
+//! Sub-tahap ini mengimplementasikan loading dan validasi snapshot.
+//! **ZERO-TRUST PRINCIPLE**: Snapshot TIDAK dipercaya secara default.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                 SNAPSHOT VALIDATION FLOW                        │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  STEP 1: READ METADATA                                          │
+//! │  ──────────────────────                                         │
+//! │  read_snapshot_metadata(path)                                   │
+//! │    └── Parse metadata.json                                      │
+//! │    └── Extract expected state_root                              │
+//! │                                                                 │
+//! │  STEP 2: LOAD SNAPSHOT                                          │
+//! │  ──────────────────────                                         │
+//! │  load_snapshot(path)                                            │
+//! │    └── Verify data.mdb exists                                   │
+//! │    └── Open LMDB environment (read-only)                        │
+//! │    └── Return ChainDb instance                                  │
+//! │                                                                 │
+//! │  STEP 3: VALIDATE STATE ROOT                                    │
+//! │  ──────────────────────                                         │
+//! │  validate_snapshot(path)                                        │
+//! │    └── Load state from LMDB                                     │
+//! │    └── Compute state_root from state                            │
+//! │    └── Compare: computed == expected?                           │
+//! │        ├── YES → Ok(())                                        │
+//! │        └── NO  → Err(SnapshotCorrupted)                        │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### ChainDb Methods (13.18.3)
+//!
+//! | Method | Signature | Description |
+//! |--------|-----------|-------------|
+//! | `load_snapshot` | `(path: &Path) -> Result<ChainDb, DbError>` | Load snapshot sebagai read-only ChainDb |
+//! | `read_snapshot_metadata` | `(path: &Path) -> Result<SnapshotMetadata, DbError>` | Baca metadata.json |
+//! | `validate_snapshot` | `(path: &Path) -> Result<(), DbError>` | Validasi state_root (CONSENSUS-GRADE) |
+//! | `list_available_snapshots` | `(base: &Path) -> Result<Vec<SnapshotMetadata>, DbError>` | List semua snapshot valid |
+//!
+//! #### New DbError Variants (13.18.3)
+//!
+//! | Variant | Description |
+//! |---------|-------------|
+//! | `MetadataRead` | Gagal baca metadata.json |
+//! | `MetadataInvalid` | JSON invalid atau field tidak lengkap |
+//! | `DataNotFound` | data.mdb tidak ditemukan |
+//! | `SnapshotOpenFailed` | Gagal buka LMDB environment |
+//! | `SnapshotCorrupted` | state_root mismatch (expected vs computed) |
+//! | `StateLoadFailed` | Gagal load state dari snapshot |
+//!
+//! #### Security Boundaries
+//!
+//! ```text
+//! ⚠️ CONSENSUS-CRITICAL VALIDATION:
+//!
+//! 1. Snapshot TIDAK dipercaya secara default
+//! 2. state_root WAJIB divalidasi sebelum boot
+//! 3. Snapshot korup HARUS ditolak (SnapshotCorrupted error)
+//! 4. Validasi via Merkle hash (deterministic & verifiable)
+//!
+//! PENTING:
+//! - JANGAN skip validate_snapshot() saat recovery
+//! - Snapshot tanpa metadata DITOLAK
+//! - Snapshot parsial DITOLAK
+//! - list_available_snapshots() bersifat read-only & safe
+//! ```
+//!
 //! ### Implementation Status (13.18)
 //!
 //! ```text
@@ -3948,7 +4020,7 @@
 //! |-----------|--------------------------------|--------|
 //! | 13.18.1   | Snapshot Types & Configuration | ✅     |
 //! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ✅     |
-//! | 13.18.3   | Snapshot Loading & Validation  | ⏳     |
+//! | 13.18.3   | Snapshot Loading & Validation  | ✅     |
 //! | 13.18.4   | Block Replay After Snapshot    | ⏳     |
 //! | 13.18.5   | Celestia Control-Plane Rebuild | ⏳     |
 //! | 13.18.6   | Automatic Checkpoint Trigger   | ⏳     |
@@ -3962,7 +4034,7 @@
 //! ```text
 //! crates/chain/src/state/internal_snapshot.rs — Snapshot types & config (13.18.1)
 //! crates/chain/src/state/mod.rs               — Re-exports & documentation
-//! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2) ✅
+//! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2-3) ✅
 //! crates/chain/src/lib.rs                     — Chain snapshot integration (13.18.4-6) [PENDING]
 //! ```
 //!
