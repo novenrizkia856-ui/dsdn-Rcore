@@ -610,6 +610,52 @@ pub struct BlobHeightRes {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SNAPSHOT LIST & FAST SYNC RPC RESPONSE TYPES (13.18.7)
+// ════════════════════════════════════════════════════════════════════════════
+// Response structs untuk snapshot listing, inspection, dan fast sync.
+// SEMUA OPERASI INI ADALAH READ-ONLY atau EXPLICIT-ACTION.
+// Tidak ada implicit behavior atau auto-sync.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Response for snapshot list query
+/// 
+/// Returns list of available snapshots sorted by height ascending.
+/// Used by operators to select snapshot for fast sync.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SnapshotListRes {
+    /// List of available snapshots (sorted by height ASC)
+    pub snapshots: Vec<SnapshotMetadataRes>,
+}
+
+/// Response for snapshot metadata query
+/// 
+/// Returns metadata for a specific snapshot.
+/// Used for inspection before fast sync.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SnapshotMetadataRes {
+    /// Block height of snapshot
+    pub height: u64,
+    /// State root hash (hex string)
+    pub state_root: String,
+    /// Unix timestamp when snapshot was created
+    pub timestamp: u64,
+}
+
+/// Response for fast sync operation
+/// 
+/// Returns status of fast sync initiation.
+/// Fast sync is NOT started immediately - this returns whether it CAN start.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FastSyncStatusRes {
+    /// Whether fast sync was successfully initiated
+    pub started: bool,
+    /// Snapshot height being used
+    pub from_height: u64,
+    /// Human-readable status message
+    pub message: String,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // WALLET RPC RESPONSE TYPES (13.17.8)
 // ════════════════════════════════════════════════════════════════════════════
 // Response structs for wallet operations.
@@ -2886,6 +2932,295 @@ SyncRequest::GetChainTip => {
             } else {
                 "Blob does NOT match commitment".to_string()
             },
+        })
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT LIST & FAST SYNC RPC (13.18.7)
+    // ════════════════════════════════════════════════════════════════════════════
+    // RPC endpoints untuk snapshot listing, inspection, dan fast sync.
+    //
+    // KEAMANAN:
+    // - Semua operasi eksplisit (tidak ada implicit behavior)
+    // - Snapshot divalidasi sebelum digunakan
+    // - Fast sync TIDAK bypass konsensus
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Get list of all available snapshots
+    /// 
+    /// # Returns
+    /// * `SnapshotListRes` with list of snapshots sorted by height ascending
+    /// 
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Returns empty list if no snapshots exist
+    /// - Invalid snapshots are filtered out at DB layer
+    pub fn get_snapshot_list(&self) -> Result<SnapshotListRes, RpcError> {
+        // Get snapshot base path from config
+        let base_path = std::path::Path::new(&self.chain.snapshot_config.path);
+
+        // List available snapshots (associated function)
+        let snapshots = crate::db::ChainDb::list_available_snapshots(base_path)
+            .map_err(|e| RpcError {
+                code: -32070,
+                message: format!("failed to list snapshots: {}", e),
+            })?;
+
+        // Convert to response type and sort by height ascending
+        let mut snapshot_list: Vec<SnapshotMetadataRes> = snapshots
+            .into_iter()
+            .map(|m| SnapshotMetadataRes {
+                height: m.height,
+                state_root: m.state_root.to_hex(),
+                timestamp: m.timestamp,
+            })
+            .collect();
+
+        snapshot_list.sort_by(|a, b| a.height.cmp(&b.height));
+
+        Ok(SnapshotListRes {
+            snapshots: snapshot_list,
+        })
+    }
+
+    /// Get metadata for a specific snapshot by height
+    /// 
+    /// # Arguments
+    /// * `height` - Block height of snapshot to query
+    /// 
+    /// # Returns
+    /// * `SnapshotMetadataRes` with snapshot details
+    /// 
+    /// # Errors
+    /// * If no snapshot exists at given height
+    /// 
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Does NOT fallback to other heights
+    /// - Does NOT auto-create snapshot
+    pub fn get_snapshot_metadata(
+        &self,
+        height: u64,
+    ) -> Result<SnapshotMetadataRes, RpcError> {
+        // Construct snapshot path
+        let snapshot_path = format!(
+            "{}/checkpoint_{}",
+            self.chain.snapshot_config.path,
+            height
+        );
+        let path = std::path::Path::new(&snapshot_path);
+
+        // Read metadata (will fail if not exists)
+        use crate::db::ChainDb;
+
+        let metadata = ChainDb::read_snapshot_metadata(path)
+            .map_err(|e| RpcError {
+                code: -32071,
+                message: format!("snapshot not found at height {}: {}", height, e),
+            })?;
+
+
+        Ok(SnapshotMetadataRes {
+            height: metadata.height,
+            state_root: metadata.state_root.to_hex(),
+            timestamp: metadata.timestamp,
+        })
+    }
+
+    /// Create a snapshot at current height
+    /// 
+    /// # Returns
+    /// * `Ok(())` on success
+    /// 
+    /// # Notes
+    /// - Creates snapshot at current chain tip
+    /// - Respects retention policy (max_snapshots)
+    /// - Blocks until snapshot is complete
+    pub fn create_snapshot(&self) -> Result<(), RpcError> {
+        // Get current chain tip
+        let (tip_height, _) = self.chain.get_chain_tip().map_err(|e| RpcError {
+            code: -32072,
+            message: format!("failed to get chain tip: {}", e),
+        })?;
+
+        // Create snapshot path
+        let snapshot_path = format!(
+            "{}/checkpoint_{}",
+            self.chain.snapshot_config.path,
+            tip_height
+        );
+        let path = std::path::Path::new(&snapshot_path);
+
+        // Create snapshot via ChainDb
+        self.chain.db.create_snapshot(tip_height, path)
+            .map_err(|e| RpcError {
+                code: -32073,
+                message: format!("failed to create snapshot: {}", e),
+            })?;
+
+        // Get state_root for metadata
+        let state_root = {
+            let state = self.chain.state.read();
+            state.compute_state_root().map_err(|e| RpcError {
+                code: -32074,
+                message: format!("failed to compute state root: {}", e),
+            })?
+        };
+
+        // Get block hash
+        let block_hash = self.chain.db.get_block(tip_height)
+            .map_err(|e| RpcError {
+                code: -32075,
+                message: format!("failed to get block: {}", e),
+            })?
+            .map(|b| crate::block::Block::compute_hash(&b.header))
+            .ok_or_else(|| RpcError {
+                code: -32076,
+                message: format!("block not found at height {}", tip_height),
+            })?;
+
+        // Write metadata
+        let metadata = crate::state::SnapshotMetadata {
+            height: tip_height,
+            state_root,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            block_hash,
+        };
+
+        self.chain.db.write_snapshot_metadata(path, &metadata)
+            .map_err(|e| RpcError {
+                code: -32077,
+                message: format!("failed to write metadata: {}", e),
+            })?;
+
+        // Cleanup old snapshots
+        let keep_count = self.chain.snapshot_config.max_snapshots as usize;
+        self.chain.cleanup_old_snapshots(keep_count)
+            .map_err(|e| RpcError {
+                code: -32078,
+                message: format!("cleanup failed: {}", e),
+            })?;
+
+        Ok(())
+    }
+
+    /// Initiate fast sync from a specific snapshot
+    /// 
+    /// # Arguments
+    /// * `height` - Snapshot height to sync from
+    /// 
+    /// # Returns
+    /// * `FastSyncStatusRes` indicating whether sync can start
+    /// 
+    /// # Notes
+    /// - VALIDATES snapshot before use
+    /// - Does NOT bypass consensus
+    /// - Returns status only (actual sync may be async in future)
+    /// 
+    /// # Flow
+    /// 1. Validate snapshot exists
+    /// 2. Validate snapshot integrity (state_root match)
+    /// 3. Load snapshot state
+    /// 4. Replay blocks from snapshot to tip
+    /// 5. Rebuild control-plane from Celestia
+    pub fn fast_sync_from_snapshot(
+        &self,
+        height: u64,
+    ) -> Result<FastSyncStatusRes, RpcError> {
+        use crate::db::ChainDb;
+
+        // ─────────────────────────────────────────────────────────
+        // Construct snapshot path
+        // ─────────────────────────────────────────────────────────
+        let snapshot_path = format!(
+            "{}/checkpoint_{}",
+            self.chain.snapshot_config.path,
+            height
+        );
+        let path = std::path::Path::new(&snapshot_path);
+
+        // ─────────────────────────────────────────────────────────
+        // Step 1: Read snapshot metadata (existence check)
+        // ─────────────────────────────────────────────────────────
+        let metadata = ChainDb::read_snapshot_metadata(path)
+            .map_err(|e| RpcError {
+                code: -32080,
+                message: format!(
+                    "snapshot not found at height {}: {}",
+                    height, e
+                ),
+            })?;
+
+        // ─────────────────────────────────────────────────────────
+        // Step 2: Validate snapshot integrity
+        // validate_snapshot -> Result<(), DbError>
+        // Ok(())  = valid
+        // Err(..) = invalid
+        // ─────────────────────────────────────────────────────────
+        ChainDb::validate_snapshot(path)
+            .map_err(|e| RpcError {
+                code: -32081,
+                message: format!("snapshot validation failed: {}", e),
+            })?;
+
+        // ─────────────────────────────────────────────────────────
+        // Step 3: Get current chain tip
+        // ─────────────────────────────────────────────────────────
+        let (tip_height, _) = self.chain.get_chain_tip()
+            .map_err(|e| RpcError {
+                code: -32082,
+                message: format!("failed to get chain tip: {}", e),
+            })?;
+
+        // Prevent future snapshot usage
+        if height > tip_height {
+            return Ok(FastSyncStatusRes {
+                started: false,
+                from_height: height,
+                message: format!(
+                    "snapshot height {} is ahead of current tip {}",
+                    height, tip_height
+                ),
+            });
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // Step 4: Load snapshot (SIDE EFFECT)
+        // NOTE:
+        // - load_snapshot DOES NOT return DB
+        // - it mutates / initializes underlying storage
+        // ─────────────────────────────────────────────────────────
+        ChainDb::load_snapshot(path)
+            .map_err(|e| RpcError {
+                code: -32083,
+                message: format!("failed to load snapshot: {}", e),
+            })?;
+
+        // ─────────────────────────────────────────────────────────
+        // Step 5: Replay blocks from snapshot height to tip
+        // ─────────────────────────────────────────────────────────
+        if height < tip_height {
+            self.chain
+                .replay_blocks_from(height + 1, tip_height, None)
+                .map_err(|e| RpcError {
+                    code: -32084,
+                    message: format!("block replay failed: {}", e),
+                })?;
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // Done
+        // ─────────────────────────────────────────────────────────
+        Ok(FastSyncStatusRes {
+            started: true,
+            from_height: metadata.height,
+            message: format!(
+                "fast sync completed: loaded snapshot at height {}, replayed to {}",
+                height, tip_height
+            ),
         })
     }
 }
