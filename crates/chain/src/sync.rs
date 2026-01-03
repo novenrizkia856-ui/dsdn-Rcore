@@ -916,6 +916,124 @@ impl StateReplayEngine {
     pub fn get_final_state(&self) -> ChainState {
         self.state_checkpoint.clone().unwrap_or_else(ChainState::new)
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // CHAIN-INTEGRATED REPLAY (13.18.4)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Metode replay yang menggunakan Chain::replay_blocks_from untuk
+    // memanfaatkan logic replay yang sudah ada di Chain struct.
+    //
+    // PERBEDAAN DENGAN replay_from_checkpoint():
+    // - replay_using_chain() menggunakan Chain state langsung
+    // - replay_from_checkpoint() menggunakan cloned state
+    // - replay_using_chain() lebih cocok untuk fast sync
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Replay blocks menggunakan Chain::replay_blocks_from.
+    ///
+    /// Method ini adalah wrapper yang mengintegrasikan StateReplayEngine
+    /// dengan Chain::replay_blocks_from untuk:
+    /// - Fast sync dari snapshot
+    /// - Recovery setelah snapshot restore
+    ///
+    /// ## Flow
+    ///
+    /// ```text
+    /// 1. Panggil chain.replay_blocks_from(start_height, end_height, progress)
+    /// 2. State di-update langsung di chain.state
+    /// 3. Update current_height setelah replay
+    /// 4. Mark replay sebagai complete
+    /// ```
+    ///
+    /// ## Arguments
+    /// * `progress` - Optional callback untuk progress reporting
+    ///
+    /// ## Returns
+    /// * `Ok(())` - Replay sukses
+    /// * `Err` - Replay gagal (state_root mismatch, block missing, dll)
+    ///
+    /// ## Note
+    /// Method ini TIDAK menggunakan state_checkpoint internal.
+    /// State langsung di-update ke chain.state.
+    pub fn replay_using_chain(
+        &mut self,
+        progress: Option<&dyn Fn(u64, u64)>,
+    ) -> Result<()> {
+        // Use Chain's replay_blocks_from
+        self.chain.replay_blocks_from(
+            self.start_height,
+            self.end_height,
+            progress,
+        ).map_err(|e| anyhow::anyhow!("Chain replay failed: {}", e))?;
+
+        // Update current_height to mark completion
+        self.current_height = self.end_height + 1;
+
+        // Get final state from chain
+        let final_state = self.chain.state.read().clone();
+        self.state_checkpoint = Some(final_state);
+
+        Ok(())
+    }
+
+    /// Replay untuk fast sync dari snapshot.
+    ///
+    /// Shortcut method yang menggabungkan:
+    /// 1. Load state dari snapshot (caller responsibility)
+    /// 2. Set state ke chain
+    /// 3. Replay blocks ke tip
+    ///
+    /// ## Arguments
+    /// * `snapshot_height` - Height snapshot yang di-restore
+    /// * `target_height` - Height target (tip)
+    /// * `snapshot_state` - ChainState dari snapshot
+    /// * `progress` - Optional progress callback
+    ///
+    /// ## Returns
+    /// * `Ok(ChainState)` - Final state setelah replay
+    /// * `Err` - Replay gagal
+    ///
+    /// ## Example
+    /// ```text
+    /// // 1. Load snapshot
+    /// let snapshot_db = ChainDb::load_snapshot(path)?;
+    /// let snapshot_state = snapshot_db.load_state()?;
+    ///
+    /// // 2. Create replay engine
+    /// let mut engine = StateReplayEngine::new(chain, snapshot_height, tip_height);
+    ///
+    /// // 3. Fast sync
+    /// let final_state = engine.fast_sync_from_snapshot(
+    ///     snapshot_height,
+    ///     tip_height,
+    ///     snapshot_state,
+    ///     Some(&|cur, total| println!("{}/{}", cur, total)),
+    /// )?;
+    /// ```
+    pub fn fast_sync_from_snapshot(
+        &mut self,
+        snapshot_height: u64,
+        target_height: u64,
+        snapshot_state: ChainState,
+        progress: Option<&dyn Fn(u64, u64)>,
+    ) -> Result<ChainState> {
+        // Set chain state ke snapshot state
+        {
+            let mut state_guard = self.chain.state.write();
+            *state_guard = snapshot_state;
+        }
+
+        // Update engine parameters
+        self.start_height = snapshot_height;
+        self.end_height = target_height;
+        self.current_height = snapshot_height + 1;
+
+        // Replay using chain
+        self.replay_using_chain(progress)?;
+
+        // Return final state
+        Ok(self.get_final_state())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
