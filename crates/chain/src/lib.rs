@@ -599,6 +599,62 @@ pub use economic::{
 // ════════════════════════════════════════════════════════════════════════════
 pub use wallet::Wallet;
 
+// ════════════════════════════════════════════════════════════════════════════
+// CHAIN ERROR (13.18.4)
+// ════════════════════════════════════════════════════════════════════════════
+// Error type untuk Chain operations termasuk block replay.
+// Digunakan untuk recovery, fast sync, dan snapshot restore.
+// ════════════════════════════════════════════════════════════════════════════
+
+use thiserror::Error;
+
+/// Error type untuk Chain operations.
+///
+/// Digunakan oleh:
+/// - replay_blocks_from() — Block replay setelah snapshot
+/// - get_blocks_range() — Fetch block range
+/// - Fast sync operations
+#[derive(Debug, Error)]
+pub enum ChainError {
+    /// Block tidak ditemukan di database
+    #[error("block not found at height {0}")]
+    BlockNotFound(u64),
+
+    /// Range tidak valid (start > end)
+    #[error("invalid block range: start {start} > end {end}")]
+    InvalidRange {
+        start: u64,
+        end: u64,
+    },
+
+    /// State root mismatch setelah replay
+    #[error("state root mismatch at height {height}: expected {expected}, computed {computed}")]
+    StateRootMismatch {
+        height: u64,
+        expected: String,
+        computed: String,
+    },
+
+    /// Block signature verification failed
+    #[error("block signature verification failed at height {0}")]
+    SignatureVerificationFailed(u64),
+
+    /// Transaction execution error
+    #[error("transaction execution error at height {height}: {message}")]
+    TransactionError {
+        height: u64,
+        message: String,
+    },
+
+    /// Database error
+    #[error("database error: {0}")]
+    DatabaseError(String),
+
+    /// Replay interrupted
+    #[error("replay interrupted at height {0}")]
+    ReplayInterrupted(u64),
+}
+
 /// Top-level Chain struct combining DB, state, mempool and miner.
 #[derive(Clone)]
 pub struct Chain {
@@ -1230,6 +1286,221 @@ impl Chain {
     pub fn get_sync_progress(&self) -> anyhow::Result<(u64, u64)> {
         let (height, _) = self.get_chain_tip()?;
         Ok((height, height))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // BLOCK REPLAY (13.18.4)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Methods untuk replay blocks setelah snapshot restore.
+    //
+    // CONSENSUS-CRITICAL:
+    // - Replay HARUS deterministik
+    // - state_root WAJIB diverifikasi setiap block
+    // - Block TIDAK boleh di-skip
+    // - Mismatch = replay gagal total
+    //
+    // USE CASES:
+    // - Fast sync: load snapshot → replay blocks → catch up to tip
+    // - Recovery: restore checkpoint → replay → rebuild state
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Replay blocks from start_height to end_height.
+    ///
+    /// Melakukan re-eksekusi semua transaksi di setiap block untuk
+    /// membangun ulang state dari snapshot/checkpoint.
+    ///
+    /// ## Consensus-Critical
+    ///
+    /// - Replay bersifat DETERMINISTIK
+    /// - state_root diverifikasi setiap block
+    /// - Mismatch state_root = error (ChainError::StateRootMismatch)
+    /// - Block TIDAK boleh di-skip
+    ///
+    /// ## Flow
+    ///
+    /// ```text
+    /// for height in (start_height + 1)..=end_height:
+    ///     1. Load block dari DB
+    ///     2. Execute all transactions (apply_payload)
+    ///     3. Process automatic slashing
+    ///     4. Process economic job
+    ///     5. Compute state_root
+    ///     6. Verify: computed == block.header.state_root
+    ///     7. If progress callback: progress(height, end_height)
+    /// ```
+    ///
+    /// ## Arguments
+    /// * `start_height` - Height snapshot/checkpoint (replay dimulai dari start_height + 1)
+    /// * `end_height` - Height target (inclusive)
+    /// * `progress` - Optional callback untuk progress reporting
+    ///
+    /// ## Returns
+    /// * `Ok(())` - Replay sukses, state valid
+    /// * `Err(ChainError)` - Replay gagal
+    ///
+    /// ## Example
+    /// ```text
+    /// // Replay dari snapshot height 1000 ke tip 1500
+    /// chain.replay_blocks_from(1000, 1500, Some(&|current, total| {
+    ///     println!("Replaying block {}/{}", current, total);
+    /// }))?;
+    /// ```
+
+    pub fn replay_blocks_from(
+        &self,
+        start_height: u64,
+        end_height: u64,
+        progress: Option<&dyn Fn(u64, u64)>,
+    ) -> Result<(), ChainError> {
+        // Validate range
+        if start_height > end_height {
+            return Err(ChainError::InvalidRange {
+                start: start_height,
+                end: end_height,
+            });
+        }
+
+        // Replay starts from start_height + 1 (snapshot is at start_height)
+        let replay_start = start_height.saturating_add(1);
+
+        // If nothing to replay
+        if replay_start > end_height {
+            return Ok(());
+        }
+
+        // Get blocks to replay
+        let blocks = self.get_blocks_range(replay_start, end_height)?;
+
+        // Replay each block
+        for block in blocks {
+            let height = block.header.height;
+
+            // 1. VERIFY BLOCK SIGNATURE
+            let sig_valid = block.verify_signature()
+                .map_err(|e| ChainError::DatabaseError(format!(
+                    "signature check error at height {}: {}", height, e
+                )))?;
+
+            if !sig_valid {
+                return Err(ChainError::SignatureVerificationFailed(height));
+            }
+
+            // 2. EXECUTE ALL TRANSACTIONS
+            {
+                let mut state_guard = self.state.write();
+                let proposer = block.header.proposer;
+
+                for tx in &block.body.transactions {
+                    match state_guard.apply_payload(tx, &proposer) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("   ⚠️ Replay TX error at height {} (continuing): {}", height, e);
+                        }
+                    }
+                }
+
+                // 3. PROCESS AUTOMATIC SLASHING
+                let _slashing_events = state_guard.process_automatic_slashing(
+                    height,
+                    block.header.timestamp.timestamp() as u64,
+                );
+
+                // 4. PROCESS ECONOMIC JOB
+                // NOTE: The economic job API expects (height, timestamp) — do not pass
+                // unrelated values here. If you need metrics like active validator count
+                // for logging, derive them from the state's validators map.
+
+                // optional: collect metrics for observability/logging
+                let _current_epoch_number = state_guard.epoch_info.epoch_number;
+                let _active_validators = state_guard.validators.iter().filter(|(_, v)| v.active).count();
+                let _active_nodes = state_guard.node_cost_index.len();
+
+                // Call economic job with (height, timestamp) as required by the implementation
+                let _burn_event = state_guard.process_economic_job(
+                    height,
+                    block.header.timestamp.timestamp() as u64,
+                );
+
+                if let Some(ev) = &_burn_event {
+                    // If you want to log in replay mode, prefer debug-level logs
+                    // println!("   🔥 Replay Treasury burn: {} tokens", ev.amount_burned);
+                }
+
+                // 5. COMPUTE STATE ROOT (propagate any error)
+                let computed_root = state_guard
+                    .compute_state_root()
+                    .map_err(|e| ChainError::DatabaseError(format!(
+                        "state_root computation error at height {}: {}",
+                        height, e
+                    )))?;
+
+
+                // 6. VERIFY STATE ROOT
+                if computed_root != block.header.state_root {
+                    return Err(ChainError::StateRootMismatch {
+                        height,
+                        expected: block.header.state_root.to_hex(),
+                        computed: computed_root.to_hex(),
+                    });
+                }
+            }
+
+            // 7. PROGRESS CALLBACK
+            if let Some(cb) = progress {
+                cb(height, end_height);
+            }
+        }
+
+        Ok(())
+    }
+
+
+    /// Get blocks in a range from database.
+    ///
+    /// Fetches blocks sequentially from start_height to end_height (inclusive).
+    /// Blocks are returned in ascending order by height.
+    ///
+    /// ## Arguments
+    /// * `start_height` - First block height (inclusive)
+    /// * `end_height` - Last block height (inclusive)
+    ///
+    /// ## Returns
+    /// * `Ok(Vec<Block>)` - Blocks sorted ascending by height
+    /// * `Err(ChainError::BlockNotFound)` - If any block is missing
+    /// * `Err(ChainError::InvalidRange)` - If start > end
+    ///
+    /// ## Example
+    /// ```text
+    /// let blocks = chain.get_blocks_range(100, 110)?;
+    /// assert_eq!(blocks.len(), 11);  // 100..=110 = 11 blocks
+    /// ```
+    pub fn get_blocks_range(
+        &self,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<Vec<crate::block::Block>, ChainError> {
+        // Validate range
+        if start_height > end_height {
+            return Err(ChainError::InvalidRange {
+                start: start_height,
+                end: end_height,
+            });
+        }
+
+        let mut blocks = Vec::with_capacity((end_height - start_height + 1) as usize);
+
+        // Fetch blocks sequentially (deterministic order)
+        for height in start_height..=end_height {
+            let block = self.db.get_block(height)
+                .map_err(|e| ChainError::DatabaseError(format!(
+                    "failed to load block at height {}: {}", height, e
+                )))?
+                .ok_or(ChainError::BlockNotFound(height))?;
+            
+            blocks.push(block);
+        }
+
+        Ok(blocks)
     }
 
     // ============================================================
