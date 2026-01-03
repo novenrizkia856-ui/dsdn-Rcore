@@ -4097,6 +4097,98 @@
 //! - Replay HANYA execute dan verify
 //! ```
 //!
+//! ### 13.18.5 — Celestia Control-Plane Rebuild
+//!
+//! Sub-tahap ini mengimplementasikan rebuild control-plane state dari Celestia DA.
+//! **CONTROL-PLANE = SUMBER KEBENARAN KEDUA SETELAH SNAPSHOT**.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │              CONTROL-PLANE REBUILD FLOW                         │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  STEP 1: FETCH BLOBS                                            │
+//! │  ─────────────────                                              │
+//! │  client.fetch_control_plane_range(start_da, end_da)             │
+//! │    └── Returns Vec<CelestiaBlob> sorted by (height, index)     │
+//! │                                                                 │
+//! │  STEP 2: PROCESS BLOBS (ordered)                                │
+//! │  ───────────────────────────────                                │
+//! │  for blob in blobs:                                             │
+//! │      update = parse_blob_to_update(blob)                       │
+//! │      match update:                                              │
+//! │          ValidatorSetUpdate → update validator_set             │
+//! │          EpochRotation → update epoch_info                     │
+//! │          GovernanceProposal → restore proposal (NON-BINDING)   │
+//! │          ReceiptBatch → skip (handled by ClaimReward tx)       │
+//! │          ConfigUpdate → apply config                           │
+//! │          Checkpoint → skip (verification only)                 │
+//! │                                                                 │
+//! │  CRITICAL INVARIANTS                                            │
+//! │  ────────────────────                                           │
+//! │  - Blobs HARUS diproses dalam urutan (height, index)           │
+//! │  - Decode gagal = error keras (tidak boleh skip)               │
+//! │  - Rebuild HARUS idempotent                                    │
+//! │  - Governance proposals TIDAK dieksekusi                        │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### CelestiaClient Methods (13.18.5)
+//!
+//! | Method | Signature | Description |
+//! |--------|-----------|-------------|
+//! | `fetch_control_plane_range` | `(&self, start: u64, end: u64) -> Result<Vec<CelestiaBlob>, CelestiaError>` | Fetch blobs untuk range heights |
+//! | `parse_blob_to_update` | `(&self, blob: &CelestiaBlob) -> Result<ControlPlaneUpdate, CelestiaError>` | Parse blob ke update |
+//!
+//! #### Chain Methods (13.18.5)
+//!
+//! | Method | Signature | Description |
+//! |--------|-----------|-------------|
+//! | `rebuild_control_plane` | `(&self, blobs: Vec<CelestiaBlob>) -> Result<(), ChainError>` | Apply blobs ke state |
+//!
+//! #### New Types (13.18.5)
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `CelestiaBlob` | Blob struct dengan height, index, data, namespace |
+//! | `CelestiaError` | Error enum untuk Celestia operations |
+//! | `ControlPlaneUpdate::EpochRotation` | Epoch rotation notification |
+//! | `ControlPlaneUpdate::GovernanceProposal` | Governance proposal restore |
+//!
+//! #### Control-Plane Update Types
+//!
+//! | Type | Tag | Action |
+//! |------|-----|--------|
+//! | ValidatorSetUpdate | 1 | Update validator registry |
+//! | EpochRotation | 4 | Update epoch counter (no rewards) |
+//! | GovernanceProposal | 5 | Restore proposal (NON-BINDING) |
+//! | ReceiptBatch | 0 | Skip (handled by ClaimReward) |
+//! | ConfigUpdate | 2 | Apply config change |
+//! | Checkpoint | 3 | Skip (verification only) |
+//!
+//! #### Security Notes
+//!
+//! ```text
+//! ⚠️ ZERO-TRUST TERHADAP CELESTIA BLOBS:
+//!
+//! 1. Blob ordering adalah SUMBER KEBENARAN
+//! 2. Reorder atau skip = state divergence
+//! 3. Decode gagal = FATAL ERROR (tidak boleh continue)
+//! 4. GovernanceProposal TIDAK dieksekusi (NON-BINDING)
+//!
+//! KAPAN DIPANGGIL:
+//! - Setelah snapshot restore
+//! - Setelah block replay
+//! - Sebelum node siap menerima transaksi baru
+//!
+//! TIDAK DILAKUKAN:
+//! - Execute governance
+//! - Trigger new transactions
+//! - Modify block production
+//! - Compute stake ulang
+//! ```
+//!
 //! ### Implementation Status (13.18)
 //!
 //! ```text
@@ -4106,7 +4198,7 @@
 //! | 13.18.2   | Snapshot Creation (LMDB Copy)  | ✅     |
 //! | 13.18.3   | Snapshot Loading & Validation  | ✅     |
 //! | 13.18.4   | Block Replay After Snapshot    | ✅     |
-//! | 13.18.5   | Celestia Control-Plane Rebuild | ⏳     |
+//! | 13.18.5   | Celestia Control-Plane Rebuild | ✅     |
 //! | 13.18.6   | Automatic Checkpoint Trigger   | ⏳     |
 //! | 13.18.7   | Fast Sync RPC & CLI            | ⏳     |
 //! | 13.18.8   | Documentation Update           | ⏳     |
@@ -4119,8 +4211,9 @@
 //! crates/chain/src/state/internal_snapshot.rs — Snapshot types & config (13.18.1)
 //! crates/chain/src/state/mod.rs               — Re-exports & documentation
 //! crates/chain/src/db.rs                      — LMDB snapshot operations (13.18.2-3) ✅
-//! crates/chain/src/lib.rs                     — Block replay (13.18.4) ✅
+//! crates/chain/src/lib.rs                     — Block replay (13.18.4), Control-plane rebuild (13.18.5) ✅
 //! crates/chain/src/sync.rs                    — StateReplayEngine integration (13.18.4) ✅
+//! crates/chain/src/celestia.rs                — Control-plane fetch & types (13.18.5) ✅
 //! ```
 //!
 //! ### Catatan Penting
