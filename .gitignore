@@ -26,3 +26,21 @@ Thumbs.db
 # === Logs ===
 *.log
 logs/
+
+# === Wallet & Blockchain Data ===
+wallet.dat
+wallet.json
+wallet/
+chaindb/
+chaindb/*
+*.mdb
+*.ldb
+*.db
+*.sqlite
+*.sqlite3
+
+# === Node State ===
+data/
+state/
+snapshot/
+checkpoints/
