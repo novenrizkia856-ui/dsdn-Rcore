@@ -4342,6 +4342,96 @@
 //! - Progress ditampilkan step-by-step
 //! - Validasi dilakukan sebelum operasi berat
 //! ```
+//!
+//! ### 13.18.8 — Snapshot System E2E Testing
+//!
+//! Sub-tahap ini menyediakan comprehensive E2E test coverage untuk
+//! memvalidasi seluruh snapshot system sebelum production.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │              SNAPSHOT E2E TEST COVERAGE                         │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  TEST CASES                                                     │
+//! │  ──────────                                                     │
+//! │  test_snapshot_create      → Verifikasi pembuatan snapshot      │
+//! │  test_snapshot_load        → Verifikasi loading snapshot        │
+//! │  test_snapshot_validate    → Verifikasi validasi state_root     │
+//! │  test_block_replay         → Verifikasi replay blocks           │
+//! │  test_fast_sync_flow       → Verifikasi full fast sync          │
+//! │  test_cleanup_old_snapshots → Verifikasi FIFO cleanup           │
+//! │                                                                 │
+//! │  CLI RUNNER                                                     │
+//! │  ──────────                                                     │
+//! │  dsdn-chain test --module snapshot                              │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! #### Testing Checklist
+//!
+//! | Test | Verifies | Pass Condition |
+//! |------|----------|----------------|
+//! | `test_snapshot_create` | Folder & metadata creation | Files exist, height correct, state_root non-zero |
+//! | `test_snapshot_load` | State restoration | Balances & validators match original |
+//! | `test_snapshot_validate` | Integrity check | Valid passes, corrupt fails |
+//! | `test_block_replay` | Block re-execution | Final state_root matches original |
+//! | `test_fast_sync_flow` | Complete recovery | State identical to normal chain |
+//! | `test_cleanup_old_snapshots` | Retention policy | Oldest deleted, newest kept |
+//!
+//! #### Failure Conditions (MUST FAIL)
+//!
+//! ```text
+//! SNAPSHOT CREATE:
+//! - Folder tidak terbuat → FAIL
+//! - metadata.json tidak ada → FAIL
+//! - Height salah → FAIL
+//! - State root kosong → FAIL
+//!
+//! SNAPSHOT LOAD:
+//! - Balance tidak match → FAIL
+//! - Validator set tidak match → FAIL
+//!
+//! SNAPSHOT VALIDATE:
+//! - Valid snapshot return false → FAIL
+//! - Corrupt snapshot return true → FAIL
+//!
+//! BLOCK REPLAY:
+//! - Final state_root berbeda → FAIL
+//!
+//! FAST SYNC:
+//! - Final state tidak identik → FAIL
+//!
+//! CLEANUP:
+//! - Snapshot terbaru terhapus → FAIL
+//! - Count tidak sesuai keep_count → FAIL
+//! ```
+//!
+//! #### Regression Protection
+//!
+//! ```text
+//! Test ini melindungi dari:
+//! ✗ Silent snapshot corruption
+//! ✗ State root calculation changes
+//! ✗ Block replay divergence
+//! ✗ Cleanup logic bugs
+//! ✗ Metadata format changes
+//! ✗ Fast sync state mismatch
+//! ```
+//!
+//! #### Running Tests
+//!
+//! ```bash
+//! # Run snapshot tests only
+//! cargo test test_snapshot_e2e_runner -- --nocapture
+//!
+//! # Run via CLI
+//! dsdn-chain test --module snapshot
+//!
+//! # Run all E2E tests including snapshot
+//! dsdn-chain test --module all
+//! ```
 use crate::types::{Address, Hash};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
