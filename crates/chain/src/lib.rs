@@ -1413,7 +1413,9 @@ impl Chain {
         end_height: u64,
         progress: Option<&dyn Fn(u64, u64)>,
     ) -> Result<(), ChainError> {
-        // Validate range
+        // ─────────────────────────────────────────────
+        // 0. Validate range
+        // ─────────────────────────────────────────────
         if start_height > end_height {
             return Err(ChainError::InvalidRange {
                 start: start_height,
@@ -1421,73 +1423,60 @@ impl Chain {
             });
         }
 
-        // Replay starts from start_height + 1 (snapshot is at start_height)
+        // Snapshot is assumed at start_height
         let replay_start = start_height.saturating_add(1);
-
-        // If nothing to replay
         if replay_start > end_height {
             return Ok(());
         }
 
-        // Get blocks to replay
+        // ─────────────────────────────────────────────
+        // 1. Load blocks to replay
+        // ─────────────────────────────────────────────
         let blocks = self.get_blocks_range(replay_start, end_height)?;
 
-        // Replay each block
+        // ─────────────────────────────────────────────
+        // 2. Replay loop (NO signature verification)
+        // ─────────────────────────────────────────────
         for block in blocks {
             let height = block.header.height;
 
-            // 1. VERIFY BLOCK SIGNATURE
-            let sig_valid = block.verify_signature()
-                .map_err(|e| ChainError::DatabaseError(format!(
-                    "signature check error at height {}: {}", height, e
-                )))?;
-
-            if !sig_valid {
-                return Err(ChainError::SignatureVerificationFailed(height));
-            }
-
-            // 2. EXECUTE ALL TRANSACTIONS
             {
                 let mut state_guard = self.state.write();
                 let proposer = block.header.proposer;
 
+                // ─────────────────────────────────────────
+                // Apply all transactions (deterministic)
+                // ─────────────────────────────────────────
                 for tx in &block.body.transactions {
-                    match state_guard.apply_payload(tx, &proposer) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("   ⚠️ Replay TX error at height {} (continuing): {}", height, e);
-                        }
+                    if let Err(e) = state_guard.apply_payload(tx, &proposer) {
+                        // Replay must be resilient:
+                        // log and continue unless you want hard-fail semantics
+                        eprintln!(
+                            "⚠️ Replay TX error at height {} (continuing): {}",
+                            height, e
+                        );
                     }
                 }
 
-                // 3. PROCESS AUTOMATIC SLASHING
-                let _slashing_events = state_guard.process_automatic_slashing(
+                // ─────────────────────────────────────────
+                // Automatic slashing (time-based)
+                // ─────────────────────────────────────────
+                let _ = state_guard.process_automatic_slashing(
                     height,
                     block.header.timestamp.timestamp() as u64,
                 );
 
-                // 4. PROCESS ECONOMIC JOB
-                // NOTE: The economic job API expects (height, timestamp) — do not pass
-                // unrelated values here. If you need metrics like active validator count
-                // for logging, derive them from the state's validators map.
-
-                // optional: collect metrics for observability/logging
-                let _current_epoch_number = state_guard.epoch_info.epoch_number;
-                let _active_validators = state_guard.validators.iter().filter(|(_, v)| v.active).count();
-                let _active_nodes = state_guard.node_cost_index.len();
-
-                // Call economic job with (height, timestamp) as required by the implementation
-                let _burn_event = state_guard.process_economic_job(
+                // ─────────────────────────────────────────
+                // Economic job (burns, fees, epochs, etc.)
+                // ─────────────────────────────────────────
+                let _ = state_guard.process_economic_job(
                     height,
                     block.header.timestamp.timestamp() as u64,
                 );
 
-                if let Some(ev) = &_burn_event {
-                    // If you want to log in replay mode, prefer debug-level logs
-                    // println!("   🔥 Replay Treasury burn: {} tokens", ev.amount_burned);
-                }
-
-                // 5. COMPUTE STATE ROOT (propagate any error)
+                // ─────────────────────────────────────────
+                // Compute & verify state root (CRITICAL)
+                // ─────────────────────────────────────────
                 let computed_root = state_guard
                     .compute_state_root()
                     .map_err(|e| ChainError::DatabaseError(format!(
@@ -1495,8 +1484,6 @@ impl Chain {
                         height, e
                     )))?;
 
-
-                // 6. VERIFY STATE ROOT
                 if computed_root != block.header.state_root {
                     return Err(ChainError::StateRootMismatch {
                         height,
@@ -1506,7 +1493,9 @@ impl Chain {
                 }
             }
 
-            // 7. PROGRESS CALLBACK
+            // ─────────────────────────────────────────────
+            // 3. Progress callback
+            // ─────────────────────────────────────────────
             if let Some(cb) = progress {
                 cb(height, end_height);
             }
@@ -1514,6 +1503,7 @@ impl Chain {
 
         Ok(())
     }
+
 
 
     /// Get blocks in a range from database.

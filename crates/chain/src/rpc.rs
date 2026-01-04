@@ -3037,75 +3037,120 @@ SyncRequest::GetChainTip => {
     /// - Respects retention policy (max_snapshots)
     /// - Blocks until snapshot is complete
     pub fn create_snapshot(&self) -> Result<(), RpcError> {
-        // Get current chain tip
+        use std::fs;
+        use std::path::Path;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // ─────────────────────────────────────────────
+        // 1. Get current chain tip
+        // ─────────────────────────────────────────────
         let (tip_height, _) = self.chain.get_chain_tip().map_err(|e| RpcError {
             code: -32072,
             message: format!("failed to get chain tip: {}", e),
         })?;
 
-        // Create snapshot path
-        let snapshot_path = format!(
-            "{}/checkpoint_{}",
-            self.chain.snapshot_config.path,
-            tip_height
-        );
-        let path = std::path::Path::new(&snapshot_path);
+        // ─────────────────────────────────────────────
+        // 2. Prepare snapshot directory
+        // ─────────────────────────────────────────────
+        let snapshot_path = Path::new(&self.chain.snapshot_config.path)
+            .join(format!("checkpoint_{}", tip_height));
 
-        // Create snapshot via ChainDb
-        self.chain.db.create_snapshot(tip_height, path)
-            .map_err(|e| RpcError {
+        if snapshot_path.exists() {
+            fs::remove_dir_all(&snapshot_path).map_err(|e| RpcError {
                 code: -32073,
+                message: format!("failed to clean existing snapshot dir: {}", e),
+            })?;
+        }
+
+        fs::create_dir_all(&snapshot_path).map_err(|e| RpcError {
+            code: -32074,
+            message: format!("failed to create snapshot dir: {}", e),
+        })?;
+
+        // ─────────────────────────────────────────────
+        // 3. CREATE SNAPSHOT (LMDB COPY)
+        //    → SINGLE SOURCE OF TRUTH
+        // ─────────────────────────────────────────────
+        self.chain
+            .db
+            .create_snapshot(
+                tip_height,
+                Path::new(&self.chain.snapshot_config.path),
+            )
+            .map_err(|e| RpcError {
+                code: -32075,
                 message: format!("failed to create snapshot: {}", e),
             })?;
 
-        // Get state_root for metadata
+        // ─────────────────────────────────────────────
+        // 4. Compute state root (READ-ONLY)
+        // ─────────────────────────────────────────────
         let state_root = {
             let state = self.chain.state.read();
             state.compute_state_root().map_err(|e| RpcError {
-                code: -32074,
+                code: -32076,
                 message: format!("failed to compute state root: {}", e),
             })?
         };
 
-        // Get block hash
-        let block_hash = self.chain.db.get_block(tip_height)
-            .map_err(|e| RpcError {
-                code: -32075,
-                message: format!("failed to get block: {}", e),
-            })?
-            .map(|b| crate::block::Block::compute_hash(&b.header))
-            .ok_or_else(|| RpcError {
-                code: -32076,
-                message: format!("block not found at height {}", tip_height),
-            })?;
+        // ─────────────────────────────────────────────
+        // 5. Get block hash at snapshot height
+        // ─────────────────────────────────────────────
+        let block_hash = {
+            let block = self
+                .chain
+                .db
+                .get_block(tip_height)
+                .map_err(|e| RpcError {
+                    code: -32077,
+                    message: format!("failed to get block: {}", e),
+                })?
+                .ok_or_else(|| RpcError {
+                    code: -32078,
+                    message: format!("block not found at height {}", tip_height),
+                })?;
 
-        // Write metadata
+            crate::block::Block::compute_hash(&block.header)
+        };
+
+        // ─────────────────────────────────────────────
+        // 6. Write snapshot metadata
+        // ─────────────────────────────────────────────
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         let metadata = crate::state::SnapshotMetadata {
             height: tip_height,
             state_root,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            timestamp,
             block_hash,
         };
 
-        self.chain.db.write_snapshot_metadata(path, &metadata)
+        self.chain
+            .db
+            .write_snapshot_metadata(&snapshot_path, &metadata)
             .map_err(|e| RpcError {
-                code: -32077,
-                message: format!("failed to write metadata: {}", e),
+                code: -32079,
+                message: format!("failed to write snapshot metadata: {}", e),
             })?;
 
-        // Cleanup old snapshots
+        // ─────────────────────────────────────────────
+        // 7. Cleanup old snapshots
+        // ─────────────────────────────────────────────
         let keep_count = self.chain.snapshot_config.max_snapshots as usize;
-        self.chain.cleanup_old_snapshots(keep_count)
+
+        self.chain
+            .cleanup_old_snapshots(keep_count)
             .map_err(|e| RpcError {
-                code: -32078,
-                message: format!("cleanup failed: {}", e),
+                code: -32080,
+                message: format!("failed to cleanup old snapshots: {}", e),
             })?;
 
         Ok(())
     }
+
 
     /// Initiate fast sync from a specific snapshot
     /// 

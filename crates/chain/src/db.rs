@@ -2465,44 +2465,71 @@ Ok(headers)
     /// db.create_snapshot(1000, Path::new("./snapshots"))?;
     /// // Creates: ./snapshots/checkpoint_1000/data.mdb
     /// ```
+    /// 
+    //
+    fn find_env_data_mdb(&self) -> Option<std::path::PathBuf> {
+        let candidate = self.env_path.join("data.mdb");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        // mungkin env_path sendiri adalah file (rare) atau data.mdb ada di parent
+        if self.env_path.is_file() {
+            if let Some(name) = self.env_path.file_name().and_then(|n| n.to_str()) {
+                if name == "data.mdb" {
+                    return Some(self.env_path.clone());
+                }
+            }
+        }
+        if let Some(parent) = self.env_path.parent() {
+            let p2 = parent.join("data.mdb");
+            if p2.exists() {
+                return Some(p2);
+            }
+        }
+        // try scanning env_path for data.mdb (non-recursive)
+        if let Ok(entries) = std::fs::read_dir(&self.env_path) {
+            for e in entries.flatten() {
+                if let Ok(fname) = e.file_name().into_string() {
+                    if fname == "data.mdb" {
+                        return Some(e.path());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn create_snapshot(
         &self,
-        height: u64,
-        target_path: &Path,
-    ) -> std::result::Result<(), DbError> {
-        let snapshot_folder = target_path.join(format!("checkpoint_{}", height));
+        _height: u64,
+        snapshot_path: &Path,
+    ) -> Result<(), DbError> {
 
-        // 1. Create snapshot directory
-        std::fs::create_dir_all(&snapshot_folder).map_err(|e| {
+        // 1. Ensure snapshot directory exists
+        std::fs::create_dir_all(snapshot_path).map_err(|e| {
             DbError::DirectoryCreation(format!(
                 "path={}, error={}",
-                snapshot_folder.display(),
+                snapshot_path.display(),
                 e
             ))
         })?;
 
-        // 2. Source LMDB data.mdb
-        let src_data = self.env_path.join("data.mdb");
-        if !src_data.exists() {
-            let _ = std::fs::remove_dir_all(&snapshot_folder);
-            return Err(DbError::LmdbCopy(format!(
-                "source data.mdb not found at {}",
-                src_data.display()
-            )));
-        }
+        // 2. Find source data.mdb
+        let src_data = self
+            .find_env_data_mdb()
+            .ok_or_else(|| DbError::LmdbCopy(format!(
+                "source data.mdb not found (env_path={})",
+                self.env_path.display()
+            )))?;
 
-        // 3. Destination
-        let dst_data = snapshot_folder.join("data.mdb");
+        // 3. Sync LMDB to disk
+        self.env
+            .sync(true)
+            .map_err(|e| DbError::LmdbCopy(format!("env.sync failed: {}", e)))?;
 
-        // 4. Flush LMDB state to disk (SAFE, no unsafe)
-        self.env.sync(true).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&snapshot_folder);
-            DbError::LmdbCopy(format!("env.sync failed: {}", e))
-        })?;
-
-        // 5. Copy data.mdb atomically
+        // 4. Copy data.mdb
+        let dst_data = snapshot_path.join("data.mdb");
         std::fs::copy(&src_data, &dst_data).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&snapshot_folder);
             DbError::LmdbCopy(format!(
                 "copy failed: {} -> {}, error={}",
                 src_data.display(),
@@ -2510,6 +2537,13 @@ Ok(headers)
                 e
             ))
         })?;
+
+        // 5. Copy lock.mdb if exists (best-effort)
+        let src_lock = src_data.with_file_name("lock.mdb");
+        let dst_lock = snapshot_path.join("lock.mdb");
+        if src_lock.exists() {
+            let _ = std::fs::copy(&src_lock, &dst_lock);
+        }
 
         Ok(())
     }
