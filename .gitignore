@@ -12,6 +12,9 @@ secrets/
 private/
 keys/
 
+
+#== cargo lock ===
+cargo.lock
 # === Local Config ===
 config.local.*
 node_config.toml
