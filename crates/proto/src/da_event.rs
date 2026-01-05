@@ -190,6 +190,58 @@ impl From<ChunkDeclaredEvent> for DAEvent {
     }
 }
 
+/// Event untuk penambahan replica ke node
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaAddedEvent {
+    /// Identifier chunk
+    pub chunk_hash: String,
+    /// Identifier node yang menyimpan replica
+    pub node_id: String,
+    /// Index replica (contoh: 0, 1, 2 untuk RF=3)
+    pub replica_index: u8,
+    /// Timestamp replica ditambahkan
+    pub added_at: u64,
+    /// True jika replica sudah diverifikasi tersimpan
+    pub verified: bool,
+}
+
+impl From<ReplicaAddedEvent> for DAEvent {
+    fn from(event: ReplicaAddedEvent) -> Self {
+        DAEvent::ReplicaAdded {
+            version: 1,
+            timestamp_ms: event.added_at,
+            chunk_hash: event.chunk_hash,
+            node_id: event.node_id,
+            replica_index: event.replica_index,
+        }
+    }
+}
+
+/// Event untuk penghapusan replica dari node
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaRemovedEvent {
+    /// Identifier chunk
+    pub chunk_hash: String,
+    /// Identifier node yang kehilangan replica
+    pub node_id: String,
+    /// Alasan penghapusan replica
+    pub reason: ReplicaRemovalReason,
+    /// Timestamp replica dihapus
+    pub removed_at: u64,
+}
+
+impl From<ReplicaRemovedEvent> for DAEvent {
+    fn from(event: ReplicaRemovedEvent) -> Self {
+        DAEvent::ReplicaRemoved {
+            version: 1,
+            timestamp_ms: event.removed_at,
+            chunk_hash: event.chunk_hash,
+            node_id: event.node_id,
+            reason: event.reason,
+        }
+    }
+}
+
 // ============================================================================
 // DAEventEnvelope System (Specification 14A.2)
 // ============================================================================
@@ -545,6 +597,211 @@ mod tests {
                 assert_eq!(replication_factor, event.replication_factor, "replication_factor mapping failed");
             }
             _ => panic!("conversion must produce DAEvent::ChunkDeclared"),
+        }
+    }
+
+    #[test]
+    fn test_replica_added_event_verified_true() {
+        let original = ReplicaAddedEvent {
+            chunk_hash: "abc123def456".to_string(),
+            node_id: "node-001".to_string(),
+            replica_index: 0,
+            added_at: 1704067200000,
+            verified: true,
+        };
+
+        // Serialize
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+
+        // Deserialize
+        let deserialized: ReplicaAddedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        // Verify ALL fields
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.node_id, deserialized.node_id, "node_id mismatch");
+        assert_eq!(original.replica_index, deserialized.replica_index, "replica_index mismatch");
+        assert_eq!(original.added_at, deserialized.added_at, "added_at mismatch");
+        assert_eq!(original.verified, deserialized.verified, "verified mismatch");
+        assert!(deserialized.verified, "verified must be true");
+
+        // Full equality
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_replica_added_event_verified_false() {
+        let original = ReplicaAddedEvent {
+            chunk_hash: "xyz789".to_string(),
+            node_id: "node-002".to_string(),
+            replica_index: 2,
+            added_at: 1704153600000,
+            verified: false,
+        };
+
+        // Serialize
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+
+        // Deserialize
+        let deserialized: ReplicaAddedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        // Verify ALL fields
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.node_id, deserialized.node_id, "node_id mismatch");
+        assert_eq!(original.replica_index, deserialized.replica_index, "replica_index mismatch");
+        assert_eq!(original.added_at, deserialized.added_at, "added_at mismatch");
+        assert_eq!(original.verified, deserialized.verified, "verified mismatch");
+        assert!(!deserialized.verified, "verified must be false");
+
+        // Full equality
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_replica_added_event_to_da_event_conversion() {
+        let event = ReplicaAddedEvent {
+            chunk_hash: "test-chunk".to_string(),
+            node_id: "test-node".to_string(),
+            replica_index: 1,
+            added_at: 1700000000000,
+            verified: true,
+        };
+
+        // Convert to DAEvent
+        let da_event: DAEvent = event.clone().into();
+
+        // Verify mapping
+        match da_event {
+            DAEvent::ReplicaAdded {
+                version,
+                timestamp_ms,
+                chunk_hash,
+                node_id,
+                replica_index,
+            } => {
+                assert_eq!(version, 1, "version must be 1");
+                assert_eq!(timestamp_ms, event.added_at, "timestamp_ms must equal added_at");
+                assert_eq!(chunk_hash, event.chunk_hash, "chunk_hash mapping failed");
+                assert_eq!(node_id, event.node_id, "node_id mapping failed");
+                assert_eq!(replica_index, event.replica_index, "replica_index mapping failed");
+            }
+            _ => panic!("conversion must produce DAEvent::ReplicaAdded"),
+        }
+    }
+
+    #[test]
+    fn test_replica_removed_event_reason_node_offline() {
+        let original = ReplicaRemovedEvent {
+            chunk_hash: "chunk-offline".to_string(),
+            node_id: "node-offline".to_string(),
+            reason: ReplicaRemovalReason::NodeOffline,
+            removed_at: 1704067200000,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: ReplicaRemovedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.node_id, deserialized.node_id, "node_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, ReplicaRemovalReason::NodeOffline, "reason must be NodeOffline");
+        assert_eq!(original.removed_at, deserialized.removed_at, "removed_at mismatch");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_replica_removed_event_reason_rebalance() {
+        let original = ReplicaRemovedEvent {
+            chunk_hash: "chunk-rebalance".to_string(),
+            node_id: "node-rebalance".to_string(),
+            reason: ReplicaRemovalReason::Rebalance,
+            removed_at: 1704153600000,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: ReplicaRemovedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.node_id, deserialized.node_id, "node_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, ReplicaRemovalReason::Rebalance, "reason must be Rebalance");
+        assert_eq!(original.removed_at, deserialized.removed_at, "removed_at mismatch");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_replica_removed_event_reason_corruption() {
+        let original = ReplicaRemovedEvent {
+            chunk_hash: "chunk-corrupt".to_string(),
+            node_id: "node-corrupt".to_string(),
+            reason: ReplicaRemovalReason::Corruption,
+            removed_at: 1704240000000,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: ReplicaRemovedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.node_id, deserialized.node_id, "node_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, ReplicaRemovalReason::Corruption, "reason must be Corruption");
+        assert_eq!(original.removed_at, deserialized.removed_at, "removed_at mismatch");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_replica_removed_event_reason_manual() {
+        let original = ReplicaRemovedEvent {
+            chunk_hash: "chunk-manual".to_string(),
+            node_id: "node-manual".to_string(),
+            reason: ReplicaRemovalReason::Manual,
+            removed_at: 1704326400000,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: ReplicaRemovedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.node_id, deserialized.node_id, "node_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, ReplicaRemovalReason::Manual, "reason must be Manual");
+        assert_eq!(original.removed_at, deserialized.removed_at, "removed_at mismatch");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_replica_removed_event_to_da_event_conversion() {
+        let event = ReplicaRemovedEvent {
+            chunk_hash: "test-chunk-removed".to_string(),
+            node_id: "test-node-removed".to_string(),
+            reason: ReplicaRemovalReason::Rebalance,
+            removed_at: 1700000000000,
+        };
+
+        // Convert to DAEvent
+        let da_event: DAEvent = event.clone().into();
+
+        // Verify mapping
+        match da_event {
+            DAEvent::ReplicaRemoved {
+                version,
+                timestamp_ms,
+                chunk_hash,
+                node_id,
+                reason,
+            } => {
+                assert_eq!(version, 1, "version must be 1");
+                assert_eq!(timestamp_ms, event.removed_at, "timestamp_ms must equal removed_at");
+                assert_eq!(chunk_hash, event.chunk_hash, "chunk_hash mapping failed");
+                assert_eq!(node_id, event.node_id, "node_id mapping failed");
+                assert_eq!(reason, event.reason, "reason mapping failed");
+            }
+            _ => panic!("conversion must produce DAEvent::ReplicaRemoved"),
         }
     }
 }
