@@ -158,6 +158,38 @@ impl From<NodeRegisteredEvent> for DAEvent {
     }
 }
 
+/// Event untuk deklarasi chunk baru dalam sistem DA
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkDeclaredEvent {
+    /// SHA256 hex hash dari data chunk
+    pub chunk_hash: String,
+    /// Ukuran chunk dalam bytes
+    pub size_bytes: u64,
+    /// Identifier pihak yang meng-upload chunk
+    pub uploader_id: String,
+    /// Replication factor yang dibutuhkan
+    pub replication_factor: u8,
+    /// Hash encryption key jika chunk terenkripsi (None jika tidak)
+    pub encryption_key_hash: Option<[u8; 32]>,
+    /// Celestia blob commitment (fixed 32 bytes)
+    pub da_commitment: [u8; 32],
+    /// Timestamp deklarasi dalam milliseconds
+    pub declared_at: u64,
+}
+
+impl From<ChunkDeclaredEvent> for DAEvent {
+    fn from(event: ChunkDeclaredEvent) -> Self {
+        DAEvent::ChunkDeclared {
+            version: 1,
+            timestamp_ms: event.declared_at,
+            chunk_hash: event.chunk_hash,
+            size_bytes: event.size_bytes,
+            uploader_id: event.uploader_id,
+            replication_factor: event.replication_factor,
+        }
+    }
+}
+
 // ============================================================================
 // DAEventEnvelope System (Specification 14A.2)
 // ============================================================================
@@ -385,5 +417,134 @@ mod tests {
         let serialized = bincode::serialize(&datacenter).expect("serialize DataCenter");
         let deserialized: NodeType = bincode::deserialize(&serialized).expect("deserialize DataCenter");
         assert_eq!(datacenter, deserialized);
+    }
+
+    #[test]
+    fn test_chunk_declared_event_with_encryption_key_hash() {
+        let encryption_key: [u8; 32] = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+        ];
+
+        let da_commitment: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        ];
+
+        let original = ChunkDeclaredEvent {
+            chunk_hash: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            size_bytes: 1048576,
+            uploader_id: "uploader-001".to_string(),
+            replication_factor: 3,
+            encryption_key_hash: Some(encryption_key),
+            da_commitment: da_commitment,
+            declared_at: 1704067200000,
+        };
+
+        // Serialize
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+
+        // Deserialize
+        let deserialized: ChunkDeclaredEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        // Verify ALL fields
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.size_bytes, deserialized.size_bytes, "size_bytes mismatch");
+        assert_eq!(original.uploader_id, deserialized.uploader_id, "uploader_id mismatch");
+        assert_eq!(original.replication_factor, deserialized.replication_factor, "replication_factor mismatch");
+        assert_eq!(original.encryption_key_hash, deserialized.encryption_key_hash, "encryption_key_hash mismatch");
+        assert!(deserialized.encryption_key_hash.is_some(), "encryption_key_hash must be Some");
+        assert_eq!(deserialized.encryption_key_hash.unwrap().len(), 32, "encryption_key_hash must be 32 bytes");
+        assert_eq!(original.da_commitment, deserialized.da_commitment, "da_commitment mismatch");
+        assert_eq!(original.da_commitment.len(), 32, "da_commitment must be 32 bytes");
+        assert_eq!(original.declared_at, deserialized.declared_at, "declared_at mismatch");
+
+        // Full equality
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_chunk_declared_event_without_encryption_key_hash() {
+        let da_commitment: [u8; 32] = [
+            0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8,
+            0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1, 0xf0,
+            0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8,
+            0xe7, 0xe6, 0xe5, 0xe4, 0xe3, 0xe2, 0xe1, 0xe0,
+        ];
+
+        let original = ChunkDeclaredEvent {
+            chunk_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            size_bytes: 524288,
+            uploader_id: "uploader-002".to_string(),
+            replication_factor: 5,
+            encryption_key_hash: None,
+            da_commitment: da_commitment,
+            declared_at: 1704153600000,
+        };
+
+        // Serialize
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+
+        // Deserialize
+        let deserialized: ChunkDeclaredEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        // Verify ALL fields
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.size_bytes, deserialized.size_bytes, "size_bytes mismatch");
+        assert_eq!(original.uploader_id, deserialized.uploader_id, "uploader_id mismatch");
+        assert_eq!(original.replication_factor, deserialized.replication_factor, "replication_factor mismatch");
+        assert_eq!(original.encryption_key_hash, deserialized.encryption_key_hash, "encryption_key_hash mismatch");
+        assert!(deserialized.encryption_key_hash.is_none(), "encryption_key_hash must be None");
+        assert_eq!(original.da_commitment, deserialized.da_commitment, "da_commitment mismatch");
+        assert_eq!(original.da_commitment.len(), 32, "da_commitment must be 32 bytes");
+        assert_eq!(original.declared_at, deserialized.declared_at, "declared_at mismatch");
+
+        // Full equality
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_chunk_declared_event_to_da_event_conversion() {
+        let da_commitment: [u8; 32] = [0x42u8; 32];
+        let encryption_key: [u8; 32] = [0x13u8; 32];
+
+        let event = ChunkDeclaredEvent {
+            chunk_hash: "deadbeef".to_string(),
+            size_bytes: 2048,
+            uploader_id: "test-uploader".to_string(),
+            replication_factor: 2,
+            encryption_key_hash: Some(encryption_key),
+            da_commitment: da_commitment,
+            declared_at: 1700000000000,
+        };
+
+        // Convert to DAEvent
+        let da_event: DAEvent = event.clone().into();
+
+        // Verify mapping
+        match da_event {
+            DAEvent::ChunkDeclared {
+                version,
+                timestamp_ms,
+                chunk_hash,
+                size_bytes,
+                uploader_id,
+                replication_factor,
+            } => {
+                assert_eq!(version, 1, "version must be 1");
+                assert_eq!(timestamp_ms, event.declared_at, "timestamp_ms must equal declared_at");
+                assert_eq!(chunk_hash, event.chunk_hash, "chunk_hash mapping failed");
+                assert_eq!(size_bytes, event.size_bytes, "size_bytes mapping failed");
+                assert_eq!(uploader_id, event.uploader_id, "uploader_id mapping failed");
+                assert_eq!(replication_factor, event.replication_factor, "replication_factor mapping failed");
+            }
+            _ => panic!("conversion must produce DAEvent::ChunkDeclared"),
+        }
     }
 }
