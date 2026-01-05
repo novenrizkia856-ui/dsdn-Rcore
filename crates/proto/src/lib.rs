@@ -5,6 +5,7 @@
 //! ## Modules
 //! - `da_event`: DAEvent enum dan semua event types
 //! - `da_health`: DAHealthStatus dan DAError types
+//! - `encoding`: Serialization helpers untuk deterministic encoding
 //!
 //! ## Event Types
 //! - NodeRegistered: Node bergabung ke network
@@ -18,7 +19,9 @@
 
 pub mod da_event;
 pub mod da_health;
+pub mod encoding;
 
 pub use da_health::{DAHealthStatus, DAError};
+pub use encoding::*;
 
 pub const PROTO_VERSION: &str = "0.1";
