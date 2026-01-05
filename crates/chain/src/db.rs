@@ -2501,12 +2501,15 @@ Ok(headers)
 
     pub fn create_snapshot(
         &self,
-        _height: u64,
-        snapshot_path: &Path,
+        height: u64,  // ← Gunakan height, bukan _height
+        base_path: &Path,  // ← Renamed untuk kejelasan
     ) -> Result<(), DbError> {
 
-        // 1. Ensure snapshot directory exists
-        std::fs::create_dir_all(snapshot_path).map_err(|e| {
+        // 1. Build checkpoint path: base_path/checkpoint_{height}
+        let snapshot_path = base_path.join(format!("checkpoint_{}", height));
+
+        // 2. Ensure snapshot directory exists
+        std::fs::create_dir_all(&snapshot_path).map_err(|e| {
             DbError::DirectoryCreation(format!(
                 "path={}, error={}",
                 snapshot_path.display(),
@@ -2514,7 +2517,7 @@ Ok(headers)
             ))
         })?;
 
-        // 2. Find source data.mdb
+        // 3. Find source data.mdb
         let src_data = self
             .find_env_data_mdb()
             .ok_or_else(|| DbError::LmdbCopy(format!(
@@ -2522,14 +2525,16 @@ Ok(headers)
                 self.env_path.display()
             )))?;
 
-        // 3. Sync LMDB to disk
+        // 4. Sync LMDB to disk
         self.env
             .sync(true)
             .map_err(|e| DbError::LmdbCopy(format!("env.sync failed: {}", e)))?;
 
-        // 4. Copy data.mdb
+        // 5. Copy data.mdb to checkpoint folder
         let dst_data = snapshot_path.join("data.mdb");
         std::fs::copy(&src_data, &dst_data).map_err(|e| {
+            // Cleanup on failure
+            let _ = std::fs::remove_dir_all(&snapshot_path);
             DbError::LmdbCopy(format!(
                 "copy failed: {} -> {}, error={}",
                 src_data.display(),
@@ -2538,7 +2543,7 @@ Ok(headers)
             ))
         })?;
 
-        // 5. Copy lock.mdb if exists (best-effort)
+        // 6. Copy lock.mdb if exists (best-effort)
         let src_lock = src_data.with_file_name("lock.mdb");
         let dst_lock = snapshot_path.join("lock.mdb");
         if src_lock.exists() {
@@ -3223,10 +3228,16 @@ mod tests {
         let snapshot_dir = tempdir().unwrap();
         let db = ChainDb::open(db_dir.path()).unwrap();
 
-        // Create 3 snapshots
+        // Create 3 snapshots with explicit verification
         for height in [1000u64, 2000, 3000] {
             db.create_snapshot(height, snapshot_dir.path()).unwrap();
+            
             let checkpoint_path = snapshot_dir.path().join(format!("checkpoint_{}", height));
+            
+            // Verify checkpoint was created
+            assert!(checkpoint_path.exists(), "checkpoint_{} should exist after create_snapshot", height);
+            assert!(checkpoint_path.join("data.mdb").exists(), "data.mdb should exist in checkpoint_{}", height);
+            
             let metadata = SnapshotMetadata {
                 height,
                 state_root: Hash::from_bytes([height as u8; 64]),
@@ -3234,20 +3245,38 @@ mod tests {
                 block_hash: Hash::from_bytes([height as u8; 64]),
             };
             db.write_snapshot_metadata(&checkpoint_path, &metadata).unwrap();
+            
+            // Verify metadata was written
+            assert!(checkpoint_path.join("metadata.json").exists(), "metadata.json should exist in checkpoint_{}", height);
         }
 
         // List snapshots
         let snapshots = ChainDb::list_available_snapshots(snapshot_dir.path());
-        assert!(snapshots.is_ok());
+        assert!(snapshots.is_ok(), "list_available_snapshots should succeed: {:?}", snapshots.err());
         let list = snapshots.unwrap();
-        assert_eq!(list.len(), 3);
+        
+        // Debug output if test fails
+        if list.len() != 3 {
+            eprintln!("Expected 3 snapshots, got {}:", list.len());
+            for (i, s) in list.iter().enumerate() {
+                eprintln!("  [{}] height={}", i, s.height);
+            }
+            // List actual directory contents
+            if let Ok(entries) = std::fs::read_dir(snapshot_dir.path()) {
+                eprintln!("Directory contents:");
+                for entry in entries.flatten() {
+                    eprintln!("  {:?}", entry.path());
+                }
+            }
+        }
+        
+        assert_eq!(list.len(), 3, "should have 3 snapshots");
 
         // Verify sorted by height ascending
         assert_eq!(list[0].height, 1000);
         assert_eq!(list[1].height, 2000);
         assert_eq!(list[2].height, 3000);
     }
-
     #[test]
     fn test_list_snapshots_ignores_invalid() {
         use crate::state::SnapshotMetadata;

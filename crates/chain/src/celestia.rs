@@ -1209,6 +1209,8 @@ mod tests {
                 (ControlPlaneUpdate::ValidatorSetUpdate { .. }, ControlPlaneUpdate::ValidatorSetUpdate { .. }) => {}
                 (ControlPlaneUpdate::ConfigUpdate { .. }, ControlPlaneUpdate::ConfigUpdate { .. }) => {}
                 (ControlPlaneUpdate::Checkpoint { .. }, ControlPlaneUpdate::Checkpoint { .. }) => {}
+                (ControlPlaneUpdate::EpochRotation { .. }, ControlPlaneUpdate::EpochRotation { .. }) => {}
+                (ControlPlaneUpdate::GovernanceProposal { .. }, ControlPlaneUpdate::GovernanceProposal { .. }) => {}
                 _ => panic!("type mismatch after deserialization"),
             }
         }

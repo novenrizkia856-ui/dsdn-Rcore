@@ -5104,7 +5104,7 @@ impl ChainState {
     /// 
     /// ## Usage
     /// 
-    /// ```rust
+    /// ```ignore
     /// let mut state = ChainState::new();
     /// state.mint(&genesis_address, GENESIS_AMOUNT)?;
     /// ```

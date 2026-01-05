@@ -5106,8 +5106,8 @@ fn test_snapshot_load(verbose: bool) -> Result<TestResult> {
     };
 
     // Create snapshot
-    let snapshot_path = temp_dir.path().join("test_snapshot");
-    if let Err(e) = chain.db.create_snapshot(height, &snapshot_path) {
+    let snapshot_base = temp_dir.path().join("test_snapshot");
+    if let Err(e) = chain.db.create_snapshot(height, &snapshot_base) {
         return Ok(TestResult {
             name: test_name,
             passed: false,
@@ -5115,6 +5115,7 @@ fn test_snapshot_load(verbose: bool) -> Result<TestResult> {
             duration_ms: start.elapsed().as_millis(),
         });
     }
+    let checkpoint_path = snapshot_base.join(format!("checkpoint_{}", height));
 
     // Write metadata
     let block_hash = match chain.db.get_block(height) {
@@ -5139,7 +5140,7 @@ fn test_snapshot_load(verbose: bool) -> Result<TestResult> {
         timestamp: 0,
         block_hash,
     };
-    if let Err(e) = chain.db.write_snapshot_metadata(&snapshot_path, &metadata) {
+    if let Err(e) = chain.db.write_snapshot_metadata(&checkpoint_path, &metadata) {
         return Ok(TestResult {
             name: test_name,
             passed: false,
@@ -5149,7 +5150,7 @@ fn test_snapshot_load(verbose: bool) -> Result<TestResult> {
     }
 
     // Load snapshot - creates a new ChainDb from snapshot
-    let loaded_db = match crate::db::ChainDb::load_snapshot(&snapshot_path) {
+    let loaded_db = match crate::db::ChainDb::load_snapshot(&checkpoint_path) {
         Ok(db) => db,
         Err(e) => return Ok(TestResult {
             name: test_name,
@@ -5271,8 +5272,8 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
     };
 
     // Create valid snapshot
-    let snapshot_path = temp_dir.path().join("valid_snapshot");
-    if let Err(e) = chain.db.create_snapshot(height, &snapshot_path) {
+    let snapshot_base = temp_dir.path().join("valid_snapshot");
+    if let Err(e) = chain.db.create_snapshot(height, &snapshot_base) {
         return Ok(TestResult {
             name: test_name,
             passed: false,
@@ -5280,7 +5281,7 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
             duration_ms: start.elapsed().as_millis(),
         });
     }
-
+    let checkpoint_path = snapshot_base.join(format!("checkpoint_{}", height));
     let state_root = {
         let state = chain.state.read();
         match state.compute_state_root() {
@@ -5315,7 +5316,7 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
         timestamp: 0,
         block_hash: block_hash.clone(),
     };
-    if let Err(e) = chain.db.write_snapshot_metadata(&snapshot_path, &metadata) {
+    if let Err(e) = chain.db.write_snapshot_metadata(&checkpoint_path, &metadata) {
         return Ok(TestResult {
             name: test_name,
             passed: false,
@@ -5325,7 +5326,7 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
     }
 
     // Test 1: Valid snapshot should pass (Ok(()) = valid)
-    let valid_result = crate::db::ChainDb::validate_snapshot(&snapshot_path);
+    let valid_result = crate::db::ChainDb::validate_snapshot(&checkpoint_path);
     match valid_result {
         Ok(()) => {
             if verbose {
@@ -5352,6 +5353,8 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
             duration_ms: start.elapsed().as_millis(),
         });
     }
+    // Build the checkpoint path (create_snapshot creates corrupt_snapshot/checkpoint_{height}/)
+    let corrupt_checkpoint_path = corrupt_path.join(format!("checkpoint_{}", height));
 
     // Write metadata with WRONG state_root
     let bad_state_root = Hash::from_bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00,
@@ -5368,7 +5371,7 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
         timestamp: 0,
         block_hash: block_hash.clone(),
     };
-    if let Err(e) = chain.db.write_snapshot_metadata(&corrupt_path, &bad_metadata) {
+    if let Err(e) = chain.db.write_snapshot_metadata(&corrupt_checkpoint_path, &bad_metadata) {
         return Ok(TestResult {
             name: test_name,
             passed: false,
@@ -5378,7 +5381,7 @@ fn test_snapshot_validate(verbose: bool) -> Result<TestResult> {
     }
 
     // Corrupt snapshot should FAIL validation (Err = invalid)
-    let corrupt_result = crate::db::ChainDb::validate_snapshot(&corrupt_path);
+    let corrupt_result = crate::db::ChainDb::validate_snapshot(&corrupt_checkpoint_path);
     match corrupt_result {
         Err(_) => {
             // Error means validation failed - this is expected for corrupt snapshot
@@ -5467,6 +5470,8 @@ fn test_block_replay(verbose: bool) -> Result<TestResult> {
             duration_ms: start.elapsed().as_millis(),
         });
     }
+    // Build checkpoint path (create_snapshot creates replay_snapshot/checkpoint_{height}/)
+    let checkpoint_path = snapshot_path.join(format!("checkpoint_{}", snapshot_height));
 
     // We need to capture state_root at height 3
     // Since state is now at height 5, we load the snapshot to get state at height 3
@@ -5515,7 +5520,7 @@ fn test_block_replay(verbose: bool) -> Result<TestResult> {
     };
 
     // Load snapshot to get state_root at that height - returns new ChainDb
-    let loaded_db = match crate::db::ChainDb::load_snapshot(&snapshot_path) {
+    let loaded_db = match crate::db::ChainDb::load_snapshot(&checkpoint_path) {
         Ok(db) => db,
         Err(e) => return Ok(TestResult {
             name: test_name,
@@ -5706,9 +5711,11 @@ fn test_fast_sync_flow(verbose: bool) -> Result<TestResult> {
             duration_ms: start.elapsed().as_millis(),
         });
     }
+    // Build checkpoint path (create_snapshot creates fastsync_snapshot/checkpoint_{height}/)
+    let checkpoint_path = snapshot_path.join(format!("checkpoint_{}", snapshot_height));
 
     // Get state at snapshot height by loading snapshot - returns new ChainDb
-    let loaded_db = match crate::db::ChainDb::load_snapshot(&snapshot_path) {
+    let loaded_db = match crate::db::ChainDb::load_snapshot(&checkpoint_path) {
         Ok(db) => db,
         Err(e) => return Ok(TestResult {
             name: test_name,
@@ -5758,7 +5765,7 @@ fn test_fast_sync_flow(verbose: bool) -> Result<TestResult> {
         timestamp: 0,
         block_hash,
     };
-    if let Err(e) = original_chain.db.write_snapshot_metadata(&snapshot_path, &metadata) {
+    if let Err(e) = original_chain.db.write_snapshot_metadata(&checkpoint_path, &metadata) {
         return Ok(TestResult {
             name: test_name,
             passed: false,

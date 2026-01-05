@@ -300,6 +300,8 @@ impl Mempool {
     
     /// Pop transaksi berdasarkan ResourceClass tertentu (untuk specialized nodes)
     /// Hanya mengambil tx yang sesuai dengan resource_class yang diminta
+    /// Pop transaksi berdasarkan ResourceClass tertentu (untuk specialized nodes)
+    /// Hanya mengambil tx yang sesuai dengan resource_class yang diminta
     pub fn pop_by_resource(&self, limit: usize, rclass: crate::tx::ResourceClass) -> Vec<TxEnvelope> {
         let mut out = Vec::with_capacity(limit);
         let mut temp_storage: Vec<Entry> = Vec::new();
@@ -326,20 +328,30 @@ impl Mempool {
                             self.nonce_map.write().remove(&nonce_key);
                         }
 
-                        // Decrement counter
+                        // Decrement counter - FIX: avoid deadlock
                         match entry.resource_class {
                             crate::tx::ResourceClass::Transfer => {
-                                *self.transfer_count.write() = self.transfer_count.read().saturating_sub(1);
+                                let mut count = self.transfer_count.write();
+                                *count = count.saturating_sub(1);
                             }
                             crate::tx::ResourceClass::Storage => {
-                                *self.storage_count.write() = self.storage_count.read().saturating_sub(1);
+                                let mut count = self.storage_count.write();
+                                *count = count.saturating_sub(1);
                             }
                             crate::tx::ResourceClass::Compute => {
-                                *self.compute_count.write() = self.compute_count.read().saturating_sub(1);
+                                let mut count = self.compute_count.write();
+                                *count = count.saturating_sub(1);
                             }
                             crate::tx::ResourceClass::Governance => {
-                                *self.governance_count.write() = self.governance_count.read().saturating_sub(1);
+                                let mut count = self.governance_count.write();
+                                *count = count.saturating_sub(1);
                             }
+                        }
+                        
+                        // Decrement private count if applicable
+                        if entry.is_private {
+                            let mut count = self.private_count.write();
+                            *count = count.saturating_sub(1);
                         }
 
                         out.push(entry.tx);
