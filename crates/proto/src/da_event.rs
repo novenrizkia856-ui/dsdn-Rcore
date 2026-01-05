@@ -6,6 +6,7 @@
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 use std::collections::HashMap;
+use serde_big_array::BigArray;
 
 /// Core DA Event enum untuk semua event yang di-post ke Celestia DA.
 ///
@@ -237,6 +238,36 @@ impl From<ReplicaRemovedEvent> for DAEvent {
             timestamp_ms: event.removed_at,
             chunk_hash: event.chunk_hash,
             node_id: event.node_id,
+            reason: event.reason,
+        }
+    }
+}
+
+/// Event untuk permintaan penghapusan chunk (pointer removal)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRequestedEvent {
+    /// Identifier chunk yang diminta dihapus
+    pub chunk_hash: String,
+    /// Identifier pihak yang meminta delete
+    pub requester_id: String,
+    /// Alasan penghapusan
+    pub reason: DeleteReason,
+    /// Timestamp request delete dibuat
+    pub requested_at: u64,
+    /// Waktu tunggu sebelum penghapusan aktual (pointer removal)
+    pub grace_period_ms: u64,
+    /// Ed25519 signature dari requester (fixed 64 bytes)
+    #[serde(with = "BigArray")]
+    pub signature: [u8; 64],
+}
+
+impl From<DeleteRequestedEvent> for DAEvent {
+    fn from(event: DeleteRequestedEvent) -> Self {
+        DAEvent::DeleteRequested {
+            version: 1,
+            timestamp_ms: event.requested_at,
+            chunk_hash: event.chunk_hash,
+            requester_id: event.requester_id,
             reason: event.reason,
         }
     }
@@ -802,6 +833,162 @@ mod tests {
                 assert_eq!(reason, event.reason, "reason mapping failed");
             }
             _ => panic!("conversion must produce DAEvent::ReplicaRemoved"),
+        }
+    }
+
+    #[test]
+    fn test_delete_requested_event_reason_user_request() {
+        let signature: [u8; 64] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+            0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+            0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+        ];
+
+        let original = DeleteRequestedEvent {
+            chunk_hash: "chunk-user-delete".to_string(),
+            requester_id: "user-001".to_string(),
+            reason: DeleteReason::UserRequest,
+            requested_at: 1704067200000,
+            grace_period_ms: 86400000,
+            signature: signature,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: DeleteRequestedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.requester_id, deserialized.requester_id, "requester_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, DeleteReason::UserRequest, "reason must be UserRequest");
+        assert_eq!(original.requested_at, deserialized.requested_at, "requested_at mismatch");
+        assert_eq!(original.grace_period_ms, deserialized.grace_period_ms, "grace_period_ms mismatch");
+        assert_eq!(original.signature, deserialized.signature, "signature mismatch");
+        assert_eq!(original.signature.len(), 64, "signature must be 64 bytes");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_delete_requested_event_reason_expired() {
+        let signature: [u8; 64] = [0xaau8; 64];
+
+        let original = DeleteRequestedEvent {
+            chunk_hash: "chunk-expired".to_string(),
+            requester_id: "system".to_string(),
+            reason: DeleteReason::Expired,
+            requested_at: 1704153600000,
+            grace_period_ms: 0,
+            signature: signature,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: DeleteRequestedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.requester_id, deserialized.requester_id, "requester_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, DeleteReason::Expired, "reason must be Expired");
+        assert_eq!(original.requested_at, deserialized.requested_at, "requested_at mismatch");
+        assert_eq!(original.grace_period_ms, deserialized.grace_period_ms, "grace_period_ms mismatch");
+        assert_eq!(original.signature, deserialized.signature, "signature mismatch");
+        assert_eq!(original.signature.len(), 64, "signature must be 64 bytes");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_delete_requested_event_reason_governance() {
+        let signature: [u8; 64] = [0xbbu8; 64];
+
+        let original = DeleteRequestedEvent {
+            chunk_hash: "chunk-governance".to_string(),
+            requester_id: "governance-council".to_string(),
+            reason: DeleteReason::Governance,
+            requested_at: 1704240000000,
+            grace_period_ms: 604800000,
+            signature: signature,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: DeleteRequestedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.requester_id, deserialized.requester_id, "requester_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, DeleteReason::Governance, "reason must be Governance");
+        assert_eq!(original.requested_at, deserialized.requested_at, "requested_at mismatch");
+        assert_eq!(original.grace_period_ms, deserialized.grace_period_ms, "grace_period_ms mismatch");
+        assert_eq!(original.signature, deserialized.signature, "signature mismatch");
+        assert_eq!(original.signature.len(), 64, "signature must be 64 bytes");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_delete_requested_event_reason_compliance() {
+        let signature: [u8; 64] = [0xccu8; 64];
+
+        let original = DeleteRequestedEvent {
+            chunk_hash: "chunk-compliance".to_string(),
+            requester_id: "legal-team".to_string(),
+            reason: DeleteReason::Compliance,
+            requested_at: 1704326400000,
+            grace_period_ms: 3600000,
+            signature: signature,
+        };
+
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+        let deserialized: DeleteRequestedEvent =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        assert_eq!(original.chunk_hash, deserialized.chunk_hash, "chunk_hash mismatch");
+        assert_eq!(original.requester_id, deserialized.requester_id, "requester_id mismatch");
+        assert_eq!(original.reason, deserialized.reason, "reason mismatch");
+        assert_eq!(original.reason, DeleteReason::Compliance, "reason must be Compliance");
+        assert_eq!(original.requested_at, deserialized.requested_at, "requested_at mismatch");
+        assert_eq!(original.grace_period_ms, deserialized.grace_period_ms, "grace_period_ms mismatch");
+        assert_eq!(original.signature, deserialized.signature, "signature mismatch");
+        assert_eq!(original.signature.len(), 64, "signature must be 64 bytes");
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_delete_requested_event_to_da_event_conversion() {
+        let signature: [u8; 64] = [0xffu8; 64];
+
+        let event = DeleteRequestedEvent {
+            chunk_hash: "test-delete-chunk".to_string(),
+            requester_id: "test-requester".to_string(),
+            reason: DeleteReason::UserRequest,
+            requested_at: 1700000000000,
+            grace_period_ms: 172800000,
+            signature: signature,
+        };
+
+        // Convert to DAEvent
+        let da_event: DAEvent = event.clone().into();
+
+        // Verify mapping
+        match da_event {
+            DAEvent::DeleteRequested {
+                version,
+                timestamp_ms,
+                chunk_hash,
+                requester_id,
+                reason,
+            } => {
+                assert_eq!(version, 1, "version must be 1");
+                assert_eq!(timestamp_ms, event.requested_at, "timestamp_ms must equal requested_at");
+                assert_eq!(chunk_hash, event.chunk_hash, "chunk_hash mapping failed");
+                assert_eq!(requester_id, event.requester_id, "requester_id mapping failed");
+                assert_eq!(reason, event.reason, "reason mapping failed");
+            }
+            _ => panic!("conversion must produce DAEvent::DeleteRequested"),
         }
     }
 }
