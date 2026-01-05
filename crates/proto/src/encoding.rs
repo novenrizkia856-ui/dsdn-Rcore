@@ -120,6 +120,15 @@ pub fn batch_decode(bytes: &[u8]) -> Result<Vec<DAEvent>, DAError> {
     let count = u64::from_le_bytes(count_bytes) as usize;
     cursor += 8;
     
+    // Validate count to prevent allocation overflow
+    // Each event needs at least 8 bytes for length prefix
+    let max_possible_events = (bytes.len() - 8) / 8;
+    if count > max_possible_events {
+        return Err(DAError::DecodeFailed(
+            format!("invalid event count {} exceeds maximum possible {}", count, max_possible_events)
+        ));
+    }
+    
     let mut events = Vec::with_capacity(count);
     
     // Read each event
