@@ -4,6 +4,7 @@
 //! Penambahan variant baru harus backward-compatible.
 
 use serde::{Serialize, Deserialize};
+use sha3::{Sha3_256, Digest};
 
 /// Core DA Event enum untuk semua event yang di-post ke Celestia DA.
 ///
@@ -113,4 +114,112 @@ pub enum DeleteReason {
     Governance,
     /// Compliance requirement
     Compliance,
+}
+
+// ============================================================================
+// DAEventEnvelope System (Specification 14A.2)
+// ============================================================================
+
+/// Lightweight discriminant enum for DA event routing and indexing.
+///
+/// This enum carries NO payload data - it exists solely to identify
+/// event types without deserializing the full payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DAEventType {
+    NodeRegistered,
+    ChunkDeclared,
+    ReplicaAdded,
+    ReplicaRemoved,
+    DeleteRequested,
+}
+
+/// Error types for DAEventEnvelope decoding operations.
+///
+/// Explicit error variants prevent hidden failure modes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DAEventDecodeError {
+    /// Input bytes are empty or structurally invalid
+    InvalidFormat,
+    /// Bincode deserialization failed
+    DeserializationFailed,
+}
+
+/// Universal envelope wrapper for all DA events posted to Celestia.
+///
+/// This is the CANONICAL container format. Field order is fixed and
+/// MUST NOT be changed to preserve binary compatibility.
+///
+/// # Wire Format (bincode)
+/// ```text
+/// [version:1][timestamp_ms:8][sequence:8][event_type:1][payload_len:8][payload:N][checksum:32]
+/// ```
+///
+/// # Verification Flow
+/// 1. `decode()` - deserialize from bytes
+/// 2. `verify_checksum()` - validate payload integrity
+/// 3. Deserialize `payload` to concrete `DAEvent` variant
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DAEventEnvelope {
+    /// Envelope schema version (current = 1)
+    pub version: u8,
+    /// Unix timestamp in milliseconds (caller-provided)
+    pub timestamp_ms: u64,
+    /// Monotonic sequence number (caller-managed for ordering)
+    pub sequence: u64,
+    /// Event type discriminant for routing without payload inspection
+    pub event_type: DAEventType,
+    /// Serialized event payload (bincode-encoded DAEvent)
+    pub payload: Vec<u8>,
+    /// SHA3-256 checksum of payload for integrity verification
+    pub checksum: [u8; 32],
+}
+
+impl DAEventEnvelope {
+    /// Serialize envelope to deterministic binary format using bincode.
+    ///
+    /// # Returns
+    /// Binary representation suitable for DA layer storage.
+    /// Returns empty Vec only on catastrophic serialization failure
+    /// (should not occur with well-formed envelope).
+    pub fn encode(&self) -> Vec<u8> {
+        // bincode serialization of fixed-structure data cannot fail
+        // under normal conditions; empty fallback is defensive only
+        bincode::serialize(self).unwrap_or_else(|_| Vec::new())
+    }
+
+    /// Deserialize envelope from binary format.
+    ///
+    /// # Arguments
+    /// * `bytes` - Raw bytes from DA layer
+    ///
+    /// # Returns
+    /// * `Ok(Self)` - Successfully decoded envelope
+    /// * `Err(InvalidFormat)` - Empty or malformed input
+    /// * `Err(DeserializationFailed)` - Bincode decode failure
+    ///
+    /// # Note
+    /// This method does NOT verify checksum. Call `verify_checksum()`
+    /// separately after decoding to validate payload integrity.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DAEventDecodeError> {
+        if bytes.is_empty() {
+            return Err(DAEventDecodeError::InvalidFormat);
+        }
+        bincode::deserialize(bytes).map_err(|_| DAEventDecodeError::DeserializationFailed)
+    }
+
+    /// Verify payload integrity by comparing stored checksum with computed SHA3-256.
+    ///
+    /// # Returns
+    /// * `true` - Checksum matches, payload is intact
+    /// * `false` - Checksum mismatch, payload may be corrupted
+    ///
+    /// # Security
+    /// MUST be called after `decode()` before trusting payload contents.
+    /// Detects both accidental corruption and malicious tampering.
+    pub fn verify_checksum(&self) -> bool {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&self.payload);
+        let computed: [u8; 32] = hasher.finalize().into();
+        computed == self.checksum
+    }
 }
