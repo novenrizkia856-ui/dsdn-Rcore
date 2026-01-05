@@ -6,6 +6,7 @@
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 use std::collections::HashMap;
+use std::fmt;
 use serde_big_array::BigArray;
 
 /// Core DA Event enum untuk semua event yang di-post ke Celestia DA.
@@ -379,6 +380,62 @@ impl DAEventEnvelope {
         let computed: [u8; 32] = hasher.finalize().into();
         computed == self.checksum
     }
+}
+
+// ============================================================================
+// BlobRef & BlobMetadata Types (Specification 14A.7)
+// ============================================================================
+
+/// Referensi ke blob Celestia
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    /// Celestia block height
+    pub height: u64,
+    /// Celestia namespace v0 (fixed 29 bytes)
+    pub namespace: [u8; 29],
+    /// Blob index di dalam block
+    pub index: u32,
+    /// Blob commitment (fixed 32 bytes)
+    pub commitment: [u8; 32],
+}
+
+impl fmt::Display for BlobRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "BlobRef(height={}, namespace={}, index={}, commitment={})",
+            self.height,
+            bytes_to_hex(&self.namespace),
+            self.index,
+            bytes_to_hex(&self.commitment)
+        )
+    }
+}
+
+/// Metadata blob Celestia
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobMetadata {
+    /// Referensi ke blob
+    pub blob_ref: BlobRef,
+    /// Ukuran blob dalam bytes
+    pub size_bytes: u64,
+    /// Jumlah event di dalam blob
+    pub event_count: u32,
+    /// Sequence pertama dalam blob
+    pub first_sequence: u64,
+    /// Sequence terakhir dalam blob
+    pub last_sequence: u64,
+    /// Timestamp pembuatan metadata
+    pub created_at: u64,
+}
+
+/// Helper function untuk encode bytes ke hex string (deterministic)
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{:02x}", byte));
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -990,5 +1047,216 @@ mod tests {
             }
             _ => panic!("conversion must produce DAEvent::DeleteRequested"),
         }
+    }
+
+    #[test]
+    fn test_blob_ref_creation_and_field_sizes() {
+        let namespace: [u8; 29] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c,
+        ];
+
+        let commitment: [u8; 32] = [
+            0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+            0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+            0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+            0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+        ];
+
+        let blob_ref = BlobRef {
+            height: 12345678,
+            namespace: namespace,
+            index: 42,
+            commitment: commitment,
+        };
+
+        // Verify field sizes
+        assert_eq!(blob_ref.namespace.len(), 29, "namespace must be 29 bytes");
+        assert_eq!(blob_ref.commitment.len(), 32, "commitment must be 32 bytes");
+
+        // Verify field values
+        assert_eq!(blob_ref.height, 12345678, "height mismatch");
+        assert_eq!(blob_ref.index, 42, "index mismatch");
+        assert_eq!(blob_ref.namespace, namespace, "namespace mismatch");
+        assert_eq!(blob_ref.commitment, commitment, "commitment mismatch");
+    }
+
+    #[test]
+    fn test_blob_ref_display_output() {
+        let namespace: [u8; 29] = [0x01u8; 29];
+        let commitment: [u8; 32] = [0xffu8; 32];
+
+        let blob_ref = BlobRef {
+            height: 100,
+            namespace: namespace,
+            index: 5,
+            commitment: commitment,
+        };
+
+        let display_output = format!("{}", blob_ref);
+
+        // Verify output is not empty
+        assert!(!display_output.is_empty(), "Display output must not be empty");
+
+        // Verify output contains all important fields
+        assert!(display_output.contains("100"), "Display must contain height");
+        assert!(display_output.contains("5"), "Display must contain index");
+        assert!(display_output.contains("BlobRef"), "Display must contain type name");
+
+        // Verify determinism - multiple calls produce same output
+        let display_output_2 = format!("{}", blob_ref);
+        assert_eq!(display_output, display_output_2, "Display must be deterministic");
+
+        // Verify namespace hex is present (29 bytes = 58 hex chars of "01")
+        assert!(display_output.contains("0101010101"), "Display must contain namespace hex");
+
+        // Verify commitment hex is present (32 bytes = 64 hex chars of "ff")
+        assert!(display_output.contains("ffffffff"), "Display must contain commitment hex");
+    }
+
+    #[test]
+    fn test_blob_ref_serialization_roundtrip() {
+        let namespace: [u8; 29] = [
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x09,
+        ];
+
+        let commitment: [u8; 32] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+        ];
+
+        let original = BlobRef {
+            height: 999999,
+            namespace: namespace,
+            index: 123,
+            commitment: commitment,
+        };
+
+        // Serialize
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+
+        // Deserialize
+        let deserialized: BlobRef =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        // Verify ALL fields
+        assert_eq!(original.height, deserialized.height, "height mismatch");
+        assert_eq!(original.namespace, deserialized.namespace, "namespace mismatch");
+        assert_eq!(original.namespace.len(), 29, "namespace must be 29 bytes");
+        assert_eq!(original.index, deserialized.index, "index mismatch");
+        assert_eq!(original.commitment, deserialized.commitment, "commitment mismatch");
+        assert_eq!(original.commitment.len(), 32, "commitment must be 32 bytes");
+
+        // Full equality
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_blob_metadata_creation() {
+        let namespace: [u8; 29] = [0xabu8; 29];
+        let commitment: [u8; 32] = [0xcdu8; 32];
+
+        let blob_ref = BlobRef {
+            height: 500000,
+            namespace: namespace,
+            index: 10,
+            commitment: commitment,
+        };
+
+        let metadata = BlobMetadata {
+            blob_ref: blob_ref.clone(),
+            size_bytes: 1048576,
+            event_count: 100,
+            first_sequence: 1000,
+            last_sequence: 1099,
+            created_at: 1704067200000,
+        };
+
+        // Verify all fields
+        assert_eq!(metadata.blob_ref, blob_ref, "blob_ref mismatch");
+        assert_eq!(metadata.size_bytes, 1048576, "size_bytes mismatch");
+        assert_eq!(metadata.event_count, 100, "event_count mismatch");
+        assert_eq!(metadata.first_sequence, 1000, "first_sequence mismatch");
+        assert_eq!(metadata.last_sequence, 1099, "last_sequence mismatch");
+        assert_eq!(metadata.created_at, 1704067200000, "created_at mismatch");
+    }
+
+    #[test]
+    fn test_blob_metadata_serialization_roundtrip() {
+        let namespace: [u8; 29] = [0x12u8; 29];
+        let commitment: [u8; 32] = [0x34u8; 32];
+
+        let blob_ref = BlobRef {
+            height: 777777,
+            namespace: namespace,
+            index: 55,
+            commitment: commitment,
+        };
+
+        let original = BlobMetadata {
+            blob_ref: blob_ref,
+            size_bytes: 2097152,
+            event_count: 250,
+            first_sequence: 5000,
+            last_sequence: 5249,
+            created_at: 1704153600000,
+        };
+
+        // Serialize
+        let serialized = bincode::serialize(&original).expect("serialization must succeed");
+
+        // Deserialize
+        let deserialized: BlobMetadata =
+            bincode::deserialize(&serialized).expect("deserialization must succeed");
+
+        // Verify ALL fields
+        assert_eq!(original.blob_ref, deserialized.blob_ref, "blob_ref mismatch");
+        assert_eq!(original.blob_ref.namespace.len(), 29, "namespace must be 29 bytes");
+        assert_eq!(original.blob_ref.commitment.len(), 32, "commitment must be 32 bytes");
+        assert_eq!(original.size_bytes, deserialized.size_bytes, "size_bytes mismatch");
+        assert_eq!(original.event_count, deserialized.event_count, "event_count mismatch");
+        assert_eq!(original.first_sequence, deserialized.first_sequence, "first_sequence mismatch");
+        assert_eq!(original.last_sequence, deserialized.last_sequence, "last_sequence mismatch");
+        assert_eq!(original.created_at, deserialized.created_at, "created_at mismatch");
+
+        // Full equality
+        assert_eq!(original, deserialized, "full struct equality failed");
+    }
+
+    #[test]
+    fn test_blob_metadata_sequence_ordering() {
+        let namespace: [u8; 29] = [0x00u8; 29];
+        let commitment: [u8; 32] = [0x00u8; 32];
+
+        let blob_ref = BlobRef {
+            height: 1,
+            namespace: namespace,
+            index: 0,
+            commitment: commitment,
+        };
+
+        let metadata = BlobMetadata {
+            blob_ref: blob_ref,
+            size_bytes: 1024,
+            event_count: 10,
+            first_sequence: 100,
+            last_sequence: 109,
+            created_at: 1704067200000,
+        };
+
+        // Verify sequence relationship
+        assert!(metadata.first_sequence <= metadata.last_sequence, "first_sequence must be <= last_sequence");
+        assert_eq!(
+            metadata.last_sequence - metadata.first_sequence + 1,
+            metadata.event_count as u64,
+            "sequence range must match event_count"
+        );
     }
 }
