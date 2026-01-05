@@ -961,6 +961,7 @@ dependencies = [
  "bytes",
  "dsdn-common",
  "prost",
+ "serde",
  "tempfile",
  "tokio",
  "tonic",
