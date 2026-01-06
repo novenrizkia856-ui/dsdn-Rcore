@@ -3,13 +3,251 @@
 //! Modul ini menyediakan implementasi konkret `CelestiaDA` sebagai
 //! backend Data Availability menggunakan Celestia network.
 //!
-//! Tahap ini HANYA berisi inisialisasi dan wiring.
+//! Tahap ini berisi inisialisasi, wiring, dan manajemen namespace.
 //! Implementasi trait `DALayer` akan ditambahkan di tahap selanjutnya.
 
 use crate::da::{DAConfig, DAError, DAHealthStatus};
+use sha2::{Sha256, Digest};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
+
+// ════════════════════════════════════════════════════════════════════════════
+// NAMESPACE CONSTANTS & COMPUTATION
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Default DSDN namespace untuk control plane data.
+///
+/// Nilai ini dihitung secara deterministik dari string "dsdn-control-v0"
+/// menggunakan `compute_namespace`. Konstanta ini digunakan sebagai
+/// namespace default untuk DSDN control plane operations.
+///
+/// # Computation
+///
+/// ```ignore
+/// DSDN_NAMESPACE_V0 = compute_namespace("dsdn-control-v0")
+/// ```
+pub const DSDN_NAMESPACE_V0: [u8; 29] = compute_namespace_const("dsdn-control-v0");
+
+/// Menghitung namespace 29-byte dari string name secara deterministik.
+///
+/// Fungsi ini menggunakan SHA-256 untuk menghasilkan hash dari input string,
+/// kemudian mengambil 29 byte pertama sebagai namespace.
+///
+/// # Arguments
+///
+/// * `name` - String identifier untuk namespace
+///
+/// # Returns
+///
+/// Array 29-byte yang merupakan namespace identifier.
+///
+/// # Determinism
+///
+/// Fungsi ini sepenuhnya deterministik:
+/// - Input yang sama selalu menghasilkan output yang sama
+/// - Tidak bergantung pada state eksternal
+/// - Tidak menggunakan randomness
+/// - Platform-independent
+///
+/// # Example
+///
+/// ```ignore
+/// let ns1 = compute_namespace("my-app");
+/// let ns2 = compute_namespace("my-app");
+/// assert_eq!(ns1, ns2); // Selalu sama
+/// ```
+pub fn compute_namespace(name: &str) -> [u8; 29] {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let hash = hasher.finalize();
+    
+    let mut namespace = [0u8; 29];
+    namespace.copy_from_slice(&hash[..29]);
+    namespace
+}
+
+/// Const function untuk menghitung namespace pada compile time.
+///
+/// Implementasi ini menggunakan algoritma SHA-256 secara manual
+/// untuk memungkinkan evaluasi pada compile time.
+const fn compute_namespace_const(name: &str) -> [u8; 29] {
+    // SHA-256 constants
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    const fn rotr(x: u32, n: u32) -> u32 {
+        (x >> n) | (x << (32 - n))
+    }
+
+    const fn ch(x: u32, y: u32, z: u32) -> u32 {
+        (x & y) ^ (!x & z)
+    }
+
+    const fn maj(x: u32, y: u32, z: u32) -> u32 {
+        (x & y) ^ (x & z) ^ (y & z)
+    }
+
+    const fn sigma0(x: u32) -> u32 {
+        rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22)
+    }
+
+    const fn sigma1(x: u32) -> u32 {
+        rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25)
+    }
+
+    const fn gamma0(x: u32) -> u32 {
+        rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3)
+    }
+
+    const fn gamma1(x: u32) -> u32 {
+        rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10)
+    }
+
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    
+    // Prepare message block (simplified for short inputs < 56 bytes)
+    let mut block = [0u8; 64];
+    let mut i = 0;
+    while i < len && i < 55 {
+        block[i] = bytes[i];
+        i += 1;
+    }
+    block[len] = 0x80; // Padding
+    
+    // Length in bits (big endian)
+    let bit_len = (len as u64) * 8;
+    block[56] = ((bit_len >> 56) & 0xff) as u8;
+    block[57] = ((bit_len >> 48) & 0xff) as u8;
+    block[58] = ((bit_len >> 40) & 0xff) as u8;
+    block[59] = ((bit_len >> 32) & 0xff) as u8;
+    block[60] = ((bit_len >> 24) & 0xff) as u8;
+    block[61] = ((bit_len >> 16) & 0xff) as u8;
+    block[62] = ((bit_len >> 8) & 0xff) as u8;
+    block[63] = (bit_len & 0xff) as u8;
+
+    // Initial hash values
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    // Parse block into 16 32-bit words
+    let mut w = [0u32; 64];
+    let mut j = 0;
+    while j < 16 {
+        w[j] = ((block[j * 4] as u32) << 24)
+            | ((block[j * 4 + 1] as u32) << 16)
+            | ((block[j * 4 + 2] as u32) << 8)
+            | (block[j * 4 + 3] as u32);
+        j += 1;
+    }
+
+    // Extend to 64 words
+    j = 16;
+    while j < 64 {
+        w[j] = gamma1(w[j - 2])
+            .wrapping_add(w[j - 7])
+            .wrapping_add(gamma0(w[j - 15]))
+            .wrapping_add(w[j - 16]);
+        j += 1;
+    }
+
+    // Compression
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut hh = h[7];
+
+    j = 0;
+    while j < 64 {
+        let t1 = hh
+            .wrapping_add(sigma1(e))
+            .wrapping_add(ch(e, f, g))
+            .wrapping_add(K[j])
+            .wrapping_add(w[j]);
+        let t2 = sigma0(a).wrapping_add(maj(a, b, c));
+
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+        j += 1;
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+
+    // Convert to bytes and take first 29
+    let mut result = [0u8; 29];
+    let mut k = 0;
+    while k < 7 {
+        result[k * 4] = ((h[k] >> 24) & 0xff) as u8;
+        result[k * 4 + 1] = ((h[k] >> 16) & 0xff) as u8;
+        result[k * 4 + 2] = ((h[k] >> 8) & 0xff) as u8;
+        result[k * 4 + 3] = (h[k] & 0xff) as u8;
+        k += 1;
+    }
+    // Last byte from h[7]
+    result[28] = ((h[7] >> 24) & 0xff) as u8;
+
+    result
+}
+
+/// Memvalidasi format namespace.
+///
+/// Namespace valid jika:
+/// - Bukan all-zeros (reserved)
+/// - Memiliki panjang tepat 29 bytes
+///
+/// # Arguments
+///
+/// * `namespace` - Namespace 29-byte untuk divalidasi
+///
+/// # Returns
+///
+/// * `Ok(())` - Namespace valid
+/// * `Err(DAError::InvalidNamespace)` - Namespace tidak valid
+fn validate_namespace_format(namespace: &[u8; 29]) -> Result<(), DAError> {
+    // Check if namespace is all zeros (reserved/invalid)
+    let all_zeros = namespace.iter().all(|&b| b == 0);
+    if all_zeros {
+        return Err(DAError::InvalidNamespace);
+    }
+    
+    Ok(())
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // CELESTIA DA STRUCT
@@ -179,6 +417,41 @@ impl CelestiaDA {
         &self.namespace
     }
 
+    /// Mengubah namespace yang digunakan.
+    ///
+    /// Method ini hanya mengubah field `namespace` internal.
+    /// Tidak melakukan network call atau mengubah field lain.
+    ///
+    /// # Arguments
+    ///
+    /// * `ns` - Namespace baru 29-byte
+    ///
+    /// # Note
+    ///
+    /// Method ini tidak melakukan validasi namespace.
+    /// Gunakan `validate_namespace()` setelah set jika diperlukan.
+    pub fn set_namespace(&mut self, ns: [u8; 29]) {
+        self.namespace = ns;
+    }
+
+    /// Memvalidasi namespace yang sedang aktif.
+    ///
+    /// Validasi dilakukan tanpa network call, hanya memeriksa
+    /// format dan nilai namespace.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Namespace valid
+    /// * `Err(DAError::InvalidNamespace)` - Namespace tidak valid
+    ///
+    /// # Validation Rules
+    ///
+    /// Namespace dianggap invalid jika:
+    /// - Semua bytes adalah zero (reserved)
+    pub fn validate_namespace(&self) -> Result<(), DAError> {
+        validate_namespace_format(&self.namespace)
+    }
+
     /// Mendapatkan height terakhir yang diketahui.
     pub fn last_height(&self) -> u64 {
         self.last_height.load(Ordering::SeqCst)
@@ -223,6 +496,244 @@ mod tests {
             retry_count: 3,
             retry_delay_ms: 100,
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // COMPUTE_NAMESPACE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_compute_namespace_deterministic() {
+        let ns1 = compute_namespace("test-namespace");
+        let ns2 = compute_namespace("test-namespace");
+        assert_eq!(ns1, ns2, "Same input should produce same output");
+    }
+
+    #[test]
+    fn test_compute_namespace_different_inputs() {
+        let ns1 = compute_namespace("namespace-a");
+        let ns2 = compute_namespace("namespace-b");
+        assert_ne!(ns1, ns2, "Different inputs should produce different outputs");
+    }
+
+    #[test]
+    fn test_compute_namespace_length() {
+        let ns = compute_namespace("any-string");
+        assert_eq!(ns.len(), 29, "Namespace must be exactly 29 bytes");
+    }
+
+    #[test]
+    fn test_compute_namespace_empty_string() {
+        let ns = compute_namespace("");
+        assert_eq!(ns.len(), 29, "Empty string should still produce 29 bytes");
+    }
+
+    #[test]
+    fn test_compute_namespace_long_string() {
+        let long_string = "a".repeat(1000);
+        let ns = compute_namespace(&long_string);
+        assert_eq!(ns.len(), 29, "Long string should produce 29 bytes");
+    }
+
+    #[test]
+    fn test_compute_namespace_consistent_across_runs() {
+        // This tests that the same input always gives same output
+        let expected = compute_namespace("dsdn-control-v0");
+        for _ in 0..100 {
+            let actual = compute_namespace("dsdn-control-v0");
+            assert_eq!(expected, actual);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DSDN_NAMESPACE_V0 TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dsdn_namespace_v0_consistent_with_compute() {
+        let computed = compute_namespace("dsdn-control-v0");
+        assert_eq!(
+            DSDN_NAMESPACE_V0, computed,
+            "DSDN_NAMESPACE_V0 must equal compute_namespace(\"dsdn-control-v0\")"
+        );
+    }
+
+    #[test]
+    fn test_dsdn_namespace_v0_length() {
+        assert_eq!(DSDN_NAMESPACE_V0.len(), 29);
+    }
+
+    #[test]
+    fn test_dsdn_namespace_v0_not_all_zeros() {
+        let all_zeros = DSDN_NAMESPACE_V0.iter().all(|&b| b == 0);
+        assert!(!all_zeros, "DSDN_NAMESPACE_V0 should not be all zeros");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SET_NAMESPACE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_set_namespace_changes_namespace() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let mut celestia_da = CelestiaDA::new(config).unwrap();
+
+        let old_namespace = *celestia_da.namespace();
+        let new_namespace = [0xAB; 29];
+
+        celestia_da.set_namespace(new_namespace);
+
+        assert_eq!(celestia_da.namespace(), &new_namespace);
+        assert_ne!(celestia_da.namespace(), &old_namespace);
+    }
+
+    #[tokio::test]
+    async fn test_set_namespace_does_not_change_other_fields() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let mut celestia_da = CelestiaDA::new(config.clone()).unwrap();
+
+        // Set some values
+        celestia_da.set_last_height(12345);
+        celestia_da.set_health_status(DAHealthStatus::Degraded);
+
+        // Capture state before
+        let last_height_before = celestia_da.last_height();
+        let health_status_before = celestia_da.health_status();
+        let rpc_url_before = celestia_da.config().rpc_url.clone();
+
+        // Change namespace
+        celestia_da.set_namespace([0xFF; 29]);
+
+        // Verify other fields unchanged
+        assert_eq!(celestia_da.last_height(), last_height_before);
+        assert_eq!(celestia_da.health_status(), health_status_before);
+        assert_eq!(celestia_da.config().rpc_url, rpc_url_before);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // VALIDATE_NAMESPACE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_validate_namespace_valid() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Default namespace [0x01; 29] should be valid
+        let result = celestia_da.validate_namespace();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_namespace_dsdn_v0_valid() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.namespace = DSDN_NAMESPACE_V0;
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let result = celestia_da.validate_namespace();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_namespace_all_zeros_invalid() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let mut celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Set namespace to all zeros
+        celestia_da.set_namespace([0x00; 29]);
+
+        let result = celestia_da.validate_namespace();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DAError::InvalidNamespace));
+    }
+
+    #[tokio::test]
+    async fn test_validate_namespace_no_panic() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let mut celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Test various namespaces - none should panic
+        let test_cases: [[u8; 29]; 4] = [
+            [0x00; 29],
+            [0xFF; 29],
+            [0x01; 29],
+            DSDN_NAMESPACE_V0,
+        ];
+
+        for ns in test_cases {
+            celestia_da.set_namespace(ns);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                celestia_da.validate_namespace()
+            }));
+            assert!(result.is_ok(), "validate_namespace should not panic");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // VALIDATE_NAMESPACE_FORMAT TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_namespace_format_valid() {
+        let ns = [0x01; 29];
+        assert!(validate_namespace_format(&ns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_namespace_format_all_zeros() {
+        let ns = [0x00; 29];
+        let result = validate_namespace_format(&ns);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DAError::InvalidNamespace));
+    }
+
+    #[test]
+    fn test_validate_namespace_format_one_non_zero() {
+        let mut ns = [0x00; 29];
+        ns[28] = 0x01; // One non-zero byte
+        assert!(validate_namespace_format(&ns).is_ok());
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -454,6 +965,22 @@ mod tests {
 
         assert!(result.is_ok(), "Should not panic");
         assert!(result.unwrap().is_err(), "Should return error");
+    }
+
+    #[tokio::test]
+    async fn test_from_env_invalid_timeout() {
+        std::env::set_var("DA_RPC_URL", "http://localhost:26658");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_TIMEOUT_MS", "not_a_number");
+
+        let result = CelestiaDA::from_env();
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_TIMEOUT_MS");
+
+        assert!(result.is_err(), "from_env should fail with invalid timeout");
     }
 
     // ════════════════════════════════════════════════════════════════════════
