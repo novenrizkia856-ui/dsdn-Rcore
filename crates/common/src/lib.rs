@@ -1,16 +1,35 @@
-﻿//! dsdn-common
-//! Common utilities.
+﻿//! # DSDN Common Crate (14A)
 //!
-//! This crate provides shared utilities and abstractions used across
-//! the DSDN system, including:
+//! Common utilities dan DA Abstraction Layer.
 //!
-//! - `crypto` - Cryptographic primitives and utilities
-//! - `cid` - Content ID helpers based on SHA-256. Exposes deterministic hex string representation.
-//! - `config` - Configuration management
-//! - `consistent_hash` - Consistent hashing implementation
-//! - `da` - Data Availability layer abstraction trait
-//! - `celestia_da` - Celestia DA backend implementation
-//! - `mock_da` - Mock DA backend for testing
+//! ## Modules
+//! - `da`: DALayer trait definition
+//! - `celestia_da`: Celestia implementation
+//! - `mock_da`: Mock implementation for testing
+//! - `crypto`: Cryptographic utilities
+//! - `cid`: Content addressing utilities
+//! - `config`: Configuration management
+//! - `consistent_hash`: Consistent hashing for placement
+//!
+//! ## DA Layer Architecture
+//! ```text
+//! ┌─────────────────┐
+//! │    DALayer      │  <- Abstract trait
+//! └────────┬────────┘
+//!          │
+//!    ┌─────┴─────┐
+//!    │           │
+//! ┌──▼──┐    ┌───▼───┐
+//! │Celestia│  │MockDA │
+//! └──────┘    └───────┘
+//! ```
+//!
+//! ## Usage
+//! ```rust,ignore
+//! let da = CelestiaDA::from_env()?;
+//! let blob_ref = da.post_blob(data).await?;
+//! let blob = da.get_blob(&blob_ref).await?;
+//! ```
 
 pub mod crypto;
 pub mod cid;
