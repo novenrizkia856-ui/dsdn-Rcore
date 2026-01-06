@@ -3,14 +3,25 @@
 //! Modul ini menyediakan implementasi konkret `CelestiaDA` sebagai
 //! backend Data Availability menggunakan Celestia network.
 //!
-//! Tahap ini berisi inisialisasi, wiring, dan manajemen namespace.
-//! Implementasi trait `DALayer` akan ditambahkan di tahap selanjutnya.
+//! Tahap ini berisi inisialisasi, wiring, manajemen namespace, dan
+//! operasi `post_blob` untuk mengirim data ke Celestia.
 
-use crate::da::{DAConfig, DAError, DAHealthStatus};
+use crate::da::{BlobRef, DAConfig, DAError, DAHealthStatus};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
+use sha3::Sha3_256;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
+use tracing::{debug, error, info, warn};
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Maximum blob size in bytes (2 MB)
+pub const MAX_BLOB_SIZE: usize = 2 * 1024 * 1024;
 
 // ════════════════════════════════════════════════════════════════════════════
 // NAMESPACE CONSTANTS & COMPUTATION
@@ -250,6 +261,84 @@ fn validate_namespace_format(namespace: &[u8; 29]) -> Result<(), DAError> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// BLOB COMMITMENT
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Menghitung blob commitment menggunakan SHA3-256.
+///
+/// Commitment adalah hash 32-byte dari data blob yang digunakan
+/// untuk identifikasi dan verifikasi integritas blob.
+///
+/// # Arguments
+///
+/// * `data` - Data blob mentah
+///
+/// # Returns
+///
+/// Array 32-byte commitment hash.
+///
+/// # Determinism
+///
+/// Fungsi ini sepenuhnya deterministik:
+/// - Input sama → output sama
+/// - Tidak ada randomness
+/// - Tidak ada salt
+/// - Platform-independent
+pub fn compute_blob_commitment(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    
+    let mut commitment = [0u8; 32];
+    commitment.copy_from_slice(&result);
+    commitment
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// JSON-RPC TYPES
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Blob data untuk JSON-RPC request
+#[derive(Debug, Serialize)]
+struct BlobData {
+    /// Namespace dalam format base64
+    namespace: String,
+    /// Data blob dalam format base64
+    data: String,
+    /// Share version (selalu 0 untuk Celestia)
+    share_version: u32,
+    /// Commitment dalam format base64
+    commitment: String,
+}
+
+/// JSON-RPC request untuk blob.Submit
+#[derive(Debug, Serialize)]
+struct JsonRpcRequest {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: Vec<serde_json::Value>,
+}
+
+/// JSON-RPC response
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    #[allow(dead_code)]
+    id: u64,
+    result: Option<u64>,
+    error: Option<JsonRpcError>,
+}
+
+/// JSON-RPC error
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // CELESTIA DA STRUCT
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -407,6 +496,192 @@ impl CelestiaDA {
         })
     }
 
+    /// Mengirim blob ke Celestia DA layer.
+    ///
+    /// Method ini mengirim data ke Celestia melalui JSON-RPC `blob.Submit`.
+    /// Data akan di-encode ke base64 dan dikirim bersama namespace aktif.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Data blob mentah (maksimum 2MB)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BlobRef)` - Referensi ke blob yang tersimpan
+    /// * `Err(DAError)` - Jika pengiriman gagal
+    ///
+    /// # Errors
+    ///
+    /// Mengembalikan error jika:
+    /// - Data melebihi 2MB (`DAError::Other`)
+    /// - Network error (`DAError::NetworkError`)
+    /// - Timeout (`DAError::Timeout`)
+    /// - Response tidak valid (`DAError::SerializationError`)
+    ///
+    /// # Retry Behavior
+    ///
+    /// Method ini melakukan retry dengan exponential backoff jika terjadi
+    /// error yang bersifat transient (network error, timeout). Jumlah retry
+    /// dan delay ditentukan oleh konfigurasi.
+    ///
+    /// # State Updates
+    ///
+    /// Jika sukses, `last_height` akan diupdate secara atomic dengan
+    /// height dari response.
+    pub async fn post_blob(&self, data: &[u8]) -> Result<BlobRef, DAError> {
+        // Validate data size
+        if data.len() > MAX_BLOB_SIZE {
+            error!(
+                size = data.len(),
+                max = MAX_BLOB_SIZE,
+                "blob size exceeds maximum"
+            );
+            return Err(DAError::Other(format!(
+                "blob size {} exceeds maximum {} bytes",
+                data.len(),
+                MAX_BLOB_SIZE
+            )));
+        }
+
+        debug!(size = data.len(), "posting blob to Celestia");
+
+        // Compute commitment
+        let commitment = compute_blob_commitment(data);
+
+        // Build blob data
+        let blob_data = BlobData {
+            namespace: BASE64.encode(&self.namespace),
+            data: BASE64.encode(data),
+            share_version: 0,
+            commitment: BASE64.encode(&commitment),
+        };
+
+        // Build JSON-RPC request
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "blob.Submit",
+            params: vec![
+                serde_json::json!([blob_data]),
+                serde_json::json!(0.002), // gas price
+            ],
+        };
+
+        // Retry loop with exponential backoff
+        let mut last_error = DAError::Unavailable;
+        let mut retry_delay = self.config.retry_delay_ms;
+
+        for attempt in 0..=self.config.retry_count {
+            if attempt > 0 {
+                warn!(attempt, retry_count = self.config.retry_count, "retrying post_blob");
+                tokio::time::sleep(Duration::from_millis(retry_delay)).await;
+                retry_delay *= 2; // Exponential backoff
+            }
+
+            match self.send_blob_submit(&request).await {
+                Ok(height) => {
+                    // Update last_height atomically
+                    self.last_height.store(height, Ordering::SeqCst);
+                    
+                    // Update health status to Healthy
+                    *self.health_status.write().unwrap() = DAHealthStatus::Healthy;
+
+                    info!(height, commitment = ?hex::encode(&commitment[..8]), "blob posted successfully");
+
+                    return Ok(BlobRef {
+                        height,
+                        commitment,
+                        namespace: self.namespace,
+                    });
+                }
+                Err(e) => {
+                    // Check if error is retryable
+                    let is_retryable = matches!(
+                        e,
+                        DAError::NetworkError(_) | DAError::Timeout | DAError::Unavailable
+                    );
+
+                    if !is_retryable {
+                        error!(error = ?e, "non-retryable error in post_blob");
+                        return Err(e);
+                    }
+
+                    warn!(attempt, error = ?e, "retryable error in post_blob");
+                    last_error = e;
+
+                    // Update health status to Degraded after first failure
+                    if attempt == 0 {
+                        *self.health_status.write().unwrap() = DAHealthStatus::Degraded;
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted
+        error!(retry_count = self.config.retry_count, "all retries exhausted for post_blob");
+        *self.health_status.write().unwrap() = DAHealthStatus::Unavailable;
+        Err(last_error)
+    }
+
+    /// Mengirim JSON-RPC request blob.Submit ke Celestia node.
+    async fn send_blob_submit(&self, request: &JsonRpcRequest) -> Result<u64, DAError> {
+        let mut req_builder = self.client
+            .post(&self.config.rpc_url)
+            .header("Content-Type", "application/json");
+
+        // Add auth token if present
+        if let Some(ref token) = self.config.auth_token {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = req_builder
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    DAError::Timeout
+                } else if e.is_connect() {
+                    DAError::Unavailable
+                } else {
+                    DAError::NetworkError(format!("request failed: {}", e))
+                }
+            })?;
+
+        // Check HTTP status
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DAError::NetworkError(format!(
+                "HTTP error: {}",
+                status
+            )));
+        }
+
+        // Parse response
+        let body = response
+            .text()
+            .await
+            .map_err(|e| DAError::NetworkError(format!("failed to read response: {}", e)))?;
+
+        let rpc_response: JsonRpcResponse = serde_json::from_str(&body)
+            .map_err(|e| DAError::SerializationError(format!("failed to parse response: {}", e)))?;
+
+        // Check for RPC error
+        if let Some(error) = rpc_response.error {
+            return Err(DAError::Other(format!(
+                "RPC error {}: {}",
+                error.code, error.message
+            )));
+        }
+
+        // Extract height from result
+        let height = rpc_response.result.ok_or_else(|| {
+            DAError::SerializationError("missing result in response".to_string())
+        })?;
+
+        Ok(height)
+    }
+
     /// Mendapatkan referensi ke konfigurasi.
     pub fn config(&self) -> &DAConfig {
         &self.config
@@ -481,7 +756,9 @@ impl CelestiaDA {
 mod tests {
     use super::*;
     use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::method;
+    use wiremock::matchers::{method, path, body_json_schema};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     // ════════════════════════════════════════════════════════════════════════
     // HELPER FUNCTIONS
@@ -495,6 +772,492 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             retry_delay_ms: 100,
+        }
+    }
+
+    fn create_blob_submit_success_response(height: u64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{}}}"#, height)
+    }
+
+    fn create_blob_submit_error_response(code: i64, message: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{},"message":"{}"}}}}"#,
+            code, message
+        )
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // COMPUTE_BLOB_COMMITMENT TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_compute_blob_commitment_deterministic() {
+        let data = b"test data for commitment";
+        let c1 = compute_blob_commitment(data);
+        let c2 = compute_blob_commitment(data);
+        assert_eq!(c1, c2, "Same input should produce same commitment");
+    }
+
+    #[test]
+    fn test_compute_blob_commitment_different_inputs() {
+        let c1 = compute_blob_commitment(b"data 1");
+        let c2 = compute_blob_commitment(b"data 2");
+        assert_ne!(c1, c2, "Different inputs should produce different commitments");
+    }
+
+    #[test]
+    fn test_compute_blob_commitment_length() {
+        let c = compute_blob_commitment(b"any data");
+        assert_eq!(c.len(), 32, "Commitment must be exactly 32 bytes");
+    }
+
+    #[test]
+    fn test_compute_blob_commitment_empty() {
+        let c = compute_blob_commitment(b"");
+        assert_eq!(c.len(), 32, "Empty input should produce 32-byte commitment");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // POST_BLOB SUCCESS TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_post_blob_success() {
+        let mock_server = MockServer::start().await;
+
+        // Mock HEAD for init
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock POST for blob.Submit
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_blob_submit_success_response(12345))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Initial last_height should be 0
+        assert_eq!(celestia_da.last_height(), 0);
+
+        let data = b"test blob data";
+        let result = celestia_da.post_blob(data).await;
+
+        assert!(result.is_ok(), "post_blob should succeed");
+
+        let blob_ref = result.unwrap();
+        assert_eq!(blob_ref.height, 12345);
+        assert_eq!(blob_ref.namespace, [0x01; 29]);
+        assert_eq!(blob_ref.commitment, compute_blob_commitment(data));
+
+        // last_height should be updated
+        assert_eq!(celestia_da.last_height(), 12345);
+
+        // health status should be Healthy
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_small_data() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_blob_submit_success_response(100))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Test with 1 byte
+        let result = celestia_da.post_blob(&[0x42]).await;
+        assert!(result.is_ok());
+
+        // Test with empty (allowed)
+        let result = celestia_da.post_blob(&[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_updates_last_height() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_blob_submit_success_response(999))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        assert_eq!(celestia_da.last_height(), 0, "Initial height should be 0");
+
+        let _ = celestia_da.post_blob(b"data").await;
+
+        assert_eq!(celestia_da.last_height(), 999, "Height should be updated after success");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // POST_BLOB SIZE VALIDATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_post_blob_exceeds_max_size() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // No POST mock - should not reach network
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Create data > 2MB
+        let large_data = vec![0u8; MAX_BLOB_SIZE + 1];
+        let result = celestia_da.post_blob(&large_data).await;
+
+        assert!(result.is_err(), "Should fail for data > 2MB");
+        
+        let err = result.unwrap_err();
+        match err {
+            DAError::Other(msg) => {
+                assert!(msg.contains("exceeds maximum"), "Error message should mention size limit");
+            }
+            _ => panic!("Expected DAError::Other for size validation"),
+        }
+
+        // last_height should NOT be updated
+        assert_eq!(celestia_da.last_height(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_exactly_max_size() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_blob_submit_success_response(500))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Exactly 2MB should succeed
+        let max_data = vec![0u8; MAX_BLOB_SIZE];
+        let result = celestia_da.post_blob(&max_data).await;
+
+        assert!(result.is_ok(), "Exactly 2MB should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_no_network_call_on_size_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Counter for POST requests
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_string(create_blob_submit_success_response(1))
+            })
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let large_data = vec![0u8; MAX_BLOB_SIZE + 1];
+        let _ = celestia_da.post_blob(&large_data).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 0, "No network call should be made for size validation error");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // POST_BLOB RETRY TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_post_blob_retry_then_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Track call count
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = counter.fetch_add(1, Ordering::SeqCst);
+                if count < 2 {
+                    // First 2 calls fail
+                    ResponseTemplate::new(500)
+                } else {
+                    // Third call succeeds
+                    ResponseTemplate::new(200)
+                        .set_body_string(create_blob_submit_success_response(777))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.retry_count = 3;
+        config.retry_delay_ms = 10; // Fast for testing
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+        let result = celestia_da.post_blob(b"retry test").await;
+
+        assert!(result.is_ok(), "Should succeed after retries");
+        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Should have made 3 calls (2 failures + 1 success)");
+        assert_eq!(celestia_da.last_height(), 777);
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_all_retries_exhausted() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // All calls fail
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.retry_count = 2;
+        config.retry_delay_ms = 10;
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+        let result = celestia_da.post_blob(b"fail test").await;
+
+        assert!(result.is_err(), "Should fail after all retries exhausted");
+        
+        // health status should be Unavailable
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_retry_count_respected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            })
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.retry_count = 2; // 1 initial + 2 retries = 3 total
+        config.retry_delay_ms = 10;
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+        let _ = celestia_da.post_blob(b"count test").await;
+
+        // Initial + retry_count retries
+        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Should make exactly 1 + retry_count calls");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // POST_BLOB RESPONSE ERROR TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_post_blob_invalid_json_response() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("not valid json")
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.retry_count = 0; // No retry for this test
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+        let result = celestia_da.post_blob(b"test").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, DAError::SerializationError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_rpc_error_response() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_blob_submit_error_response(-32000, "internal error"))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.retry_count = 0;
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+        let result = celestia_da.post_blob(b"test").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            DAError::Other(msg) => {
+                assert!(msg.contains("RPC error"));
+                assert!(msg.contains("-32000"));
+            }
+            _ => panic!("Expected DAError::Other for RPC error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_missing_result() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"jsonrpc":"2.0","id":1}"#)
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.retry_count = 0;
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+        let result = celestia_da.post_blob(b"test").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, DAError::SerializationError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_post_blob_no_panic_on_errors() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Various bad responses
+        let bad_responses = vec![
+            "",
+            "null",
+            "[]",
+            "{}",
+            r#"{"error": "bad"}"#,
+            r#"{"result": "not a number"}"#,
+        ];
+
+        for bad_response in bad_responses {
+            let server = MockServer::start().await;
+            
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(bad_response)
+                )
+                .mount(&server)
+                .await;
+
+            let mut config = create_test_config(&server.uri());
+            config.retry_count = 0;
+
+            let celestia_da = CelestiaDA::new(config).unwrap();
+            
+            // Should not panic
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    celestia_da.post_blob(b"test").await
+                })
+            }));
+
+            assert!(result.is_ok(), "Should not panic on bad response: {}", bad_response);
         }
     }
 
