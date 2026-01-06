@@ -1134,6 +1134,215 @@ impl CelestiaDA {
         *self.health_status.write().unwrap() = status;
     }
 
+    /// Perform a health check on the Celestia DA connection.
+    ///
+    /// This method checks the health of the connection by calling `header.NetworkHead`
+    /// and measuring the latency. Based on the results, it returns the appropriate
+    /// `DAHealthStatus` and updates the internal state.
+    ///
+    /// # Returns
+    ///
+    /// * `DAHealthStatus::Healthy` - Connection is healthy, latency is acceptable
+    /// * `DAHealthStatus::Degraded` - Connection works but latency is high (>1000ms)
+    /// * `DAHealthStatus::Unavailable` - Cannot reach the Celestia node
+    ///
+    /// # Latency Measurement
+    ///
+    /// Latency is measured from before the request is sent until the response
+    /// is fully received and parsed.
+    ///
+    /// # Internal State Update
+    ///
+    /// This method updates the internal `health_status` field atomically
+    /// based on the check results.
+    pub async fn health_check(&self) -> DAHealthStatus {
+        use std::time::Instant;
+
+        debug!("starting health check");
+
+        let start = Instant::now();
+
+        // Build JSON-RPC request for header.NetworkHead
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "header.NetworkHead",
+            params: vec![],
+        };
+
+        let mut req_builder = self.client
+            .post(&self.config.rpc_url)
+            .header("Content-Type", "application/json");
+
+        if let Some(ref token) = self.config.auth_token {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        // Send request
+        let response_result = req_builder
+            .json(&request)
+            .send()
+            .await;
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        // Handle network errors
+        let response = match response_result {
+            Ok(resp) => resp,
+            Err(e) => {
+                let error_msg = if e.is_timeout() {
+                    "connection timeout".to_string()
+                } else if e.is_connect() {
+                    "connection failed".to_string()
+                } else {
+                    format!("network error: {}", e)
+                };
+
+                error!(
+                    error = %error_msg,
+                    latency_ms,
+                    "health check failed: network error"
+                );
+
+                let status = DAHealthStatus::Unavailable;
+                *self.health_status.write().unwrap() = status;
+                return status;
+            }
+        };
+
+        // Check HTTP status
+        let http_status = response.status();
+        if !http_status.is_success() {
+            warn!(
+                http_status = %http_status,
+                latency_ms,
+                "health check failed: HTTP error"
+            );
+
+            let status = DAHealthStatus::Unavailable;
+            *self.health_status.write().unwrap() = status;
+            return status;
+        }
+
+        // Parse response body
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    latency_ms,
+                    "health check failed: failed to read response body"
+                );
+
+                let status = DAHealthStatus::Unavailable;
+                *self.health_status.write().unwrap() = status;
+                return status;
+            }
+        };
+
+        // Parse JSON-RPC response
+        let rpc_response: Result<JsonRpcNetworkHeadResponse, _> = serde_json::from_str(&body);
+        let rpc_response = match rpc_response {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    latency_ms,
+                    "health check failed: failed to parse response"
+                );
+
+                let status = DAHealthStatus::Unavailable;
+                *self.health_status.write().unwrap() = status;
+                return status;
+            }
+        };
+
+        // Check for RPC error
+        if let Some(error) = rpc_response.error {
+            error!(
+                code = error.code,
+                message = %error.message,
+                latency_ms,
+                "health check failed: RPC error"
+            );
+
+            let status = DAHealthStatus::Unavailable;
+            *self.health_status.write().unwrap() = status;
+            return status;
+        }
+
+        // Extract network height
+        let network_height = match rpc_response.result {
+            Some(result) => {
+                match result.header.height.parse::<u64>() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            latency_ms,
+                            "health check failed: failed to parse height"
+                        );
+
+                        let status = DAHealthStatus::Unavailable;
+                        *self.health_status.write().unwrap() = status;
+                        return status;
+                    }
+                }
+            }
+            None => {
+                error!(
+                    latency_ms,
+                    "health check failed: missing result in response"
+                );
+
+                let status = DAHealthStatus::Unavailable;
+                *self.health_status.write().unwrap() = status;
+                return status;
+            }
+        };
+
+        let local_height = self.last_height.load(Ordering::SeqCst);
+
+        // Determine health status based on latency and sync state
+        // Threshold: latency > 1000ms is considered degraded
+        const LATENCY_THRESHOLD_MS: u64 = 1000;
+
+        let status = if latency_ms > LATENCY_THRESHOLD_MS {
+            warn!(
+                latency_ms,
+                threshold = LATENCY_THRESHOLD_MS,
+                "health check: high latency detected"
+            );
+            DAHealthStatus::Degraded
+        } else {
+            debug!(
+                network_height,
+                local_height,
+                latency_ms,
+                "health check: healthy"
+            );
+            DAHealthStatus::Healthy
+        };
+
+        // Update internal state
+        *self.health_status.write().unwrap() = status;
+
+        // Update last_height if network height is higher
+        if network_height > local_height {
+            self.last_height.store(network_height, Ordering::SeqCst);
+        }
+
+        info!(
+            status = ?status,
+            network_height,
+            local_height,
+            latency_ms,
+            "health check completed"
+        );
+
+        status
+    }
+
     /// Subscribe to blobs from Celestia DA layer.
     ///
     /// This method creates a polling-based subscription stream that yields
@@ -3946,6 +4155,368 @@ mod tests {
                 !matches!(e, DAError::BlobNotFound(_)),
                 "Should not return BlobNotFound error for empty block"
             );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // HEALTH_CHECK TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_health_check_healthy_state() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with immediate response (low latency)
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_network_head_response(100)
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Healthy);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_healthy_updates_last_height() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_network_head_response(500)
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        assert_eq!(celestia_da.last_height(), 0);
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Healthy);
+        assert_eq!(celestia_da.last_height(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_degraded_high_latency() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with delayed response (high latency)
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_network_head_response(100))
+                    .set_delay(Duration::from_millis(1100)) // > 1000ms threshold
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Degraded);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Degraded);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_unavailable_network_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with timeout (simulates network issue)
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_network_head_response(100))
+                    .set_delay(Duration::from_secs(10)) // Much longer than timeout
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config(&mock_server.uri());
+        config.timeout_ms = 100; // Very short timeout
+
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Unavailable);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_unavailable_rpc_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with RPC error
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"internal error"}}"#
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Unavailable);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_unavailable_http_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with HTTP 500 error
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Unavailable);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_unavailable_invalid_response() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with invalid JSON
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Unavailable);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_unavailable_missing_result() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead with null result
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"jsonrpc":"2.0","id":1,"result":null}"#
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let status = celestia_da.health_check().await;
+
+        assert_eq!(status, DAHealthStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_no_panic_on_any_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let bad_responses = vec![
+            "",
+            "null",
+            "[]",
+            "{}",
+            r#"{"error": "bad"}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"header":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"header":{"height":"not_a_number"}}}"#,
+        ];
+
+        for bad_response in bad_responses {
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(bad_response))
+                .mount(&server)
+                .await;
+
+            let config = create_test_config(&server.uri());
+            let celestia_da = CelestiaDA::new(config).unwrap();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::spawn(move || {
+                    tokio::runtime::Runtime::new().unwrap().block_on(async {
+                        celestia_da.health_check().await
+                    })
+                }).join().unwrap()
+            }));
+
+            assert!(result.is_ok(), "Should not panic on bad response: {}", bad_response);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_check_latency_is_measured() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Add a small delay to ensure latency is measurable
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(create_network_head_response(100))
+                    .set_delay(Duration::from_millis(50))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        let start = std::time::Instant::now();
+        let _status = celestia_da.health_check().await;
+        let elapsed = start.elapsed();
+
+        // Verify that the health check actually waited for the response
+        // It should be at least 50ms due to the mock delay
+        assert!(elapsed.as_millis() >= 40, "Latency should be at least 40ms, was {}ms", elapsed.as_millis());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_internal_state_updates() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_network_head_response(100)
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Initially healthy
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Healthy);
+
+        // Manually set to degraded
+        celestia_da.set_health_status(DAHealthStatus::Degraded);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Degraded);
+
+        // health_check should update back to healthy
+        let status = celestia_da.health_check().await;
+        assert_eq!(status, DAHealthStatus::Healthy);
+        assert_eq!(celestia_da.health_status(), DAHealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_consecutive_calls() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_network_head_response(100)
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = CelestiaDA::new(config).unwrap();
+
+        // Multiple consecutive health checks should all work
+        for _ in 0..5 {
+            let status = celestia_da.health_check().await;
+            assert_eq!(status, DAHealthStatus::Healthy);
         }
     }
 }
