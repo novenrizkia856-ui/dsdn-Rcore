@@ -9,13 +9,16 @@
 //! - `config` - Configuration management
 //! - `consistent_hash` - Consistent hashing implementation
 //! - `da` - Data Availability layer abstraction trait
+//! - `celestia_da` - Celestia DA backend implementation
 
 pub mod crypto;
 pub mod cid;
 pub mod config;
 pub mod consistent_hash;
 pub mod da;
+pub mod celestia_da;
 
-pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream};
+pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream, DAConfig};
+pub use celestia_da::CelestiaDA;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
