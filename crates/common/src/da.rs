@@ -30,13 +30,173 @@ pub struct BlobRef {
 /// Data blob yang diterima dari DA layer.
 ///
 /// `Blob` merepresentasikan unit data yang disimpan dan diambil
-/// dari DA layer, beserta referensi untuk identifikasi.
+/// dari DA layer, beserta referensi untuk identifikasi dan
+/// timestamp penerimaan.
 #[derive(Debug, Clone)]
 pub struct Blob {
+    /// Referensi ke blob ini di DA layer
+    pub ref_: BlobRef,
     /// Data mentah blob
     pub data: Vec<u8>,
-    /// Referensi ke blob ini di DA layer
-    pub blob_ref: BlobRef,
+    /// Timestamp Unix (milliseconds) saat blob diterima
+    pub received_at: u64,
+}
+
+/// Konfigurasi untuk DA layer backend.
+///
+/// `DAConfig` menyimpan semua parameter yang diperlukan untuk
+/// menginisialisasi dan berkomunikasi dengan DA layer backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DAConfig {
+    /// URL RPC endpoint untuk DA layer
+    pub rpc_url: String,
+    /// Namespace 29-byte untuk blob storage
+    pub namespace: [u8; 29],
+    /// Token autentikasi opsional
+    pub auth_token: Option<String>,
+    /// Timeout untuk operasi dalam milliseconds
+    pub timeout_ms: u64,
+    /// Jumlah retry untuk operasi yang gagal
+    pub retry_count: u8,
+    /// Delay antar retry dalam milliseconds
+    pub retry_delay_ms: u64,
+}
+
+impl Default for DAConfig {
+    /// Membuat DAConfig dengan nilai default yang aman.
+    ///
+    /// Default values:
+    /// - `rpc_url`: "http://localhost:26658" (localhost development)
+    /// - `namespace`: 29 zero bytes
+    /// - `auth_token`: None
+    /// - `timeout_ms`: 30000 (30 detik)
+    /// - `retry_count`: 3
+    /// - `retry_delay_ms`: 1000 (1 detik)
+    fn default() -> Self {
+        Self {
+            rpc_url: "http://localhost:26658".to_string(),
+            namespace: [0u8; 29],
+            auth_token: None,
+            timeout_ms: 30000,
+            retry_count: 3,
+            retry_delay_ms: 1000,
+        }
+    }
+}
+
+impl DAConfig {
+    /// Membuat DAConfig dari environment variables.
+    ///
+    /// Environment variables yang dibaca:
+    /// - `DA_RPC_URL`: URL RPC endpoint (wajib)
+    /// - `DA_NAMESPACE`: Namespace hex string 58 karakter (wajib)
+    /// - `DA_AUTH_TOKEN`: Token autentikasi (opsional)
+    /// - `DA_TIMEOUT_MS`: Timeout dalam milliseconds (default: 30000)
+    /// - `DA_RETRY_COUNT`: Jumlah retry (default: 3)
+    /// - `DA_RETRY_DELAY_MS`: Delay antar retry dalam ms (default: 1000)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(DAConfig)` - Konfigurasi berhasil dibaca
+    /// * `Err(DAError)` - Error jika environment variable tidak valid
+    ///
+    /// # Errors
+    ///
+    /// Mengembalikan error jika:
+    /// - `DA_RPC_URL` tidak ada
+    /// - `DA_NAMESPACE` tidak ada atau bukan hex valid 58 karakter
+    /// - Nilai numerik tidak dapat di-parse
+    pub fn from_env() -> Result<Self, DAError> {
+        // Required: DA_RPC_URL
+        let rpc_url = std::env::var("DA_RPC_URL")
+            .map_err(|_| DAError::Other("DA_RPC_URL environment variable not set".to_string()))?;
+
+        // Required: DA_NAMESPACE (hex string, 29 bytes = 58 hex chars)
+        let namespace_hex = std::env::var("DA_NAMESPACE")
+            .map_err(|_| DAError::Other("DA_NAMESPACE environment variable not set".to_string()))?;
+        
+        let namespace = Self::parse_namespace(&namespace_hex)?;
+
+        // Optional: DA_AUTH_TOKEN
+        let auth_token = std::env::var("DA_AUTH_TOKEN").ok();
+
+        // Optional with default: DA_TIMEOUT_MS
+        let timeout_ms = match std::env::var("DA_TIMEOUT_MS") {
+            Ok(val) => val.parse::<u64>().map_err(|_| {
+                DAError::Other(format!("DA_TIMEOUT_MS invalid: '{}'", val))
+            })?,
+            Err(_) => 30000,
+        };
+
+        // Optional with default: DA_RETRY_COUNT
+        let retry_count = match std::env::var("DA_RETRY_COUNT") {
+            Ok(val) => val.parse::<u8>().map_err(|_| {
+                DAError::Other(format!("DA_RETRY_COUNT invalid: '{}'", val))
+            })?,
+            Err(_) => 3,
+        };
+
+        // Optional with default: DA_RETRY_DELAY_MS
+        let retry_delay_ms = match std::env::var("DA_RETRY_DELAY_MS") {
+            Ok(val) => val.parse::<u64>().map_err(|_| {
+                DAError::Other(format!("DA_RETRY_DELAY_MS invalid: '{}'", val))
+            })?,
+            Err(_) => 1000,
+        };
+
+        Ok(Self {
+            rpc_url,
+            namespace,
+            auth_token,
+            timeout_ms,
+            retry_count,
+            retry_delay_ms,
+        })
+    }
+
+    /// Parse namespace dari hex string.
+    ///
+    /// # Arguments
+    ///
+    /// * `hex` - Hex string 58 karakter (29 bytes)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok([u8; 29])` - Namespace bytes
+    /// * `Err(DAError)` - Jika hex tidak valid atau panjang salah
+    fn parse_namespace(hex: &str) -> Result<[u8; 29], DAError> {
+        // Namespace harus 29 bytes = 58 hex chars
+        if hex.len() != 58 {
+            return Err(DAError::Other(format!(
+                "DA_NAMESPACE must be 58 hex characters (29 bytes), got {} characters",
+                hex.len()
+            )));
+        }
+
+        let bytes = Self::hex_to_bytes(hex).map_err(|e| {
+            DAError::Other(format!("DA_NAMESPACE invalid hex: {}", e))
+        })?;
+
+        let mut namespace = [0u8; 29];
+        namespace.copy_from_slice(&bytes);
+        Ok(namespace)
+    }
+
+    /// Convert hex string to bytes.
+    fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+        if hex.len() % 2 != 0 {
+            return Err("hex string must have even length".to_string());
+        }
+
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for i in (0..hex.len()).step_by(2) {
+            let byte_str = &hex[i..i + 2];
+            let byte = u8::from_str_radix(byte_str, 16)
+                .map_err(|_| format!("invalid hex byte: '{}'", byte_str))?;
+            bytes.push(byte);
+        }
+        Ok(bytes)
+    }
 }
 
 /// Status kesehatan DA layer.
@@ -290,4 +450,362 @@ pub trait DALayer: Send + Sync {
     /// Namespace tidak berubah selama lifetime instance.
     /// Method ini TIDAK melakukan alokasi atau I/O.
     fn namespace(&self) -> &[u8; 29];
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UNIT TESTS
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ════════════════════════════════════════════════════════════════════════
+    // BLOB TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_blob_creation() {
+        let blob_ref = BlobRef {
+            height: 12345,
+            commitment: [0xAB; 32],
+            namespace: [0xCD; 29],
+        };
+
+        let data = vec![1, 2, 3, 4, 5];
+        let received_at = 1700000000000u64;
+
+        let blob = Blob {
+            ref_: blob_ref.clone(),
+            data: data.clone(),
+            received_at,
+        };
+
+        // Verify all fields stored correctly
+        assert_eq!(blob.ref_.height, 12345);
+        assert_eq!(blob.ref_.commitment, [0xAB; 32]);
+        assert_eq!(blob.ref_.namespace, [0xCD; 29]);
+        assert_eq!(blob.data, data);
+        assert_eq!(blob.received_at, received_at);
+    }
+
+    #[test]
+    fn test_blob_no_data_transformation() {
+        let original_data = vec![0x00, 0xFF, 0x7F, 0x80, 0x01];
+        
+        let blob = Blob {
+            ref_: BlobRef {
+                height: 1,
+                commitment: [0; 32],
+                namespace: [0; 29],
+            },
+            data: original_data.clone(),
+            received_at: 0,
+        };
+
+        // Data harus identik, tanpa transformasi
+        assert_eq!(blob.data, original_data);
+        assert_eq!(blob.data.len(), 5);
+    }
+
+    #[test]
+    fn test_blob_empty_data() {
+        let blob = Blob {
+            ref_: BlobRef {
+                height: 0,
+                commitment: [0; 32],
+                namespace: [0; 29],
+            },
+            data: vec![],
+            received_at: 0,
+        };
+
+        assert!(blob.data.is_empty());
+    }
+
+    #[test]
+    fn test_blob_large_data() {
+        let large_data = vec![0xFFu8; 1_000_000]; // 1MB
+
+        let blob = Blob {
+            ref_: BlobRef {
+                height: 999999,
+                commitment: [0x11; 32],
+                namespace: [0x22; 29],
+            },
+            data: large_data.clone(),
+            received_at: u64::MAX,
+        };
+
+        assert_eq!(blob.data.len(), 1_000_000);
+        assert_eq!(blob.data, large_data);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DACONFIG DEFAULT TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_daconfig_default_all_fields_set() {
+        let config = DAConfig::default();
+
+        // All fields must be set
+        assert!(!config.rpc_url.is_empty());
+        assert_eq!(config.namespace.len(), 29);
+        assert!(config.auth_token.is_none());
+        assert!(config.timeout_ms > 0);
+        assert!(config.retry_count > 0);
+        assert!(config.retry_delay_ms > 0);
+    }
+
+    #[test]
+    fn test_daconfig_default_values() {
+        let config = DAConfig::default();
+
+        assert_eq!(config.rpc_url, "http://localhost:26658");
+        assert_eq!(config.namespace, [0u8; 29]);
+        assert_eq!(config.auth_token, None);
+        assert_eq!(config.timeout_ms, 30000);
+        assert_eq!(config.retry_count, 3);
+        assert_eq!(config.retry_delay_ms, 1000);
+    }
+
+    #[test]
+    fn test_daconfig_default_consistent() {
+        let config1 = DAConfig::default();
+        let config2 = DAConfig::default();
+
+        // Must be consistent across runs
+        assert_eq!(config1, config2);
+    }
+
+    #[test]
+    fn test_daconfig_default_namespace_size() {
+        let config = DAConfig::default();
+        
+        // Namespace MUST be exactly 29 bytes
+        assert_eq!(config.namespace.len(), 29);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DACONFIG FROM_ENV TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_daconfig_from_env_missing_rpc_url() {
+        // Clear any existing env vars
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, DAError::Other(_)));
+    }
+
+    #[test]
+    fn test_daconfig_from_env_missing_namespace() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        std::env::remove_var("DA_NAMESPACE");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_invalid_namespace_length() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        std::env::set_var("DA_NAMESPACE", "0011223344"); // Too short (10 chars, need 58)
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        if let DAError::Other(msg) = err {
+            assert!(msg.contains("58 hex characters"));
+        } else {
+            panic!("Expected DAError::Other");
+        }
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_invalid_namespace_hex() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        // 58 chars but invalid hex (contains 'GG')
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899AABBCCDDEEFF00112233445566778899AABBGG");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_invalid_timeout() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_TIMEOUT_MS", "not_a_number");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        if let DAError::Other(msg) = err {
+            assert!(msg.contains("DA_TIMEOUT_MS invalid"));
+        } else {
+            panic!("Expected DAError::Other");
+        }
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_invalid_retry_count() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_RETRY_COUNT", "256"); // Overflow for u8
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_RETRY_COUNT");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_invalid_retry_delay() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_RETRY_DELAY_MS", "-1"); // Negative
+
+        let result = DAConfig::from_env();
+        assert!(result.is_err());
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_RETRY_DELAY_MS");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_success_minimal() {
+        // Set required env vars
+        std::env::set_var("DA_RPC_URL", "http://celestia:26658");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_ok());
+
+        let config = result.unwrap();
+        assert_eq!(config.rpc_url, "http://celestia:26658");
+        assert_eq!(config.auth_token, None);
+        // Defaults should be used
+        assert_eq!(config.timeout_ms, 30000);
+        assert_eq!(config.retry_count, 3);
+        assert_eq!(config.retry_delay_ms, 1000);
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_success_full() {
+        std::env::set_var("DA_RPC_URL", "http://celestia:26658");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_AUTH_TOKEN", "secret_token_123");
+        std::env::set_var("DA_TIMEOUT_MS", "60000");
+        std::env::set_var("DA_RETRY_COUNT", "5");
+        std::env::set_var("DA_RETRY_DELAY_MS", "2000");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_ok());
+
+        let config = result.unwrap();
+        assert_eq!(config.rpc_url, "http://celestia:26658");
+        assert_eq!(config.auth_token, Some("secret_token_123".to_string()));
+        assert_eq!(config.timeout_ms, 60000);
+        assert_eq!(config.retry_count, 5);
+        assert_eq!(config.retry_delay_ms, 2000);
+
+        // Verify namespace parsed correctly
+        let expected_namespace: [u8; 29] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        ];
+        assert_eq!(config.namespace, expected_namespace);
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_AUTH_TOKEN");
+        std::env::remove_var("DA_TIMEOUT_MS");
+        std::env::remove_var("DA_RETRY_COUNT");
+        std::env::remove_var("DA_RETRY_DELAY_MS");
+    }
+
+    #[test]
+    fn test_daconfig_from_env_auth_token_optional() {
+        std::env::set_var("DA_RPC_URL", "http://test:1234");
+        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::remove_var("DA_AUTH_TOKEN");
+
+        let result = DAConfig::from_env();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().auth_token, None);
+
+        // Cleanup
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // BLOB REF TESTS (sanity check - not modified)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_blob_ref_equality() {
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        let ref2 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        assert_eq!(ref1, ref2);
+    }
+
+    #[test]
+    fn test_blob_ref_clone() {
+        let original = BlobRef {
+            height: 999,
+            commitment: [0xFF; 32],
+            namespace: [0xAA; 29],
+        };
+
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
 }
