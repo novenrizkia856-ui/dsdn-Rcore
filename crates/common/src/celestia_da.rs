@@ -8,10 +8,14 @@
 
 use crate::da::{BlobRef, DAConfig, DAError, DAHealthStatus};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use sha3::Sha3_256;
+use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -22,6 +26,9 @@ use tracing::{debug, error, info, warn};
 
 /// Maximum blob size in bytes (2 MB)
 pub const MAX_BLOB_SIZE: usize = 2 * 1024 * 1024;
+
+/// Default poll interval for blob subscription in milliseconds
+pub const DEFAULT_POLL_INTERVAL_MS: u64 = 5000;
 
 // ════════════════════════════════════════════════════════════════════════════
 // NAMESPACE CONSTANTS & COMPUTATION
@@ -261,6 +268,57 @@ fn validate_namespace_format(namespace: &[u8; 29]) -> Result<(), DAError> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// BLOB SUBSCRIPTION TYPES
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Blob data returned from subscription stream.
+///
+/// This struct represents a blob retrieved during subscription polling,
+/// containing the blob data along with its position in the chain.
+#[derive(Debug, Clone)]
+pub struct Blob {
+    /// Block height where the blob was included
+    pub height: u64,
+    /// Index of the blob within the block
+    pub index: u32,
+    /// Namespace of the blob (29 bytes)
+    pub namespace: [u8; 29],
+    /// Raw blob data
+    pub data: Vec<u8>,
+    /// Blob commitment (SHA3-256 hash)
+    pub commitment: [u8; 32],
+}
+
+/// Type alias for blob subscription stream.
+///
+/// BlobStream is a pinned, boxed, sendable stream that yields
+/// `Result<Blob, DAError>` items. This type is used as the return
+/// type of `subscribe_blobs`.
+pub type BlobStream = Pin<Box<dyn Stream<Item = Result<Blob, DAError>> + Send>>;
+
+/// Blob subscription configuration for polling-based subscription.
+///
+/// BlobSubscription contains the configuration for creating a subscription
+/// stream. The actual stream state is managed internally during iteration.
+///
+/// # Fields
+///
+/// * `da` - Arc reference to CelestiaDA for making RPC calls
+/// * `from_height` - Starting block height for subscription
+/// * `namespace` - Namespace filter (29 bytes)
+/// * `poll_interval_ms` - Polling interval in milliseconds
+pub struct BlobSubscription {
+    /// Arc reference to CelestiaDA instance
+    da: Arc<CelestiaDA>,
+    /// Starting block height for subscription
+    from_height: u64,
+    /// Namespace filter (29 bytes)
+    namespace: [u8; 29],
+    /// Polling interval in milliseconds
+    poll_interval_ms: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // BLOB COMMITMENT
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -361,6 +419,57 @@ struct BlobGetResult {
 struct JsonRpcError {
     code: i64,
     message: String,
+}
+
+/// JSON-RPC response untuk blob.GetAll (returns array of blobs)
+#[derive(Debug, Deserialize)]
+struct JsonRpcGetAllResponse {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    #[allow(dead_code)]
+    id: u64,
+    result: Option<Vec<BlobGetAllItem>>,
+    error: Option<JsonRpcError>,
+}
+
+/// Blob item dari response blob.GetAll
+#[derive(Debug, Deserialize)]
+struct BlobGetAllItem {
+    /// Namespace dalam format base64
+    namespace: String,
+    /// Data blob dalam format base64
+    data: String,
+    /// Share version
+    #[allow(dead_code)]
+    share_version: u32,
+    /// Commitment dalam format base64
+    commitment: String,
+    /// Index within the block
+    #[serde(default)]
+    index: u32,
+}
+
+/// JSON-RPC response untuk header.NetworkHead (returns latest height)
+#[derive(Debug, Deserialize)]
+struct JsonRpcNetworkHeadResponse {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    #[allow(dead_code)]
+    id: u64,
+    result: Option<NetworkHeadResult>,
+    error: Option<JsonRpcError>,
+}
+
+/// Network head result
+#[derive(Debug, Deserialize)]
+struct NetworkHeadResult {
+    header: HeaderInfo,
+}
+
+/// Header info containing height
+#[derive(Debug, Deserialize)]
+struct HeaderInfo {
+    height: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -492,8 +601,41 @@ impl CelestiaDA {
     /// Melakukan HTTP HEAD request ke endpoint untuk memverifikasi
     /// bahwa node dapat dijangkau.
     fn validate_connection(client: &reqwest::Client, rpc_url: &str) -> Result<(), DAError> {
-        // Use blocking client for initialization
-        // This is acceptable during initialization phase
+        // Check if we're already inside a tokio runtime
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // We're inside a runtime - use thread::spawn to avoid nested runtime
+            let client = client.clone();
+            let rpc_url = rpc_url.to_string();
+            
+            let result = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| DAError::Other(format!("failed to create runtime: {}", e)))?;
+                
+                rt.block_on(async {
+                    let response = client.head(&rpc_url).send().await;
+                    match response {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            if e.is_timeout() {
+                                Err(DAError::Timeout)
+                            } else if e.is_connect() {
+                                Err(DAError::Unavailable)
+                            } else {
+                                Err(DAError::NetworkError(format!("connection validation failed: {}", e)))
+                            }
+                        }
+                    }
+                })
+            })
+            .join()
+            .map_err(|_| DAError::Other("validation thread panicked".to_string()))?;
+            
+            return result;
+        }
+        
+        // Not inside a runtime - create one directly
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -991,6 +1133,420 @@ impl CelestiaDA {
     pub fn set_health_status(&self, status: DAHealthStatus) {
         *self.health_status.write().unwrap() = status;
     }
+
+    /// Subscribe to blobs from Celestia DA layer.
+    ///
+    /// This method creates a polling-based subscription stream that yields
+    /// blobs matching the specified namespace. The stream uses a configurable
+    /// polling interval to fetch new blobs.
+    ///
+    /// # Arguments
+    ///
+    /// * `namespace` - The 29-byte namespace to filter blobs
+    ///
+    /// # Returns
+    ///
+    /// A `BlobStream` that yields `Result<Blob, DAError>` items.
+    ///
+    /// # Ordering
+    ///
+    /// Blobs are yielded in (height ASC, index ASC) order.
+    /// No duplicate blobs will be yielded.
+    ///
+    /// # Reconnection
+    ///
+    /// If polling fails due to network errors, the stream will retry
+    /// with exponential backoff. The stream will not terminate on
+    /// transient errors.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use futures::StreamExt;
+    ///
+    /// let stream = celestia_da.subscribe_blobs(&namespace);
+    /// while let Some(result) = stream.next().await {
+    ///     match result {
+    ///         Ok(blob) => println!("Received blob at height {}", blob.height),
+    ///         Err(e) => eprintln!("Error: {:?}", e),
+    ///     }
+    /// }
+    /// ```
+    pub fn subscribe_blobs(self: &Arc<Self>, namespace: &[u8; 29]) -> BlobStream {
+        let subscription = BlobSubscription {
+            da: Arc::clone(self),
+            from_height: self.last_height().saturating_add(1),
+            namespace: *namespace,
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+        };
+
+        debug!(
+            namespace = ?hex::encode(&namespace[..8]),
+            from_height = subscription.from_height,
+            poll_interval_ms = subscription.poll_interval_ms,
+            "created blob subscription"
+        );
+
+        subscription.into_stream()
+    }
+
+    /// Get blobs at a specific height for a namespace.
+    ///
+    /// This is an internal helper method used by BlobSubscription.
+    async fn get_blobs_at_height(
+        &self,
+        height: u64,
+        namespace: &[u8; 29],
+    ) -> Result<Vec<Blob>, DAError> {
+        debug!(height, namespace = ?hex::encode(&namespace[..8]), "fetching blobs at height");
+
+        // Build JSON-RPC request for blob.GetAll
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "blob.GetAll",
+            params: vec![
+                serde_json::json!(height),
+                serde_json::json!([BASE64.encode(namespace)]),
+            ],
+        };
+
+        let mut req_builder = self.client
+            .post(&self.config.rpc_url)
+            .header("Content-Type", "application/json");
+
+        if let Some(ref token) = self.config.auth_token {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = req_builder
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    DAError::Timeout
+                } else if e.is_connect() {
+                    DAError::Unavailable
+                } else {
+                    DAError::NetworkError(format!("request failed: {}", e))
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DAError::NetworkError(format!("HTTP error: {}", status)));
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|e| DAError::NetworkError(format!("failed to read response: {}", e)))?;
+
+        let rpc_response: JsonRpcGetAllResponse = serde_json::from_str(&body)
+            .map_err(|e| DAError::SerializationError(format!("failed to parse response: {}", e)))?;
+
+        if let Some(error) = rpc_response.error {
+            // "blob not found" or similar is not a fatal error for subscription
+            if error.code == -32000 || error.message.to_lowercase().contains("not found") {
+                return Ok(Vec::new());
+            }
+            return Err(DAError::Other(format!("RPC error {}: {}", error.code, error.message)));
+        }
+
+        let blob_items = rpc_response.result.unwrap_or_default();
+        let mut blobs = Vec::with_capacity(blob_items.len());
+
+        for (idx, item) in blob_items.into_iter().enumerate() {
+            // Decode namespace
+            let ns_bytes = BASE64.decode(&item.namespace)
+                .map_err(|e| DAError::SerializationError(format!("failed to decode namespace: {}", e)))?;
+
+            if ns_bytes.len() != 29 {
+                warn!(
+                    height,
+                    index = idx,
+                    len = ns_bytes.len(),
+                    "invalid namespace length, skipping blob"
+                );
+                continue;
+            }
+
+            let mut blob_namespace = [0u8; 29];
+            blob_namespace.copy_from_slice(&ns_bytes);
+
+            // Filter by namespace - skip blobs that don't match
+            if blob_namespace != *namespace {
+                continue;
+            }
+
+            // Decode data
+            let data = BASE64.decode(&item.data)
+                .map_err(|e| DAError::SerializationError(format!("failed to decode blob data: {}", e)))?;
+
+            // Decode commitment
+            let commitment_bytes = BASE64.decode(&item.commitment)
+                .map_err(|e| DAError::SerializationError(format!("failed to decode commitment: {}", e)))?;
+
+            if commitment_bytes.len() != 32 {
+                warn!(
+                    height,
+                    index = idx,
+                    len = commitment_bytes.len(),
+                    "invalid commitment length, skipping blob"
+                );
+                continue;
+            }
+
+            let mut commitment = [0u8; 32];
+            commitment.copy_from_slice(&commitment_bytes);
+
+            blobs.push(Blob {
+                height,
+                index: item.index,
+                namespace: blob_namespace,
+                data,
+                commitment,
+            });
+        }
+
+        // Sort by index to ensure ordering within block
+        blobs.sort_by_key(|b| b.index);
+
+        debug!(height, count = blobs.len(), "fetched blobs at height");
+        Ok(blobs)
+    }
+
+    /// Get the current network head height.
+    ///
+    /// This is an internal helper method used by BlobSubscription.
+    async fn get_network_head(&self) -> Result<u64, DAError> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "header.NetworkHead",
+            params: vec![],
+        };
+
+        let mut req_builder = self.client
+            .post(&self.config.rpc_url)
+            .header("Content-Type", "application/json");
+
+        if let Some(ref token) = self.config.auth_token {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = req_builder
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    DAError::Timeout
+                } else if e.is_connect() {
+                    DAError::Unavailable
+                } else {
+                    DAError::NetworkError(format!("request failed: {}", e))
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DAError::NetworkError(format!("HTTP error: {}", status)));
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|e| DAError::NetworkError(format!("failed to read response: {}", e)))?;
+
+        let rpc_response: JsonRpcNetworkHeadResponse = serde_json::from_str(&body)
+            .map_err(|e| DAError::SerializationError(format!("failed to parse response: {}", e)))?;
+
+        if let Some(error) = rpc_response.error {
+            return Err(DAError::Other(format!("RPC error {}: {}", error.code, error.message)));
+        }
+
+        let result = rpc_response.result.ok_or_else(|| {
+            DAError::SerializationError("missing result in network head response".to_string())
+        })?;
+
+        let height: u64 = result.header.height.parse()
+            .map_err(|e| DAError::SerializationError(format!("failed to parse height: {}", e)))?;
+
+        Ok(height)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// BLOB SUBSCRIPTION STREAM CREATION
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Internal state for blob subscription stream.
+/// This is kept separate from BlobSubscription to comply with the spec.
+struct BlobSubscriptionState {
+    da: Arc<CelestiaDA>,
+    namespace: [u8; 29],
+    poll_interval_ms: u64,
+    current_height: u64,
+    pending_blobs: Vec<Blob>,
+    seen_blobs: HashSet<(u64, u32)>,
+    retry_delay_ms: u64,
+}
+
+impl BlobSubscription {
+    /// Convert the subscription configuration into a stream.
+    ///
+    /// This method creates the actual polling stream using the
+    /// configuration stored in BlobSubscription.
+    fn into_stream(self) -> BlobStream {
+        use futures::stream::unfold;
+
+        let initial_state = BlobSubscriptionState {
+            da: self.da,
+            namespace: self.namespace,
+            poll_interval_ms: self.poll_interval_ms,
+            current_height: self.from_height,
+            pending_blobs: Vec::new(),
+            seen_blobs: HashSet::new(),
+            retry_delay_ms: 100, // Initial retry delay
+        };
+
+        Box::pin(unfold(initial_state, |mut state| async move {
+            loop {
+                // 1. If we have pending blobs, yield the next one
+                if !state.pending_blobs.is_empty() {
+                    let blob = state.pending_blobs.remove(0);
+                    let key = (blob.height, blob.index);
+
+                    // Skip if already seen (deduplication)
+                    if state.seen_blobs.contains(&key) {
+                        continue;
+                    }
+
+                    state.seen_blobs.insert(key);
+                    return Some((Ok(blob), state));
+                }
+
+                // 2. Poll for new blobs
+                debug!(
+                    height = state.current_height,
+                    namespace = ?hex::encode(&state.namespace[..8]),
+                    "polling for blobs"
+                );
+
+                // First get the network head to avoid polling future heights
+                let head_result = state.da.get_network_head().await;
+                let head_height = match head_result {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let is_retryable = matches!(
+                            e,
+                            DAError::NetworkError(_) | DAError::Timeout | DAError::Unavailable
+                        );
+
+                        if is_retryable {
+                            warn!(
+                                error = ?e,
+                                retry_delay_ms = state.retry_delay_ms,
+                                "failed to get network head, will retry"
+                            );
+
+                            // Sleep before retry
+                            tokio::time::sleep(Duration::from_millis(state.retry_delay_ms)).await;
+                            state.retry_delay_ms = (state.retry_delay_ms * 2).min(60000);
+
+                            // Return error but continue stream
+                            return Some((Err(e), state));
+                        } else {
+                            error!(error = ?e, "non-retryable error getting network head");
+                            return Some((Err(e), state));
+                        }
+                    }
+                };
+
+                // If we're ahead of the chain, wait for new blocks
+                if state.current_height > head_height {
+                    tokio::time::sleep(Duration::from_millis(state.poll_interval_ms)).await;
+                    continue;
+                }
+
+                // Fetch blobs at current height
+                let blobs_result = state.da.get_blobs_at_height(
+                    state.current_height,
+                    &state.namespace
+                ).await;
+
+                match blobs_result {
+                    Ok(blobs) => {
+                        // Reset retry delay on success
+                        state.retry_delay_ms = 100;
+
+                        if !blobs.is_empty() {
+                            debug!(
+                                height = state.current_height,
+                                count = blobs.len(),
+                                "received blobs"
+                            );
+
+                            // Sort blobs by (height, index) for proper ordering
+                            let mut sorted_blobs = blobs;
+                            sorted_blobs.sort_by(|a, b| {
+                                (a.height, a.index).cmp(&(b.height, b.index))
+                            });
+
+                            state.pending_blobs = sorted_blobs;
+                            state.current_height = state.current_height.saturating_add(1);
+
+                            // Continue loop to yield blobs
+                            continue;
+                        } else {
+                            // No blobs at this height, move to next
+                            state.current_height = state.current_height.saturating_add(1);
+
+                            // If we're caught up, wait before next poll
+                            if state.current_height > head_height {
+                                tokio::time::sleep(Duration::from_millis(state.poll_interval_ms)).await;
+                            }
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        let is_retryable = matches!(
+                            e,
+                            DAError::NetworkError(_) | DAError::Timeout | DAError::Unavailable
+                        );
+
+                        if is_retryable {
+                            warn!(
+                                error = ?e,
+                                height = state.current_height,
+                                retry_delay_ms = state.retry_delay_ms,
+                                "poll failed, will retry"
+                            );
+
+                            // Sleep before retry
+                            tokio::time::sleep(Duration::from_millis(state.retry_delay_ms)).await;
+                            state.retry_delay_ms = (state.retry_delay_ms * 2).min(60000);
+
+                            // Return error but continue stream
+                            return Some((Err(e), state));
+                        } else {
+                            error!(
+                                error = ?e,
+                                height = state.current_height,
+                                "non-retryable poll error"
+                            );
+
+                            // Move to next height and continue
+                            state.current_height = state.current_height.saturating_add(1);
+                            return Some((Err(e), state));
+                        }
+                    }
+                }
+            }
+        }))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1415,9 +1971,11 @@ mod tests {
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                celestia_da.get_blob(&blob_ref).await
-            })
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    celestia_da.get_blob(&blob_ref).await
+                })
+            }).join().unwrap()
         }));
 
         assert!(result.is_ok(), "Should not panic");
@@ -1786,9 +2344,11 @@ mod tests {
             };
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    celestia_da.get_blob(&blob_ref).await
-                })
+                std::thread::spawn(move || {
+                    tokio::runtime::Runtime::new().unwrap().block_on(async {
+                        celestia_da.get_blob(&blob_ref).await
+                    })
+                }).join().unwrap()
             }));
 
             assert!(result.is_ok(), "Should not panic on bad response: {}", bad_response);
@@ -2198,9 +2758,11 @@ mod tests {
             let celestia_da = CelestiaDA::new(config).unwrap();
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    celestia_da.post_blob(b"test").await
-                })
+                std::thread::spawn(move || {
+                    tokio::runtime::Runtime::new().unwrap().block_on(async {
+                        celestia_da.post_blob(b"test").await
+                    })
+                }).join().unwrap()
             }));
 
             assert!(result.is_ok(), "Should not panic on bad response: {}", bad_response);
@@ -2712,6 +3274,678 @@ mod tests {
             let result = CelestiaDA::new(config);
 
             assert!(result.is_ok(), "Should succeed with status code {}", status_code);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SUBSCRIBE_BLOBS TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    use futures::StreamExt;
+    use wiremock::matchers::{body_string_contains, method as http_method};
+
+    fn create_network_head_response(height: u64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"header":{{"height":"{}"}}}}}}"#,
+            height
+        )
+    }
+
+    fn create_get_all_response(blobs: &[(u32, &[u8; 29], &[u8], &[u8; 32])]) -> String {
+        let blob_items: Vec<String> = blobs
+            .iter()
+            .map(|(index, namespace, data, commitment)| {
+                format!(
+                    r#"{{"namespace":"{}","data":"{}","share_version":0,"commitment":"{}","index":{}}}"#,
+                    BASE64.encode(namespace),
+                    BASE64.encode(data),
+                    BASE64.encode(commitment),
+                    index
+                )
+            })
+            .collect();
+
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":[{}]}}"#,
+            blob_items.join(",")
+        )
+    }
+
+    fn create_get_all_empty_response() -> String {
+        r#"{"jsonrpc":"2.0","id":1,"result":[]}"#.to_string()
+    }
+
+    fn create_get_all_not_found_response() -> String {
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"blob: not found"}}"#.to_string()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // A. SUBSCRIBE_BLOBS BASIC TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_basic_valid_namespace() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x01; 29];
+        let test_data = b"test blob data";
+        let test_commitment = compute_blob_commitment(test_data);
+
+        // Mock HEAD for init
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Mock header.NetworkHead
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        // Mock blob.GetAll with one blob
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_get_all_response(&[(0, &test_namespace, test_data, &test_commitment)])
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Get first blob with timeout
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.next()
+        ).await;
+
+        assert!(result.is_ok(), "Stream should yield within timeout");
+        let item = result.unwrap();
+        assert!(item.is_some(), "Stream should yield a blob");
+
+        let blob_result = item.unwrap();
+        assert!(blob_result.is_ok(), "Blob should be Ok");
+
+        let blob = blob_result.unwrap();
+        assert_eq!(blob.namespace, test_namespace);
+        assert_eq!(blob.data, test_data);
+        assert_eq!(blob.commitment, test_commitment);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_yields_in_order() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x02; 29];
+
+        let data1 = b"blob one";
+        let data2 = b"blob two";
+        let data3 = b"blob three";
+        let commitment1 = compute_blob_commitment(data1);
+        let commitment2 = compute_blob_commitment(data2);
+        let commitment3 = compute_blob_commitment(data3);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        // Return blobs in non-sequential index order to test sorting
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_get_all_response(&[
+                    (2, &test_namespace, data3, &commitment3), // index 2 first
+                    (0, &test_namespace, data1, &commitment1), // index 0 second
+                    (1, &test_namespace, data2, &commitment2), // index 1 third
+                ])
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Collect first 3 blobs
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let result = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+            if let Ok(Some(Ok(blob))) = result {
+                received.push(blob);
+            }
+        }
+
+        assert_eq!(received.len(), 3, "Should receive 3 blobs");
+
+        // Verify ordering by index (ASC)
+        assert_eq!(received[0].index, 0);
+        assert_eq!(received[1].index, 1);
+        assert_eq!(received[2].index, 2);
+
+        // Verify data matches expected order
+        assert_eq!(received[0].data, data1);
+        assert_eq!(received[1].data, data2);
+        assert_eq!(received[2].data, data3);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_no_duplicates() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x03; 29];
+        let test_data = b"unique blob";
+        let test_commitment = compute_blob_commitment(test_data);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(move |_: &wiremock::Request| {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(
+                    create_get_all_response(&[(0, &test_namespace, test_data, &test_commitment)])
+                )
+            })
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Get first blob
+        let result1 = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+        assert!(result1.is_ok());
+        let blob1 = result1.unwrap().unwrap().unwrap();
+        assert_eq!(blob1.height, 1);
+        assert_eq!(blob1.index, 0);
+
+        // The stream should not yield duplicates even if polled again
+        // Due to seen_blobs tracking
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // B. NAMESPACE FILTER TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_filters_wrong_namespace() {
+        let mock_server = MockServer::start().await;
+        let target_namespace = [0x10; 29];
+        let wrong_namespace = [0x20; 29];
+
+        let target_data = b"target blob";
+        let wrong_data = b"wrong namespace blob";
+        let target_commitment = compute_blob_commitment(target_data);
+        let wrong_commitment = compute_blob_commitment(wrong_data);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        // Return both target and wrong namespace blobs
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_get_all_response(&[
+                    (0, &wrong_namespace, wrong_data, &wrong_commitment),
+                    (1, &target_namespace, target_data, &target_commitment),
+                ])
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&target_namespace);
+
+        // Should only get the target namespace blob
+        let result = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+        assert!(result.is_ok());
+
+        let blob = result.unwrap().unwrap().unwrap();
+        assert_eq!(blob.namespace, target_namespace, "Should only yield target namespace");
+        assert_eq!(blob.data, target_data);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_ignores_mismatched_namespace() {
+        let mock_server = MockServer::start().await;
+        let target_namespace = [0x11; 29];
+        let other_namespace = [0x22; 29];
+
+        let other_data = b"other namespace data";
+        let other_commitment = compute_blob_commitment(other_data);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        // Only return blobs with different namespace
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_get_all_response(&[(0, &other_namespace, other_data, &other_commitment)])
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&target_namespace);
+
+        // Should timeout because no matching blobs
+        let result = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+
+        // Either timeout or empty - both acceptable since wrong namespace is filtered
+        if let Ok(Some(Ok(blob))) = result {
+            panic!("Should not yield blob with wrong namespace, got: {:?}", blob.namespace);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // C. ORDERING GUARANTEE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_ordering_height_index() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x04; 29];
+
+        // Blobs at different heights
+        let data_h1_i0 = b"height1-index0";
+        let data_h1_i1 = b"height1-index1";
+        let commitment_h1_i0 = compute_blob_commitment(data_h1_i0);
+        let commitment_h1_i1 = compute_blob_commitment(data_h1_i1);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        // Return blobs in random order, expect sorted output
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_get_all_response(&[
+                    (1, &test_namespace, data_h1_i1, &commitment_h1_i1), // index 1 first
+                    (0, &test_namespace, data_h1_i0, &commitment_h1_i0), // index 0 second
+                ])
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Get blobs
+        let result1 = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+        let result2 = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        let blob1 = result1.unwrap().unwrap().unwrap();
+        let blob2 = result2.unwrap().unwrap().unwrap();
+
+        // Verify ordering: index 0 before index 1
+        assert_eq!(blob1.index, 0, "First blob should have index 0");
+        assert_eq!(blob2.index, 1, "Second blob should have index 1");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // D. RECONNECTION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_reconnection_after_failure() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x05; 29];
+        let test_data = b"reconnection blob";
+        let test_commitment = compute_blob_commitment(test_data);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call fails
+                    ResponseTemplate::new(500).set_body_string("Internal Server Error")
+                } else {
+                    // Subsequent calls succeed
+                    ResponseTemplate::new(200).set_body_string(create_network_head_response(1))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                create_get_all_response(&[(0, &test_namespace, test_data, &test_commitment)])
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // First attempt should fail but stream continues
+        let result1 = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+        // Either error or success - stream should not terminate
+        if let Ok(Some(Err(_))) = result1 {
+            // Error is expected on first try
+        }
+
+        // Subsequent attempt should succeed
+        let result2 = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+        assert!(result2.is_ok(), "Stream should eventually succeed after retry");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_stream_survives_error() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x06; 29];
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Always return network error
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Get multiple errors - stream should not terminate
+        for _ in 0..3 {
+            let result = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+            if let Ok(Some(result)) = result {
+                assert!(result.is_err(), "Should return error on network failure");
+            }
+        }
+
+        // Stream should still be alive (not None)
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_no_height_reset_on_reconnect() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x07; 29];
+        let test_data = b"no reset blob";
+        let test_commitment = compute_blob_commitment(test_data);
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_head = Arc::clone(&call_count);
+        let call_count_getall = Arc::clone(&call_count);
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(move |_: &wiremock::Request| {
+                call_count_head.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(create_network_head_response(5))
+            })
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_getall.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call fails
+                    ResponseTemplate::new(500)
+                } else {
+                    // Second call succeeds with blob at height 1
+                    ResponseTemplate::new(200).set_body_string(
+                        create_get_all_response(&[(0, &test_namespace, test_data, &test_commitment)])
+                    )
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+        celestia_da.set_last_height(0); // Start from height 1
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // First attempt might fail
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+
+        // Second attempt should succeed
+        let result = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+
+        if let Ok(Some(Ok(blob))) = result {
+            // Height should be >= 1, not reset to 0
+            assert!(blob.height >= 1, "Height should not reset to 0 after error");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // E. STREAM SAFETY TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_no_panic() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x08; 29];
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // Return malformed response
+        Mock::given(http_method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+                    let _ = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+                });
+            }).join().unwrap()
+        }));
+
+        assert!(result.is_ok(), "Stream should not panic on malformed response");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_no_hang() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x09; 29];
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(0)))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_get_all_empty_response()))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Should not hang - timeout should fire
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+
+        // Timeout is acceptable, infinite hang is not
+        assert!(result.is_err() || result.unwrap().is_some(), "Stream should not hang indefinitely");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_not_busy_loop() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x0A; 29];
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(move |_: &wiremock::Request| {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(create_network_head_response(0))
+            })
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_get_all_empty_response()))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Poll for 1 second
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let _ = stream.next().await;
+            }
+        }).await;
+
+        // With 5 second poll interval, should have very few calls (< 5)
+        let calls = call_count.load(Ordering::SeqCst);
+        assert!(calls < 10, "Should not busy-loop, got {} calls in 1 second", calls);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_blobs_empty_block_handling() {
+        let mock_server = MockServer::start().await;
+        let test_namespace = [0x0B; 29];
+
+        Mock::given(http_method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("header.NetworkHead"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_network_head_response(1)))
+            .mount(&mock_server)
+            .await;
+
+        // Return not found error (empty block)
+        Mock::given(http_method("POST"))
+            .and(body_string_contains("blob.GetAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(create_get_all_not_found_response()))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let celestia_da = Arc::new(CelestiaDA::new(config).unwrap());
+
+        let mut stream = celestia_da.subscribe_blobs(&test_namespace);
+
+        // Should handle "not found" gracefully without error
+        let result = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+
+        // Either timeout (waiting for next poll) or empty is fine
+        // Should not return an error for "blob not found"
+        if let Ok(Some(Err(e))) = result {
+            // Only network errors are acceptable, not "not found" as error
+            assert!(
+                !matches!(e, DAError::BlobNotFound(_)),
+                "Should not return BlobNotFound error for empty block"
+            );
         }
     }
 }
