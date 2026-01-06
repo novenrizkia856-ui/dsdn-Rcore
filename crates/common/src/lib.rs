@@ -1,9 +1,21 @@
 ﻿//! dsdn-common
 //! Common utilities.
+//!
+//! This crate provides shared utilities and abstractions used across
+//! the DSDN system, including:
+//!
+//! - `crypto` - Cryptographic primitives and utilities
+//! - `cid` - Content ID helpers based on SHA-256. Exposes deterministic hex string representation.
+//! - `config` - Configuration management
+//! - `consistent_hash` - Consistent hashing implementation
+//! - `da` - Data Availability layer abstraction trait
 
 pub mod crypto;
 pub mod cid;
 pub mod config;
 pub mod consistent_hash;
+pub mod da;
+
+pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
