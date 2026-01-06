@@ -218,31 +218,57 @@ pub enum DAHealthStatus {
 /// saat berinteraksi dengan DA layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DAError {
-    /// Blob dengan referensi yang diberikan tidak ditemukan
-    BlobNotFound,
-    /// Timeout saat berkomunikasi dengan DA layer
-    Timeout,
-    /// Error jaringan saat berkomunikasi dengan DA layer
-    NetworkError(String),
-    /// Error serialisasi atau deserialisasi data
-    SerializationError(String),
-    /// Namespace yang diberikan tidak valid
+    /// Blob dengan referensi yang diberikan tidak ditemukan.
+    /// Menyimpan `BlobRef` yang dicari untuk keperluan diagnostik.
+    BlobNotFound(BlobRef),
+    
+    /// Blob ditemukan tetapi data tidak valid.
+    /// Terjadi ketika commitment tidak cocok dengan data yang diterima,
+    /// mengindikasikan data korupsi atau blob yang salah.
+    InvalidBlob,
+    
+    /// Namespace yang diberikan tidak valid atau tidak cocok.
+    /// Terjadi ketika namespace pada request tidak cocok dengan
+    /// namespace aktif pada CelestiaDA instance.
     InvalidNamespace,
-    /// DA layer tidak tersedia
+    
+    /// Timeout saat berkomunikasi dengan DA layer.
+    /// Operasi melebihi batas waktu yang dikonfigurasi.
+    Timeout,
+    
+    /// DA layer tidak tersedia atau tidak dapat dijangkau.
+    /// Berbeda dengan NetworkError, ini mengindikasikan bahwa
+    /// DA layer secara eksplisit tidak dapat diakses.
     Unavailable,
-    /// Error lainnya yang tidak terkategorikan
+    
+    /// Error jaringan saat berkomunikasi dengan DA layer.
+    /// Menyimpan pesan detail tentang error yang terjadi.
+    NetworkError(String),
+    
+    /// Error serialisasi atau deserialisasi data.
+    /// Terjadi saat encoding/decoding JSON-RPC atau base64.
+    SerializationError(String),
+    
+    /// Error lainnya yang tidak terkategorikan.
+    /// Digunakan untuk error yang tidak masuk kategori di atas.
     Other(String),
 }
 
 impl std::fmt::Display for DAError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DAError::BlobNotFound => write!(f, "blob not found"),
+            DAError::BlobNotFound(ref_) => write!(
+                f, 
+                "blob not found at height {} with commitment {:?}", 
+                ref_.height,
+                &ref_.commitment[..8] // Show first 8 bytes for brevity
+            ),
+            DAError::InvalidBlob => write!(f, "blob data invalid: commitment mismatch"),
+            DAError::InvalidNamespace => write!(f, "namespace mismatch"),
             DAError::Timeout => write!(f, "operation timed out"),
+            DAError::Unavailable => write!(f, "DA layer unavailable"),
             DAError::NetworkError(msg) => write!(f, "network error: {}", msg),
             DAError::SerializationError(msg) => write!(f, "serialization error: {}", msg),
-            DAError::InvalidNamespace => write!(f, "invalid namespace"),
-            DAError::Unavailable => write!(f, "DA layer unavailable"),
             DAError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -349,107 +375,86 @@ pub trait DALayer: Send + Sync {
     ///
     /// # Returns
     ///
-    /// * `Ok(Vec<u8>)` - Data mentah blob yang identik dengan
-    ///   data yang di-post sebelumnya.
+    /// * `Ok(Vec<u8>)` - Data blob mentah yang berhasil diambil.
     /// * `Err(DAError)` - Error jika pengambilan gagal.
     ///
     /// # Errors
     ///
     /// Mengembalikan error jika:
     /// - Blob tidak ditemukan (`DAError::BlobNotFound`)
-    /// - DA layer tidak tersedia (`DAError::Unavailable`)
-    /// - Timeout saat mengambil data (`DAError::Timeout`)
+    /// - Blob data tidak valid / commitment mismatch (`DAError::InvalidBlob`)
+    /// - Namespace tidak cocok (`DAError::InvalidNamespace`)
+    /// - Timeout saat mengambil (`DAError::Timeout`)
     /// - Error jaringan (`DAError::NetworkError`)
     ///
     /// # Async Behavior
     ///
-    /// Method ini async dan non-blocking. Future akan resolve
-    /// setelah data berhasil diambil atau error terjadi.
+    /// Method ini async dan non-blocking. Future akan resolve setelah
+    /// data berhasil diambil dan divalidasi dari DA layer.
     ///
-    /// # Catatan
+    /// # Validasi
     ///
-    /// Method ini TIDAK melakukan verifikasi integritas data.
-    /// Verifikasi commitment adalah tanggung jawab implementor.
+    /// Implementasi WAJIB melakukan validasi:
+    /// - Namespace pada response cocok dengan namespace aktif
+    /// - Commitment dari data cocok dengan `blob_ref.commitment`
+    /// 
+    /// Jika validasi gagal, kembalikan error yang sesuai tanpa
+    /// mengembalikan data yang tidak valid.
     fn get_blob(&self, blob_ref: &BlobRef) -> impl std::future::Future<Output = Result<Vec<u8>, DAError>> + Send;
 
-    /// Subscribe ke stream blob pada namespace tertentu.
+    /// Subscribe ke stream blob baru di DA layer.
     ///
-    /// Method ini mengembalikan stream yang akan menerima blob
-    /// baru yang di-post ke namespace yang ditentukan secara real-time.
+    /// Method ini memulai subscription ke DA layer untuk menerima
+    /// notifikasi setiap kali ada blob baru yang masuk ke namespace
+    /// yang dikonfigurasi.
     ///
     /// # Arguments
     ///
-    /// * `namespace` - Namespace 29-byte untuk di-subscribe.
-    ///   Harus merupakan namespace yang valid di DA layer.
+    /// * `from_height` - Height awal untuk mulai subscribe.
+    ///   Jika `None`, subscribe dari height terbaru.
+    ///   Jika `Some(height)`, subscribe mulai dari height tersebut.
     ///
     /// # Returns
     ///
-    /// `BlobStream` - Stream asinkron yang menghasilkan `Result<Blob, DAError>`.
-    /// Stream akan terus aktif dan menghasilkan blob baru hingga di-drop.
-    ///
-    /// # Synchronous
-    ///
-    /// Method ini TIDAK async. Pembuatan stream dilakukan secara
-    /// synchronous, namun konsumsi stream dilakukan secara async.
+    /// * `Ok(BlobStream)` - Stream asinkron yang yield `Blob` baru.
+    /// * `Err(DAError)` - Error jika subscription gagal dimulai.
     ///
     /// # Stream Behavior
     ///
-    /// - Stream bersifat `Send` dan dapat dikonsumsi dari thread manapun
-    /// - Error pada stream dikembalikan sebagai `Result::Err` dalam item
-    /// - Stream tidak akan terminate secara normal; hanya berhenti jika di-drop
-    /// - Backpressure ditangani oleh implementor
+    /// - Stream akan terus aktif sampai di-drop atau terjadi error fatal
+    /// - Jika koneksi terputus, implementasi HARUS melakukan reconnect
+    /// - Error transient dikirim melalui stream, bukan terminate stream
+    /// - Stream TIDAK BOLEH miss blob (at-least-once delivery)
     ///
-    /// # Catatan
+    /// # Ordering
     ///
-    /// Method ini TIDAK memfilter blob berdasarkan kriteria apapun
-    /// selain namespace. Filtering tambahan adalah tanggung jawab caller.
-    fn subscribe_blobs(&self, namespace: &[u8; 29]) -> BlobStream;
+    /// Blob dijamin terurut berdasarkan height. Blob dengan height
+    /// lebih rendah akan di-yield sebelum blob dengan height lebih tinggi.
+    fn subscribe_blobs(&self, from_height: Option<u64>) -> impl std::future::Future<Output = Result<BlobStream, DAError>> + Send;
 
-    /// Memeriksa status kesehatan DA layer.
+    /// Memeriksa kesehatan koneksi ke DA layer.
     ///
-    /// Method ini digunakan untuk monitoring dan health checking
-    /// koneksi ke DA layer. Dapat dipanggil secara periodik untuk
-    /// memantau status sistem.
+    /// Method ini melakukan health check ke DA layer untuk memverifikasi
+    /// bahwa koneksi aktif dan DA layer dapat menerima request.
     ///
     /// # Returns
     ///
-    /// `DAHealthStatus` yang menunjukkan kondisi DA layer saat ini:
-    /// - `Healthy` - DA layer beroperasi normal
-    /// - `Degraded` - DA layer mengalami penurunan performa
-    /// - `Unavailable` - DA layer tidak dapat dijangkau
+    /// * `Ok(DAHealthStatus)` - Status kesehatan DA layer.
+    /// * `Err(DAError)` - Error jika health check gagal dilakukan.
+    ///
+    /// # Health Status
+    ///
+    /// - `Healthy`: DA layer beroperasi normal
+    /// - `Degraded`: DA layer beroperasi tapi ada masalah performa
+    /// - `Unavailable`: DA layer tidak dapat diakses
     ///
     /// # Async Behavior
     ///
-    /// Method ini async karena mungkin perlu melakukan request
-    /// ke DA layer untuk verifikasi konektivitas dan status.
-    ///
-    /// # Catatan
-    ///
-    /// Method ini TIDAK memodifikasi state apapun dan aman
-    /// untuk dipanggil berulang kali. Hasil mencerminkan kondisi
-    /// pada saat pemanggilan dan dapat berubah sewaktu-waktu.
-    fn health_check(&self) -> impl std::future::Future<Output = DAHealthStatus> + Send;
-
-    /// Mengembalikan namespace yang digunakan oleh instance ini.
-    ///
-    /// Namespace adalah identifier 29-byte yang mengelompokkan
-    /// blob dalam DA layer. Setiap instance `DALayer` terikat
-    /// pada satu namespace.
-    ///
-    /// # Returns
-    ///
-    /// Referensi ke namespace 29-byte yang digunakan oleh instance ini.
-    ///
-    /// # Synchronous
-    ///
-    /// Method ini synchronous dan murah untuk dipanggil karena
-    /// hanya mengembalikan referensi ke data yang sudah ada.
-    ///
-    /// # Catatan
-    ///
-    /// Namespace tidak berubah selama lifetime instance.
-    /// Method ini TIDAK melakukan alokasi atau I/O.
-    fn namespace(&self) -> &[u8; 29];
+    /// Method ini async dan HARUS:
+    /// - Memiliki timeout internal yang reasonable
+    /// - Tidak block lebih dari beberapa detik
+    /// - Menggunakan request ringan (minimal overhead)
+    fn health_check(&self) -> impl std::future::Future<Output = Result<DAHealthStatus, DAError>> + Send;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -461,107 +466,264 @@ mod tests {
     use super::*;
 
     // ════════════════════════════════════════════════════════════════════════
-    // BLOB TESTS
+    // BLOB REF TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_blob_creation() {
+    fn test_blob_ref_equality() {
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        let ref2 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        assert_eq!(ref1, ref2);
+    }
+
+    #[test]
+    fn test_blob_ref_inequality_height() {
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        let ref2 = BlobRef {
+            height: 101, // Different
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        assert_ne!(ref1, ref2);
+    }
+
+    #[test]
+    fn test_blob_ref_inequality_commitment() {
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        let ref2 = BlobRef {
+            height: 100,
+            commitment: [0x12; 32], // Different
+            namespace: [0x22; 29],
+        };
+
+        assert_ne!(ref1, ref2);
+    }
+
+    #[test]
+    fn test_blob_ref_clone() {
+        let original = BlobRef {
+            height: 999,
+            commitment: [0xFF; 32],
+            namespace: [0xAA; 29],
+        };
+
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DA ERROR TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_daerror_blob_not_found_display() {
         let blob_ref = BlobRef {
             height: 12345,
             commitment: [0xAB; 32],
-            namespace: [0xCD; 29],
+            namespace: [0x01; 29],
         };
-
-        let data = vec![1, 2, 3, 4, 5];
-        let received_at = 1700000000000u64;
-
-        let blob = Blob {
-            ref_: blob_ref.clone(),
-            data: data.clone(),
-            received_at,
-        };
-
-        // Verify all fields stored correctly
-        assert_eq!(blob.ref_.height, 12345);
-        assert_eq!(blob.ref_.commitment, [0xAB; 32]);
-        assert_eq!(blob.ref_.namespace, [0xCD; 29]);
-        assert_eq!(blob.data, data);
-        assert_eq!(blob.received_at, received_at);
-    }
-
-    #[test]
-    fn test_blob_no_data_transformation() {
-        let original_data = vec![0x00, 0xFF, 0x7F, 0x80, 0x01];
         
-        let blob = Blob {
-            ref_: BlobRef {
-                height: 1,
-                commitment: [0; 32],
-                namespace: [0; 29],
-            },
-            data: original_data.clone(),
-            received_at: 0,
-        };
-
-        // Data harus identik, tanpa transformasi
-        assert_eq!(blob.data, original_data);
-        assert_eq!(blob.data.len(), 5);
+        let error = DAError::BlobNotFound(blob_ref);
+        let display = format!("{}", error);
+        
+        assert!(display.contains("blob not found"));
+        assert!(display.contains("12345"));
     }
 
     #[test]
-    fn test_blob_empty_data() {
-        let blob = Blob {
-            ref_: BlobRef {
-                height: 0,
-                commitment: [0; 32],
-                namespace: [0; 29],
-            },
-            data: vec![],
-            received_at: 0,
+    fn test_daerror_blob_not_found_contains_ref() {
+        let blob_ref = BlobRef {
+            height: 999,
+            commitment: [0xCD; 32],
+            namespace: [0x02; 29],
         };
-
-        assert!(blob.data.is_empty());
+        
+        let error = DAError::BlobNotFound(blob_ref.clone());
+        
+        if let DAError::BlobNotFound(ref_) = error {
+            assert_eq!(ref_.height, 999);
+            assert_eq!(ref_.commitment, [0xCD; 32]);
+        } else {
+            panic!("Expected BlobNotFound variant");
+        }
     }
 
     #[test]
-    fn test_blob_large_data() {
-        let large_data = vec![0xFFu8; 1_000_000]; // 1MB
+    fn test_daerror_invalid_blob_display() {
+        let error = DAError::InvalidBlob;
+        let display = format!("{}", error);
+        
+        assert!(display.contains("invalid") || display.contains("mismatch"));
+    }
 
-        let blob = Blob {
-            ref_: BlobRef {
-                height: 999999,
-                commitment: [0x11; 32],
-                namespace: [0x22; 29],
-            },
-            data: large_data.clone(),
-            received_at: u64::MAX,
+    #[test]
+    fn test_daerror_invalid_namespace_display() {
+        let error = DAError::InvalidNamespace;
+        let display = format!("{}", error);
+        
+        assert!(display.contains("namespace"));
+    }
+
+    #[test]
+    fn test_daerror_timeout_display() {
+        let error = DAError::Timeout;
+        let display = format!("{}", error);
+        
+        assert!(display.contains("timeout") || display.contains("timed out"));
+    }
+
+    #[test]
+    fn test_daerror_unavailable_display() {
+        let error = DAError::Unavailable;
+        let display = format!("{}", error);
+        
+        assert!(display.contains("unavailable"));
+    }
+
+    #[test]
+    fn test_daerror_network_error_display() {
+        let error = DAError::NetworkError("connection refused".to_string());
+        let display = format!("{}", error);
+        
+        assert!(display.contains("network"));
+        assert!(display.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_daerror_serialization_error_display() {
+        let error = DAError::SerializationError("invalid JSON".to_string());
+        let display = format!("{}", error);
+        
+        assert!(display.contains("serialization"));
+        assert!(display.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn test_daerror_other_display() {
+        let error = DAError::Other("custom error message".to_string());
+        let display = format!("{}", error);
+        
+        assert!(display.contains("custom error message"));
+    }
+
+    #[test]
+    fn test_daerror_equality() {
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
         };
+        
+        let ref2 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+        
+        assert_eq!(
+            DAError::BlobNotFound(ref1.clone()),
+            DAError::BlobNotFound(ref2.clone())
+        );
+        assert_eq!(DAError::InvalidBlob, DAError::InvalidBlob);
+        assert_eq!(DAError::InvalidNamespace, DAError::InvalidNamespace);
+        assert_eq!(DAError::Timeout, DAError::Timeout);
+        assert_eq!(DAError::Unavailable, DAError::Unavailable);
+        assert_eq!(
+            DAError::NetworkError("test".to_string()),
+            DAError::NetworkError("test".to_string())
+        );
+    }
 
-        assert_eq!(blob.data.len(), 1_000_000);
-        assert_eq!(blob.data, large_data);
+    #[test]
+    fn test_daerror_inequality() {
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+        
+        let ref2 = BlobRef {
+            height: 200, // Different
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+        
+        assert_ne!(
+            DAError::BlobNotFound(ref1),
+            DAError::BlobNotFound(ref2)
+        );
+        assert_ne!(DAError::InvalidBlob, DAError::InvalidNamespace);
+        assert_ne!(DAError::Timeout, DAError::Unavailable);
+    }
+
+    #[test]
+    fn test_daerror_clone() {
+        let blob_ref = BlobRef {
+            height: 500,
+            commitment: [0xEE; 32],
+            namespace: [0xFF; 29],
+        };
+        
+        let error = DAError::BlobNotFound(blob_ref);
+        let cloned = error.clone();
+        
+        assert_eq!(error, cloned);
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // DACONFIG DEFAULT TESTS
+    // DA HEALTH STATUS TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_daconfig_default_all_fields_set() {
-        let config = DAConfig::default();
-
-        // All fields must be set
-        assert!(!config.rpc_url.is_empty());
-        assert_eq!(config.namespace.len(), 29);
-        assert!(config.auth_token.is_none());
-        assert!(config.timeout_ms > 0);
-        assert!(config.retry_count > 0);
-        assert!(config.retry_delay_ms > 0);
+    fn test_dahealthstatus_equality() {
+        assert_eq!(DAHealthStatus::Healthy, DAHealthStatus::Healthy);
+        assert_eq!(DAHealthStatus::Degraded, DAHealthStatus::Degraded);
+        assert_eq!(DAHealthStatus::Unavailable, DAHealthStatus::Unavailable);
     }
 
     #[test]
-    fn test_daconfig_default_values() {
-        let config = DAConfig::default();
+    fn test_dahealthstatus_inequality() {
+        assert_ne!(DAHealthStatus::Healthy, DAHealthStatus::Degraded);
+        assert_ne!(DAHealthStatus::Healthy, DAHealthStatus::Unavailable);
+        assert_ne!(DAHealthStatus::Degraded, DAHealthStatus::Unavailable);
+    }
 
+    #[test]
+    fn test_dahealthstatus_copy() {
+        let status = DAHealthStatus::Healthy;
+        let copied = status; // Copy, not move
+        assert_eq!(status, copied);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DA CONFIG TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_daconfig_default() {
+        let config = DAConfig::default();
+        
         assert_eq!(config.rpc_url, "http://localhost:26658");
         assert_eq!(config.namespace, [0u8; 29]);
         assert_eq!(config.auth_token, None);
@@ -571,12 +733,34 @@ mod tests {
     }
 
     #[test]
-    fn test_daconfig_default_consistent() {
+    fn test_daconfig_clone() {
+        let config = DAConfig {
+            rpc_url: "http://test:1234".to_string(),
+            namespace: [0x11; 29],
+            auth_token: Some("token".to_string()),
+            timeout_ms: 5000,
+            retry_count: 5,
+            retry_delay_ms: 500,
+        };
+        
+        let cloned = config.clone();
+        assert_eq!(config, cloned);
+    }
+
+    #[test]
+    fn test_daconfig_equality() {
         let config1 = DAConfig::default();
         let config2 = DAConfig::default();
-
-        // Must be consistent across runs
         assert_eq!(config1, config2);
+    }
+
+    #[test]
+    fn test_daconfig_inequality() {
+        let config1 = DAConfig::default();
+        let mut config2 = DAConfig::default();
+        config2.timeout_ms = 9999;
+        
+        assert_ne!(config1, config2);
     }
 
     #[test]
@@ -777,35 +961,59 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // BLOB REF TESTS (sanity check - not modified)
+    // BLOB TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_blob_ref_equality() {
-        let ref1 = BlobRef {
+    fn test_blob_creation() {
+        let blob_ref = BlobRef {
             height: 100,
             commitment: [0x11; 32],
             namespace: [0x22; 29],
         };
 
-        let ref2 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
+        let blob = Blob {
+            ref_: blob_ref.clone(),
+            data: vec![1, 2, 3, 4, 5],
+            received_at: 1234567890,
         };
 
-        assert_eq!(ref1, ref2);
+        assert_eq!(blob.ref_, blob_ref);
+        assert_eq!(blob.data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(blob.received_at, 1234567890);
     }
 
     #[test]
-    fn test_blob_ref_clone() {
-        let original = BlobRef {
-            height: 999,
-            commitment: [0xFF; 32],
-            namespace: [0xAA; 29],
+    fn test_blob_clone() {
+        let blob = Blob {
+            ref_: BlobRef {
+                height: 200,
+                commitment: [0xAA; 32],
+                namespace: [0xBB; 29],
+            },
+            data: vec![10, 20, 30],
+            received_at: 9999,
         };
 
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
+        let cloned = blob.clone();
+        
+        assert_eq!(blob.ref_, cloned.ref_);
+        assert_eq!(blob.data, cloned.data);
+        assert_eq!(blob.received_at, cloned.received_at);
+    }
+
+    #[test]
+    fn test_blob_empty_data() {
+        let blob = Blob {
+            ref_: BlobRef {
+                height: 1,
+                commitment: [0x00; 32],
+                namespace: [0x00; 29],
+            },
+            data: vec![],
+            received_at: 0,
+        };
+
+        assert!(blob.data.is_empty());
     }
 }
