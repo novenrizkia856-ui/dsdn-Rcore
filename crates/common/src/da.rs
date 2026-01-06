@@ -17,7 +17,7 @@ use futures::Stream;
 /// `BlobRef` menyimpan informasi yang diperlukan untuk mengidentifikasi
 /// dan mengambil kembali blob dari DA layer. Struct ini bersifat
 /// immutable setelah dibuat.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlobRef {
     /// Height di mana blob di-commit ke DA layer
     pub height: u64,
@@ -530,6 +530,22 @@ mod tests {
 
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_blob_ref_hash() {
+        use std::collections::HashMap;
+        
+        let ref1 = BlobRef {
+            height: 100,
+            commitment: [0x11; 32],
+            namespace: [0x22; 29],
+        };
+
+        let mut map: HashMap<BlobRef, String> = HashMap::new();
+        map.insert(ref1.clone(), "test".to_string());
+        
+        assert_eq!(map.get(&ref1), Some(&"test".to_string()));
     }
 
     // ════════════════════════════════════════════════════════════════════════
