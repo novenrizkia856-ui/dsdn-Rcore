@@ -17,6 +17,7 @@ use dsdn_common::consistent_hash::NodeDesc;
 pub mod scheduler;
 pub mod da_consumer;
 pub mod state_machine;
+pub mod state_rebuild;
 
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
@@ -25,6 +26,7 @@ pub use state_machine::{
     NodeRegisteredPayload, NodeUnregisteredPayload, ChunkDeclaredPayload, ChunkRemovedPayload,
     ReplicaAddedPayload, ReplicaRemovedPayload, ZoneAssignedPayload, ZoneUnassignedPayload,
 };
+pub use state_rebuild::{StateRebuilder, RebuildProgress, RebuildError};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
