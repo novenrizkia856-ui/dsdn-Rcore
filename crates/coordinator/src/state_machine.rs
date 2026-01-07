@@ -1784,9 +1784,9 @@ mod tests {
         let mut sm = StateMachine::new();
 
         sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "owner1")).unwrap();
-        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
-        sm.apply_event(make_replica_added_event(3, TEST_HASH_1, "node2")).unwrap();
-        sm.apply_event(make_replica_added_event(4, TEST_HASH_1, "node3")).unwrap();
+        sm.apply_event(make_replica_added_event_full(2, TEST_HASH_1, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node2", 1)).unwrap();
+        sm.apply_event(make_replica_added_event_full(4, TEST_HASH_1, "node3", 2)).unwrap();
 
         let replicas = sm.state().replica_map.get(TEST_HASH_1).unwrap();
         assert_eq!(replicas.len(), 3);

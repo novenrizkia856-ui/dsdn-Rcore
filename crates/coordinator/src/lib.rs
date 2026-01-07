@@ -1,11 +1,65 @@
-//! Coordinator library: in-memory registry, placement, scheduling, and DA consumption.
+//! # DSDN Coordinator Crate (14A)
 //!
-//! This crate provides the core Coordinator functionality for DSDN:
+//! The Coordinator is the central orchestration component of DSDN (Decentralized
+//! Storage and Data Network). It manages node registry, placement decisions,
+//! workload scheduling, and DA layer integration.
 //!
-//! - **Node Registry**: Track registered storage nodes
-//! - **Object Placement**: Consistent hashing for replica placement
-//! - **Scheduling**: Score-based node selection for workloads
-//! - **DA Consumer**: Event consumption from Data Availability layer
+//! ## Architecture Overview
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │                           COORDINATOR                                   │
+//! │                                                                         │
+//! │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐     │
+//! │  │   DAConsumer    │───▶│  StateMachine   │───▶│ DADerivedState  │     │
+//! │  │ (Event Ingest)  │    │ (Event Apply)   │    │ (Authoritative) │     │
+//! │  └────────┬────────┘    └─────────────────┘    └────────┬────────┘     │
+//! │           │                                              │              │
+//! │           │ subscribe                          read-only │              │
+//! │           │                                              ▼              │
+//! │  ┌────────┴────────┐                          ┌─────────────────┐      │
+//! │  │    DALayer      │◀─────────────────────────│   Scheduler     │      │
+//! │  │  (Celestia)     │         publish          │   Placement     │      │
+//! │  └────────┬────────┘                          └─────────────────┘      │
+//! │           │                                              ▲              │
+//! │           │                                              │              │
+//! │  ┌────────┴────────┐    ┌─────────────────┐             │              │
+//! │  │ EventPublisher  │───▶│  StateRebuilder │─────────────┘              │
+//! │  │ (Event Write)   │    │   (Recovery)    │     rebuild                │
+//! │  └─────────────────┘    └─────────────────┘                            │
+//! │                                                                         │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Modules
+//!
+//! - **scheduler**: Node scoring and workload-aware scheduling
+//! - **da_consumer**: Event consumption from DA layer
+//! - **state_machine**: Deterministic event processing
+//! - **state_rebuild**: State reconstruction from DA history
+//! - **event_publisher**: Event batching and publishing to DA
+//!
+//! ## Key Invariant
+//!
+//! **Coordinator state can ALWAYS be reconstructed from DA.**
+//! **There is NO authoritative local state.**
+//!
+//! All state is derived from events on the Data Availability layer. On restart,
+//! crash recovery, or new node bootstrap, the complete state is rebuilt by
+//! replaying events from DA. This ensures:
+//!
+//! - Byzantine fault tolerance
+//! - Deterministic state across all coordinators
+//! - Full auditability
+//! - No single point of failure
+//!
+//! ## Data Flow
+//!
+//! 1. **Ingest**: `DAConsumer` subscribes to DA layer events
+//! 2. **Apply**: `StateMachine` processes events deterministically
+//! 3. **Query**: Scheduler and Placement read from `DADerivedState`
+//! 4. **Publish**: `EventPublisher` writes new events to DA
+//! 5. **Recovery**: `StateRebuilder` reconstructs state from DA history
 
 use std::collections::HashMap;
 use parking_lot::RwLock;
