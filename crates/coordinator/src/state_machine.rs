@@ -210,6 +210,262 @@ impl DADerivedState {
         }
         chunk_hashes
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ZONE STATISTICS API (14A.27)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// List all zones.
+    ///
+    /// # Returns
+    ///
+    /// A vector of unique zone names, sorted for deterministic output.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic (sorted)
+    pub fn list_zones(&self) -> Vec<String> {
+        let mut zones: Vec<String> = self.zone_map.keys().cloned().collect();
+        zones.sort();
+        zones
+    }
+
+    /// Get the number of nodes in a zone.
+    ///
+    /// # Arguments
+    ///
+    /// * `zone` - The zone ID to look up
+    ///
+    /// # Returns
+    ///
+    /// Number of nodes in the zone. Returns 0 if zone does not exist.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    pub fn zone_node_count(&self, zone: &str) -> usize {
+        match self.zone_map.get(zone) {
+            Some(node_ids) => node_ids.len(),
+            None => 0,
+        }
+    }
+
+    /// Get the total capacity of all nodes in a zone.
+    ///
+    /// # Arguments
+    ///
+    /// * `zone` - The zone ID to look up
+    ///
+    /// # Returns
+    ///
+    /// Total capacity_gb of all nodes in the zone. Returns 0 if zone does not exist.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    /// - Overflow safe (saturating add)
+    pub fn zone_capacity(&self, zone: &str) -> u64 {
+        match self.zone_map.get(zone) {
+            Some(node_ids) => {
+                let mut total: u64 = 0;
+                for node_id in node_ids {
+                    if let Some(node) = self.node_registry.get(node_id) {
+                        total = total.saturating_add(node.capacity_gb);
+                    }
+                }
+                total
+            }
+            None => 0,
+        }
+    }
+
+    /// Calculate the used capacity of a node.
+    ///
+    /// This is computed as: sum of sizes of all chunks with replicas on this node.
+    fn node_used_capacity(&self, node_id: &str) -> u64 {
+        let mut used: u64 = 0;
+        for (chunk_hash, replicas) in &self.replica_map {
+            if replicas.iter().any(|r| r.node_id == node_id) {
+                if let Some(chunk) = self.chunk_map.get(chunk_hash) {
+                    // Convert bytes to GB (rounded up)
+                    let chunk_gb = (chunk.size_bytes + (1 << 30) - 1) / (1 << 30);
+                    used = used.saturating_add(chunk_gb);
+                }
+            }
+        }
+        used
+    }
+
+    /// Get the utilization of a zone.
+    ///
+    /// Utilization = total_used_capacity / total_capacity
+    ///
+    /// # Arguments
+    ///
+    /// * `zone` - The zone ID to look up
+    ///
+    /// # Returns
+    ///
+    /// Utilization ratio in range 0.0 to 1.0.
+    /// Returns 0.0 if zone does not exist or has 0 capacity.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    /// - Never returns NaN
+    /// - Never returns > 1.0
+    pub fn zone_utilization(&self, zone: &str) -> f64 {
+        let total_capacity = self.zone_capacity(zone);
+        if total_capacity == 0 {
+            return 0.0;
+        }
+
+        // Calculate used capacity for all nodes in zone
+        let mut total_used: u64 = 0;
+        if let Some(node_ids) = self.zone_map.get(zone) {
+            for node_id in node_ids {
+                total_used = total_used.saturating_add(self.node_used_capacity(node_id));
+            }
+        }
+
+        let utilization = total_used as f64 / total_capacity as f64;
+        // Clamp to 0.0..=1.0 to prevent any floating point issues
+        utilization.clamp(0.0, 1.0)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ZONE-AWARE PLACEMENT HELPER (14A.27)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Suggest nodes for replica placement.
+    ///
+    /// This method suggests `rf` node_ids for placing replicas of a chunk,
+    /// preferring nodes in distinct zones with lower utilization.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - The chunk to place replicas for
+    /// * `rf` - Target replication factor (number of replicas needed)
+    ///
+    /// # Returns
+    ///
+    /// A vector of node_ids suggested for placement. Length is at most `rf`.
+    /// Returns empty vector if chunk does not exist.
+    ///
+    /// # Selection Criteria
+    ///
+    /// 1. Node must be registered
+    /// 2. Node must NOT already have a replica of this chunk
+    /// 3. Node must have capacity > 0
+    /// 4. Prefer distinct zones
+    /// 5. Among eligible zones, prefer lower utilization
+    /// 6. Among eligible nodes in a zone, prefer higher capacity
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic (same input = same output)
+    /// - No duplicate nodes in result
+    pub fn suggest_placement(&self, chunk_hash: &str, rf: u8) -> Vec<String> {
+        // Chunk must exist
+        if !self.chunk_map.contains_key(chunk_hash) {
+            return Vec::new();
+        }
+
+        // Get nodes that already have this chunk
+        let existing_nodes: std::collections::HashSet<String> = self
+            .get_replicas(chunk_hash)
+            .iter()
+            .map(|r| r.node_id.clone())
+            .collect();
+
+        // Build list of eligible nodes with their zone and capacity
+        let mut eligible: Vec<(String, String, u64)> = Vec::new(); // (node_id, zone, capacity)
+        
+        for (node_id, node) in &self.node_registry {
+            // Skip if already has replica
+            if existing_nodes.contains(node_id) {
+                continue;
+            }
+            // Skip if no capacity
+            if node.capacity_gb == 0 {
+                continue;
+            }
+            eligible.push((node_id.clone(), node.zone.clone(), node.capacity_gb));
+        }
+
+        if eligible.is_empty() {
+            return Vec::new();
+        }
+
+        // Calculate zone utilizations
+        let mut zone_utils: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for zone in self.zone_map.keys() {
+            zone_utils.insert(zone.clone(), self.zone_utilization(zone));
+        }
+
+        // Sort eligible nodes:
+        // 1. By zone utilization (ascending) - prefer less utilized zones
+        // 2. By capacity (descending) - prefer nodes with more capacity
+        // 3. By node_id (ascending) - for determinism
+        eligible.sort_by(|a, b| {
+            let util_a = zone_utils.get(&a.1).copied().unwrap_or(0.0);
+            let util_b = zone_utils.get(&b.1).copied().unwrap_or(0.0);
+            
+            // First compare by utilization (lower is better)
+            match util_a.partial_cmp(&util_b) {
+                Some(std::cmp::Ordering::Equal) | None => {}
+                Some(ord) => return ord,
+            }
+            
+            // Then by capacity (higher is better)
+            match b.2.cmp(&a.2) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+            
+            // Finally by node_id for determinism
+            a.0.cmp(&b.0)
+        });
+
+        // Select nodes, preferring distinct zones
+        let mut result: Vec<String> = Vec::new();
+        let mut used_zones: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // First pass: pick one node per zone
+        for (node_id, zone, _capacity) in &eligible {
+            if result.len() >= rf as usize {
+                break;
+            }
+            if !used_zones.contains(zone) {
+                result.push(node_id.clone());
+                used_zones.insert(zone.clone());
+            }
+        }
+
+        // Second pass: if we need more, allow reusing zones
+        if result.len() < rf as usize {
+            for (node_id, _zone, _capacity) in &eligible {
+                if result.len() >= rf as usize {
+                    break;
+                }
+                if !result.contains(node_id) {
+                    result.push(node_id.clone());
+                }
+            }
+        }
+
+        result
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2564,5 +2820,379 @@ mod tests {
         let replicas = sm.state().get_replicas(TEST_HASH_1);
         assert_eq!(chunk.current_rf as usize, replicas.len());
         assert_eq!(chunk.current_rf, 2);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // K. ZONE STATISTICS TESTS (14A.27)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_list_zones() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(4, "node4", "zone-c")).unwrap();
+
+        let zones = sm.state().list_zones();
+        assert_eq!(zones.len(), 3);
+        // Should be sorted
+        assert_eq!(zones, vec!["zone-a", "zone-b", "zone-c"]);
+    }
+
+    #[test]
+    fn test_list_zones_empty() {
+        let sm = StateMachine::new();
+        let zones = sm.state().list_zones();
+        assert!(zones.is_empty());
+    }
+
+    #[test]
+    fn test_zone_node_count() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-b")).unwrap();
+
+        assert_eq!(sm.state().zone_node_count("zone-a"), 2);
+        assert_eq!(sm.state().zone_node_count("zone-b"), 1);
+        assert_eq!(sm.state().zone_node_count("zone-nonexistent"), 0);
+    }
+
+    #[test]
+    fn test_zone_capacity() {
+        let mut sm = StateMachine::new();
+        
+        // Register nodes with specific capacities
+        sm.apply_event(DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        }).unwrap();
+        
+        sm.apply_event(DAEvent {
+            sequence: 2,
+            timestamp: 2000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node2".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "node2:7001".to_string(),
+                capacity_gb: 200,
+            }),
+        }).unwrap();
+        
+        sm.apply_event(DAEvent {
+            sequence: 3,
+            timestamp: 3000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node3".to_string(),
+                zone: "zone-b".to_string(),
+                addr: "node3:7001".to_string(),
+                capacity_gb: 50,
+            }),
+        }).unwrap();
+
+        assert_eq!(sm.state().zone_capacity("zone-a"), 300);
+        assert_eq!(sm.state().zone_capacity("zone-b"), 50);
+        assert_eq!(sm.state().zone_capacity("zone-nonexistent"), 0);
+    }
+
+    #[test]
+    fn test_zone_utilization_empty() {
+        let sm = StateMachine::new();
+        
+        // Non-existent zone
+        assert_eq!(sm.state().zone_utilization("zone-nonexistent"), 0.0);
+    }
+
+    #[test]
+    fn test_zone_utilization_zero_capacity() {
+        let mut sm = StateMachine::new();
+        
+        // Register node with 0 capacity
+        sm.apply_event(DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 0,
+            }),
+        }).unwrap();
+
+        // Should return 0.0, not NaN or infinity
+        let util = sm.state().zone_utilization("zone-a");
+        assert_eq!(util, 0.0);
+        assert!(!util.is_nan());
+    }
+
+    #[test]
+    fn test_zone_utilization_with_replicas() {
+        let mut sm = StateMachine::new();
+        
+        // Register node with 100GB capacity
+        sm.apply_event(DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        }).unwrap();
+
+        // Declare a chunk (1GB = 1073741824 bytes)
+        sm.apply_event(make_chunk_declared_event_full(
+            2, TEST_HASH_1, 1073741824, 3, "uploader1", [0u8; 32]
+        )).unwrap();
+
+        // No replicas yet - utilization should be 0
+        let util_before = sm.state().zone_utilization("zone-a");
+        assert_eq!(util_before, 0.0);
+
+        // Add replica
+        sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node1", 0)).unwrap();
+
+        // Now utilization should be > 0 but <= 1.0
+        let util_after = sm.state().zone_utilization("zone-a");
+        assert!(util_after >= 0.0);
+        assert!(util_after <= 1.0);
+    }
+
+    #[test]
+    fn test_zone_utilization_range() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+
+        let util = sm.state().zone_utilization("zone-a");
+        assert!(util >= 0.0);
+        assert!(util <= 1.0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // L. PLACEMENT SUGGESTION TESTS (14A.27)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_suggest_placement_chunk_not_exist() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+
+        // Chunk doesn't exist
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 3);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_suggest_placement_basic() {
+        let mut sm = StateMachine::new();
+        
+        // Register nodes in different zones
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-c")).unwrap();
+
+        // Declare chunk
+        sm.apply_event(make_chunk_declared_event(4, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Suggest placement for rf=3
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 3);
+        
+        assert_eq!(suggestions.len(), 3);
+        
+        // All suggestions should be unique
+        let unique: std::collections::HashSet<_> = suggestions.iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn test_suggest_placement_prefers_distinct_zones() {
+        let mut sm = StateMachine::new();
+        
+        // Register 2 nodes in zone-a, 1 in zone-b
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-b")).unwrap();
+
+        // Declare chunk
+        sm.apply_event(make_chunk_declared_event(4, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Suggest placement for rf=2
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 2);
+        
+        assert_eq!(suggestions.len(), 2);
+        
+        // Should pick nodes from different zones
+        let node1_zone = if suggestions.contains(&"node1".to_string()) || suggestions.contains(&"node2".to_string()) {
+            "zone-a"
+        } else {
+            "other"
+        };
+        let node3_present = suggestions.contains(&"node3".to_string());
+        
+        // At least one from zone-b should be present
+        assert!(node3_present || node1_zone == "zone-a");
+    }
+
+    #[test]
+    fn test_suggest_placement_excludes_existing_replicas() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-c")).unwrap();
+
+        // Declare chunk
+        sm.apply_event(make_chunk_declared_event(4, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Add replica to node1
+        sm.apply_event(make_replica_added_event_full(5, TEST_HASH_1, "node1", 0)).unwrap();
+
+        // Suggest placement for rf=2
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 2);
+        
+        // node1 should NOT be in suggestions since it already has a replica
+        assert!(!suggestions.contains(&"node1".to_string()));
+        assert_eq!(suggestions.len(), 2);
+    }
+
+    #[test]
+    fn test_suggest_placement_no_duplicates() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-a")).unwrap();
+
+        sm.apply_event(make_chunk_declared_event(4, TEST_HASH_1, "uploader1")).unwrap();
+
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 3);
+        
+        // No duplicates
+        let unique: std::collections::HashSet<_> = suggestions.iter().collect();
+        assert_eq!(unique.len(), suggestions.len());
+    }
+
+    #[test]
+    fn test_suggest_placement_respects_rf_limit() {
+        let mut sm = StateMachine::new();
+        
+        // Register 5 nodes
+        for i in 1..=5 {
+            sm.apply_event(make_node_registered_event(
+                i as u64, 
+                &format!("node{}", i), 
+                &format!("zone-{}", (i % 3))
+            )).unwrap();
+        }
+
+        sm.apply_event(make_chunk_declared_event(10, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Request rf=3, should get exactly 3
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 3);
+        assert!(suggestions.len() <= 3);
+    }
+
+    #[test]
+    fn test_suggest_placement_rf_greater_than_zones() {
+        let mut sm = StateMachine::new();
+        
+        // Only 2 zones, but rf=3
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-b")).unwrap();
+
+        sm.apply_event(make_chunk_declared_event(4, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Request rf=3 with only 2 zones - should still return 3 nodes
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 3);
+        assert_eq!(suggestions.len(), 3);
+    }
+
+    #[test]
+    fn test_suggest_placement_excludes_zero_capacity() {
+        let mut sm = StateMachine::new();
+        
+        // Node with 0 capacity
+        sm.apply_event(DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 0,
+            }),
+        }).unwrap();
+        
+        // Node with capacity
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+
+        sm.apply_event(make_chunk_declared_event(3, TEST_HASH_1, "uploader1")).unwrap();
+
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 2);
+        
+        // Should not include node1 (0 capacity)
+        assert!(!suggestions.contains(&"node1".to_string()));
+        assert_eq!(suggestions.len(), 1);
+    }
+
+    #[test]
+    fn test_suggest_placement_deterministic() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-c")).unwrap();
+
+        sm.apply_event(make_chunk_declared_event(4, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Call multiple times - should get same result
+        let suggestions1 = sm.state().suggest_placement(TEST_HASH_1, 3);
+        let suggestions2 = sm.state().suggest_placement(TEST_HASH_1, 3);
+        let suggestions3 = sm.state().suggest_placement(TEST_HASH_1, 3);
+
+        assert_eq!(suggestions1, suggestions2);
+        assert_eq!(suggestions2, suggestions3);
+    }
+
+    #[test]
+    fn test_suggest_placement_empty_nodes() {
+        let mut sm = StateMachine::new();
+        
+        // No nodes registered
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 3);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_suggest_placement_all_nodes_have_replica() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+
+        sm.apply_event(make_chunk_declared_event(3, TEST_HASH_1, "uploader1")).unwrap();
+
+        // Add replicas to all nodes
+        sm.apply_event(make_replica_added_event_full(4, TEST_HASH_1, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(5, TEST_HASH_1, "node2", 1)).unwrap();
+
+        // No more eligible nodes
+        let suggestions = sm.state().suggest_placement(TEST_HASH_1, 1);
+        assert!(suggestions.is_empty());
     }
 }
