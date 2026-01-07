@@ -21,6 +21,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use tracing::debug;
+
 use crate::da_consumer::{DADerivedState, ChunkMeta, ReplicaInfo};
 use crate::NodeInfo;
 
@@ -55,6 +57,75 @@ impl fmt::Display for StateError {
 }
 
 impl std::error::Error for StateError {}
+
+// ════════════════════════════════════════════════════════════════════════════
+// QUERY API FOR DADERIVED STATE
+// ════════════════════════════════════════════════════════════════════════════
+
+impl DADerivedState {
+    /// Get a node by ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The node ID to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Some(&NodeInfo)` - Reference to the node if found
+    /// * `None` - If node does not exist
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    pub fn get_node(&self, id: &str) -> Option<&NodeInfo> {
+        self.node_registry.get(id)
+    }
+
+    /// List all registered nodes.
+    ///
+    /// # Returns
+    ///
+    /// A vector of references to all registered nodes.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic (order may vary based on HashMap)
+    pub fn list_nodes(&self) -> Vec<&NodeInfo> {
+        self.node_registry.values().collect()
+    }
+
+    /// Get all nodes in a specific zone.
+    ///
+    /// # Arguments
+    ///
+    /// * `zone` - The zone ID to look up
+    ///
+    /// # Returns
+    ///
+    /// A vector of references to nodes in the specified zone.
+    /// Returns empty vector if zone does not exist.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    pub fn nodes_in_zone(&self, zone: &str) -> Vec<&NodeInfo> {
+        match self.zone_map.get(zone) {
+            Some(node_ids) => {
+                node_ids
+                    .iter()
+                    .filter_map(|id| self.node_registry.get(id))
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // EVENT TYPES
@@ -216,12 +287,83 @@ pub trait EventHandler: Send + Sync {
 /// Handler for NodeRegistered events.
 struct NodeRegisteredHandler;
 
+impl NodeRegisteredHandler {
+    /// Validate node_id is not empty and not whitespace-only.
+    fn validate_node_id(node_id: &str) -> Result<(), StateError> {
+        if node_id.is_empty() {
+            return Err(StateError::ValidationError("node_id cannot be empty".to_string()));
+        }
+        if node_id.trim().is_empty() {
+            return Err(StateError::ValidationError("node_id cannot be whitespace-only".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Validate addr has valid host:port format.
+    fn validate_addr(addr: &str) -> Result<(), StateError> {
+        if addr.is_empty() {
+            return Err(StateError::ValidationError("addr cannot be empty".to_string()));
+        }
+
+        // Must contain exactly one colon separating host and port
+        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Err(StateError::ValidationError(format!(
+                "addr '{}' must be in host:port format",
+                addr
+            )));
+        }
+
+        let port_str = parts[0];
+        let host = parts[1];
+
+        // Host cannot be empty
+        if host.is_empty() {
+            return Err(StateError::ValidationError(format!(
+                "addr '{}' has empty host",
+                addr
+            )));
+        }
+
+        // Port must be a valid number
+        if port_str.parse::<u16>().is_err() {
+            return Err(StateError::ValidationError(format!(
+                "addr '{}' has invalid port '{}'",
+                addr, port_str
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Remove node from all zones in zone_map.
+    fn remove_node_from_zones(state: &mut DADerivedState, node_id: &str) {
+        for nodes in state.zone_map.values_mut() {
+            nodes.retain(|n| n != node_id);
+        }
+    }
+
+    /// Add node to zone in zone_map.
+    fn add_node_to_zone(state: &mut DADerivedState, zone: &str, node_id: &str) {
+        let nodes = state.zone_map.entry(zone.to_string()).or_insert_with(Vec::new);
+        if !nodes.contains(&node_id.to_string()) {
+            nodes.push(node_id.to_string());
+        }
+    }
+}
+
 impl EventHandler for NodeRegisteredHandler {
     fn handle(&self, state: &mut DADerivedState, event: &DAEvent) -> Result<(), StateError> {
         let payload = match &event.payload {
             DAEventPayload::NodeRegistered(p) => p,
             _ => return Err(StateError::ValidationError("Invalid payload type".to_string())),
         };
+
+        // Validate node_id
+        Self::validate_node_id(&payload.node_id)?;
+
+        // Validate addr
+        Self::validate_addr(&payload.addr)?;
 
         // Idempotency: check if node already exists with same data
         if let Some(existing) = state.node_registry.get(&payload.node_id) {
@@ -230,7 +372,28 @@ impl EventHandler for NodeRegisteredHandler {
                 && existing.capacity_gb == payload.capacity_gb
             {
                 // Already registered with same data - idempotent no-op
+                debug!(
+                    node_id = %payload.node_id,
+                    zone = %payload.zone,
+                    "Node already registered with same data, skipping"
+                );
                 return Ok(());
+            }
+        }
+
+        // Check if node is changing zones
+        let old_zone = state.node_registry.get(&payload.node_id).map(|n| n.zone.clone());
+
+        // Remove node from old zone if it exists and zone is changing
+        if let Some(ref old_z) = old_zone {
+            if old_z != &payload.zone {
+                Self::remove_node_from_zones(state, &payload.node_id);
+                debug!(
+                    node_id = %payload.node_id,
+                    old_zone = %old_z,
+                    new_zone = %payload.zone,
+                    "Node moving zones"
+                );
             }
         }
 
@@ -243,6 +406,15 @@ impl EventHandler for NodeRegisteredHandler {
             meta: serde_json::json!({}),
         };
         state.node_registry.insert(payload.node_id.clone(), node_info);
+
+        // Add node to zone_map
+        Self::add_node_to_zone(state, &payload.zone, &payload.node_id);
+
+        debug!(
+            node_id = %payload.node_id,
+            zone = %payload.zone,
+            "Node registered successfully"
+        );
 
         Ok(())
     }
@@ -1055,5 +1227,404 @@ mod tests {
     fn test_default_impl() {
         let sm = StateMachine::default();
         assert_eq!(sm.sequence(), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // G. NODE REGISTRY FROM DA TESTS (14A.24)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_node_registration_updates_zone_map() {
+        let mut sm = StateMachine::new();
+        let event = make_node_registered_event(1, "node1", "zone-a");
+
+        sm.apply_event(event).unwrap();
+
+        // Node should be in node_registry
+        assert!(sm.state().node_registry.contains_key("node1"));
+
+        // Node should be in zone_map
+        let zone_nodes = sm.state().zone_map.get("zone-a").unwrap();
+        assert!(zone_nodes.contains(&"node1".to_string()));
+    }
+
+    #[test]
+    fn test_node_zone_change_updates_both_maps() {
+        let mut sm = StateMachine::new();
+
+        // Register node in zone-a
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        assert!(sm.state().zone_map.get("zone-a").unwrap().contains(&"node1".to_string()));
+
+        // Move node to zone-b
+        sm.apply_event(DAEvent {
+            sequence: 2,
+            timestamp: 2000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-b".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        }).unwrap();
+
+        // Node should NOT be in zone-a anymore
+        let zone_a_nodes = sm.state().zone_map.get("zone-a");
+        assert!(zone_a_nodes.is_none() || !zone_a_nodes.unwrap().contains(&"node1".to_string()));
+
+        // Node should be in zone-b
+        let zone_b_nodes = sm.state().zone_map.get("zone-b").unwrap();
+        assert!(zone_b_nodes.contains(&"node1".to_string()));
+
+        // Node registry should have updated zone
+        let node = sm.state().node_registry.get("node1").unwrap();
+        assert_eq!(node.zone, "zone-b");
+    }
+
+    #[test]
+    fn test_node_idempotency_with_zone_map() {
+        let mut sm = StateMachine::new();
+        let event = make_node_registered_event(1, "node1", "zone-a");
+
+        // Apply twice
+        sm.apply_event(event.clone()).unwrap();
+        sm.apply_event(event).unwrap();
+
+        // Should still have exactly 1 node in zone
+        let zone_nodes = sm.state().zone_map.get("zone-a").unwrap();
+        assert_eq!(zone_nodes.len(), 1);
+        assert_eq!(sm.state().node_registry.len(), 1);
+    }
+
+    #[test]
+    fn test_validation_empty_node_id() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "host:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("empty"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+
+        // State should not have changed
+        assert!(sm.state().node_registry.is_empty());
+    }
+
+    #[test]
+    fn test_validation_whitespace_node_id() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "   ".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "host:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("whitespace"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+
+        // State should not have changed
+        assert!(sm.state().node_registry.is_empty());
+    }
+
+    #[test]
+    fn test_validation_invalid_addr_no_port() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "hostonly".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("host:port"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+
+        // State should not have changed
+        assert!(sm.state().node_registry.is_empty());
+    }
+
+    #[test]
+    fn test_validation_invalid_addr_invalid_port() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "host:notaport".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("invalid port"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+
+        // State should not have changed
+        assert!(sm.state().node_registry.is_empty());
+    }
+
+    #[test]
+    fn test_validation_empty_addr() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        // State should not have changed
+        assert!(sm.state().node_registry.is_empty());
+    }
+
+    #[test]
+    fn test_validation_addr_empty_host() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: ":7001".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        // State should not have changed
+        assert!(sm.state().node_registry.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // H. QUERY API TESTS (14A.24)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_node() {
+        let mut sm = StateMachine::new();
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+
+        let node = sm.state().get_node("node1");
+        assert!(node.is_some());
+        assert_eq!(node.unwrap().id, "node1");
+        assert_eq!(node.unwrap().zone, "zone-a");
+
+        // Non-existent node
+        assert!(sm.state().get_node("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_list_nodes() {
+        let mut sm = StateMachine::new();
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-a")).unwrap();
+
+        let nodes = sm.state().list_nodes();
+        assert_eq!(nodes.len(), 3);
+
+        let node_ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(node_ids.contains(&"node1"));
+        assert!(node_ids.contains(&"node2"));
+        assert!(node_ids.contains(&"node3"));
+    }
+
+    #[test]
+    fn test_nodes_in_zone() {
+        let mut sm = StateMachine::new();
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+        sm.apply_event(make_node_registered_event(2, "node2", "zone-b")).unwrap();
+        sm.apply_event(make_node_registered_event(3, "node3", "zone-a")).unwrap();
+
+        // Zone-a should have 2 nodes
+        let zone_a_nodes = sm.state().nodes_in_zone("zone-a");
+        assert_eq!(zone_a_nodes.len(), 2);
+        let ids: Vec<&str> = zone_a_nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"node1"));
+        assert!(ids.contains(&"node3"));
+
+        // Zone-b should have 1 node
+        let zone_b_nodes = sm.state().nodes_in_zone("zone-b");
+        assert_eq!(zone_b_nodes.len(), 1);
+        assert_eq!(zone_b_nodes[0].id, "node2");
+
+        // Non-existent zone should return empty
+        let zone_c_nodes = sm.state().nodes_in_zone("zone-c");
+        assert!(zone_c_nodes.is_empty());
+    }
+
+    #[test]
+    fn test_nodes_in_zone_empty() {
+        let sm = StateMachine::new();
+        let nodes = sm.state().nodes_in_zone("any-zone");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_list_nodes_empty() {
+        let sm = StateMachine::new();
+        let nodes = sm.state().list_nodes();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_node_no_duplicate_in_zone_map() {
+        let mut sm = StateMachine::new();
+
+        // Register same node multiple times in same zone
+        for i in 0..5 {
+            sm.apply_event(DAEvent {
+                sequence: i,
+                timestamp: i * 1000,
+                payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                    node_id: "node1".to_string(),
+                    zone: "zone-a".to_string(),
+                    addr: "node1:7001".to_string(),
+                    capacity_gb: 100,
+                }),
+            }).unwrap();
+        }
+
+        // Should still have exactly 1 entry in zone_map
+        let zone_nodes = sm.state().zone_map.get("zone-a").unwrap();
+        assert_eq!(zone_nodes.len(), 1);
+
+        // Should still have exactly 1 node in registry
+        assert_eq!(sm.state().node_registry.len(), 1);
+    }
+
+    #[test]
+    fn test_node_not_in_multiple_zones() {
+        let mut sm = StateMachine::new();
+
+        // Register node in zone-a
+        sm.apply_event(make_node_registered_event(1, "node1", "zone-a")).unwrap();
+
+        // Move to zone-b
+        sm.apply_event(DAEvent {
+            sequence: 2,
+            timestamp: 2000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-b".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        }).unwrap();
+
+        // Move to zone-c
+        sm.apply_event(DAEvent {
+            sequence: 3,
+            timestamp: 3000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-c".to_string(),
+                addr: "node1:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        }).unwrap();
+
+        // Node should only be in zone-c
+        let mut zones_with_node = 0;
+        for (zone, nodes) in sm.state().zone_map.iter() {
+            if nodes.contains(&"node1".to_string()) {
+                zones_with_node += 1;
+                assert_eq!(zone, "zone-c");
+            }
+        }
+        assert_eq!(zones_with_node, 1, "Node should be in exactly one zone");
+    }
+
+    #[test]
+    fn test_valid_addr_with_ipv4() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "192.168.1.1:7001".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+        assert!(result.is_ok());
+        assert_eq!(sm.state().node_registry.len(), 1);
+    }
+
+    #[test]
+    fn test_valid_addr_with_hostname() {
+        let mut sm = StateMachine::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: "node1".to_string(),
+                zone: "zone-a".to_string(),
+                addr: "my-server.example.com:8080".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        let result = sm.apply_event(event);
+        assert!(result.is_ok());
+        assert_eq!(sm.state().node_registry.len(), 1);
     }
 }
