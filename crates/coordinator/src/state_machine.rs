@@ -160,6 +160,56 @@ impl DADerivedState {
     pub fn list_chunks(&self) -> Vec<&ChunkMeta> {
         self.chunk_map.values().collect()
     }
+
+    /// Get all replicas for a chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - The chunk hash to look up
+    ///
+    /// # Returns
+    ///
+    /// A vector of references to replica info for the specified chunk.
+    /// Returns empty vector if chunk does not exist or has no replicas.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    pub fn get_replicas(&self, chunk_hash: &str) -> Vec<&ReplicaInfo> {
+        match self.replica_map.get(chunk_hash) {
+            Some(replicas) => replicas.iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Get all chunk hashes stored on a specific node.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - The node ID to look up
+    ///
+    /// # Returns
+    ///
+    /// A vector of chunk hashes that have replicas on the specified node.
+    /// Returns empty vector if node has no replicas.
+    /// No duplicates guaranteed.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    pub fn chunks_on_node(&self, node_id: &str) -> Vec<String> {
+        let mut chunk_hashes = Vec::new();
+        for (chunk_hash, replicas) in &self.replica_map {
+            if replicas.iter().any(|r| r.node_id == node_id) {
+                chunk_hashes.push(chunk_hash.clone());
+            }
+        }
+        chunk_hashes
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -226,9 +276,14 @@ pub struct ChunkRemovedPayload {
 /// Event payload for replica addition.
 #[derive(Debug, Clone)]
 pub struct ReplicaAddedPayload {
+    /// Hash of the chunk this replica belongs to
     pub chunk_hash: String,
+    /// Node ID where replica is stored
     pub node_id: String,
-    pub created_at: u64,
+    /// Replica index (unique per chunk)
+    pub replica_index: u8,
+    /// Timestamp when replica was added
+    pub added_at: u64,
 }
 
 /// Event payload for replica removal.
@@ -635,6 +690,39 @@ impl EventHandler for ChunkRemovedHandler {
 /// Handler for ReplicaAdded events.
 struct ReplicaAddedHandler;
 
+impl ReplicaAddedHandler {
+    /// Validate that chunk exists in chunk_map.
+    fn validate_chunk_exists(state: &DADerivedState, chunk_hash: &str) -> Result<(), StateError> {
+        if !state.chunk_map.contains_key(chunk_hash) {
+            return Err(StateError::ValidationError(format!(
+                "Chunk '{}' does not exist, cannot add replica",
+                chunk_hash
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check if replica already exists (same node_id and replica_index).
+    fn replica_exists(replicas: &[ReplicaInfo], node_id: &str, replica_index: u8) -> bool {
+        replicas.iter().any(|r| r.node_id == node_id && r.replica_index == replica_index)
+    }
+
+    /// Check for conflicting replica_index (same index, different node).
+    fn has_index_conflict(replicas: &[ReplicaInfo], node_id: &str, replica_index: u8) -> bool {
+        replicas.iter().any(|r| r.replica_index == replica_index && r.node_id != node_id)
+    }
+
+    /// Update current_rf in chunk_map based on replica count.
+    fn update_current_rf(state: &mut DADerivedState, chunk_hash: &str) {
+        if let Some(replicas) = state.replica_map.get(chunk_hash) {
+            let rf = replicas.len().min(255) as u8;
+            if let Some(chunk) = state.chunk_map.get_mut(chunk_hash) {
+                chunk.current_rf = rf;
+            }
+        }
+    }
+}
+
 impl EventHandler for ReplicaAddedHandler {
     fn handle(&self, state: &mut DADerivedState, event: &DAEvent) -> Result<(), StateError> {
         let payload = match &event.payload {
@@ -642,24 +730,49 @@ impl EventHandler for ReplicaAddedHandler {
             _ => return Err(StateError::ValidationError("Invalid payload type".to_string())),
         };
 
-        // Get or create replica list for chunk
+        // Validate chunk exists
+        Self::validate_chunk_exists(state, &payload.chunk_hash)?;
+
+        // Get replica list (must exist because chunk exists)
         let replicas = state.replica_map.entry(payload.chunk_hash.clone()).or_insert_with(Vec::new);
 
-        // Idempotency: check if replica already exists for this node
-        for replica in replicas.iter() {
-            if replica.node_id == payload.node_id {
-                // Already exists - idempotent no-op
-                return Ok(());
-            }
+        // Idempotency: check if exact same replica already exists
+        if Self::replica_exists(replicas, &payload.node_id, payload.replica_index) {
+            debug!(
+                chunk_hash = %payload.chunk_hash,
+                node_id = %payload.node_id,
+                replica_index = %payload.replica_index,
+                "Replica already exists, skipping"
+            );
+            return Ok(());
+        }
+
+        // Check for conflicting replica_index
+        if Self::has_index_conflict(replicas, &payload.node_id, payload.replica_index) {
+            return Err(StateError::ValidationError(format!(
+                "Replica index {} already used by another node for chunk '{}'",
+                payload.replica_index, payload.chunk_hash
+            )));
         }
 
         // Add replica
         let replica_info = ReplicaInfo {
             node_id: payload.node_id.clone(),
-            confirmed: true,
-            created_at: payload.created_at,
+            replica_index: payload.replica_index,
+            added_at: payload.added_at,
+            verified: false,
         };
         replicas.push(replica_info);
+
+        // Update current_rf
+        Self::update_current_rf(state, &payload.chunk_hash);
+
+        debug!(
+            chunk_hash = %payload.chunk_hash,
+            node_id = %payload.node_id,
+            replica_index = %payload.replica_index,
+            "Replica added successfully"
+        );
 
         Ok(())
     }
@@ -668,6 +781,23 @@ impl EventHandler for ReplicaAddedHandler {
 /// Handler for ReplicaRemoved events.
 struct ReplicaRemovedHandler;
 
+impl ReplicaRemovedHandler {
+    /// Update current_rf in chunk_map based on replica count.
+    fn update_current_rf(state: &mut DADerivedState, chunk_hash: &str) {
+        if let Some(replicas) = state.replica_map.get(chunk_hash) {
+            let rf = replicas.len().min(255) as u8;
+            if let Some(chunk) = state.chunk_map.get_mut(chunk_hash) {
+                chunk.current_rf = rf;
+            }
+        } else {
+            // No replicas left - set current_rf to 0
+            if let Some(chunk) = state.chunk_map.get_mut(chunk_hash) {
+                chunk.current_rf = 0;
+            }
+        }
+    }
+}
+
 impl EventHandler for ReplicaRemovedHandler {
     fn handle(&self, state: &mut DADerivedState, event: &DAEvent) -> Result<(), StateError> {
         let payload = match &event.payload {
@@ -675,9 +805,36 @@ impl EventHandler for ReplicaRemovedHandler {
             _ => return Err(StateError::ValidationError("Invalid payload type".to_string())),
         };
 
-        // Idempotency: removing from non-existent chunk is no-op
+        // Check if replica exists before removal
+        let replica_existed = if let Some(replicas) = state.replica_map.get(&payload.chunk_hash) {
+            replicas.iter().any(|r| r.node_id == payload.node_id)
+        } else {
+            false
+        };
+
+        // Idempotency: removing from non-existent chunk/replica is no-op
         if let Some(replicas) = state.replica_map.get_mut(&payload.chunk_hash) {
+            let original_len = replicas.len();
             replicas.retain(|r| r.node_id != payload.node_id);
+            
+            if replicas.len() < original_len {
+                debug!(
+                    chunk_hash = %payload.chunk_hash,
+                    node_id = %payload.node_id,
+                    "Replica removed"
+                );
+            }
+        }
+
+        // Update current_rf
+        Self::update_current_rf(state, &payload.chunk_hash);
+
+        if !replica_existed {
+            debug!(
+                chunk_hash = %payload.chunk_hash,
+                node_id = %payload.node_id,
+                "Replica removal requested but replica did not exist (idempotent no-op)"
+            );
         }
 
         Ok(())
@@ -986,7 +1143,37 @@ mod tests {
             payload: DAEventPayload::ReplicaAdded(ReplicaAddedPayload {
                 chunk_hash: chunk_hash.to_string(),
                 node_id: node_id.to_string(),
-                created_at: seq * 1000,
+                replica_index: 0,  // Default to index 0
+                added_at: seq * 1000,
+            }),
+        }
+    }
+
+    fn make_replica_added_event_full(
+        seq: u64,
+        chunk_hash: &str,
+        node_id: &str,
+        replica_index: u8,
+    ) -> DAEvent {
+        DAEvent {
+            sequence: seq,
+            timestamp: seq * 1000,
+            payload: DAEventPayload::ReplicaAdded(ReplicaAddedPayload {
+                chunk_hash: chunk_hash.to_string(),
+                node_id: node_id.to_string(),
+                replica_index,
+                added_at: seq * 1000,
+            }),
+        }
+    }
+
+    fn make_replica_removed_event(seq: u64, chunk_hash: &str, node_id: &str) -> DAEvent {
+        DAEvent {
+            sequence: seq,
+            timestamp: seq * 1000,
+            payload: DAEventPayload::ReplicaRemoved(ReplicaRemovedPayload {
+                chunk_hash: chunk_hash.to_string(),
+                node_id: node_id.to_string(),
             }),
         }
     }
@@ -2085,5 +2272,297 @@ mod tests {
         // current_rf should still be 0
         let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
         assert_eq!(chunk.current_rf, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // J. REPLICA MAP TESTS (14A.26)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_replica_added_basic() {
+        let mut sm = StateMachine::new();
+        
+        // First declare chunk
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        
+        // Add replica
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
+
+        // Verify replica added
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(replicas[0].node_id, "node1");
+        assert_eq!(replicas[0].replica_index, 0);
+        assert!(!replicas[0].verified);
+
+        // Verify current_rf updated
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.current_rf, 1);
+    }
+
+    #[test]
+    fn test_replica_added_multiple() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event_full(2, TEST_HASH_1, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node2", 1)).unwrap();
+        sm.apply_event(make_replica_added_event_full(4, TEST_HASH_1, "node3", 2)).unwrap();
+
+        // Verify all replicas added
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(replicas.len(), 3);
+
+        // Verify current_rf updated
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.current_rf, 3);
+    }
+
+    #[test]
+    fn test_replica_added_idempotency() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        
+        let event = make_replica_added_event(2, TEST_HASH_1, "node1");
+        sm.apply_event(event.clone()).unwrap();
+        sm.apply_event(event).unwrap();
+
+        // Should still have exactly 1 replica
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(replicas.len(), 1);
+
+        // current_rf should be 1
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.current_rf, 1);
+    }
+
+    #[test]
+    fn test_replica_added_chunk_not_exist() {
+        let mut sm = StateMachine::new();
+        
+        // Try to add replica to non-existent chunk
+        let result = sm.apply_event(make_replica_added_event(1, TEST_HASH_1, "node1"));
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("does not exist"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+
+        // State should not have changed
+        assert!(sm.state().replica_map.is_empty());
+    }
+
+    #[test]
+    fn test_replica_added_index_conflict() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event_full(2, TEST_HASH_1, "node1", 0)).unwrap();
+
+        // Try to add another replica with same index but different node
+        let result = sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node2", 0));
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("already used"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+
+        // Should still have only 1 replica
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(replicas.len(), 1);
+    }
+
+    #[test]
+    fn test_replica_removed_basic() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
+        
+        // Verify replica exists
+        assert_eq!(sm.state().get_replicas(TEST_HASH_1).len(), 1);
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 1);
+
+        // Remove replica
+        sm.apply_event(make_replica_removed_event(3, TEST_HASH_1, "node1")).unwrap();
+
+        // Verify replica removed
+        assert_eq!(sm.state().get_replicas(TEST_HASH_1).len(), 0);
+        
+        // Verify current_rf updated
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 0);
+    }
+
+    #[test]
+    fn test_replica_removed_idempotency() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
+        sm.apply_event(make_replica_removed_event(3, TEST_HASH_1, "node1")).unwrap();
+
+        // Remove again - should be no-op
+        let result = sm.apply_event(make_replica_removed_event(4, TEST_HASH_1, "node1"));
+        assert!(result.is_ok());
+
+        // current_rf should still be 0
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 0);
+    }
+
+    #[test]
+    fn test_replica_removed_nonexistent_chunk() {
+        let mut sm = StateMachine::new();
+        
+        // Remove from non-existent chunk - should be no-op
+        let result = sm.apply_event(make_replica_removed_event(1, TEST_HASH_1, "node1"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_replica_removed_nonexistent_replica() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
+
+        // Remove non-existent replica - should be no-op
+        let result = sm.apply_event(make_replica_removed_event(3, TEST_HASH_1, "node2"));
+        assert!(result.is_ok());
+
+        // node1 replica should still exist
+        assert_eq!(sm.state().get_replicas(TEST_HASH_1).len(), 1);
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 1);
+    }
+
+    #[test]
+    fn test_replica_add_remove_add_consistency() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        
+        // Add
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 1);
+
+        // Remove
+        sm.apply_event(make_replica_removed_event(3, TEST_HASH_1, "node1")).unwrap();
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 0);
+
+        // Add again (same node)
+        sm.apply_event(make_replica_added_event(4, TEST_HASH_1, "node1")).unwrap();
+        assert_eq!(sm.state().get_chunk(TEST_HASH_1).unwrap().current_rf, 1);
+    }
+
+    #[test]
+    fn test_get_replicas_query() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event_full(2, TEST_HASH_1, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node2", 1)).unwrap();
+
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(replicas.len(), 2);
+
+        let node_ids: Vec<&str> = replicas.iter().map(|r| r.node_id.as_str()).collect();
+        assert!(node_ids.contains(&"node1"));
+        assert!(node_ids.contains(&"node2"));
+
+        // Non-existent chunk
+        let empty = sm.state().get_replicas(TEST_HASH_2);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_chunks_on_node_query() {
+        let mut sm = StateMachine::new();
+        
+        // Create two chunks
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_chunk_declared_event(2, TEST_HASH_2, "uploader2")).unwrap();
+        sm.apply_event(make_chunk_declared_event(3, TEST_HASH_3, "uploader3")).unwrap();
+
+        // Add replicas: node1 has chunks 1 and 2, node2 has only chunk 2
+        sm.apply_event(make_replica_added_event_full(4, TEST_HASH_1, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(5, TEST_HASH_2, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(6, TEST_HASH_2, "node2", 1)).unwrap();
+
+        // Check node1
+        let node1_chunks = sm.state().chunks_on_node("node1");
+        assert_eq!(node1_chunks.len(), 2);
+        assert!(node1_chunks.contains(&TEST_HASH_1.to_string()));
+        assert!(node1_chunks.contains(&TEST_HASH_2.to_string()));
+
+        // Check node2
+        let node2_chunks = sm.state().chunks_on_node("node2");
+        assert_eq!(node2_chunks.len(), 1);
+        assert!(node2_chunks.contains(&TEST_HASH_2.to_string()));
+
+        // Check non-existent node
+        let empty = sm.state().chunks_on_node("node3");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_chunks_on_node_no_duplicates() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_replica_added_event_full(2, TEST_HASH_1, "node1", 0)).unwrap();
+        
+        // Even if we try to add same replica twice (idempotent), no duplicates
+        sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node1", 0)).unwrap();
+
+        let chunks = sm.state().chunks_on_node("node1");
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_replica_info_struct() {
+        let info = ReplicaInfo {
+            node_id: "node1".to_string(),
+            replica_index: 2,
+            added_at: 1234567890,
+            verified: true,
+        };
+
+        assert_eq!(info.node_id, "node1");
+        assert_eq!(info.replica_index, 2);
+        assert_eq!(info.added_at, 1234567890);
+        assert!(info.verified);
+    }
+
+    #[test]
+    fn test_current_rf_invariant() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        
+        // Add 3 replicas
+        sm.apply_event(make_replica_added_event_full(2, TEST_HASH_1, "node1", 0)).unwrap();
+        sm.apply_event(make_replica_added_event_full(3, TEST_HASH_1, "node2", 1)).unwrap();
+        sm.apply_event(make_replica_added_event_full(4, TEST_HASH_1, "node3", 2)).unwrap();
+        
+        // Invariant: current_rf == replica_map.len()
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(chunk.current_rf as usize, replicas.len());
+        assert_eq!(chunk.current_rf, 3);
+
+        // Remove 1 replica
+        sm.apply_event(make_replica_removed_event(5, TEST_HASH_1, "node2")).unwrap();
+        
+        // Invariant still holds
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        let replicas = sm.state().get_replicas(TEST_HASH_1);
+        assert_eq!(chunk.current_rf as usize, replicas.len());
+        assert_eq!(chunk.current_rf, 2);
     }
 }

@@ -63,14 +63,16 @@ pub struct ChunkMeta {
 /// Information about a replica of a chunk.
 ///
 /// Tracks where replicas are stored and their status.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaInfo {
     /// Node ID where replica is stored
     pub node_id: String,
-    /// Whether replica is confirmed healthy
-    pub confirmed: bool,
-    /// Timestamp when replica was created
-    pub created_at: u64,
+    /// Replica index (unique per chunk)
+    pub replica_index: u8,
+    /// Timestamp when replica was added (from DA event)
+    pub added_at: u64,
+    /// Whether replica has been verified
+    pub verified: bool,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -467,13 +469,15 @@ mod tests {
     fn test_replica_info_creation() {
         let replica = ReplicaInfo {
             node_id: "node1".to_string(),
-            confirmed: true,
-            created_at: 1234567890,
+            replica_index: 0,
+            added_at: 1234567890,
+            verified: true,
         };
 
         assert_eq!(replica.node_id, "node1");
-        assert!(replica.confirmed);
-        assert_eq!(replica.created_at, 1234567890);
+        assert_eq!(replica.replica_index, 0);
+        assert_eq!(replica.added_at, 1234567890);
+        assert!(replica.verified);
     }
 
     // ════════════════════════════════════════════════════════════════════════
