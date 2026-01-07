@@ -22,10 +22,12 @@
 //! assert_eq!(data, b"test data");
 //! ```
 
-use crate::da::{Blob, BlobRef, BlobStream, DAError, DAHealthStatus};
+use crate::da::{Blob, BlobRef, BlobStream, DAError, DAHealthStatus, DALayer};
 use rand::Rng;
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::sync::Arc;
@@ -514,6 +516,119 @@ impl MockDA {
 impl Default for MockDA {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DALAYER TRAIT IMPLEMENTATION
+// ════════════════════════════════════════════════════════════════════════════
+
+impl DALayer for MockDA {
+    fn post_blob<'a>(&'a self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Simulate latency (async, non-blocking)
+            self.simulate_latency().await;
+
+            // Check for simulated failure
+            if self.should_fail() {
+                warn!("MockDA: simulated failure on post_blob");
+                return Err(DAError::Unavailable);
+            }
+
+            let height = self.next_height.fetch_add(1, Ordering::SeqCst);
+            let _index = self.next_index.fetch_add(1, Ordering::SeqCst);
+
+            // Compute commitment
+            let commitment = Self::compute_commitment(data);
+
+            let blob_ref = BlobRef {
+                height,
+                commitment,
+                namespace: self.namespace,
+            };
+
+            // Store blob
+            self.blobs
+                .write()
+                .unwrap()
+                .insert(blob_ref.clone(), data.to_vec());
+
+            debug!(
+                height,
+                commitment = ?hex::encode(&commitment[..8]),
+                "MockDA: posted blob"
+            );
+
+            Ok(blob_ref)
+        })
+    }
+
+    fn get_blob<'a>(&'a self, ref_: &'a BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Simulate latency (async, non-blocking)
+            self.simulate_latency().await;
+
+            // Check for simulated failure
+            if self.should_fail() {
+                warn!("MockDA: simulated failure on get_blob");
+                return Err(DAError::Unavailable);
+            }
+
+            // Retrieve blob
+            let blobs = self.blobs.read().unwrap();
+            match blobs.get(ref_) {
+                Some(data) => {
+                    debug!(
+                        height = ref_.height,
+                        commitment = ?hex::encode(&ref_.commitment[..8]),
+                        "MockDA: retrieved blob"
+                    );
+                    Ok(data.clone())
+                }
+                None => {
+                    debug!(
+                        height = ref_.height,
+                        commitment = ?hex::encode(&ref_.commitment[..8]),
+                        "MockDA: blob not found"
+                    );
+                    Err(DAError::BlobNotFound(ref_.clone()))
+                }
+            }
+        })
+    }
+
+    fn subscribe_blobs(&self, _from_height: Option<u64>) -> Pin<Box<dyn Future<Output = Result<BlobStream, DAError>> + Send + '_>> {
+        // NOTE: subscribe_blobs via DALayer trait cannot work because:
+        // - BlobStream is 'static (no lifetime parameter)
+        // - We only have &self, not Arc<Self>
+        // - Cannot capture &self in a 'static stream
+        //
+        // Use Arc<MockDA>::subscribe_blobs() directly for subscription functionality.
+        Box::pin(async move {
+            Err(DAError::Other(
+                "subscribe_blobs via trait requires Arc<MockDA>. Use MockDA::subscribe_blobs() directly.".to_string()
+            ))
+        })
+    }
+
+    fn health_check(&self) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>> {
+        Box::pin(async move {
+            // Simulate latency
+            self.simulate_latency().await;
+
+            // Check for simulated failure
+            if self.should_fail() {
+                warn!("MockDA: simulated failure on health_check");
+                return Ok(DAHealthStatus::Unavailable);
+            }
+
+            // Check for degraded status based on latency
+            if self.latency_ms > 500 {
+                return Ok(DAHealthStatus::Degraded);
+            }
+
+            Ok(DAHealthStatus::Healthy)
+        })
     }
 }
 

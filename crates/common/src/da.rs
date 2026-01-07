@@ -5,6 +5,7 @@
 //! DSDN berinteraksi dengan berbagai backend DA secara seragam tanpa
 //! terikat pada implementasi spesifik.
 
+use std::future::Future;
 use std::pin::Pin;
 use futures::Stream;
 
@@ -360,7 +361,7 @@ pub trait DALayer: Send + Sync {
     ///
     /// Method ini TIDAK melakukan validasi terhadap isi data.
     /// Validasi semantik adalah tanggung jawab caller.
-    fn post_blob(&self, data: &[u8]) -> impl std::future::Future<Output = Result<BlobRef, DAError>> + Send;
+    fn post_blob<'a>(&'a self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + 'a>>;
 
     /// Mengambil blob dari DA layer berdasarkan referensi.
     ///
@@ -400,7 +401,7 @@ pub trait DALayer: Send + Sync {
     /// 
     /// Jika validasi gagal, kembalikan error yang sesuai tanpa
     /// mengembalikan data yang tidak valid.
-    fn get_blob(&self, blob_ref: &BlobRef) -> impl std::future::Future<Output = Result<Vec<u8>, DAError>> + Send;
+    fn get_blob<'a>(&'a self, blob_ref: &'a BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + 'a>>;
 
     /// Subscribe ke stream blob baru di DA layer.
     ///
@@ -430,7 +431,7 @@ pub trait DALayer: Send + Sync {
     ///
     /// Blob dijamin terurut berdasarkan height. Blob dengan height
     /// lebih rendah akan di-yield sebelum blob dengan height lebih tinggi.
-    fn subscribe_blobs(&self, from_height: Option<u64>) -> impl std::future::Future<Output = Result<BlobStream, DAError>> + Send;
+    fn subscribe_blobs(&self, from_height: Option<u64>) -> Pin<Box<dyn Future<Output = Result<BlobStream, DAError>> + Send + '_>>;
 
     /// Memeriksa kesehatan koneksi ke DA layer.
     ///
@@ -454,7 +455,7 @@ pub trait DALayer: Send + Sync {
     /// - Memiliki timeout internal yang reasonable
     /// - Tidak block lebih dari beberapa detik
     /// - Menggunakan request ringan (minimal overhead)
-    fn health_check(&self) -> impl std::future::Future<Output = Result<DAHealthStatus, DAError>> + Send;
+    fn health_check(&self) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>>;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

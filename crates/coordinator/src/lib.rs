@@ -1,4 +1,11 @@
-//! Coordinator library: in-memory registry, placement and scheduling logic.
+//! Coordinator library: in-memory registry, placement, scheduling, and DA consumption.
+//!
+//! This crate provides the core Coordinator functionality for DSDN:
+//!
+//! - **Node Registry**: Track registered storage nodes
+//! - **Object Placement**: Consistent hashing for replica placement
+//! - **Scheduling**: Score-based node selection for workloads
+//! - **DA Consumer**: Event consumption from Data Availability layer
 
 use std::collections::HashMap;
 use parking_lot::RwLock;
@@ -8,7 +15,10 @@ use serde::{Serialize, Deserialize};
 use dsdn_common::consistent_hash::NodeDesc;
 
 pub mod scheduler;
+pub mod da_consumer;
+
 pub use scheduler::{NodeStats, Workload, Scheduler};
+pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]

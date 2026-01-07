@@ -6,13 +6,15 @@
 //! Tahap ini berisi inisialisasi, wiring, manajemen namespace, dan
 //! operasi `post_blob` dan `get_blob` untuk mengirim/mengambil data dari Celestia.
 
-use crate::da::{BlobRef, DAConfig, DAError, DAHealthStatus};
+use crate::da::{BlobRef, DAConfig, DAError, DAHealthStatus, DALayer};
+use crate::da::BlobStream as DABlobStream;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use sha3::Sha3_256;
 use std::collections::HashSet;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1755,6 +1757,45 @@ impl BlobSubscription {
                 }
             }
         }))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DALAYER TRAIT IMPLEMENTATION
+// ════════════════════════════════════════════════════════════════════════════
+
+impl DALayer for CelestiaDA {
+    fn post_blob<'a>(&'a self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Delegate to inherent method
+            CelestiaDA::post_blob(self, data).await
+        })
+    }
+
+    fn get_blob<'a>(&'a self, blob_ref: &'a BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Delegate to inherent method
+            CelestiaDA::get_blob(self, blob_ref).await
+        })
+    }
+
+    fn subscribe_blobs(&self, _from_height: Option<u64>) -> Pin<Box<dyn Future<Output = Result<DABlobStream, DAError>> + Send + '_>> {
+        Box::pin(async move {
+            // CelestiaDA needs Arc<Self> for subscribe_blobs
+            // Since we only have &self, we cannot call the inherent method directly
+            // Return an error indicating this limitation
+            Err(DAError::Other(
+                "subscribe_blobs via trait requires Arc<CelestiaDA>. Use CelestiaDA::subscribe_blobs() directly.".to_string()
+            ))
+        })
+    }
+
+    fn health_check(&self) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>> {
+        Box::pin(async move {
+            // Delegate to inherent method and wrap in Ok
+            let status = CelestiaDA::health_check(self).await;
+            Ok(status)
+        })
     }
 }
 
