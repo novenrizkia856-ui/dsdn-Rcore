@@ -40,15 +40,24 @@ use crate::NodeInfo;
 
 /// Metadata for a stored chunk.
 ///
-/// Represents information about a data chunk in the storage network.
-#[derive(Debug, Clone)]
+/// This struct represents the authoritative metadata for a chunk as declared
+/// on the DA layer. It is the primary identity for data in the storage network.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkMeta {
-    /// Content hash of the chunk
+    /// Content hash of the chunk (hex-encoded, primary identifier)
     pub hash: String,
-    /// Size in bytes
-    pub size: u64,
-    /// Owner or creator identifier
-    pub owner: String,
+    /// Size of the chunk in bytes
+    pub size_bytes: u64,
+    /// Target replication factor (desired number of replicas)
+    pub replication_factor: u8,
+    /// ID of the uploader who declared the chunk
+    pub uploader_id: String,
+    /// Timestamp when the chunk was declared (from DA event)
+    pub declared_at: u64,
+    /// DA layer commitment (32 bytes, e.g., Celestia blob commitment)
+    pub da_commitment: [u8; 32],
+    /// Current replication factor (derived field, initially 0)
+    pub current_rf: u8,
 }
 
 /// Information about a replica of a chunk.
@@ -437,13 +446,21 @@ mod tests {
     fn test_chunk_meta_creation() {
         let meta = ChunkMeta {
             hash: "abc123".to_string(),
-            size: 1024,
-            owner: "user1".to_string(),
+            size_bytes: 1024,
+            replication_factor: 3,
+            uploader_id: "user1".to_string(),
+            declared_at: 1234567890,
+            da_commitment: [0u8; 32],
+            current_rf: 0,
         };
 
         assert_eq!(meta.hash, "abc123");
-        assert_eq!(meta.size, 1024);
-        assert_eq!(meta.owner, "user1");
+        assert_eq!(meta.size_bytes, 1024);
+        assert_eq!(meta.replication_factor, 3);
+        assert_eq!(meta.uploader_id, "user1");
+        assert_eq!(meta.declared_at, 1234567890);
+        assert_eq!(meta.da_commitment, [0u8; 32]);
+        assert_eq!(meta.current_rf, 0);
     }
 
     #[test]

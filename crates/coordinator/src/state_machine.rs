@@ -125,6 +125,41 @@ impl DADerivedState {
             None => Vec::new(),
         }
     }
+
+    /// Get a chunk by hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The chunk hash to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Some(&ChunkMeta)` - Reference to the chunk metadata if found
+    /// * `None` - If chunk does not exist
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic
+    pub fn get_chunk(&self, hash: &str) -> Option<&ChunkMeta> {
+        self.chunk_map.get(hash)
+    }
+
+    /// List all declared chunks.
+    ///
+    /// # Returns
+    ///
+    /// A vector of references to all chunk metadata.
+    ///
+    /// # Guarantees
+    ///
+    /// - Read-only: does not mutate state
+    /// - Does NOT panic
+    /// - Deterministic (order may vary based on HashMap)
+    pub fn list_chunks(&self) -> Vec<&ChunkMeta> {
+        self.chunk_map.values().collect()
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -170,9 +205,16 @@ pub struct NodeUnregisteredPayload {
 /// Event payload for chunk declaration.
 #[derive(Debug, Clone)]
 pub struct ChunkDeclaredPayload {
+    /// Hash of the chunk (hex-encoded, e.g., SHA-256 = 64 hex chars)
     pub chunk_hash: String,
-    pub size: u64,
-    pub owner: String,
+    /// Size of chunk in bytes
+    pub size_bytes: u64,
+    /// Target replication factor
+    pub replication_factor: u8,
+    /// ID of the uploader
+    pub uploader_id: String,
+    /// DA layer commitment (32 bytes)
+    pub da_commitment: [u8; 32],
 }
 
 /// Event payload for chunk removal.
@@ -445,6 +487,69 @@ impl EventHandler for NodeUnregisteredHandler {
 /// Handler for ChunkDeclared events.
 struct ChunkDeclaredHandler;
 
+impl ChunkDeclaredHandler {
+    /// Validate chunk_hash is valid hex and correct length for SHA-256.
+    fn validate_chunk_hash(hash: &str) -> Result<(), StateError> {
+        if hash.is_empty() {
+            return Err(StateError::ValidationError("chunk_hash cannot be empty".to_string()));
+        }
+
+        // SHA-256 produces 32 bytes = 64 hex characters
+        if hash.len() != 64 {
+            return Err(StateError::ValidationError(format!(
+                "chunk_hash must be 64 hex characters (SHA-256), got {} chars",
+                hash.len()
+            )));
+        }
+
+        // Validate hex format
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(StateError::ValidationError(format!(
+                "chunk_hash '{}' contains invalid hex characters",
+                hash
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validate size_bytes is greater than 0.
+    fn validate_size(size_bytes: u64) -> Result<(), StateError> {
+        if size_bytes == 0 {
+            return Err(StateError::ValidationError("size_bytes must be > 0".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Validate replication_factor is greater than 0.
+    fn validate_replication_factor(rf: u8) -> Result<(), StateError> {
+        if rf == 0 {
+            return Err(StateError::ValidationError("replication_factor must be > 0".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Validate uploader_id is not empty.
+    fn validate_uploader_id(uploader_id: &str) -> Result<(), StateError> {
+        if uploader_id.is_empty() {
+            return Err(StateError::ValidationError("uploader_id cannot be empty".to_string()));
+        }
+        if uploader_id.trim().is_empty() {
+            return Err(StateError::ValidationError("uploader_id cannot be whitespace-only".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Check if two ChunkMeta are identical (for idempotency).
+    fn chunks_match(existing: &ChunkMeta, payload: &ChunkDeclaredPayload, timestamp: u64) -> bool {
+        existing.size_bytes == payload.size_bytes
+            && existing.replication_factor == payload.replication_factor
+            && existing.uploader_id == payload.uploader_id
+            && existing.da_commitment == payload.da_commitment
+            && existing.declared_at == timestamp
+    }
+}
+
 impl EventHandler for ChunkDeclaredHandler {
     fn handle(&self, state: &mut DADerivedState, event: &DAEvent) -> Result<(), StateError> {
         let payload = match &event.payload {
@@ -452,24 +557,58 @@ impl EventHandler for ChunkDeclaredHandler {
             _ => return Err(StateError::ValidationError("Invalid payload type".to_string())),
         };
 
-        // Idempotency: check if chunk already exists with same data
+        // Validate chunk_hash
+        Self::validate_chunk_hash(&payload.chunk_hash)?;
+
+        // Validate size_bytes
+        Self::validate_size(payload.size_bytes)?;
+
+        // Validate replication_factor
+        Self::validate_replication_factor(payload.replication_factor)?;
+
+        // Validate uploader_id
+        Self::validate_uploader_id(&payload.uploader_id)?;
+
+        // Check if chunk already exists
         if let Some(existing) = state.chunk_map.get(&payload.chunk_hash) {
-            if existing.size == payload.size && existing.owner == payload.owner {
+            // Check if this is truly idempotent (same data)
+            if Self::chunks_match(existing, payload, event.timestamp) {
                 // Already declared with same data - idempotent no-op
+                debug!(
+                    chunk_hash = %payload.chunk_hash,
+                    replication_factor = %payload.replication_factor,
+                    "Chunk already declared with same data, skipping"
+                );
                 return Ok(());
+            } else {
+                // Conflict: same hash, different metadata
+                return Err(StateError::ValidationError(format!(
+                    "Chunk '{}' already exists with different metadata (conflict detected)",
+                    payload.chunk_hash
+                )));
             }
         }
 
-        // Declare chunk
+        // Declare new chunk
         let chunk_meta = ChunkMeta {
             hash: payload.chunk_hash.clone(),
-            size: payload.size,
-            owner: payload.owner.clone(),
+            size_bytes: payload.size_bytes,
+            replication_factor: payload.replication_factor,
+            uploader_id: payload.uploader_id.clone(),
+            declared_at: event.timestamp,
+            da_commitment: payload.da_commitment,
+            current_rf: 0, // Initially no replicas
         };
         state.chunk_map.insert(payload.chunk_hash.clone(), chunk_meta);
 
-        // Initialize empty replica list if not exists
+        // Initialize empty replica list
         state.replica_map.entry(payload.chunk_hash.clone()).or_insert_with(Vec::new);
+
+        debug!(
+            chunk_hash = %payload.chunk_hash,
+            replication_factor = %payload.replication_factor,
+            "Chunk declared successfully"
+        );
 
         Ok(())
     }
@@ -761,6 +900,11 @@ impl Default for StateMachine {
 mod tests {
     use super::*;
 
+    // Valid SHA-256 hex hashes for testing (64 characters each)
+    const TEST_HASH_1: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const TEST_HASH_2: &str = "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3";
+    const TEST_HASH_3: &str = "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+
     // ════════════════════════════════════════════════════════════════════════
     // HELPER FUNCTIONS
     // ════════════════════════════════════════════════════════════════════════
@@ -788,14 +932,49 @@ mod tests {
         }
     }
 
-    fn make_chunk_declared_event(seq: u64, chunk_hash: &str, owner: &str) -> DAEvent {
+    /// Helper to create a valid 64-char hex hash for tests
+    fn make_valid_hash(prefix: &str) -> String {
+        let base = prefix.as_bytes();
+        let mut hash = String::with_capacity(64);
+        for i in 0..64 {
+            let c = base[i % base.len()];
+            let hex_char = format!("{:x}", c % 16);
+            hash.push_str(&hex_char);
+        }
+        hash
+    }
+
+    fn make_chunk_declared_event(seq: u64, chunk_hash: &str, uploader_id: &str) -> DAEvent {
         DAEvent {
             sequence: seq,
             timestamp: seq * 1000,
             payload: DAEventPayload::ChunkDeclared(ChunkDeclaredPayload {
                 chunk_hash: chunk_hash.to_string(),
-                size: 1024,
-                owner: owner.to_string(),
+                size_bytes: 1024,
+                replication_factor: 3,
+                uploader_id: uploader_id.to_string(),
+                da_commitment: [0u8; 32],
+            }),
+        }
+    }
+
+    fn make_chunk_declared_event_full(
+        seq: u64,
+        chunk_hash: &str,
+        size_bytes: u64,
+        replication_factor: u8,
+        uploader_id: &str,
+        da_commitment: [u8; 32],
+    ) -> DAEvent {
+        DAEvent {
+            sequence: seq,
+            timestamp: seq * 1000,
+            payload: DAEventPayload::ChunkDeclared(ChunkDeclaredPayload {
+                chunk_hash: chunk_hash.to_string(),
+                size_bytes,
+                replication_factor,
+                uploader_id: uploader_id.to_string(),
+                da_commitment,
             }),
         }
     }
@@ -857,14 +1036,14 @@ mod tests {
     #[test]
     fn test_apply_chunk_declared() {
         let mut sm = StateMachine::new();
-        let event = make_chunk_declared_event(1, "hash123", "owner1");
+        let event = make_chunk_declared_event(1, TEST_HASH_1, "owner1");
 
         let result = sm.apply_event(event);
 
         assert!(result.is_ok());
         assert_eq!(sm.state().chunk_map.len(), 1);
-        assert!(sm.state().chunk_map.contains_key("hash123"));
-        assert!(sm.state().replica_map.contains_key("hash123"));
+        assert!(sm.state().chunk_map.contains_key(TEST_HASH_1));
+        assert!(sm.state().replica_map.contains_key(TEST_HASH_1));
     }
 
     #[test]
@@ -872,12 +1051,12 @@ mod tests {
         let mut sm = StateMachine::new();
 
         // Declare chunk first
-        sm.apply_event(make_chunk_declared_event(1, "hash123", "owner1")).unwrap();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "owner1")).unwrap();
 
         // Add replica
-        sm.apply_event(make_replica_added_event(2, "hash123", "node1")).unwrap();
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
 
-        let replicas = sm.state().replica_map.get("hash123").unwrap();
+        let replicas = sm.state().replica_map.get(TEST_HASH_1).unwrap();
         assert_eq!(replicas.len(), 1);
         assert_eq!(replicas[0].node_id, "node1");
     }
@@ -932,7 +1111,7 @@ mod tests {
     #[test]
     fn test_chunk_declared_idempotent() {
         let mut sm = StateMachine::new();
-        let event = make_chunk_declared_event(1, "hash123", "owner1");
+        let event = make_chunk_declared_event(1, TEST_HASH_1, "owner1");
 
         // Apply twice
         sm.apply_event(event.clone()).unwrap();
@@ -946,14 +1125,14 @@ mod tests {
     fn test_replica_added_idempotent() {
         let mut sm = StateMachine::new();
 
-        sm.apply_event(make_chunk_declared_event(1, "hash123", "owner1")).unwrap();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "owner1")).unwrap();
 
-        let replica_event = make_replica_added_event(2, "hash123", "node1");
+        let replica_event = make_replica_added_event(2, TEST_HASH_1, "node1");
         sm.apply_event(replica_event.clone()).unwrap();
         sm.apply_event(replica_event).unwrap();
 
         // Should still have exactly 1 replica
-        let replicas = sm.state().replica_map.get("hash123").unwrap();
+        let replicas = sm.state().replica_map.get(TEST_HASH_1).unwrap();
         assert_eq!(replicas.len(), 1);
     }
 
@@ -995,8 +1174,8 @@ mod tests {
         let events = vec![
             make_node_registered_event(1, "node1", "zone-a"),
             make_node_registered_event(2, "node2", "zone-b"),
-            make_chunk_declared_event(3, "hash123", "owner1"),
-            make_replica_added_event(4, "hash123", "node1"),
+            make_chunk_declared_event(3, TEST_HASH_1, "owner1"),
+            make_replica_added_event(4, TEST_HASH_1, "node1"),
         ];
 
         let result = sm.apply_batch(events);
@@ -1004,7 +1183,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(sm.state().node_registry.len(), 2);
         assert_eq!(sm.state().chunk_map.len(), 1);
-        assert_eq!(sm.state().replica_map.get("hash123").unwrap().len(), 1);
+        assert_eq!(sm.state().replica_map.get(TEST_HASH_1).unwrap().len(), 1);
         assert_eq!(sm.sequence(), 4);
     }
 
@@ -1030,7 +1209,7 @@ mod tests {
 
         let events = vec![
             make_node_registered_event(1, "node1", "zone-a"),
-            make_chunk_declared_event(2, "hash123", "owner1"),
+            make_chunk_declared_event(2, TEST_HASH_1, "owner1"),
         ];
 
         // Apply batch twice
@@ -1161,12 +1340,12 @@ mod tests {
     fn test_multiple_replicas_per_chunk() {
         let mut sm = StateMachine::new();
 
-        sm.apply_event(make_chunk_declared_event(1, "hash123", "owner1")).unwrap();
-        sm.apply_event(make_replica_added_event(2, "hash123", "node1")).unwrap();
-        sm.apply_event(make_replica_added_event(3, "hash123", "node2")).unwrap();
-        sm.apply_event(make_replica_added_event(4, "hash123", "node3")).unwrap();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "owner1")).unwrap();
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
+        sm.apply_event(make_replica_added_event(3, TEST_HASH_1, "node2")).unwrap();
+        sm.apply_event(make_replica_added_event(4, TEST_HASH_1, "node3")).unwrap();
 
-        let replicas = sm.state().replica_map.get("hash123").unwrap();
+        let replicas = sm.state().replica_map.get(TEST_HASH_1).unwrap();
         assert_eq!(replicas.len(), 3);
     }
 
@@ -1186,24 +1365,24 @@ mod tests {
     fn test_chunk_removal_clears_replicas() {
         let mut sm = StateMachine::new();
 
-        sm.apply_event(make_chunk_declared_event(1, "hash123", "owner1")).unwrap();
-        sm.apply_event(make_replica_added_event(2, "hash123", "node1")).unwrap();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "owner1")).unwrap();
+        sm.apply_event(make_replica_added_event(2, TEST_HASH_1, "node1")).unwrap();
 
         // Verify replica exists
-        assert!(sm.state().replica_map.contains_key("hash123"));
+        assert!(sm.state().replica_map.contains_key(TEST_HASH_1));
 
         // Remove chunk
         sm.apply_event(DAEvent {
             sequence: 3,
             timestamp: 3000,
             payload: DAEventPayload::ChunkRemoved(ChunkRemovedPayload {
-                chunk_hash: "hash123".to_string(),
+                chunk_hash: TEST_HASH_1.to_string(),
             }),
         }).unwrap();
 
         // Both chunk and replicas should be gone
-        assert!(!sm.state().chunk_map.contains_key("hash123"));
-        assert!(!sm.state().replica_map.contains_key("hash123"));
+        assert!(!sm.state().chunk_map.contains_key(TEST_HASH_1));
+        assert!(!sm.state().replica_map.contains_key(TEST_HASH_1));
     }
 
     #[test]
@@ -1626,5 +1805,285 @@ mod tests {
         let result = sm.apply_event(event);
         assert!(result.is_ok());
         assert_eq!(sm.state().node_registry.len(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // I. CHUNK MAP TESTS (14A.25)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_chunk_declaration_basic() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event(1, TEST_HASH_1, "uploader1");
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_ok());
+        assert_eq!(sm.state().chunk_map.len(), 1);
+        
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.hash, TEST_HASH_1);
+        assert_eq!(chunk.size_bytes, 1024);
+        assert_eq!(chunk.replication_factor, 3);
+        assert_eq!(chunk.uploader_id, "uploader1");
+        assert_eq!(chunk.current_rf, 0); // Initially 0
+        assert_eq!(chunk.declared_at, 1000); // seq * 1000
+    }
+
+    #[test]
+    fn test_chunk_declaration_initializes_replica_map() {
+        let mut sm = StateMachine::new();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+
+        // replica_map should have entry but be empty
+        assert!(sm.state().replica_map.contains_key(TEST_HASH_1));
+        let replicas = sm.state().replica_map.get(TEST_HASH_1).unwrap();
+        assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_idempotency() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event(1, TEST_HASH_1, "uploader1");
+
+        // Apply twice
+        sm.apply_event(event.clone()).unwrap();
+        sm.apply_event(event).unwrap();
+
+        // Should still have exactly 1 chunk
+        assert_eq!(sm.state().chunk_map.len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_conflict_detection() {
+        let mut sm = StateMachine::new();
+        
+        // First declaration
+        sm.apply_event(make_chunk_declared_event_full(
+            1, TEST_HASH_1, 1024, 3, "uploader1", [0u8; 32]
+        )).unwrap();
+
+        // Second declaration with same hash but different metadata
+        let result = sm.apply_event(make_chunk_declared_event_full(
+            2, TEST_HASH_1, 2048, 3, "uploader1", [0u8; 32]  // Different size
+        ));
+
+        // Should be rejected as conflict
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("conflict"));
+            }
+            _ => panic!("Expected ValidationError with conflict message"),
+        }
+
+        // State should not have changed
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.size_bytes, 1024); // Original value
+    }
+
+    #[test]
+    fn test_chunk_validation_empty_hash() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event_full(
+            1, "", 1024, 3, "uploader1", [0u8; 32]
+        );
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("empty"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+        assert!(sm.state().chunk_map.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_validation_invalid_hash_length() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event_full(
+            1, "abc123", 1024, 3, "uploader1", [0u8; 32]  // Too short
+        );
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("64"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+        assert!(sm.state().chunk_map.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_validation_invalid_hex_chars() {
+        let mut sm = StateMachine::new();
+        // 64 chars but with invalid hex char 'g'
+        let invalid_hash = "g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let event = make_chunk_declared_event_full(
+            1, invalid_hash, 1024, 3, "uploader1", [0u8; 32]
+        );
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("invalid hex"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+        assert!(sm.state().chunk_map.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_validation_size_zero() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event_full(
+            1, TEST_HASH_1, 0, 3, "uploader1", [0u8; 32]  // size = 0
+        );
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("size_bytes"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+        assert!(sm.state().chunk_map.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_validation_rf_zero() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event_full(
+            1, TEST_HASH_1, 1024, 0, "uploader1", [0u8; 32]  // rf = 0
+        );
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("replication_factor"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+        assert!(sm.state().chunk_map.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_validation_empty_uploader() {
+        let mut sm = StateMachine::new();
+        let event = make_chunk_declared_event_full(
+            1, TEST_HASH_1, 1024, 3, "", [0u8; 32]  // empty uploader
+        );
+
+        let result = sm.apply_event(event);
+
+        assert!(result.is_err());
+        match result {
+            Err(StateError::ValidationError(msg)) => {
+                assert!(msg.contains("uploader_id"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+        assert!(sm.state().chunk_map.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_query_get_chunk() {
+        let mut sm = StateMachine::new();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+
+        let chunk = sm.state().get_chunk(TEST_HASH_1);
+        assert!(chunk.is_some());
+        assert_eq!(chunk.unwrap().hash, TEST_HASH_1);
+
+        // Non-existent chunk
+        assert!(sm.state().get_chunk(TEST_HASH_2).is_none());
+    }
+
+    #[test]
+    fn test_chunk_query_list_chunks() {
+        let mut sm = StateMachine::new();
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        sm.apply_event(make_chunk_declared_event(2, TEST_HASH_2, "uploader2")).unwrap();
+        sm.apply_event(make_chunk_declared_event(3, TEST_HASH_3, "uploader3")).unwrap();
+
+        let chunks = sm.state().list_chunks();
+        assert_eq!(chunks.len(), 3);
+
+        let hashes: Vec<&str> = chunks.iter().map(|c| c.hash.as_str()).collect();
+        assert!(hashes.contains(&TEST_HASH_1));
+        assert!(hashes.contains(&TEST_HASH_2));
+        assert!(hashes.contains(&TEST_HASH_3));
+    }
+
+    #[test]
+    fn test_chunk_query_list_empty() {
+        let sm = StateMachine::new();
+        let chunks = sm.state().list_chunks();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_multiple_with_different_rf() {
+        let mut sm = StateMachine::new();
+        
+        sm.apply_event(make_chunk_declared_event_full(
+            1, TEST_HASH_1, 1024, 3, "uploader1", [0u8; 32]
+        )).unwrap();
+        
+        sm.apply_event(make_chunk_declared_event_full(
+            2, TEST_HASH_2, 2048, 5, "uploader2", [1u8; 32]
+        )).unwrap();
+
+        let chunk1 = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        let chunk2 = sm.state().get_chunk(TEST_HASH_2).unwrap();
+
+        assert_eq!(chunk1.replication_factor, 3);
+        assert_eq!(chunk2.replication_factor, 5);
+        assert_eq!(chunk1.current_rf, 0);
+        assert_eq!(chunk2.current_rf, 0);
+    }
+
+    #[test]
+    fn test_chunk_da_commitment_stored() {
+        let mut sm = StateMachine::new();
+        let commitment = [42u8; 32];
+        
+        sm.apply_event(make_chunk_declared_event_full(
+            1, TEST_HASH_1, 1024, 3, "uploader1", commitment
+        )).unwrap();
+
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.da_commitment, commitment);
+    }
+
+    #[test]
+    fn test_chunk_current_rf_stays_zero() {
+        let mut sm = StateMachine::new();
+        
+        // Declare chunk
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+        
+        // Verify current_rf is 0
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.current_rf, 0);
+
+        // Apply same event again (idempotent)
+        sm.apply_event(make_chunk_declared_event(1, TEST_HASH_1, "uploader1")).unwrap();
+
+        // current_rf should still be 0
+        let chunk = sm.state().get_chunk(TEST_HASH_1).unwrap();
+        assert_eq!(chunk.current_rf, 0);
     }
 }
