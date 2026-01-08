@@ -23,6 +23,7 @@
 //! ## Modules
 //!
 //! - **da_follower**: DA event subscription and node-scoped state management
+//! - **delete_handler**: Safe handling of delete requests with grace period
 //! - **event_processor**: Event-to-action translation (pure logic)
 //! - **placement_verifier**: DA-based placement verification
 //!
@@ -57,9 +58,11 @@
 //! All state can be rebuilt from DA by replaying events.
 
 pub mod da_follower;
+pub mod delete_handler;
 pub mod event_processor;
 pub mod placement_verifier;
 
-pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError};
+pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError, ReplicaStatus};
+pub use delete_handler::{DeleteHandler, DeleteError, DeleteRequestedEvent, PendingDelete, Storage};
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};
 pub use placement_verifier::{PlacementVerifier, PlacementReport, PlacementDetail, PlacementStatus};
