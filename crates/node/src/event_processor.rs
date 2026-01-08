@@ -345,9 +345,11 @@ mod tests {
         {
             let mut s = state.write();
             s.my_chunks.insert(chunk_hash.to_string(), ChunkAssignment {
-                chunk_hash: chunk_hash.to_string(),
+                hash: chunk_hash.to_string(),
                 replica_index: 0,
                 assigned_at: 1000,
+                verified: false,
+                size_bytes: 1024,
             });
         }
         NodeEventProcessor::new(TEST_NODE.to_string(), state)

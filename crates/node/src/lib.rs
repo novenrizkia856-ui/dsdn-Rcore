@@ -58,5 +58,5 @@
 pub mod da_follower;
 pub mod event_processor;
 
-pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment};
+pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError};
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};

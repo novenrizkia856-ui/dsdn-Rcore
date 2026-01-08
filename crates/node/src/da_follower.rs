@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
+use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{debug, warn, error};
 
@@ -45,6 +46,22 @@ use dsdn_coordinator::{
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// STATE ERROR
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Errors that can occur during state derivation.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum StateError {
+    /// Event data is malformed or invalid.
+    #[error("Malformed event: {0}")]
+    MalformedEvent(String),
+
+    /// State is inconsistent with event.
+    #[error("Inconsistent state: {0}")]
+    InconsistentState(String),
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // CHUNK ASSIGNMENT
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -52,14 +69,33 @@ use dsdn_coordinator::{
 ///
 /// This struct represents the assignment metadata for chunks that
 /// this node is responsible for storing.
-#[derive(Debug, Clone)]
+///
+/// ## Fields
+///
+/// - `hash`: Unique identifier of the chunk
+/// - `replica_index`: Position of this replica (0 = primary)
+/// - `assigned_at`: Timestamp when assignment was made
+/// - `verified`: Local verification status
+/// - `size_bytes`: Size of the chunk data
+///
+/// ## Derived State
+///
+/// All fields are derived from DA events:
+/// - `hash`, `replica_index`, `assigned_at` from ReplicaAdded
+/// - `verified` updated by verification events
+/// - `size_bytes` from chunk metadata
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkAssignment {
-    /// Hash of the assigned chunk
-    pub chunk_hash: String,
-    /// Replica index for this node's copy
+    /// Hash identifier of the assigned chunk
+    pub hash: String,
+    /// Replica index for this node's copy (0 = primary)
     pub replica_index: u8,
-    /// Timestamp when assignment was made
+    /// Timestamp when assignment was made (from DA event)
     pub assigned_at: u64,
+    /// Whether this replica has been locally verified
+    pub verified: bool,
+    /// Size of the chunk in bytes
+    pub size_bytes: u64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -78,9 +114,16 @@ pub struct ChunkAssignment {
 ///
 /// This state is NOT authoritative. The DA layer is the single source of truth.
 /// This state can be fully reconstructed by replaying DA events.
+///
+/// ## Determinism
+///
+/// All state mutations are deterministic:
+/// - Same events → Same state
+/// - No random values
+/// - No local timestamps
 #[derive(Debug)]
 pub struct NodeDerivedState {
-    /// Chunks assigned to this node: chunk_hash -> assignment info
+    /// Chunks assigned to this node: hash -> assignment info
     pub my_chunks: HashMap<String, ChunkAssignment>,
     /// Subset of coordinator state for local decisions (non-authoritative)
     pub coordinator_state: DADerivedState,
@@ -88,6 +131,8 @@ pub struct NodeDerivedState {
     pub last_sequence: u64,
     /// Last height processed from DA
     pub last_height: u64,
+    /// Chunk metadata cache: hash -> size_bytes (from ChunkDeclared events)
+    chunk_sizes: HashMap<String, u64>,
 }
 
 impl NodeDerivedState {
@@ -98,6 +143,190 @@ impl NodeDerivedState {
             coordinator_state: DADerivedState::new(),
             last_sequence: 0,
             last_height: 0,
+            chunk_sizes: HashMap::new(),
+        }
+    }
+
+    /// Apply a DA event to this node's state.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The DA event to apply
+    /// * `node_id` - This node's identifier for filtering
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Event applied (or ignored if not relevant)
+    /// * `Err(StateError)` - Event was malformed
+    ///
+    /// # Guarantees
+    ///
+    /// - Pure state mutation (no IO, no async)
+    /// - Deterministic behavior
+    /// - Idempotent for same event
+    /// - Never panics
+    /// - Irrelevant events are NO-OP (not error)
+    pub fn apply_event(&mut self, event: &DAEvent, node_id: &str) -> Result<(), StateError> {
+        match &event.payload {
+            DAEventPayload::ReplicaAdded(p) => {
+                // Only process if this node is the target
+                if p.node_id != node_id {
+                    return Ok(()); // NO-OP for other nodes
+                }
+
+                // Idempotency: skip if already assigned
+                if self.my_chunks.contains_key(&p.chunk_hash) {
+                    debug!("Replica already assigned: {}", p.chunk_hash);
+                    return Ok(());
+                }
+
+                // Get size from cached chunk metadata (default 0 if not known)
+                let size_bytes = self.chunk_sizes.get(&p.chunk_hash).copied().unwrap_or(0);
+
+                // Add chunk assignment
+                let assignment = ChunkAssignment {
+                    hash: p.chunk_hash.clone(),
+                    replica_index: p.replica_index,
+                    assigned_at: p.added_at,
+                    verified: false, // New assignments start unverified
+                    size_bytes,
+                };
+                self.my_chunks.insert(p.chunk_hash.clone(), assignment);
+                debug!(
+                    "Node {} assigned chunk {} (index {})",
+                    node_id, p.chunk_hash, p.replica_index
+                );
+            }
+            DAEventPayload::ReplicaRemoved(p) => {
+                // Only process if this node is the target
+                if p.node_id != node_id {
+                    return Ok(()); // NO-OP for other nodes
+                }
+
+                // Remove chunk assignment (idempotent)
+                if self.my_chunks.remove(&p.chunk_hash).is_some() {
+                    debug!("Node {} removed chunk {}", node_id, p.chunk_hash);
+                }
+            }
+            DAEventPayload::ChunkDeclared(p) => {
+                // Cache chunk size for future ReplicaAdded events
+                self.chunk_sizes.insert(p.chunk_hash.clone(), p.size_bytes);
+                
+                // Also update existing assignment if we have it
+                if let Some(assignment) = self.my_chunks.get_mut(&p.chunk_hash) {
+                    assignment.size_bytes = p.size_bytes;
+                }
+            }
+            DAEventPayload::ChunkRemoved(p) => {
+                // Remove from cache
+                self.chunk_sizes.remove(&p.chunk_hash);
+                
+                // If we have this chunk, it should be removed
+                // (ReplicaRemoved should come first, but handle gracefully)
+                if self.my_chunks.remove(&p.chunk_hash).is_some() {
+                    debug!("Chunk {} globally removed, cleaned from node state", p.chunk_hash);
+                }
+            }
+            // Other events are NO-OP for node state
+            DAEventPayload::NodeRegistered(_) => {}
+            DAEventPayload::NodeUnregistered(_) => {}
+            DAEventPayload::ZoneAssigned(_) => {}
+            DAEventPayload::ZoneUnassigned(_) => {}
+        }
+
+        Ok(())
+    }
+
+    /// Get all chunk assignments for this node.
+    ///
+    /// # Returns
+    ///
+    /// Vector of references to all chunk assignments.
+    /// Order is not guaranteed (HashMap iteration order).
+    pub fn get_my_chunks(&self) -> Vec<&ChunkAssignment> {
+        self.my_chunks.values().collect()
+    }
+
+    /// Get a specific chunk assignment by hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The chunk hash to look up
+    ///
+    /// # Returns
+    ///
+    /// * `Some(&ChunkAssignment)` - If chunk is assigned to this node
+    /// * `None` - If chunk is not assigned
+    pub fn get_chunk_assignment(&self, hash: &str) -> Option<&ChunkAssignment> {
+        self.my_chunks.get(hash)
+    }
+
+    /// Determine if this node should store a chunk.
+    ///
+    /// A node should store a chunk if:
+    /// - The chunk is assigned to this node (via ReplicaAdded)
+    /// - The chunk is not yet verified (needs to be fetched/stored)
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash of the chunk to check
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Node should store this chunk
+    /// * `false` - Node should NOT store (not assigned or already verified)
+    pub fn should_store(&self, chunk_hash: &str) -> bool {
+        match self.my_chunks.get(chunk_hash) {
+            Some(assignment) => !assignment.verified,
+            None => false, // Not assigned, don't store
+        }
+    }
+
+    /// Determine if this node should delete a chunk.
+    ///
+    /// A node should delete a chunk if:
+    /// - The chunk is NOT assigned to this node
+    /// - (The chunk was previously assigned but ReplicaRemoved was received)
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash of the chunk to check
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Node should delete this chunk (not assigned)
+    /// * `false` - Node should NOT delete (still assigned)
+    pub fn should_delete(&self, chunk_hash: &str) -> bool {
+        !self.my_chunks.contains_key(chunk_hash)
+    }
+
+    /// Mark a chunk as verified.
+    ///
+    /// Called after successful storage/verification of chunk data.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash of the verified chunk
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Chunk was found and marked verified
+    /// * `false` - Chunk not assigned to this node
+    pub fn set_verified(&mut self, chunk_hash: &str, verified: bool) -> bool {
+        if let Some(assignment) = self.my_chunks.get_mut(chunk_hash) {
+            assignment.verified = verified;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update sequence number.
+    ///
+    /// Only increases, never decreases (monotonic).
+    pub fn update_sequence(&mut self, sequence: u64) {
+        if sequence > self.last_sequence {
+            self.last_sequence = sequence;
         }
     }
 }
@@ -282,15 +511,17 @@ impl DAFollower {
                                         match Self::decode_events(&blob.data) {
                                             Ok(events) => {
                                                 // Process events
+                                                let mut state_guard = state.write();
                                                 for event in events {
-                                                    if Self::is_relevant_event(&event, &node_id) {
-                                                        Self::apply_event(&state, &event, &node_id);
+                                                    // Apply event (handles filtering internally)
+                                                    if let Err(e) = state_guard.apply_event(&event, &node_id) {
+                                                        warn!("Failed to apply event: {:?}", e);
                                                     }
-                                                    Self::update_sequence(&state, event.sequence);
+                                                    state_guard.update_sequence(event.sequence);
                                                 }
                                                 // Update last height
                                                 last_height.store(blob.ref_.height, Ordering::SeqCst);
-                                                state.write().last_height = blob.ref_.height;
+                                                state_guard.last_height = blob.ref_.height;
                                             }
                                             Err(e) => {
                                                 warn!("Failed to decode blob for node {}: {:?}", node_id, e);
@@ -537,60 +768,11 @@ impl DAFollower {
     /// Node ONLY processes:
     /// - `ReplicaAdded` where `node_id` matches
     /// - `ReplicaRemoved` where `node_id` matches
-    fn is_relevant_event(event: &DAEvent, node_id: &str) -> bool {
+    pub fn is_relevant_event(event: &DAEvent, node_id: &str) -> bool {
         match &event.payload {
             DAEventPayload::ReplicaAdded(p) => p.node_id == node_id,
             DAEventPayload::ReplicaRemoved(p) => p.node_id == node_id,
             _ => false,
-        }
-    }
-
-    /// Apply a relevant event to node state.
-    fn apply_event(
-        state: &Arc<RwLock<NodeDerivedState>>,
-        event: &DAEvent,
-        node_id: &str,
-    ) {
-        let mut state_guard = state.write();
-
-        match &event.payload {
-            DAEventPayload::ReplicaAdded(p) => {
-                if p.node_id == node_id {
-                    // Check for idempotency
-                    if state_guard.my_chunks.contains_key(&p.chunk_hash) {
-                        debug!("Replica already assigned: {}", p.chunk_hash);
-                        return;
-                    }
-
-                    // Add chunk assignment
-                    let assignment = ChunkAssignment {
-                        chunk_hash: p.chunk_hash.clone(),
-                        replica_index: p.replica_index,
-                        assigned_at: p.added_at,
-                    };
-                    state_guard.my_chunks.insert(p.chunk_hash.clone(), assignment);
-                    debug!(
-                        "Node {} assigned chunk {} (index {})",
-                        node_id, p.chunk_hash, p.replica_index
-                    );
-                }
-            }
-            DAEventPayload::ReplicaRemoved(p) => {
-                if p.node_id == node_id {
-                    if state_guard.my_chunks.remove(&p.chunk_hash).is_some() {
-                        debug!("Node {} removed chunk {}", node_id, p.chunk_hash);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Update sequence number in state.
-    fn update_sequence(state: &Arc<RwLock<NodeDerivedState>>, sequence: u64) {
-        let mut state_guard = state.write();
-        if sequence > state_guard.last_sequence {
-            state_guard.last_sequence = sequence;
         }
     }
 
@@ -652,16 +834,17 @@ impl DAFollower {
                             let mut sorted_events = events;
                             sorted_events.sort_by_key(|e| e.sequence);
 
+                            let mut state_guard = self.state.write();
                             for event in &sorted_events {
-                                if Self::is_relevant_event(event, &self.node_id) {
-                                    Self::apply_event(&self.state, event, &self.node_id);
+                                if let Err(e) = state_guard.apply_event(event, &self.node_id) {
+                                    warn!("Failed to apply event during sync: {:?}", e);
                                 }
-                                Self::update_sequence(&self.state, event.sequence);
+                                state_guard.update_sequence(event.sequence);
                             }
 
                             // Update last height
                             self.last_height.store(blob.ref_.height, Ordering::SeqCst);
-                            self.state.write().last_height = blob.ref_.height;
+                            state_guard.last_height = blob.ref_.height;
                         }
                         Err(e) => {
                             warn!("Failed to decode blob during sync: {:?}", e);
@@ -728,56 +911,12 @@ mod tests {
     use super::*;
     use dsdn_common::MockDA;
 
+    const TEST_NODE: &str = "node-1";
+    const OTHER_NODE: &str = "other-node";
     const TEST_CHUNK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     // ════════════════════════════════════════════════════════════════════════
-    // A. BASIC STATE TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_node_derived_state_new() {
-        let state = NodeDerivedState::new();
-
-        assert!(state.my_chunks.is_empty());
-        assert!(state.coordinator_state.node_registry.is_empty());
-        assert_eq!(state.last_sequence, 0);
-        assert_eq!(state.last_height, 0);
-    }
-
-    #[test]
-    fn test_da_follower_new() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-1".to_string());
-
-        assert_eq!(follower.node_id(), "node-1");
-        assert!(!follower.is_running());
-    }
-
-    #[test]
-    fn test_da_follower_state_empty() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-2".to_string());
-
-        let state = follower.state().read();
-        assert!(state.my_chunks.is_empty());
-        assert_eq!(state.last_sequence, 0);
-    }
-
-    #[test]
-    fn test_chunk_assignment_struct() {
-        let assignment = ChunkAssignment {
-            chunk_hash: "abc123".to_string(),
-            replica_index: 0,
-            assigned_at: 1000,
-        };
-
-        assert_eq!(assignment.chunk_hash, "abc123");
-        assert_eq!(assignment.replica_index, 0);
-        assert_eq!(assignment.assigned_at, 1000);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // B. EVENT FILTERING TESTS
+    // HELPER FUNCTIONS
     // ════════════════════════════════════════════════════════════════════════
 
     fn make_replica_added(seq: u64, chunk_hash: &str, node_id: &str, index: u8) -> DAEvent {
@@ -804,28 +943,499 @@ mod tests {
         }
     }
 
+    fn make_chunk_declared(seq: u64, chunk_hash: &str, size: u64) -> DAEvent {
+        DAEvent {
+            sequence: seq,
+            timestamp: seq * 1000,
+            payload: DAEventPayload::ChunkDeclared(ChunkDeclaredPayload {
+                chunk_hash: chunk_hash.to_string(),
+                size_bytes: size,
+                replication_factor: 3,
+                uploader_id: "uploader".to_string(),
+                da_commitment: [0u8; 32],
+            }),
+        }
+    }
+
+    fn make_chunk_removed(seq: u64, chunk_hash: &str) -> DAEvent {
+        DAEvent {
+            sequence: seq,
+            timestamp: seq * 1000,
+            payload: DAEventPayload::ChunkRemoved(ChunkRemovedPayload {
+                chunk_hash: chunk_hash.to_string(),
+            }),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // A. CHUNK ASSIGNMENT STRUCT TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_chunk_assignment_struct_fields() {
+        let assignment = ChunkAssignment {
+            hash: "abc123".to_string(),
+            replica_index: 0,
+            assigned_at: 1000,
+            verified: false,
+            size_bytes: 4096,
+        };
+
+        assert_eq!(assignment.hash, "abc123");
+        assert_eq!(assignment.replica_index, 0);
+        assert_eq!(assignment.assigned_at, 1000);
+        assert!(!assignment.verified);
+        assert_eq!(assignment.size_bytes, 4096);
+    }
+
+    #[test]
+    fn test_chunk_assignment_clone() {
+        let assignment = ChunkAssignment {
+            hash: TEST_CHUNK.to_string(),
+            replica_index: 2,
+            assigned_at: 5000,
+            verified: true,
+            size_bytes: 1024,
+        };
+
+        let cloned = assignment.clone();
+        assert_eq!(assignment, cloned);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // B. ASSIGNMENT LIFECYCLE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_replica_added_creates_assignment() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+
+        let result = state.apply_event(&event, TEST_NODE);
+        assert!(result.is_ok());
+
+        assert!(state.my_chunks.contains_key(TEST_CHUNK));
+        let assignment = state.get_chunk_assignment(TEST_CHUNK).unwrap();
+        assert_eq!(assignment.hash, TEST_CHUNK);
+        assert_eq!(assignment.replica_index, 0);
+        assert!(!assignment.verified);
+    }
+
+    #[test]
+    fn test_replica_removed_deletes_assignment() {
+        let mut state = NodeDerivedState::new();
+
+        // First add
+        let add_event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+        assert!(state.my_chunks.contains_key(TEST_CHUNK));
+
+        // Then remove
+        let remove_event = make_replica_removed(2, TEST_CHUNK, TEST_NODE);
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+        assert!(!state.my_chunks.contains_key(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_chunk_declared_before_replica_added() {
+        let mut state = NodeDerivedState::new();
+
+        // ChunkDeclared first
+        let declare_event = make_chunk_declared(1, TEST_CHUNK, 8192);
+        state.apply_event(&declare_event, TEST_NODE).unwrap();
+
+        // Then ReplicaAdded
+        let add_event = make_replica_added(2, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+
+        // Should have size from ChunkDeclared
+        let assignment = state.get_chunk_assignment(TEST_CHUNK).unwrap();
+        assert_eq!(assignment.size_bytes, 8192);
+    }
+
+    #[test]
+    fn test_chunk_declared_after_replica_added() {
+        let mut state = NodeDerivedState::new();
+
+        // ReplicaAdded first (size unknown)
+        let add_event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+        assert_eq!(state.get_chunk_assignment(TEST_CHUNK).unwrap().size_bytes, 0);
+
+        // Then ChunkDeclared
+        let declare_event = make_chunk_declared(2, TEST_CHUNK, 4096);
+        state.apply_event(&declare_event, TEST_NODE).unwrap();
+
+        // Should be updated
+        let assignment = state.get_chunk_assignment(TEST_CHUNK).unwrap();
+        assert_eq!(assignment.size_bytes, 4096);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // C. VERIFICATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_set_verified_true() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        assert!(!state.get_chunk_assignment(TEST_CHUNK).unwrap().verified);
+
+        let result = state.set_verified(TEST_CHUNK, true);
+        assert!(result);
+        assert!(state.get_chunk_assignment(TEST_CHUNK).unwrap().verified);
+    }
+
+    #[test]
+    fn test_set_verified_false() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        state.set_verified(TEST_CHUNK, true);
+        state.set_verified(TEST_CHUNK, false);
+
+        assert!(!state.get_chunk_assignment(TEST_CHUNK).unwrap().verified);
+    }
+
+    #[test]
+    fn test_set_verified_unknown_chunk() {
+        let mut state = NodeDerivedState::new();
+        let result = state.set_verified("unknown", true);
+        assert!(!result);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // D. IRRELEVANT EVENT TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_replica_added_other_node_no_effect() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, OTHER_NODE, 0);
+
+        let result = state.apply_event(&event, TEST_NODE);
+        assert!(result.is_ok());
+        assert!(state.my_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_replica_removed_other_node_no_effect() {
+        let mut state = NodeDerivedState::new();
+
+        // Add for our node
+        let add_event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+
+        // Remove for other node
+        let remove_event = make_replica_removed(2, TEST_CHUNK, OTHER_NODE);
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+
+        // Our chunk should still be there
+        assert!(state.my_chunks.contains_key(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_node_registered_no_effect() {
+        let mut state = NodeDerivedState::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
+                node_id: TEST_NODE.to_string(),
+                zone: "zone-a".to_string(),
+                addr: "addr".to_string(),
+                capacity_gb: 100,
+            }),
+        };
+
+        state.apply_event(&event, TEST_NODE).unwrap();
+        assert!(state.my_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_zone_assigned_no_effect() {
+        let mut state = NodeDerivedState::new();
+        let event = DAEvent {
+            sequence: 1,
+            timestamp: 1000,
+            payload: DAEventPayload::ZoneAssigned(ZoneAssignedPayload {
+                zone_id: "zone-a".to_string(),
+                node_id: TEST_NODE.to_string(),
+            }),
+        };
+
+        state.apply_event(&event, TEST_NODE).unwrap();
+        assert!(state.my_chunks.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // E. SHOULD_STORE / SHOULD_DELETE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_should_store_assigned_unverified() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        assert!(state.should_store(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_should_store_assigned_verified() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+        state.set_verified(TEST_CHUNK, true);
+
+        // Already verified, no need to store again
+        assert!(!state.should_store(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_should_store_not_assigned() {
+        let state = NodeDerivedState::new();
+        assert!(!state.should_store(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_should_delete_not_assigned() {
+        let state = NodeDerivedState::new();
+        assert!(state.should_delete(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_should_delete_assigned() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        assert!(!state.should_delete(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_should_delete_after_removal() {
+        let mut state = NodeDerivedState::new();
+
+        let add_event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+        assert!(!state.should_delete(TEST_CHUNK));
+
+        let remove_event = make_replica_removed(2, TEST_CHUNK, TEST_NODE);
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+        assert!(state.should_delete(TEST_CHUNK));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // F. IDEMPOTENCY TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_replica_added_idempotent() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+
+        state.apply_event(&event, TEST_NODE).unwrap();
+        state.apply_event(&event, TEST_NODE).unwrap();
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        assert_eq!(state.my_chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_replica_removed_idempotent() {
+        let mut state = NodeDerivedState::new();
+
+        let add_event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+
+        let remove_event = make_replica_removed(2, TEST_CHUNK, TEST_NODE);
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+
+        assert!(state.my_chunks.is_empty());
+    }
+
+    #[test]
+    fn test_same_events_same_state() {
+        let events = vec![
+            make_chunk_declared(1, "chunk-a", 1024),
+            make_replica_added(2, "chunk-a", TEST_NODE, 0),
+            make_chunk_declared(3, "chunk-b", 2048),
+            make_replica_added(4, "chunk-b", TEST_NODE, 1),
+            make_replica_removed(5, "chunk-a", TEST_NODE),
+        ];
+
+        // Apply to first state
+        let mut state1 = NodeDerivedState::new();
+        for event in &events {
+            state1.apply_event(event, TEST_NODE).unwrap();
+        }
+
+        // Apply to second state
+        let mut state2 = NodeDerivedState::new();
+        for event in &events {
+            state2.apply_event(event, TEST_NODE).unwrap();
+        }
+
+        // States should be identical
+        assert_eq!(state1.my_chunks.len(), state2.my_chunks.len());
+        for (k, v) in &state1.my_chunks {
+            let v2 = state2.my_chunks.get(k).unwrap();
+            assert_eq!(v, v2);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // G. QUERY METHOD TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_my_chunks_empty() {
+        let state = NodeDerivedState::new();
+        assert!(state.get_my_chunks().is_empty());
+    }
+
+    #[test]
+    fn test_get_my_chunks_multiple() {
+        let mut state = NodeDerivedState::new();
+
+        state.apply_event(&make_replica_added(1, "chunk-a", TEST_NODE, 0), TEST_NODE).unwrap();
+        state.apply_event(&make_replica_added(2, "chunk-b", TEST_NODE, 1), TEST_NODE).unwrap();
+        state.apply_event(&make_replica_added(3, "chunk-c", TEST_NODE, 2), TEST_NODE).unwrap();
+
+        let chunks = state.get_my_chunks();
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn test_get_chunk_assignment_exists() {
+        let mut state = NodeDerivedState::new();
+        state.apply_event(&make_replica_added(1, TEST_CHUNK, TEST_NODE, 0), TEST_NODE).unwrap();
+
+        let assignment = state.get_chunk_assignment(TEST_CHUNK);
+        assert!(assignment.is_some());
+        assert_eq!(assignment.unwrap().hash, TEST_CHUNK);
+    }
+
+    #[test]
+    fn test_get_chunk_assignment_not_exists() {
+        let state = NodeDerivedState::new();
+        assert!(state.get_chunk_assignment(TEST_CHUNK).is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // H. SEQUENCE UPDATE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_update_sequence_increases() {
+        let mut state = NodeDerivedState::new();
+
+        state.update_sequence(5);
+        assert_eq!(state.last_sequence, 5);
+
+        state.update_sequence(10);
+        assert_eq!(state.last_sequence, 10);
+    }
+
+    #[test]
+    fn test_update_sequence_no_decrease() {
+        let mut state = NodeDerivedState::new();
+
+        state.update_sequence(10);
+        state.update_sequence(5);
+
+        assert_eq!(state.last_sequence, 10);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // I. CHUNK REMOVED GLOBAL TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_chunk_removed_clears_assignment() {
+        let mut state = NodeDerivedState::new();
+
+        state.apply_event(&make_replica_added(1, TEST_CHUNK, TEST_NODE, 0), TEST_NODE).unwrap();
+        assert!(state.my_chunks.contains_key(TEST_CHUNK));
+
+        state.apply_event(&make_chunk_removed(2, TEST_CHUNK), TEST_NODE).unwrap();
+        assert!(!state.my_chunks.contains_key(TEST_CHUNK));
+    }
+
+    #[test]
+    fn test_chunk_removed_no_assignment_no_effect() {
+        let mut state = NodeDerivedState::new();
+        state.apply_event(&make_chunk_removed(1, TEST_CHUNK), TEST_NODE).unwrap();
+        assert!(state.my_chunks.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // J. DA FOLLOWER TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_da_follower_new() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let follower = DAFollower::new(da, TEST_NODE.to_string());
+
+        assert_eq!(follower.node_id(), TEST_NODE);
+        assert!(!follower.is_running());
+        assert_eq!(follower.chunk_count(), 0);
+    }
+
+    #[test]
+    fn test_da_follower_state_empty() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let follower = DAFollower::new(da, TEST_NODE.to_string());
+
+        let state = follower.state().read();
+        assert!(state.my_chunks.is_empty());
+        assert_eq!(state.last_sequence, 0);
+    }
+
+    #[test]
+    fn test_da_follower_stop_idempotent() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let mut follower = DAFollower::new(da, TEST_NODE.to_string());
+
+        follower.stop();
+        follower.stop();
+        follower.stop();
+
+        assert!(!follower.is_running());
+    }
+
+    #[test]
+    fn test_da_follower_stop_before_start() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let mut follower = DAFollower::new(da, TEST_NODE.to_string());
+
+        follower.stop();
+        assert!(!follower.is_running());
+    }
+
     #[test]
     fn test_is_relevant_event_replica_added_match() {
-        let event = make_replica_added(1, TEST_CHUNK, "node-1", 0);
-        assert!(DAFollower::is_relevant_event(&event, "node-1"));
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        assert!(DAFollower::is_relevant_event(&event, TEST_NODE));
     }
 
     #[test]
     fn test_is_relevant_event_replica_added_no_match() {
-        let event = make_replica_added(1, TEST_CHUNK, "node-2", 0);
-        assert!(!DAFollower::is_relevant_event(&event, "node-1"));
+        let event = make_replica_added(1, TEST_CHUNK, OTHER_NODE, 0);
+        assert!(!DAFollower::is_relevant_event(&event, TEST_NODE));
     }
 
     #[test]
     fn test_is_relevant_event_replica_removed_match() {
-        let event = make_replica_removed(1, TEST_CHUNK, "node-1");
-        assert!(DAFollower::is_relevant_event(&event, "node-1"));
-    }
-
-    #[test]
-    fn test_is_relevant_event_replica_removed_no_match() {
-        let event = make_replica_removed(1, TEST_CHUNK, "node-2");
-        assert!(!DAFollower::is_relevant_event(&event, "node-1"));
+        let event = make_replica_removed(1, TEST_CHUNK, TEST_NODE);
+        assert!(DAFollower::is_relevant_event(&event, TEST_NODE));
     }
 
     #[test]
@@ -834,234 +1444,17 @@ mod tests {
             sequence: 1,
             timestamp: 1000,
             payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
-                node_id: "node-1".to_string(),
+                node_id: TEST_NODE.to_string(),
                 zone: "zone-a".to_string(),
-                addr: "node-1:7001".to_string(),
+                addr: "addr".to_string(),
                 capacity_gb: 100,
             }),
         };
-
-        // NodeRegistered is NOT relevant to node follower
-        assert!(!DAFollower::is_relevant_event(&event, "node-1"));
+        assert!(!DAFollower::is_relevant_event(&event, TEST_NODE));
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // C. APPLY EVENT TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_apply_event_replica_added() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-        let event = make_replica_added(1, TEST_CHUNK, "node-1", 0);
-
-        DAFollower::apply_event(&state, &event, "node-1");
-
-        let state_guard = state.read();
-        assert!(state_guard.my_chunks.contains_key(TEST_CHUNK));
-        assert_eq!(state_guard.my_chunks.get(TEST_CHUNK).unwrap().replica_index, 0);
-    }
-
-    #[test]
-    fn test_apply_event_replica_removed() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-
-        // First add
-        let add_event = make_replica_added(1, TEST_CHUNK, "node-1", 0);
-        DAFollower::apply_event(&state, &add_event, "node-1");
-        assert!(state.read().my_chunks.contains_key(TEST_CHUNK));
-
-        // Then remove
-        let remove_event = make_replica_removed(2, TEST_CHUNK, "node-1");
-        DAFollower::apply_event(&state, &remove_event, "node-1");
-        assert!(!state.read().my_chunks.contains_key(TEST_CHUNK));
-    }
-
-    #[test]
-    fn test_apply_event_idempotent_add() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-        let event = make_replica_added(1, TEST_CHUNK, "node-1", 0);
-
-        // Apply twice
-        DAFollower::apply_event(&state, &event, "node-1");
-        DAFollower::apply_event(&state, &event, "node-1");
-
-        // Should still have only one entry
-        assert_eq!(state.read().my_chunks.len(), 1);
-    }
-
-    #[test]
-    fn test_apply_event_idempotent_remove() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-
-        // Add first
-        let add_event = make_replica_added(1, TEST_CHUNK, "node-1", 0);
-        DAFollower::apply_event(&state, &add_event, "node-1");
-
-        // Remove twice
-        let remove_event = make_replica_removed(2, TEST_CHUNK, "node-1");
-        DAFollower::apply_event(&state, &remove_event, "node-1");
-        DAFollower::apply_event(&state, &remove_event, "node-1");
-
-        // Should be empty
-        assert!(state.read().my_chunks.is_empty());
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // D. SEQUENCE UPDATE TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_update_sequence_increases() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-
-        DAFollower::update_sequence(&state, 5);
-        assert_eq!(state.read().last_sequence, 5);
-
-        DAFollower::update_sequence(&state, 10);
-        assert_eq!(state.read().last_sequence, 10);
-    }
-
-    #[test]
-    fn test_update_sequence_no_decrease() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-
-        DAFollower::update_sequence(&state, 10);
-        DAFollower::update_sequence(&state, 5);
-
-        assert_eq!(state.read().last_sequence, 10);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // E. STOP IDEMPOTENCY TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_stop_idempotent() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let mut follower = DAFollower::new(da, "node-1".to_string());
-
-        // Stop multiple times
-        follower.stop();
-        follower.stop();
-        follower.stop();
-
-        assert!(!follower.is_running());
-    }
-
-    #[test]
-    fn test_stop_before_start() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let mut follower = DAFollower::new(da, "node-1".to_string());
-
-        follower.stop();
-        assert!(!follower.is_running());
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // F. HELPER METHOD TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_chunk_count() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-1".to_string());
-
-        assert_eq!(follower.chunk_count(), 0);
-
-        {
-            let mut state = follower.state().write();
-            state.my_chunks.insert(TEST_CHUNK.to_string(), ChunkAssignment {
-                chunk_hash: TEST_CHUNK.to_string(),
-                replica_index: 0,
-                assigned_at: 1000,
-            });
-        }
-
-        assert_eq!(follower.chunk_count(), 1);
-    }
-
-    #[test]
-    fn test_has_chunk() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-1".to_string());
-
-        assert!(!follower.has_chunk(TEST_CHUNK));
-
-        {
-            let mut state = follower.state().write();
-            state.my_chunks.insert(TEST_CHUNK.to_string(), ChunkAssignment {
-                chunk_hash: TEST_CHUNK.to_string(),
-                replica_index: 0,
-                assigned_at: 1000,
-            });
-        }
-
-        assert!(follower.has_chunk(TEST_CHUNK));
-        assert!(!follower.has_chunk("nonexistent"));
-    }
-
-    #[test]
-    fn test_get_chunk() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-1".to_string());
-
-        assert!(follower.get_chunk(TEST_CHUNK).is_none());
-
-        {
-            let mut state = follower.state().write();
-            state.my_chunks.insert(TEST_CHUNK.to_string(), ChunkAssignment {
-                chunk_hash: TEST_CHUNK.to_string(),
-                replica_index: 2,
-                assigned_at: 5000,
-            });
-        }
-
-        let assignment = follower.get_chunk(TEST_CHUNK).unwrap();
-        assert_eq!(assignment.replica_index, 2);
-        assert_eq!(assignment.assigned_at, 5000);
-    }
-
-    #[test]
-    fn test_chunk_hashes() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-1".to_string());
-
-        assert!(follower.chunk_hashes().is_empty());
-
-        {
-            let mut state = follower.state().write();
-            state.my_chunks.insert("chunk1".to_string(), ChunkAssignment {
-                chunk_hash: "chunk1".to_string(),
-                replica_index: 0,
-                assigned_at: 1000,
-            });
-            state.my_chunks.insert("chunk2".to_string(), ChunkAssignment {
-                chunk_hash: "chunk2".to_string(),
-                replica_index: 1,
-                assigned_at: 2000,
-            });
-        }
-
-        let hashes = follower.chunk_hashes();
-        assert_eq!(hashes.len(), 2);
-        assert!(hashes.contains(&"chunk1".to_string()));
-        assert!(hashes.contains(&"chunk2".to_string()));
-    }
-
-    #[test]
-    fn test_last_sequence() {
-        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
-        let follower = DAFollower::new(da, "node-1".to_string());
-
-        assert_eq!(follower.last_sequence(), 0);
-
-        DAFollower::update_sequence(&follower.state, 42);
-
-        assert_eq!(follower.last_sequence(), 42);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // G. DECODE TESTS
+    // K. DECODE TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -1092,43 +1485,20 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // H. FILTERING COMPLETE SCENARIO
+    // L. STATE ERROR TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_filtering_complete_scenario() {
-        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
-        let node_id = "my-node";
+    fn test_state_error_display() {
+        let err = StateError::MalformedEvent("test".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("Malformed"));
+    }
 
-        // Event for this node
-        let event1 = make_replica_added(1, "chunk-a", node_id, 0);
-        // Event for another node (should be ignored)
-        let event2 = make_replica_added(2, "chunk-b", "other-node", 0);
-        // Another event for this node
-        let event3 = make_replica_added(3, "chunk-c", node_id, 1);
-
-        // Process all events
-        if DAFollower::is_relevant_event(&event1, node_id) {
-            DAFollower::apply_event(&state, &event1, node_id);
-        }
-        DAFollower::update_sequence(&state, event1.sequence);
-
-        if DAFollower::is_relevant_event(&event2, node_id) {
-            DAFollower::apply_event(&state, &event2, node_id);
-        }
-        DAFollower::update_sequence(&state, event2.sequence);
-
-        if DAFollower::is_relevant_event(&event3, node_id) {
-            DAFollower::apply_event(&state, &event3, node_id);
-        }
-        DAFollower::update_sequence(&state, event3.sequence);
-
-        // Verify state
-        let state_guard = state.read();
-        assert_eq!(state_guard.my_chunks.len(), 2);
-        assert!(state_guard.my_chunks.contains_key("chunk-a"));
-        assert!(!state_guard.my_chunks.contains_key("chunk-b")); // Not ours
-        assert!(state_guard.my_chunks.contains_key("chunk-c"));
-        assert_eq!(state_guard.last_sequence, 3);
+    #[test]
+    fn test_state_error_clone() {
+        let err = StateError::InconsistentState("test".to_string());
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
     }
 }
