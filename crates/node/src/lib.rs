@@ -1,63 +1,39 @@
-//! # DSDN Node Crate
+//! # DSDN Node Crate (14A)
 //!
-//! This crate provides the storage node implementation for DSDN (Decentralized
-//! Storage and Data Network). A node acts as a **DA Follower** - it does not
-//! determine state independently but follows events from the Data Availability layer.
-//!
-//! ## Node vs Coordinator
-//!
-//! | Aspect | Coordinator | Node |
-//! |--------|-------------|------|
-//! | State scope | Full network | Node-relevant only |
-//! | Authority | Authoritative | Non-authoritative |
-//! | Role | Orchestration | Storage & execution |
-//! | State source | DA events | DA events (subset) |
-//!
-//! ## Key Principles
-//!
-//! - **DA Follower**: Node follows events from DA, does not create authoritative state
-//! - **Derived State**: All node state is derived from DA events
-//! - **Rebuildable**: Node state can be fully reconstructed from DA at any time
-//! - **Non-authoritative**: The DA layer is the single source of truth
-//!
-//! ## Modules
-//!
-//! - **da_follower**: DA event subscription and node-scoped state management
-//! - **delete_handler**: Safe handling of delete requests with grace period
-//! - **event_processor**: Event-to-action translation (pure logic)
-//! - **health**: Node health reporting and monitoring
-//! - **placement_verifier**: DA-based placement verification
-//! - **state_sync**: State synchronization and verification against DA
+//! Storage node untuk DSDN network.
 //!
 //! ## Architecture
-//!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                           NODE                                  │
-//! │                                                                 │
-//! │  ┌─────────────────┐         ┌─────────────────────────────┐   │
-//! │  │   DAFollower    │────────▶│    NodeDerivedState         │   │
-//! │  │ (Event Follow)  │         │  - my_chunks                │   │
-//! │  └────────┬────────┘         │  - coordinator_state (copy) │   │
-//! │           │                  │  - last_sequence            │   │
-//! │           │                  └──────────────┬──────────────┘   │
-//! │           │ subscribe                       │                   │
-//! │           │                  ┌──────────────▼──────────────┐   │
-//! │  ┌────────┴────────┐         │   NodeEventProcessor        │   │
-//! │  │    DALayer      │         │  - process_event()          │   │
-//! │  │  (Celestia)     │         │  - Returns NodeAction       │   │
-//! │  └─────────────────┘         └─────────────────────────────┘   │
-//! │                                                                 │
-//! └─────────────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────┐
+//! │                   Node                       │
+//! ├─────────────────────────────────────────────┤
+//! │  ┌─────────────┐    ┌──────────────────┐   │
+//! │  │ DAFollower  │───▶│ NodeDerivedState │   │
+//! │  └─────────────┘    └──────────────────┘   │
+//! │         │                    │              │
+//! │         ▼                    ▼              │
+//! │  ┌─────────────┐    ┌──────────────────┐   │
+//! │  │EventProcessor│   │  Local Storage   │   │
+//! │  └─────────────┘    └──────────────────┘   │
+//! └─────────────────────────────────────────────┘
+//!                      │
+//!                      ▼
+//!              ┌───────────────┐
+//!              │  Celestia DA  │
+//!              └───────────────┘
 //! ```
 //!
-//! ## State Characteristics
+//! ## Modules
+//! - `da_follower`: DA subscription dan event processing
+//! - `event_processor`: Event handling logic
+//! - `placement_verifier`: Placement verification
+//! - `delete_handler`: Delete request handling
+//! - `state_sync`: State synchronization
+//! - `health`: Health reporting
 //!
-//! - `my_chunks`: Only chunks assigned to this specific node
-//! - `coordinator_state`: A non-authoritative copy for local decisions
-//! - `last_sequence`: Tracks event processing progress
-//!
-//! All state can be rebuilt from DA by replaying events.
+//! ## Key Invariant
+//! Node TIDAK menerima instruksi dari Coordinator via RPC.
+//! Semua perintah datang via DA events.
 
 pub mod da_follower;
 pub mod delete_handler;

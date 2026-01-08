@@ -919,8 +919,8 @@ mod tests {
         let health = NodeHealth::check(TEST_NODE, &da, &state, &storage);
 
         let issues = health.health_issues();
-        // Should have 3 issues: disconnected, missing, overflow
-        assert_eq!(issues.len(), 3);
+        // Should have 4 issues: disconnected, missing, DA lag (200 >= 100), overflow
+        assert_eq!(issues.len(), 4);
     }
 
     // ════════════════════════════════════════════════════════════════════════
