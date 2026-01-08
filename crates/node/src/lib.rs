@@ -24,6 +24,7 @@
 //!
 //! - **da_follower**: DA event subscription and node-scoped state management
 //! - **event_processor**: Event-to-action translation (pure logic)
+//! - **placement_verifier**: DA-based placement verification
 //!
 //! ## Architecture
 //!
@@ -57,6 +58,8 @@
 
 pub mod da_follower;
 pub mod event_processor;
+pub mod placement_verifier;
 
 pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError};
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};
+pub use placement_verifier::{PlacementVerifier, PlacementReport, PlacementDetail, PlacementStatus};
