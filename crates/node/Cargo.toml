@@ -7,7 +7,7 @@ edition = "2021"
 dsdn-common = { path = "../common" }
 dsdn-storage = { path = "../storage" }
 dsdn-coordinator = { path = "../coordinator" }
-dsdn-runtime-wasm = { path = "../runtime_wasm" } # <--- pastikan ini ada
+dsdn-runtime-wasm = { path = "../runtime_wasm" }
 
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
@@ -19,7 +19,7 @@ parking_lot = "0.12"
 anyhow = "1.0"
 uuid = { version = "1.4", features = ["v4"] }
 futures = "0.3"
+thiserror = "1.0"
 
-# helper for run_wasm_client binary validation of WAT
 wat = "1.0"
 tonic = { version = "0.9", features = ["transport"] }
