@@ -25,6 +25,7 @@
 //! - **da_follower**: DA event subscription and node-scoped state management
 //! - **delete_handler**: Safe handling of delete requests with grace period
 //! - **event_processor**: Event-to-action translation (pure logic)
+//! - **health**: Node health reporting and monitoring
 //! - **placement_verifier**: DA-based placement verification
 //! - **state_sync**: State synchronization and verification against DA
 //!
@@ -61,11 +62,13 @@
 pub mod da_follower;
 pub mod delete_handler;
 pub mod event_processor;
+pub mod health;
 pub mod placement_verifier;
 pub mod state_sync;
 
 pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError, ReplicaStatus};
 pub use delete_handler::{DeleteHandler, DeleteError, DeleteRequestedEvent, PendingDelete, Storage};
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};
+pub use health::{NodeHealth, HealthStorage, DAInfo, HealthResponse, health_endpoint, DA_LAG_THRESHOLD};
 pub use placement_verifier::{PlacementVerifier, PlacementReport, PlacementDetail, PlacementStatus};
 pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
