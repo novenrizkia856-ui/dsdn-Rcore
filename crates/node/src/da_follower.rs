@@ -62,6 +62,46 @@ pub enum StateError {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// REPLICA STATUS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Status of a replica on this node.
+///
+/// Tracks the lifecycle of each chunk assigned to this node,
+/// from assignment through verification.
+///
+/// ## Status Flow
+///
+/// ```text
+/// ReplicaAdded → Pending → Stored → Verified
+///                   │          │
+///                   └─→ Missing └─→ Corrupted
+/// ```
+///
+/// ## Semantics
+///
+/// | Status    | Meaning                                        |
+/// |-----------|------------------------------------------------|
+/// | Pending   | Assigned via DA, not yet in local storage      |
+/// | Stored    | Data exists in local storage                   |
+/// | Verified  | Data verified (hash check / challenge passed)  |
+/// | Missing   | Should exist but not found locally             |
+/// | Corrupted | Data exists but failed verification            |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReplicaStatus {
+    /// Assigned via DA, not yet stored locally.
+    Pending,
+    /// Data exists in local storage.
+    Stored,
+    /// Data verified successfully.
+    Verified,
+    /// Should exist but not found locally.
+    Missing,
+    /// Data exists but failed verification.
+    Corrupted,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // CHUNK ASSIGNMENT
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -133,6 +173,8 @@ pub struct NodeDerivedState {
     pub last_height: u64,
     /// Chunk metadata cache: hash -> size_bytes (from ChunkDeclared events)
     chunk_sizes: HashMap<String, u64>,
+    /// Replica status for each chunk: hash -> status
+    pub replica_status: HashMap<String, ReplicaStatus>,
 }
 
 impl NodeDerivedState {
@@ -144,6 +186,7 @@ impl NodeDerivedState {
             last_sequence: 0,
             last_height: 0,
             chunk_sizes: HashMap::new(),
+            replica_status: HashMap::new(),
         }
     }
 
@@ -192,6 +235,10 @@ impl NodeDerivedState {
                     size_bytes,
                 };
                 self.my_chunks.insert(p.chunk_hash.clone(), assignment);
+                
+                // Set initial replica status to Pending
+                self.replica_status.insert(p.chunk_hash.clone(), ReplicaStatus::Pending);
+                
                 debug!(
                     "Node {} assigned chunk {} (index {})",
                     node_id, p.chunk_hash, p.replica_index
@@ -207,6 +254,9 @@ impl NodeDerivedState {
                 if self.my_chunks.remove(&p.chunk_hash).is_some() {
                     debug!("Node {} removed chunk {}", node_id, p.chunk_hash);
                 }
+                
+                // Remove replica status
+                self.replica_status.remove(&p.chunk_hash);
             }
             DAEventPayload::ChunkDeclared(p) => {
                 // Cache chunk size for future ReplicaAdded events
@@ -226,6 +276,9 @@ impl NodeDerivedState {
                 if self.my_chunks.remove(&p.chunk_hash).is_some() {
                     debug!("Chunk {} globally removed, cleaned from node state", p.chunk_hash);
                 }
+                
+                // Remove replica status
+                self.replica_status.remove(&p.chunk_hash);
             }
             // Other events are NO-OP for node state
             DAEventPayload::NodeRegistered(_) => {}
@@ -328,6 +381,94 @@ impl NodeDerivedState {
         if sequence > self.last_sequence {
             self.last_sequence = sequence;
         }
+    }
+
+    /// Update the status of a replica.
+    ///
+    /// This method updates the status of a specific replica assigned to this node.
+    /// It is a pure state mutation with no IO or async operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The chunk hash to update status for
+    /// * `status` - The new status to set
+    ///
+    /// # Behavior
+    ///
+    /// - If the hash is assigned to this node: updates the status
+    /// - If the hash is NOT assigned: NO-OP (does not create assignment)
+    /// - Never panics
+    ///
+    /// # Note
+    ///
+    /// Status can only be set for chunks that have been assigned via ReplicaAdded.
+    /// This ensures status is always tied to a valid DA assignment.
+    pub fn update_replica_status(&mut self, hash: &str, status: ReplicaStatus) {
+        // Only update status for assigned chunks
+        if self.my_chunks.contains_key(hash) {
+            self.replica_status.insert(hash.to_string(), status);
+        }
+        // If not assigned, NO-OP (do not create orphan status)
+    }
+
+    /// Get all chunks with Pending status.
+    ///
+    /// Returns chunk hashes that are assigned but not yet stored locally.
+    /// These are chunks that need to be fetched from the network.
+    ///
+    /// # Returns
+    ///
+    /// Vector of chunk hashes with Pending status.
+    /// Order is not guaranteed (deterministic but arbitrary).
+    ///
+    /// # Guarantees
+    ///
+    /// - Only returns chunks assigned to this node
+    /// - Only returns chunks with exactly Pending status
+    /// - Never panics
+    pub fn get_pending_replicas(&self) -> Vec<String> {
+        self.replica_status
+            .iter()
+            .filter(|(_, status)| **status == ReplicaStatus::Pending)
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+
+    /// Get all chunks with Missing status.
+    ///
+    /// Returns chunk hashes that should exist locally but are not found.
+    /// These are chunks that need repair or re-fetch.
+    ///
+    /// # Returns
+    ///
+    /// Vector of chunk hashes with Missing status.
+    /// Order is not guaranteed (deterministic but arbitrary).
+    ///
+    /// # Guarantees
+    ///
+    /// - Only returns chunks assigned to this node
+    /// - Only returns chunks with exactly Missing status
+    /// - Never panics
+    pub fn get_missing_replicas(&self) -> Vec<String> {
+        self.replica_status
+            .iter()
+            .filter(|(_, status)| **status == ReplicaStatus::Missing)
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+
+    /// Get the status of a specific replica.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The chunk hash to check
+    ///
+    /// # Returns
+    ///
+    /// * `Some(status)` - If the chunk has a status
+    /// * `None` - If the chunk has no status (not assigned)
+    pub fn get_replica_status(&self, hash: &str) -> Option<ReplicaStatus> {
+        self.replica_status.get(hash).copied()
     }
 }
 
@@ -1500,5 +1641,369 @@ mod tests {
         let err = StateError::InconsistentState("test".to_string());
         let cloned = err.clone();
         assert_eq!(err, cloned);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // M. REPLICA STATUS ENUM TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_replica_status_variants() {
+        // Verify all variants exist and are distinct
+        let pending = ReplicaStatus::Pending;
+        let stored = ReplicaStatus::Stored;
+        let verified = ReplicaStatus::Verified;
+        let missing = ReplicaStatus::Missing;
+        let corrupted = ReplicaStatus::Corrupted;
+
+        assert_ne!(pending, stored);
+        assert_ne!(stored, verified);
+        assert_ne!(verified, missing);
+        assert_ne!(missing, corrupted);
+        assert_ne!(corrupted, pending);
+    }
+
+    #[test]
+    fn test_replica_status_clone() {
+        let status = ReplicaStatus::Stored;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_replica_status_copy() {
+        let status = ReplicaStatus::Verified;
+        let copied = status; // Copy, not move
+        assert_eq!(status, copied);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // N. STATUS LIFECYCLE TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_status_pending_on_replica_added() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Status should be Pending after ReplicaAdded
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn test_status_pending_to_stored() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Update to Stored
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Stored)
+        );
+    }
+
+    #[test]
+    fn test_status_stored_to_verified() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Verified);
+
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Verified)
+        );
+    }
+
+    #[test]
+    fn test_status_pending_to_missing() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Chunk not found locally
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Missing);
+
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Missing)
+        );
+    }
+
+    #[test]
+    fn test_status_stored_to_corrupted() {
+        let mut state = NodeDerivedState::new();
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+        // Verification failed
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Corrupted);
+
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Corrupted)
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // O. UPDATE_REPLICA_STATUS SAFETY TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_update_status_unknown_hash_no_panic() {
+        let mut state = NodeDerivedState::new();
+
+        // Should not panic, should be NO-OP
+        state.update_replica_status("unknown-hash", ReplicaStatus::Stored);
+
+        // Should not create orphan status
+        assert!(state.get_replica_status("unknown-hash").is_none());
+        assert!(state.replica_status.is_empty());
+    }
+
+    #[test]
+    fn test_update_status_after_removal_no_effect() {
+        let mut state = NodeDerivedState::new();
+
+        // Add then remove
+        let add_event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&add_event, TEST_NODE).unwrap();
+
+        let remove_event = make_replica_removed(2, TEST_CHUNK, TEST_NODE);
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+
+        // Try to update status - should be NO-OP
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+
+        // Status should not exist
+        assert!(state.get_replica_status(TEST_CHUNK).is_none());
+    }
+
+    #[test]
+    fn test_status_removed_on_replica_removed() {
+        let mut state = NodeDerivedState::new();
+
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+        assert!(state.get_replica_status(TEST_CHUNK).is_some());
+
+        let remove_event = make_replica_removed(2, TEST_CHUNK, TEST_NODE);
+        state.apply_event(&remove_event, TEST_NODE).unwrap();
+
+        // Status should be removed
+        assert!(state.get_replica_status(TEST_CHUNK).is_none());
+    }
+
+    #[test]
+    fn test_status_removed_on_chunk_removed() {
+        let mut state = NodeDerivedState::new();
+
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+        assert!(state.get_replica_status(TEST_CHUNK).is_some());
+
+        let chunk_removed = make_chunk_removed(2, TEST_CHUNK);
+        state.apply_event(&chunk_removed, TEST_NODE).unwrap();
+
+        // Status should be removed
+        assert!(state.get_replica_status(TEST_CHUNK).is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // P. GET_PENDING_REPLICAS TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_pending_replicas_empty() {
+        let state = NodeDerivedState::new();
+        assert!(state.get_pending_replicas().is_empty());
+    }
+
+    #[test]
+    fn test_get_pending_replicas_only_pending() {
+        let mut state = NodeDerivedState::new();
+
+        // Add three chunks
+        let event1 = make_replica_added(1, "chunk-1", TEST_NODE, 0);
+        let event2 = make_replica_added(2, "chunk-2", TEST_NODE, 1);
+        let event3 = make_replica_added(3, "chunk-3", TEST_NODE, 2);
+
+        state.apply_event(&event1, TEST_NODE).unwrap();
+        state.apply_event(&event2, TEST_NODE).unwrap();
+        state.apply_event(&event3, TEST_NODE).unwrap();
+
+        // Update some to non-Pending
+        state.update_replica_status("chunk-2", ReplicaStatus::Stored);
+        state.update_replica_status("chunk-3", ReplicaStatus::Verified);
+
+        // Only chunk-1 should be pending
+        let pending = state.get_pending_replicas();
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&"chunk-1".to_string()));
+    }
+
+    #[test]
+    fn test_get_pending_replicas_excludes_other_status() {
+        let mut state = NodeDerivedState::new();
+
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Start with Pending
+        assert_eq!(state.get_pending_replicas().len(), 1);
+
+        // Change to Stored
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+        assert!(state.get_pending_replicas().is_empty());
+
+        // Change to Missing
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Missing);
+        assert!(state.get_pending_replicas().is_empty());
+
+        // Change to Corrupted
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Corrupted);
+        assert!(state.get_pending_replicas().is_empty());
+
+        // Change to Verified
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Verified);
+        assert!(state.get_pending_replicas().is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Q. GET_MISSING_REPLICAS TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_missing_replicas_empty() {
+        let state = NodeDerivedState::new();
+        assert!(state.get_missing_replicas().is_empty());
+    }
+
+    #[test]
+    fn test_get_missing_replicas_only_missing() {
+        let mut state = NodeDerivedState::new();
+
+        // Add three chunks
+        let event1 = make_replica_added(1, "chunk-1", TEST_NODE, 0);
+        let event2 = make_replica_added(2, "chunk-2", TEST_NODE, 1);
+        let event3 = make_replica_added(3, "chunk-3", TEST_NODE, 2);
+
+        state.apply_event(&event1, TEST_NODE).unwrap();
+        state.apply_event(&event2, TEST_NODE).unwrap();
+        state.apply_event(&event3, TEST_NODE).unwrap();
+
+        // Mark some as Missing
+        state.update_replica_status("chunk-1", ReplicaStatus::Missing);
+        state.update_replica_status("chunk-3", ReplicaStatus::Missing);
+        // chunk-2 stays Pending
+
+        // Should return chunk-1 and chunk-3
+        let missing = state.get_missing_replicas();
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains(&"chunk-1".to_string()));
+        assert!(missing.contains(&"chunk-3".to_string()));
+        assert!(!missing.contains(&"chunk-2".to_string()));
+    }
+
+    #[test]
+    fn test_get_missing_replicas_excludes_other_status() {
+        let mut state = NodeDerivedState::new();
+
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Start with Pending - not missing
+        assert!(state.get_missing_replicas().is_empty());
+
+        // Change to Stored - not missing
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+        assert!(state.get_missing_replicas().is_empty());
+
+        // Change to Missing - IS missing
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Missing);
+        assert_eq!(state.get_missing_replicas().len(), 1);
+
+        // Change to Corrupted - not missing
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Corrupted);
+        assert!(state.get_missing_replicas().is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // R. IDEMPOTENCY TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_update_status_same_status_idempotent() {
+        let mut state = NodeDerivedState::new();
+
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Update to Stored twice
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+
+        // Should still be Stored
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Stored)
+        );
+    }
+
+    #[test]
+    fn test_replica_added_idempotent_preserves_status() {
+        let mut state = NodeDerivedState::new();
+
+        let event = make_replica_added(1, TEST_CHUNK, TEST_NODE, 0);
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Update status to Stored
+        state.update_replica_status(TEST_CHUNK, ReplicaStatus::Stored);
+
+        // Try to add again (idempotent)
+        state.apply_event(&event, TEST_NODE).unwrap();
+
+        // Status should still be Stored (not reset to Pending)
+        assert_eq!(
+            state.get_replica_status(TEST_CHUNK),
+            Some(ReplicaStatus::Stored)
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // S. DETERMINISM TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_status_deterministic() {
+        let mut state1 = NodeDerivedState::new();
+        let mut state2 = NodeDerivedState::new();
+
+        // Apply same events
+        let event1 = make_replica_added(1, "chunk-1", TEST_NODE, 0);
+        let event2 = make_replica_added(2, "chunk-2", TEST_NODE, 1);
+
+        state1.apply_event(&event1, TEST_NODE).unwrap();
+        state1.apply_event(&event2, TEST_NODE).unwrap();
+        state1.update_replica_status("chunk-1", ReplicaStatus::Stored);
+
+        state2.apply_event(&event1, TEST_NODE).unwrap();
+        state2.apply_event(&event2, TEST_NODE).unwrap();
+        state2.update_replica_status("chunk-1", ReplicaStatus::Stored);
+
+        // States should be identical
+        assert_eq!(state1.get_replica_status("chunk-1"), state2.get_replica_status("chunk-1"));
+        assert_eq!(state1.get_replica_status("chunk-2"), state2.get_replica_status("chunk-2"));
     }
 }
