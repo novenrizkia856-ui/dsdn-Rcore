@@ -12,6 +12,7 @@
 //! - `gc`: Garbage collection berdasarkan DA events
 //! - `metrics`: Storage health metrics untuk observability
 //! - `recovery`: Recovery dari DA state untuk self-healing
+//! - `events`: Storage event emission untuk observability
 //! - `rpc`: RPC services untuk komunikasi antar node
 //!
 //! ## DA-Aware Storage
@@ -72,6 +73,13 @@
 //! - Tidak ada overwrite chunk yang sudah ada
 //!
 //! Recovery berbasis DA, bukan auto-magic.
+//!
+//! ## Storage Events
+//!
+//! `StorageEvent` menyediakan event emission untuk observability:
+//! - Events HANYA untuk logging, monitoring, debugging
+//! - Events TIDAK authoritative, TIDAK mempengaruhi correctness
+//! - Events TIDAK mengubah perilaku sistem
 
 pub mod chunker;
 pub mod store;
@@ -81,6 +89,7 @@ pub mod storage_proof;
 pub mod gc;
 pub mod metrics;
 pub mod recovery;
+pub mod events;
 pub mod rpc;
 
 // hasil generate dari tonic_build (OUT_DIR/api.rs)
@@ -124,4 +133,12 @@ pub use crate::recovery::{
     RecoveryDetail,
     RecoveryError,
     PeerFetcher,
+};
+pub use crate::events::{
+    StorageEvent,
+    StorageEventListener,
+    LoggingListener,
+    NoOpListener,
+    CompositeListener,
+    EventEmitter,
 };
