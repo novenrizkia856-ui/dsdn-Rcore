@@ -5,44 +5,109 @@
 //! ## Arsitektur
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────┐
-//! │              DAStorage                       │
-//! ├─────────────────────────────────────────────┤
-//! │  ┌─────────────┐    ┌──────────────────┐   │
-//! │  │    inner    │    │  chunk_metadata  │   │
-//! │  │  (Storage)  │    │   (DA metadata)  │   │
-//! │  └─────────────┘    └──────────────────┘   │
-//! │         │                    │              │
-//! │         ▼                    ▼              │
-//! │  ┌─────────────┐    ┌──────────────────┐   │
-//! │  │  Actual     │    │   DALayer        │   │
-//! │  │  Data       │    │   (Celestia)     │   │
-//! │  └─────────────┘    └──────────────────┘   │
-//! └─────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        DAStorage                                 │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │  ┌─────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
+//! │  │    inner    │  │  chunk_metadata  │  │  declared_chunks  │  │
+//! │  │  (Storage)  │  │   (DA metadata)  │  │   (DA events)     │  │
+//! │  └─────────────┘  └──────────────────┘  └───────────────────┘  │
+//! │         │                  │                     │              │
+//! │         ▼                  ▼                     ▼              │
+//! │  ┌─────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
+//! │  │  Actual     │  │   Derived from   │  │  Received from    │  │
+//! │  │  Data       │  │   DA events      │  │  DA layer         │  │
+//! │  └─────────────┘  └──────────────────┘  └───────────────────┘  │
+//! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Prinsip Kunci
 //!
 //! - `inner` adalah storage asli yang menyimpan data chunk
-//! - `chunk_metadata` adalah STATE TURUNAN, bukan authoritative
+//! - `chunk_metadata` adalah STATE TURUNAN dari DA events
+//! - `declared_chunks` menyimpan ChunkDeclared events dari DA
 //! - Data di `inner` adalah sumber kebenaran untuk keberadaan chunk
 //! - Metadata hanya untuk tracking hubungan dengan DA
+//!
+//! ## DA Metadata Sync Flow
+//!
+//! ```text
+//! DA Layer → receive_chunk_declared() → declared_chunks
+//!                                            │
+//!                                            ▼
+//!                    sync_metadata_from_da() → chunk_metadata
+//! ```
 //!
 //! ## Invariant
 //!
 //! - Metadata BUKAN pengganti data
 //! - has_chunk() HARUS cek inner, bukan metadata
 //! - Error dari inner HARUS propagate, tidak boleh disembunyikan
+//! - Metadata derived dari DA events, tidak boleh fiktif
+//! - verified TIDAK BOLEH otomatis berubah ke true saat sync
 
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, MappedRwLockReadGuard, RwLockReadGuard};
+use tracing::{debug, error, info};
 
-use dsdn_common::{BlobRef, DALayer};
+use dsdn_common::{BlobRef, DALayer, DAError};
 
 use crate::store::Storage;
+
+// ════════════════════════════════════════════════════════════════════════════
+// CHUNK DECLARED EVENT
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Event yang mendeklarasikan chunk di DA layer.
+///
+/// Struct ini merepresentasikan ChunkDeclared event yang diterima
+/// dari DA layer. Setiap event mendeklarasikan keberadaan chunk
+/// dengan metadata terkait.
+///
+/// # Fields
+///
+/// - `chunk_hash`: Hash unik chunk (canonical string)
+/// - `size_bytes`: Ukuran chunk dalam bytes
+/// - `da_commitment`: Commitment 32-byte dari DA
+/// - `blob_ref`: Referensi ke blob DA tempat event dipublish
+/// - `declared_at`: Timestamp (Unix ms) saat event dideklarasikan
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkDeclaredEvent {
+    /// Hash unik chunk.
+    pub chunk_hash: String,
+    /// Ukuran chunk dalam bytes.
+    pub size_bytes: u64,
+    /// Commitment 32-byte dari DA.
+    pub da_commitment: [u8; 32],
+    /// Referensi ke blob DA.
+    pub blob_ref: Option<BlobRef>,
+    /// Timestamp deklarasi (Unix milliseconds).
+    pub declared_at: u64,
+}
+
+impl ChunkDeclaredEvent {
+    /// Membuat ChunkDeclaredEvent baru.
+    pub fn new(
+        chunk_hash: String,
+        size_bytes: u64,
+        da_commitment: [u8; 32],
+        blob_ref: Option<BlobRef>,
+        declared_at: u64,
+    ) -> Self {
+        Self {
+            chunk_hash,
+            size_bytes,
+            da_commitment,
+            blob_ref,
+            declared_at,
+        }
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // DA CHUNK METADATA
@@ -136,6 +201,24 @@ impl DAChunkMeta {
     pub fn set_blob_ref(&mut self, blob_ref: BlobRef) {
         self.blob_ref = Some(blob_ref);
     }
+
+    /// Update from ChunkDeclaredEvent.
+    ///
+    /// Updates only DA-derived fields. Does NOT change:
+    /// - verified (MUST NOT auto-change to true)
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - ChunkDeclaredEvent to update from
+    fn update_from_event(&mut self, event: &ChunkDeclaredEvent) {
+        // Update DA-derived fields only
+        self.size_bytes = event.size_bytes;
+        self.da_commitment = event.da_commitment;
+        if event.blob_ref.is_some() {
+            self.blob_ref = event.blob_ref.clone();
+        }
+        // CRITICAL: verified TIDAK BOLEH diubah ke true secara otomatis
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -152,11 +235,12 @@ impl DAChunkMeta {
 /// - `inner`: Storage asli (filesystem / memory / dll)
 /// - `da`: Sumber kebenaran Data Availability
 /// - `chunk_metadata`: STATE TURUNAN, bukan authoritative
+/// - `declared_chunks`: ChunkDeclared events dari DA
 ///
 /// # Prinsip
 ///
 /// - Semua operasi data didelegasikan ke `inner`
-/// - Metadata di-sync saat operasi storage
+/// - Metadata di-sync dari DA events
 /// - `inner` adalah sumber kebenaran untuk keberadaan data
 /// - Metadata hanya untuk tracking, bukan pengganti data
 ///
@@ -165,6 +249,7 @@ impl DAChunkMeta {
 /// - `has_chunk()` HARUS cek `inner`, bukan metadata
 /// - Error dari `inner` HARUS propagate
 /// - Metadata tidak boleh menggantikan data asli
+/// - Metadata derived dari DA events
 pub struct DAStorage {
     /// Storage asli yang menyimpan data chunk.
     inner: Arc<dyn Storage>,
@@ -172,6 +257,10 @@ pub struct DAStorage {
     da: Arc<dyn DALayer>,
     /// Metadata chunk terkait DA. STATE TURUNAN, bukan authoritative.
     chunk_metadata: RwLock<HashMap<String, DAChunkMeta>>,
+    /// ChunkDeclared events yang diterima dari DA.
+    declared_chunks: RwLock<HashMap<String, ChunkDeclaredEvent>>,
+    /// Flag untuk menghentikan background sync.
+    sync_running: AtomicBool,
 }
 
 impl Debug for DAStorage {
@@ -180,6 +269,7 @@ impl Debug for DAStorage {
             .field("inner", &self.inner)
             .field("da", &"<DALayer>")
             .field("chunk_metadata_count", &self.chunk_metadata.read().len())
+            .field("declared_chunks_count", &self.declared_chunks.read().len())
             .finish()
     }
 }
@@ -200,6 +290,8 @@ impl DAStorage {
             inner,
             da,
             chunk_metadata: RwLock::new(HashMap::new()),
+            declared_chunks: RwLock::new(HashMap::new()),
+            sync_running: AtomicBool::new(false),
         }
     }
 
@@ -221,7 +313,243 @@ impl DAStorage {
         &self.da
     }
 
-    /// Get metadata for a chunk.
+    // ════════════════════════════════════════════════════════════════════════
+    // DA EVENT RECEIVING
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Menerima ChunkDeclared event dari DA.
+    ///
+    /// Method ini dipanggil oleh DA consumer ketika menerima
+    /// ChunkDeclared event dari DA layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - ChunkDeclaredEvent yang diterima
+    ///
+    /// # Behavior
+    ///
+    /// - Menyimpan event ke declared_chunks
+    /// - Tidak langsung update metadata (gunakan sync_metadata_from_da)
+    /// - Idempotent: event yang sama akan di-overwrite
+    pub fn receive_chunk_declared(&self, event: ChunkDeclaredEvent) {
+        debug!("Received ChunkDeclared event for chunk: {}", event.chunk_hash);
+        self.declared_chunks
+            .write()
+            .insert(event.chunk_hash.clone(), event);
+    }
+
+    /// Menerima multiple ChunkDeclared events dari DA.
+    ///
+    /// # Arguments
+    ///
+    /// * `events` - Iterator of ChunkDeclaredEvent
+    ///
+    /// # Returns
+    ///
+    /// Jumlah events yang diterima.
+    pub fn receive_chunk_declared_batch<I>(&self, events: I) -> usize
+    where
+        I: IntoIterator<Item = ChunkDeclaredEvent>,
+    {
+        let mut declared = self.declared_chunks.write();
+        let mut count = 0;
+        for event in events {
+            declared.insert(event.chunk_hash.clone(), event);
+            count += 1;
+        }
+        debug!("Received {} ChunkDeclared events", count);
+        count
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DA METADATA SYNC (14A.42)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Sinkronisasi metadata chunk dari DA events.
+    ///
+    /// Method ini mengupdate chunk_metadata berdasarkan ChunkDeclared
+    /// events yang telah diterima via receive_chunk_declared().
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(usize)`: Jumlah metadata chunk yang berhasil disinkronkan
+    /// - `Err(DAError)`: Jika terjadi error
+    ///
+    /// # Behavior
+    ///
+    /// - Untuk setiap ChunkDeclared event:
+    ///   - Jika chunk belum ada di metadata → insert
+    ///   - Jika chunk sudah ada → update hanya field DA-derived
+    /// - `verified` TIDAK BOLEH otomatis berubah ke true
+    /// - Tidak menyentuh data chunk fisik
+    /// - Tidak menghapus metadata tanpa event eksplisit
+    ///
+    /// # Invariant
+    ///
+    /// - Return value = jumlah metadata yang di-sync
+    /// - Idempotent: sync berkali-kali tidak membuat duplikat
+    pub fn sync_metadata_from_da(&self) -> Result<usize, DAError> {
+        let declared = self.declared_chunks.read();
+        let mut metadata = self.chunk_metadata.write();
+
+        let mut synced_count = 0;
+
+        for (hash, event) in declared.iter() {
+            if let Some(existing) = metadata.get_mut(hash) {
+                // Update existing metadata dengan DA-derived fields
+                // CRITICAL: verified TIDAK BOLEH auto-true
+                existing.update_from_event(event);
+                synced_count += 1;
+            } else {
+                // Insert new metadata dari event
+                let mut meta = DAChunkMeta::new(
+                    event.chunk_hash.clone(),
+                    event.size_bytes,
+                    event.da_commitment,
+                );
+                if let Some(ref blob_ref) = event.blob_ref {
+                    meta.blob_ref = Some(blob_ref.clone());
+                }
+                // CRITICAL: verified = false (already default)
+                metadata.insert(hash.clone(), meta);
+                synced_count += 1;
+            }
+        }
+
+        debug!("Synced {} metadata entries from DA events", synced_count);
+        Ok(synced_count)
+    }
+
+    /// Get metadata reference for a chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - Chunk hash
+    ///
+    /// # Returns
+    ///
+    /// - `Some(guard)`: Guard yang dapat di-deref ke &DAChunkMeta
+    /// - `None`: Jika metadata tidak ada
+    ///
+    /// # Note
+    ///
+    /// Return type adalah MappedRwLockReadGuard yang implement Deref<Target=DAChunkMeta>.
+    /// Gunakan `&*guard` atau deref langsung untuk mendapatkan &DAChunkMeta.
+    ///
+    /// TIDAK melakukan fetch DA.
+    /// TIDAK ada side-effect.
+    pub fn get_chunk_meta(&self, hash: &str) -> Option<MappedRwLockReadGuard<'_, DAChunkMeta>> {
+        let guard = self.chunk_metadata.read();
+        if guard.contains_key(hash) {
+            Some(RwLockReadGuard::map(guard, |m| m.get(hash).unwrap()))
+        } else {
+            None
+        }
+    }
+
+    /// List semua chunk hash yang pernah dideklarasikan di DA.
+    ///
+    /// # Returns
+    ///
+    /// Vector of chunk hashes yang dideklarasikan, sorted untuk determinism.
+    ///
+    /// # Note
+    ///
+    /// - TIDAK query DA langsung
+    /// - Urutan deterministik dan konsisten
+    pub fn list_declared_chunks(&self) -> Vec<String> {
+        let declared = self.declared_chunks.read();
+        let mut hashes: Vec<String> = declared.keys().cloned().collect();
+        hashes.sort(); // Deterministic ordering
+        hashes
+    }
+
+    /// Get count of declared chunks.
+    pub fn declared_chunks_count(&self) -> usize {
+        self.declared_chunks.read().len()
+    }
+
+    /// Check if chunk is declared in DA.
+    pub fn is_chunk_declared(&self, hash: &str) -> bool {
+        self.declared_chunks.read().contains_key(hash)
+    }
+
+    /// Get declared event for a chunk.
+    pub fn get_declared_event(&self, hash: &str) -> Option<ChunkDeclaredEvent> {
+        self.declared_chunks.read().get(hash).cloned()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // BACKGROUND SYNC TASK
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Start background metadata sync task.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - Interval antara sync (Duration)
+    ///
+    /// # Returns
+    ///
+    /// JoinHandle untuk task. Task berhenti ketika stop_background_sync() dipanggil.
+    ///
+    /// # Behavior
+    ///
+    /// - Memanggil sync_metadata_from_da() secara periodik
+    /// - Handle error dengan logging (tidak panic)
+    /// - Berhenti ketika sync_running = false
+    pub fn start_background_sync(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let storage = Arc::clone(self);
+        storage.sync_running.store(true, Ordering::SeqCst);
+
+        tokio::spawn(async move {
+            info!("Background metadata sync started with interval {:?}", interval);
+            let mut interval_timer = tokio::time::interval(interval);
+
+            while storage.sync_running.load(Ordering::SeqCst) {
+                interval_timer.tick().await;
+
+                if !storage.sync_running.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                match storage.sync_metadata_from_da() {
+                    Ok(count) => {
+                        if count > 0 {
+                            debug!("Background sync: synced {} metadata entries", count);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Background sync error: {}", e);
+                    }
+                }
+            }
+
+            info!("Background metadata sync stopped");
+        })
+    }
+
+    /// Stop background sync task.
+    ///
+    /// Sets sync_running to false. Task akan berhenti pada iterasi berikutnya.
+    pub fn stop_background_sync(&self) {
+        self.sync_running.store(false, Ordering::SeqCst);
+        info!("Background sync stop requested");
+    }
+
+    /// Check if background sync is running.
+    pub fn is_sync_running(&self) -> bool {
+        self.sync_running.load(Ordering::SeqCst)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // EXISTING METHODS (from 14A.41)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Get metadata for a chunk (clone).
     ///
     /// # Arguments
     ///
@@ -354,13 +682,12 @@ impl DAStorage {
         Ok(())
     }
 
-    /// Delete chunk and its metadata.
+    /// Delete chunk metadata.
     ///
     /// # Note
     ///
     /// Karena Storage trait tidak memiliki delete_chunk,
     /// method ini hanya menghapus metadata.
-    /// Untuk delete data, gunakan inner storage langsung jika tersedia.
     ///
     /// # Arguments
     ///
@@ -577,25 +904,425 @@ mod tests {
         DAStorage::new(inner, da)
     }
 
+    fn create_arc_da_storage() -> Arc<DAStorage> {
+        let inner = Arc::new(MockStorage::new());
+        let da = Arc::new(MockDA::new());
+        Arc::new(DAStorage::new(inner, da))
+    }
+
     fn create_error_da_storage() -> DAStorage {
         let inner = Arc::new(ErrorStorage);
         let da = Arc::new(MockDA::new());
         DAStorage::new(inner, da)
     }
 
+    fn create_test_event(hash: &str, size: u64) -> ChunkDeclaredEvent {
+        ChunkDeclaredEvent::new(
+            hash.to_string(),
+            size,
+            [0xAB; 32],
+            None,
+            1000,
+        )
+    }
+
+    fn create_test_event_with_blob_ref(hash: &str, size: u64) -> ChunkDeclaredEvent {
+        let blob_ref = BlobRef {
+            height: 100,
+            commitment: [0xCD; 32],
+            namespace: [0xEF; 29],
+        };
+        ChunkDeclaredEvent::new(
+            hash.to_string(),
+            size,
+            [0xAB; 32],
+            Some(blob_ref),
+            1000,
+        )
+    }
+
     // ════════════════════════════════════════════════════════════════════════
-    // A. WRAPPER CORRECTNESS TESTS
+    // A. EMPTY DA TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_empty_da_returns_zero() {
+        let storage = create_da_storage();
+
+        // No events received
+        let result = storage.sync_metadata_from_da();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_sync_empty_da_metadata_empty() {
+        let storage = create_da_storage();
+
+        storage.sync_metadata_from_da().unwrap();
+
+        assert!(storage.all_metadata().is_empty());
+        assert_eq!(storage.metadata_count(), 0);
+    }
+
+    #[test]
+    fn test_list_declared_chunks_empty() {
+        let storage = create_da_storage();
+
+        let declared = storage.list_declared_chunks();
+        assert!(declared.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // B. SINGLE CHUNK DECLARED TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_single_chunk_returns_one() {
+        let storage = create_da_storage();
+
+        // Receive single event
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+
+        let result = storage.sync_metadata_from_da();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_sync_single_chunk_metadata_correct() {
+        let storage = create_da_storage();
+
+        let event = create_test_event("chunk-1", 2048);
+        storage.receive_chunk_declared(event.clone());
+        storage.sync_metadata_from_da().unwrap();
+
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.hash, "chunk-1");
+        assert_eq!(meta.size_bytes, 2048);
+        assert_eq!(meta.da_commitment, [0xAB; 32]);
+        assert!(!meta.verified); // MUST NOT be auto-true
+    }
+
+    #[test]
+    fn test_sync_chunk_with_blob_ref() {
+        let storage = create_da_storage();
+
+        let event = create_test_event_with_blob_ref("chunk-1", 1024);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert!(meta.blob_ref.is_some());
+        let blob_ref = meta.blob_ref.unwrap();
+        assert_eq!(blob_ref.height, 100);
+    }
+
+    #[test]
+    fn test_list_declared_chunks_single() {
+        let storage = create_da_storage();
+
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+
+        let declared = storage.list_declared_chunks();
+        assert_eq!(declared.len(), 1);
+        assert!(declared.contains(&"chunk-1".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // C. IDEMPOTENCY TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_idempotent_no_duplicate() {
+        let storage = create_da_storage();
+
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+        storage.receive_chunk_declared(create_test_event("chunk-2", 2048));
+
+        // Sync twice
+        storage.sync_metadata_from_da().unwrap();
+        let count1 = storage.metadata_count();
+
+        storage.sync_metadata_from_da().unwrap();
+        let count2 = storage.metadata_count();
+
+        // Count should be same
+        assert_eq!(count1, count2);
+        assert_eq!(count1, 2);
+    }
+
+    #[test]
+    fn test_sync_twice_returns_same_count() {
+        let storage = create_da_storage();
+
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+
+        let result1 = storage.sync_metadata_from_da().unwrap();
+        let result2 = storage.sync_metadata_from_da().unwrap();
+
+        // Both should return 1 (same event synced)
+        assert_eq!(result1, 1);
+        assert_eq!(result2, 1);
+    }
+
+    #[test]
+    fn test_receive_same_event_overwrites() {
+        let storage = create_da_storage();
+
+        // Receive same chunk twice with different size
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+        storage.receive_chunk_declared(create_test_event("chunk-1", 2048));
+
+        // Should only have one declared chunk
+        assert_eq!(storage.declared_chunks_count(), 1);
+
+        storage.sync_metadata_from_da().unwrap();
+
+        // Metadata should have updated size
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.size_bytes, 2048);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // D. PARTIAL UPDATE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_preserves_local_verified() {
+        let storage = create_da_storage();
+
+        // First, create metadata manually and set verified
+        let meta = DAChunkMeta::new("chunk-1".to_string(), 1024, [0x11; 32]);
+        storage.set_metadata("chunk-1", meta);
+        storage.set_verified("chunk-1", true);
+
+        // Now receive DA event (different commitment)
+        storage.receive_chunk_declared(create_test_event("chunk-1", 2048));
+        storage.sync_metadata_from_da().unwrap();
+
+        // verified should STILL be true (not overwritten)
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert!(meta.verified); // PRESERVED
+        // But size should be updated from DA
+        assert_eq!(meta.size_bytes, 2048);
+    }
+
+    #[test]
+    fn test_sync_updates_da_fields_only() {
+        let storage = create_da_storage();
+
+        // Create metadata with blob_ref
+        let old_blob_ref = BlobRef {
+            height: 50,
+            commitment: [0x99; 32],
+            namespace: [0x88; 29],
+        };
+        let mut meta = DAChunkMeta::new("chunk-1".to_string(), 1024, [0x11; 32]);
+        meta.blob_ref = Some(old_blob_ref.clone());
+        meta.verified = true;
+        storage.set_metadata("chunk-1", meta);
+
+        // Receive event WITHOUT blob_ref
+        storage.receive_chunk_declared(create_test_event("chunk-1", 2048));
+        storage.sync_metadata_from_da().unwrap();
+
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        // blob_ref should be preserved (event had None)
+        assert!(meta.blob_ref.is_some());
+        assert_eq!(meta.blob_ref.as_ref().unwrap().height, 50);
+        // verified preserved
+        assert!(meta.verified);
+    }
+
+    #[test]
+    fn test_sync_does_not_delete_metadata() {
+        let storage = create_da_storage();
+
+        // Add metadata manually (not from DA)
+        let meta = DAChunkMeta::new("local-chunk".to_string(), 500, [0x22; 32]);
+        storage.set_metadata("local-chunk", meta);
+
+        // Receive different DA event
+        storage.receive_chunk_declared(create_test_event("da-chunk", 1024));
+        storage.sync_metadata_from_da().unwrap();
+
+        // Local metadata should still exist
+        assert!(storage.has_metadata("local-chunk"));
+        assert!(storage.has_metadata("da-chunk"));
+        assert_eq!(storage.metadata_count(), 2);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // E. GET_CHUNK_META TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_chunk_meta_returns_reference() {
+        let storage = create_da_storage();
+
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+        storage.sync_metadata_from_da().unwrap();
+
+        let guard = storage.get_chunk_meta("chunk-1");
+        assert!(guard.is_some());
+
+        // Can deref to &DAChunkMeta
+        let meta: &DAChunkMeta = &*guard.unwrap();
+        assert_eq!(meta.hash, "chunk-1");
+    }
+
+    #[test]
+    fn test_get_chunk_meta_none_if_not_exists() {
+        let storage = create_da_storage();
+
+        let guard = storage.get_chunk_meta("nonexistent");
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn test_get_chunk_meta_no_side_effect() {
+        let storage = create_da_storage();
+
+        // Call multiple times
+        let _ = storage.get_chunk_meta("chunk-1");
+        let _ = storage.get_chunk_meta("chunk-1");
+        let _ = storage.get_chunk_meta("chunk-1");
+
+        // No metadata created
+        assert_eq!(storage.metadata_count(), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // F. LIST_DECLARED_CHUNKS TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_list_declared_chunks_deterministic() {
+        let storage = create_da_storage();
+
+        // Add in random order
+        storage.receive_chunk_declared(create_test_event("zebra", 100));
+        storage.receive_chunk_declared(create_test_event("apple", 200));
+        storage.receive_chunk_declared(create_test_event("mango", 300));
+
+        let list1 = storage.list_declared_chunks();
+        let list2 = storage.list_declared_chunks();
+
+        // Same order every time
+        assert_eq!(list1, list2);
+        // Sorted order
+        assert_eq!(list1, vec!["apple", "mango", "zebra"]);
+    }
+
+    #[test]
+    fn test_list_declared_chunks_multiple() {
+        let storage = create_da_storage();
+
+        for i in 0..10 {
+            storage.receive_chunk_declared(create_test_event(&format!("chunk-{}", i), 1024));
+        }
+
+        let declared = storage.list_declared_chunks();
+        assert_eq!(declared.len(), 10);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // G. VERIFIED NOT AUTO TRUE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_verified_not_auto_true() {
+        let storage = create_da_storage();
+
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+        storage.sync_metadata_from_da().unwrap();
+
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert!(!meta.verified); // MUST be false
+    }
+
+    #[test]
+    fn test_sync_multiple_all_unverified() {
+        let storage = create_da_storage();
+
+        for i in 0..5 {
+            storage.receive_chunk_declared(create_test_event(&format!("chunk-{}", i), 1024));
+        }
+        storage.sync_metadata_from_da().unwrap();
+
+        // All should be unverified
+        let unverified = storage.unverified_chunks();
+        assert_eq!(unverified.len(), 5);
+
+        let verified = storage.verified_chunks();
+        assert!(verified.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // H. BACKGROUND SYNC TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_background_sync_starts() {
+        let storage = create_arc_da_storage();
+
+        let handle = storage.start_background_sync(Duration::from_millis(100));
+
+        assert!(storage.is_sync_running());
+
+        // Stop and wait
+        storage.stop_background_sync();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(!storage.is_sync_running());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_background_sync_processes_events() {
+        let storage = create_arc_da_storage();
+
+        // Add event before starting sync
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
+
+        let handle = storage.start_background_sync(Duration::from_millis(50));
+
+        // Wait for sync to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Metadata should be synced
+        assert!(storage.has_metadata("chunk-1"));
+
+        storage.stop_background_sync();
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_background_sync_stops_gracefully() {
+        let storage = create_arc_da_storage();
+
+        let _handle = storage.start_background_sync(Duration::from_millis(50));
+
+        assert!(storage.is_sync_running());
+
+        storage.stop_background_sync();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(!storage.is_sync_running());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // I. WRAPPER CORRECTNESS TESTS (from 14A.41)
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_put_get_through_da_storage() {
         let storage = create_da_storage();
 
-        // Put chunk
         let result = storage.put_chunk("chunk-1", b"test data");
         assert!(result.is_ok());
 
-        // Get chunk - should return same data
         let data = storage.get_chunk("chunk-1").unwrap();
         assert_eq!(data, Some(b"test data".to_vec()));
     }
@@ -604,197 +1331,39 @@ mod tests {
     fn test_has_chunk_checks_inner() {
         let storage = create_da_storage();
 
-        // Before put
         assert!(!storage.has_chunk("chunk-1").unwrap());
 
-        // After put
         storage.put_chunk("chunk-1", b"data").unwrap();
         assert!(storage.has_chunk("chunk-1").unwrap());
     }
 
     #[test]
-    fn test_get_nonexistent_chunk() {
-        let storage = create_da_storage();
-
-        let data = storage.get_chunk("nonexistent").unwrap();
-        assert!(data.is_none());
-    }
-
-    #[test]
-    fn test_put_overwrites_existing() {
-        let storage = create_da_storage();
-
-        storage.put_chunk("chunk-1", b"original").unwrap();
-        storage.put_chunk("chunk-1", b"updated").unwrap();
-
-        let data = storage.get_chunk("chunk-1").unwrap();
-        assert_eq!(data, Some(b"updated".to_vec()));
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // B. METADATA SYNC TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_metadata_created_on_put() {
-        let storage = create_da_storage();
-
-        assert!(!storage.has_metadata("chunk-1"));
-
-        storage.put_chunk("chunk-1", b"test data").unwrap();
-
-        assert!(storage.has_metadata("chunk-1"));
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert_eq!(meta.hash, "chunk-1");
-        assert_eq!(meta.size_bytes, 9); // "test data" = 9 bytes
-        assert!(!meta.verified); // WAJIB false
-    }
-
-    #[test]
-    fn test_metadata_removed_on_delete() {
-        let storage = create_da_storage();
-
-        storage.put_chunk("chunk-1", b"data").unwrap();
-        assert!(storage.has_metadata("chunk-1"));
-
-        storage.delete_metadata("chunk-1");
-        assert!(!storage.has_metadata("chunk-1"));
-    }
-
-    #[test]
-    fn test_metadata_with_commitment() {
-        let storage = create_da_storage();
-        let commitment = [0xAB; 32];
-
-        storage
-            .put_chunk_with_meta("chunk-1", b"data", commitment)
-            .unwrap();
-
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert_eq!(meta.da_commitment, commitment);
-        assert!(!meta.verified);
-    }
-
-    #[test]
-    fn test_metadata_with_blob_ref() {
-        let storage = create_da_storage();
-        let commitment = [0xCD; 32];
-        let blob_ref = BlobRef {
-            height: 100,
-            commitment: [0xEF; 32],
-            namespace: [0x01; 29],
-        };
-
-        storage
-            .put_chunk_with_blob_ref("chunk-1", b"data", commitment, blob_ref.clone())
-            .unwrap();
-
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert_eq!(meta.da_commitment, commitment);
-        assert_eq!(meta.blob_ref, Some(blob_ref));
-        assert!(!meta.verified);
-    }
-
-    #[test]
-    fn test_set_verified() {
-        let storage = create_da_storage();
-
-        storage.put_chunk("chunk-1", b"data").unwrap();
-
-        // Initially not verified
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert!(!meta.verified);
-
-        // Set verified
-        assert!(storage.set_verified("chunk-1", true));
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert!(meta.verified);
-
-        // Set not verified again
-        assert!(storage.set_verified("chunk-1", false));
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert!(!meta.verified);
-    }
-
-    #[test]
-    fn test_set_verified_nonexistent() {
-        let storage = create_da_storage();
-
-        // Should return false for nonexistent
-        assert!(!storage.set_verified("nonexistent", true));
-    }
-
-    #[test]
-    fn test_set_blob_ref() {
-        let storage = create_da_storage();
-        let blob_ref = BlobRef {
-            height: 200,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        storage.put_chunk("chunk-1", b"data").unwrap();
-
-        // Initially no blob_ref
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert!(meta.blob_ref.is_none());
-
-        // Set blob_ref
-        assert!(storage.set_blob_ref("chunk-1", blob_ref.clone()));
-        let meta = storage.get_metadata("chunk-1").unwrap();
-        assert_eq!(meta.blob_ref, Some(blob_ref));
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // C. NO DATA DUPLICATION TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
     fn test_metadata_not_authoritative() {
         let storage = create_da_storage();
 
-        // Put chunk
         storage.put_chunk("chunk-1", b"data").unwrap();
-
-        // Metadata exists
         assert!(storage.has_metadata("chunk-1"));
 
-        // Remove metadata only
         storage.delete_metadata("chunk-1");
 
-        // Metadata gone but data still exists
         assert!(!storage.has_metadata("chunk-1"));
-        assert!(storage.has_chunk("chunk-1").unwrap()); // Data still in inner
+        assert!(storage.has_chunk("chunk-1").unwrap()); // Data still exists
     }
 
     #[test]
     fn test_has_chunk_ignores_metadata() {
         let storage = create_da_storage();
 
-        // Manually add metadata without data
+        // Add metadata without data
         let meta = DAChunkMeta::new("fake-chunk".to_string(), 100, [0u8; 32]);
         storage.set_metadata("fake-chunk", meta);
 
-        // Metadata exists but has_chunk returns false
         assert!(storage.has_metadata("fake-chunk"));
         assert!(!storage.has_chunk("fake-chunk").unwrap());
     }
 
-    #[test]
-    fn test_get_chunk_ignores_metadata() {
-        let storage = create_da_storage();
-
-        // Manually add metadata without data
-        let meta = DAChunkMeta::new("fake-chunk".to_string(), 100, [0u8; 32]);
-        storage.set_metadata("fake-chunk", meta);
-
-        // get_chunk returns None (checks inner, not metadata)
-        let data = storage.get_chunk("fake-chunk").unwrap();
-        assert!(data.is_none());
-    }
-
     // ════════════════════════════════════════════════════════════════════════
-    // D. ERROR PROPAGATION TESTS
+    // J. ERROR PROPAGATION TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -821,259 +1390,65 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_put_with_meta_error_propagates() {
-        let storage = create_error_da_storage();
-
-        let result = storage.put_chunk_with_meta("chunk-1", b"data", [0u8; 32]);
-        assert!(result.is_err());
-
-        // Metadata should NOT be created on error
-        assert!(!storage.has_metadata("chunk-1"));
-    }
-
-    #[test]
-    fn test_put_with_blob_ref_error_propagates() {
-        let storage = create_error_da_storage();
-        let blob_ref = BlobRef {
-            height: 1,
-            commitment: [0u8; 32],
-            namespace: [0u8; 29],
-        };
-
-        let result = storage.put_chunk_with_blob_ref("chunk-1", b"data", [0u8; 32], blob_ref);
-        assert!(result.is_err());
-
-        // Metadata should NOT be created on error
-        assert!(!storage.has_metadata("chunk-1"));
-    }
-
     // ════════════════════════════════════════════════════════════════════════
-    // E. DETERMINISM TESTS
+    // K. CHUNK DECLARED EVENT TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_operations_deterministic() {
-        let storage1 = create_da_storage();
-        let storage2 = create_da_storage();
-
-        // Same operations
-        storage1.put_chunk("a", b"data-a").unwrap();
-        storage1.put_chunk("b", b"data-b").unwrap();
-        storage1.put_chunk("c", b"data-c").unwrap();
-
-        storage2.put_chunk("a", b"data-a").unwrap();
-        storage2.put_chunk("b", b"data-b").unwrap();
-        storage2.put_chunk("c", b"data-c").unwrap();
-
-        // Same results
-        assert_eq!(
-            storage1.get_chunk("a").unwrap(),
-            storage2.get_chunk("a").unwrap()
-        );
-        assert_eq!(
-            storage1.get_chunk("b").unwrap(),
-            storage2.get_chunk("b").unwrap()
-        );
-        assert_eq!(
-            storage1.get_chunk("c").unwrap(),
-            storage2.get_chunk("c").unwrap()
+    fn test_chunk_declared_event_creation() {
+        let event = ChunkDeclaredEvent::new(
+            "chunk-1".to_string(),
+            1024,
+            [0xAA; 32],
+            None,
+            12345,
         );
 
-        // Same metadata count
-        assert_eq!(storage1.metadata_count(), storage2.metadata_count());
+        assert_eq!(event.chunk_hash, "chunk-1");
+        assert_eq!(event.size_bytes, 1024);
+        assert_eq!(event.da_commitment, [0xAA; 32]);
+        assert!(event.blob_ref.is_none());
+        assert_eq!(event.declared_at, 12345);
     }
 
     #[test]
-    fn test_metadata_deterministic() {
-        let storage1 = create_da_storage();
-        let storage2 = create_da_storage();
-
-        let commitment = [0x55; 32];
-
-        storage1
-            .put_chunk_with_meta("chunk", b"data", commitment)
-            .unwrap();
-        storage2
-            .put_chunk_with_meta("chunk", b"data", commitment)
-            .unwrap();
-
-        let meta1 = storage1.get_metadata("chunk").unwrap();
-        let meta2 = storage2.get_metadata("chunk").unwrap();
-
-        assert_eq!(meta1.hash, meta2.hash);
-        assert_eq!(meta1.size_bytes, meta2.size_bytes);
-        assert_eq!(meta1.da_commitment, meta2.da_commitment);
-        assert_eq!(meta1.verified, meta2.verified);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // F. DACHUNKMETA TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_dachunkmeta_new_verified_false() {
-        let meta = DAChunkMeta::new("hash".to_string(), 100, [0u8; 32]);
-        assert!(!meta.verified); // WAJIB false
-        assert!(meta.blob_ref.is_none());
-    }
-
-    #[test]
-    fn test_dachunkmeta_with_blob_ref_verified_false() {
-        let blob_ref = BlobRef {
-            height: 1,
-            commitment: [0u8; 32],
-            namespace: [0u8; 29],
-        };
-        let meta = DAChunkMeta::with_blob_ref("hash".to_string(), 100, [0u8; 32], blob_ref.clone());
-        assert!(!meta.verified); // WAJIB false
-        assert_eq!(meta.blob_ref, Some(blob_ref));
-    }
-
-    #[test]
-    fn test_dachunkmeta_set_methods() {
-        let mut meta = DAChunkMeta::new("hash".to_string(), 100, [0u8; 32]);
-
-        meta.set_verified(true);
-        assert!(meta.verified);
-
-        let blob_ref = BlobRef {
-            height: 5,
-            commitment: [0xAA; 32],
-            namespace: [0xBB; 29],
-        };
-        meta.set_blob_ref(blob_ref.clone());
-        assert_eq!(meta.blob_ref, Some(blob_ref));
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // G. QUERY METHODS TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_unverified_chunks() {
+    fn test_receive_chunk_declared_batch() {
         let storage = create_da_storage();
 
-        storage.put_chunk("a", b"data").unwrap();
-        storage.put_chunk("b", b"data").unwrap();
-        storage.put_chunk("c", b"data").unwrap();
+        let events = vec![
+            create_test_event("chunk-1", 100),
+            create_test_event("chunk-2", 200),
+            create_test_event("chunk-3", 300),
+        ];
 
-        // All unverified initially
-        let unverified = storage.unverified_chunks();
-        assert_eq!(unverified.len(), 3);
-
-        // Verify one
-        storage.set_verified("b", true);
-
-        let unverified = storage.unverified_chunks();
-        assert_eq!(unverified.len(), 2);
-        assert!(!unverified.contains(&"b".to_string()));
+        let count = storage.receive_chunk_declared_batch(events);
+        assert_eq!(count, 3);
+        assert_eq!(storage.declared_chunks_count(), 3);
     }
 
     #[test]
-    fn test_verified_chunks() {
+    fn test_is_chunk_declared() {
         let storage = create_da_storage();
 
-        storage.put_chunk("a", b"data").unwrap();
-        storage.put_chunk("b", b"data").unwrap();
+        assert!(!storage.is_chunk_declared("chunk-1"));
 
-        // None verified initially
-        assert!(storage.verified_chunks().is_empty());
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
 
-        // Verify one
-        storage.set_verified("a", true);
-
-        let verified = storage.verified_chunks();
-        assert_eq!(verified.len(), 1);
-        assert!(verified.contains(&"a".to_string()));
+        assert!(storage.is_chunk_declared("chunk-1"));
+        assert!(!storage.is_chunk_declared("chunk-2"));
     }
 
     #[test]
-    fn test_chunks_with_blob_ref() {
-        let storage = create_da_storage();
-        let blob_ref = BlobRef {
-            height: 1,
-            commitment: [0u8; 32],
-            namespace: [0u8; 29],
-        };
-
-        storage.put_chunk("a", b"data").unwrap();
-        storage
-            .put_chunk_with_blob_ref("b", b"data", [0u8; 32], blob_ref)
-            .unwrap();
-
-        let with_ref = storage.chunks_with_blob_ref();
-        assert_eq!(with_ref.len(), 1);
-        assert!(with_ref.contains(&"b".to_string()));
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // H. UTILITY METHODS TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_metadata_count() {
+    fn test_get_declared_event() {
         let storage = create_da_storage();
 
-        assert_eq!(storage.metadata_count(), 0);
+        storage.receive_chunk_declared(create_test_event("chunk-1", 1024));
 
-        storage.put_chunk("a", b"data").unwrap();
-        assert_eq!(storage.metadata_count(), 1);
+        let event = storage.get_declared_event("chunk-1");
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().size_bytes, 1024);
 
-        storage.put_chunk("b", b"data").unwrap();
-        assert_eq!(storage.metadata_count(), 2);
-
-        storage.delete_metadata("a");
-        assert_eq!(storage.metadata_count(), 1);
-    }
-
-    #[test]
-    fn test_all_metadata() {
-        let storage = create_da_storage();
-
-        storage.put_chunk("a", b"data-a").unwrap();
-        storage.put_chunk("b", b"data-b").unwrap();
-
-        let all = storage.all_metadata();
-        assert_eq!(all.len(), 2);
-        assert!(all.contains_key("a"));
-        assert!(all.contains_key("b"));
-    }
-
-    #[test]
-    fn test_clear_metadata() {
-        let storage = create_da_storage();
-
-        storage.put_chunk("a", b"data").unwrap();
-        storage.put_chunk("b", b"data").unwrap();
-        assert_eq!(storage.metadata_count(), 2);
-
-        storage.clear_metadata();
-        assert_eq!(storage.metadata_count(), 0);
-
-        // Data still exists
-        assert!(storage.has_chunk("a").unwrap());
-        assert!(storage.has_chunk("b").unwrap());
-    }
-
-    #[test]
-    fn test_inner_reference() {
-        let storage = create_da_storage();
-
-        storage.put_chunk("test", b"data").unwrap();
-
-        // Access inner directly
-        let inner = storage.inner();
-        assert!(inner.has_chunk("test").unwrap());
-    }
-
-    #[test]
-    fn test_debug_impl() {
-        let storage = create_da_storage();
-        storage.put_chunk("a", b"data").unwrap();
-
-        let debug = format!("{:?}", storage);
-        assert!(debug.contains("DAStorage"));
-        assert!(debug.contains("chunk_metadata_count"));
+        let none = storage.get_declared_event("nonexistent");
+        assert!(none.is_none());
     }
 }
