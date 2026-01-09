@@ -180,6 +180,111 @@ impl Display for CommitmentReport {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// REPLICA INFO
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Informasi tentang satu replica chunk.
+///
+/// Struct ini merepresentasikan satu node yang menyimpan replica
+/// dari chunk tertentu. Derived dari DA events.
+///
+/// # Fields
+///
+/// - `node_id`: ID unik node yang menyimpan replica
+/// - `added_at`: Timestamp saat replica ditambahkan (Unix ms)
+/// - `blob_ref`: Referensi blob DA dari ReplicaAdded event
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaInfo {
+    /// ID unik node yang menyimpan replica.
+    pub node_id: String,
+    /// Timestamp saat replica ditambahkan (Unix milliseconds).
+    pub added_at: u64,
+    /// Referensi blob DA dari ReplicaAdded event.
+    pub blob_ref: Option<BlobRef>,
+}
+
+impl ReplicaInfo {
+    /// Membuat ReplicaInfo baru.
+    pub fn new(node_id: String, added_at: u64, blob_ref: Option<BlobRef>) -> Self {
+        Self {
+            node_id,
+            added_at,
+            blob_ref,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REPLICA EVENTS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Event yang menandakan replica ditambahkan.
+///
+/// Diterima dari DA layer ketika node mendeklarasikan
+/// bahwa ia menyimpan replica chunk tertentu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaAddedEvent {
+    /// Hash chunk yang di-replica.
+    pub chunk_hash: String,
+    /// ID node yang menyimpan replica.
+    pub node_id: String,
+    /// Timestamp event (Unix milliseconds).
+    pub timestamp: u64,
+    /// Referensi blob DA.
+    pub blob_ref: Option<BlobRef>,
+}
+
+impl ReplicaAddedEvent {
+    /// Membuat ReplicaAddedEvent baru.
+    pub fn new(
+        chunk_hash: String,
+        node_id: String,
+        timestamp: u64,
+        blob_ref: Option<BlobRef>,
+    ) -> Self {
+        Self {
+            chunk_hash,
+            node_id,
+            timestamp,
+            blob_ref,
+        }
+    }
+}
+
+/// Event yang menandakan replica dihapus.
+///
+/// Diterima dari DA layer ketika node tidak lagi
+/// menyimpan replica chunk tertentu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaRemovedEvent {
+    /// Hash chunk yang replica-nya dihapus.
+    pub chunk_hash: String,
+    /// ID node yang menghapus replica.
+    pub node_id: String,
+    /// Timestamp event (Unix milliseconds).
+    pub timestamp: u64,
+    /// Referensi blob DA.
+    pub blob_ref: Option<BlobRef>,
+}
+
+impl ReplicaRemovedEvent {
+    /// Membuat ReplicaRemovedEvent baru.
+    pub fn new(
+        chunk_hash: String,
+        node_id: String,
+        timestamp: u64,
+        blob_ref: Option<BlobRef>,
+    ) -> Self {
+        Self {
+            chunk_hash,
+            node_id,
+            timestamp,
+            blob_ref,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // CHUNK DECLARED EVENT
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -196,6 +301,7 @@ impl Display for CommitmentReport {
 /// - `da_commitment`: Commitment 32-byte dari DA
 /// - `blob_ref`: Referensi ke blob DA tempat event dipublish
 /// - `declared_at`: Timestamp (Unix ms) saat event dideklarasikan
+/// - `target_rf`: Target replication factor untuk chunk ini
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkDeclaredEvent {
     /// Hash unik chunk.
@@ -208,6 +314,8 @@ pub struct ChunkDeclaredEvent {
     pub blob_ref: Option<BlobRef>,
     /// Timestamp deklarasi (Unix milliseconds).
     pub declared_at: u64,
+    /// Target replication factor.
+    pub target_rf: u8,
 }
 
 impl ChunkDeclaredEvent {
@@ -225,6 +333,26 @@ impl ChunkDeclaredEvent {
             da_commitment,
             blob_ref,
             declared_at,
+            target_rf: 3, // Default RF
+        }
+    }
+
+    /// Membuat ChunkDeclaredEvent dengan target_rf spesifik.
+    pub fn with_target_rf(
+        chunk_hash: String,
+        size_bytes: u64,
+        da_commitment: [u8; 32],
+        blob_ref: Option<BlobRef>,
+        declared_at: u64,
+        target_rf: u8,
+    ) -> Self {
+        Self {
+            chunk_hash,
+            size_bytes,
+            da_commitment,
+            blob_ref,
+            declared_at,
+            target_rf,
         }
     }
 }
@@ -245,11 +373,16 @@ impl ChunkDeclaredEvent {
 /// - `da_commitment`: Commitment 32-byte dari DA
 /// - `blob_ref`: Referensi blob DA (jika sudah dipublish)
 /// - `verified`: Hasil verifikasi terhadap DA
+/// - `replicas`: Daftar replica berdasarkan DA events (DERIVED ONLY)
+/// - `target_rf`: Target replication factor dari ChunkDeclared event
+/// - `current_rf`: Jumlah replica aktif saat ini (konsisten dengan replicas.len())
 ///
 /// # Invariant
 ///
-/// `verified` TIDAK BOLEH default `true`. Chunk harus diverifikasi
-/// secara eksplisit sebelum dianggap verified.
+/// - `verified` TIDAK BOLEH default `true`. Chunk harus diverifikasi
+///   secara eksplisit sebelum dianggap verified.
+/// - `replicas` HANYA diisi dari DA events, TIDAK BOLEH dari asumsi lokal
+/// - `current_rf` HARUS selalu sama dengan `replicas.len()`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DAChunkMeta {
     /// Chunk hash (string canonical).
@@ -262,6 +395,12 @@ pub struct DAChunkMeta {
     pub blob_ref: Option<BlobRef>,
     /// Hasil verifikasi terhadap DA. Default: false.
     pub verified: bool,
+    /// Daftar replica berdasarkan DA events. DERIVED ONLY.
+    pub replicas: Vec<ReplicaInfo>,
+    /// Target replication factor dari ChunkDeclared event.
+    pub target_rf: u8,
+    /// Jumlah replica aktif saat ini. MUST equal replicas.len().
+    pub current_rf: u8,
 }
 
 impl DAChunkMeta {
@@ -275,7 +414,8 @@ impl DAChunkMeta {
     ///
     /// # Returns
     ///
-    /// DAChunkMeta dengan `verified = false` dan `blob_ref = None`.
+    /// DAChunkMeta dengan `verified = false`, `blob_ref = None`,
+    /// `replicas = []`, `target_rf = 3`, `current_rf = 0`.
     pub fn new(hash: String, size_bytes: u64, da_commitment: [u8; 32]) -> Self {
         Self {
             hash,
@@ -283,6 +423,28 @@ impl DAChunkMeta {
             da_commitment,
             blob_ref: None,
             verified: false, // WAJIB default false
+            replicas: Vec::new(), // WAJIB kosong, derived only
+            target_rf: 3, // Default RF
+            current_rf: 0, // WAJIB 0, no replicas yet
+        }
+    }
+
+    /// Membuat DAChunkMeta dengan target_rf spesifik.
+    pub fn with_target_rf(
+        hash: String,
+        size_bytes: u64,
+        da_commitment: [u8; 32],
+        target_rf: u8,
+    ) -> Self {
+        Self {
+            hash,
+            size_bytes,
+            da_commitment,
+            blob_ref: None,
+            verified: false,
+            replicas: Vec::new(),
+            target_rf,
+            current_rf: 0,
         }
     }
 
@@ -301,6 +463,9 @@ impl DAChunkMeta {
             da_commitment,
             blob_ref: Some(blob_ref),
             verified: false, // WAJIB default false
+            replicas: Vec::new(),
+            target_rf: 3,
+            current_rf: 0,
         }
     }
 
@@ -322,10 +487,75 @@ impl DAChunkMeta {
         self.blob_ref = Some(blob_ref);
     }
 
+    /// Add replica from ReplicaAdded event.
+    ///
+    /// # Arguments
+    ///
+    /// * `replica` - ReplicaInfo to add
+    ///
+    /// # Returns
+    ///
+    /// `true` if replica was added, `false` if already exists (no duplicate).
+    pub fn add_replica(&mut self, replica: ReplicaInfo) -> bool {
+        // Check for duplicate
+        if self.replicas.iter().any(|r| r.node_id == replica.node_id) {
+            return false;
+        }
+        self.replicas.push(replica);
+        self.current_rf = self.replicas.len() as u8;
+        true
+    }
+
+    /// Remove replica by node_id.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - ID node yang replicanya dihapus
+    ///
+    /// # Returns
+    ///
+    /// `true` if replica was removed, `false` if not found.
+    pub fn remove_replica(&mut self, node_id: &str) -> bool {
+        let initial_len = self.replicas.len();
+        self.replicas.retain(|r| r.node_id != node_id);
+        let removed = self.replicas.len() < initial_len;
+        self.current_rf = self.replicas.len() as u8;
+        removed
+    }
+
+    /// Get list of node IDs that hold replicas.
+    ///
+    /// # Returns
+    ///
+    /// Vector of node_id strings, sorted for determinism.
+    pub fn replica_node_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.replicas.iter().map(|r| r.node_id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Check if a node is a replica holder.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - Node ID to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if node holds a replica.
+    pub fn is_replica(&self, node_id: &str) -> bool {
+        self.replicas.iter().any(|r| r.node_id == node_id)
+    }
+
     /// Update from ChunkDeclaredEvent.
     ///
     /// Updates only DA-derived fields. Does NOT change:
     /// - verified (MUST NOT auto-change to true)
+    /// - replicas (only changed by ReplicaAdded/Removed events)
+    /// - current_rf (derived from replicas)
+    ///
+    /// DOES update:
+    /// - target_rf from event
     ///
     /// # Arguments
     ///
@@ -334,10 +564,12 @@ impl DAChunkMeta {
         // Update DA-derived fields only
         self.size_bytes = event.size_bytes;
         self.da_commitment = event.da_commitment;
+        self.target_rf = event.target_rf;
         if event.blob_ref.is_some() {
             self.blob_ref = event.blob_ref.clone();
         }
         // CRITICAL: verified TIDAK BOLEH diubah ke true secara otomatis
+        // CRITICAL: replicas TIDAK BOLEH diubah dari ChunkDeclared event
     }
 }
 
@@ -356,6 +588,8 @@ impl DAChunkMeta {
 /// - `da`: Sumber kebenaran Data Availability
 /// - `chunk_metadata`: STATE TURUNAN, bukan authoritative
 /// - `declared_chunks`: ChunkDeclared events dari DA
+/// - `replica_added_events`: ReplicaAdded events dari DA
+/// - `replica_removed_events`: ReplicaRemoved events dari DA
 ///
 /// # Prinsip
 ///
@@ -363,6 +597,7 @@ impl DAChunkMeta {
 /// - Metadata di-sync dari DA events
 /// - `inner` adalah sumber kebenaran untuk keberadaan data
 /// - Metadata hanya untuk tracking, bukan pengganti data
+/// - Replica info HANYA dari DA events, TIDAK dari asumsi lokal
 ///
 /// # Invariant
 ///
@@ -370,6 +605,7 @@ impl DAChunkMeta {
 /// - Error dari `inner` HARUS propagate
 /// - Metadata tidak boleh menggantikan data asli
 /// - Metadata derived dari DA events
+/// - Replica list derived dari ReplicaAdded/Removed events
 pub struct DAStorage {
     /// Storage asli yang menyimpan data chunk.
     inner: Arc<dyn Storage>,
@@ -379,6 +615,10 @@ pub struct DAStorage {
     chunk_metadata: RwLock<HashMap<String, DAChunkMeta>>,
     /// ChunkDeclared events yang diterima dari DA.
     declared_chunks: RwLock<HashMap<String, ChunkDeclaredEvent>>,
+    /// ReplicaAdded events yang diterima dari DA. Key: (chunk_hash, node_id).
+    replica_added_events: RwLock<HashMap<(String, String), ReplicaAddedEvent>>,
+    /// ReplicaRemoved events yang diterima dari DA. Key: (chunk_hash, node_id).
+    replica_removed_events: RwLock<HashMap<(String, String), ReplicaRemovedEvent>>,
     /// Flag untuk menghentikan background sync.
     sync_running: AtomicBool,
 }
@@ -390,6 +630,8 @@ impl Debug for DAStorage {
             .field("da", &"<DALayer>")
             .field("chunk_metadata_count", &self.chunk_metadata.read().len())
             .field("declared_chunks_count", &self.declared_chunks.read().len())
+            .field("replica_added_events_count", &self.replica_added_events.read().len())
+            .field("replica_removed_events_count", &self.replica_removed_events.read().len())
             .finish()
     }
 }
@@ -411,6 +653,8 @@ impl DAStorage {
             da,
             chunk_metadata: RwLock::new(HashMap::new()),
             declared_chunks: RwLock::new(HashMap::new()),
+            replica_added_events: RwLock::new(HashMap::new()),
+            replica_removed_events: RwLock::new(HashMap::new()),
             sync_running: AtomicBool::new(false),
         }
     }
@@ -482,6 +726,88 @@ impl DAStorage {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // REPLICA EVENT RECEIVING (14A.45)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Menerima ReplicaAdded event dari DA.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - ReplicaAddedEvent yang diterima
+    ///
+    /// # Behavior
+    ///
+    /// - Menyimpan event ke replica_added_events
+    /// - Idempotent: event yang sama akan di-overwrite
+    pub fn receive_replica_added(&self, event: ReplicaAddedEvent) {
+        debug!(
+            "Received ReplicaAdded event: chunk={}, node={}",
+            event.chunk_hash, event.node_id
+        );
+        let key = (event.chunk_hash.clone(), event.node_id.clone());
+        self.replica_added_events.write().insert(key, event);
+    }
+
+    /// Menerima ReplicaRemoved event dari DA.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - ReplicaRemovedEvent yang diterima
+    ///
+    /// # Behavior
+    ///
+    /// - Menyimpan event ke replica_removed_events
+    /// - Idempotent: event yang sama akan di-overwrite
+    pub fn receive_replica_removed(&self, event: ReplicaRemovedEvent) {
+        debug!(
+            "Received ReplicaRemoved event: chunk={}, node={}",
+            event.chunk_hash, event.node_id
+        );
+        let key = (event.chunk_hash.clone(), event.node_id.clone());
+        self.replica_removed_events.write().insert(key, event);
+    }
+
+    /// Menerima batch ReplicaAdded events.
+    ///
+    /// # Returns
+    ///
+    /// Jumlah events yang diterima.
+    pub fn receive_replica_added_batch<I>(&self, events: I) -> usize
+    where
+        I: IntoIterator<Item = ReplicaAddedEvent>,
+    {
+        let mut added = self.replica_added_events.write();
+        let mut count = 0;
+        for event in events {
+            let key = (event.chunk_hash.clone(), event.node_id.clone());
+            added.insert(key, event);
+            count += 1;
+        }
+        debug!("Received {} ReplicaAdded events", count);
+        count
+    }
+
+    /// Menerima batch ReplicaRemoved events.
+    ///
+    /// # Returns
+    ///
+    /// Jumlah events yang diterima.
+    pub fn receive_replica_removed_batch<I>(&self, events: I) -> usize
+    where
+        I: IntoIterator<Item = ReplicaRemovedEvent>,
+    {
+        let mut removed = self.replica_removed_events.write();
+        let mut count = 0;
+        for event in events {
+            let key = (event.chunk_hash.clone(), event.node_id.clone());
+            removed.insert(key, event);
+            count += 1;
+        }
+        debug!("Received {} ReplicaRemoved events", count);
+        count
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // DA METADATA SYNC (14A.42)
     // ════════════════════════════════════════════════════════════════════════
 
@@ -521,16 +847,18 @@ impl DAStorage {
                 existing.update_from_event(event);
                 synced_count += 1;
             } else {
-                // Insert new metadata dari event
-                let mut meta = DAChunkMeta::new(
+                // Insert new metadata dari event dengan target_rf
+                let mut meta = DAChunkMeta::with_target_rf(
                     event.chunk_hash.clone(),
                     event.size_bytes,
                     event.da_commitment,
+                    event.target_rf,
                 );
                 if let Some(ref blob_ref) = event.blob_ref {
                     meta.blob_ref = Some(blob_ref.clone());
                 }
                 // CRITICAL: verified = false (already default)
+                // CRITICAL: replicas = [] (must be synced separately)
                 metadata.insert(hash.clone(), meta);
                 synced_count += 1;
             }
@@ -597,6 +925,227 @@ impl DAStorage {
     /// Get declared event for a chunk.
     pub fn get_declared_event(&self, hash: &str) -> Option<ChunkDeclaredEvent> {
         self.declared_chunks.read().get(hash).cloned()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // REPLICA TRACKING (14A.45)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Sinkronisasi replica info dari DA events untuk satu chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash chunk yang akan di-sync
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())`: Sync berhasil
+    /// - `Err(DAError)`: Jika metadata chunk tidak ada
+    ///
+    /// # Behavior
+    ///
+    /// - Fetch ReplicaAdded dan ReplicaRemoved events untuk chunk_hash
+    /// - Proses events secara urut berdasarkan timestamp
+    /// - ReplicaAdded → tambahkan ke replicas (jika belum ada)
+    /// - ReplicaRemoved → hapus dari replicas
+    /// - Update current_rf sesuai replicas.len()
+    /// - target_rf TIDAK DIUBAH (hanya dari ChunkDeclared event)
+    ///
+    /// # Invariant
+    ///
+    /// - Idempotent: sync berkali-kali menghasilkan state yang sama
+    /// - current_rf selalu konsisten dengan replicas.len()
+    /// - Tidak menghapus metadata chunk
+    /// - Tidak panic
+    pub fn sync_replica_info(&self, chunk_hash: &str) -> Result<(), DAError> {
+        // Check metadata exists
+        if !self.chunk_metadata.read().contains_key(chunk_hash) {
+            return Err(DAError::Other(format!(
+                "Metadata not found for chunk: {}",
+                chunk_hash
+            )));
+        }
+
+        // Collect all replica events for this chunk
+        let added_events: Vec<ReplicaAddedEvent> = {
+            let added = self.replica_added_events.read();
+            added
+                .iter()
+                .filter(|((hash, _), _)| hash == chunk_hash)
+                .map(|(_, event)| event.clone())
+                .collect()
+        };
+
+        let removed_events: Vec<ReplicaRemovedEvent> = {
+            let removed = self.replica_removed_events.read();
+            removed
+                .iter()
+                .filter(|((hash, _), _)| hash == chunk_hash)
+                .map(|(_, event)| event.clone())
+                .collect()
+        };
+
+        // Combine and sort by timestamp
+        #[derive(Debug)]
+        enum ReplicaEvent {
+            Added(ReplicaAddedEvent),
+            Removed(ReplicaRemovedEvent),
+        }
+
+        let mut events: Vec<(u64, ReplicaEvent)> = Vec::new();
+        for e in added_events {
+            events.push((e.timestamp, ReplicaEvent::Added(e)));
+        }
+        for e in removed_events {
+            events.push((e.timestamp, ReplicaEvent::Removed(e)));
+        }
+        events.sort_by_key(|(ts, _)| *ts);
+
+        // Apply events to metadata
+        let mut metadata = self.chunk_metadata.write();
+        if let Some(meta) = metadata.get_mut(chunk_hash) {
+            // Clear and rebuild replicas from events
+            meta.replicas.clear();
+
+            for (_, event) in events {
+                match event {
+                    ReplicaEvent::Added(e) => {
+                        let replica = ReplicaInfo::new(
+                            e.node_id.clone(),
+                            e.timestamp,
+                            e.blob_ref.clone(),
+                        );
+                        // Add if not duplicate
+                        if !meta.replicas.iter().any(|r| r.node_id == e.node_id) {
+                            meta.replicas.push(replica);
+                        }
+                    }
+                    ReplicaEvent::Removed(e) => {
+                        meta.replicas.retain(|r| r.node_id != e.node_id);
+                    }
+                }
+            }
+
+            // Update current_rf
+            meta.current_rf = meta.replicas.len() as u8;
+
+            debug!(
+                "Synced replica info for {}: current_rf={}, target_rf={}",
+                chunk_hash, meta.current_rf, meta.target_rf
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Sinkronisasi replica info untuk semua chunks.
+    ///
+    /// # Returns
+    ///
+    /// Jumlah chunks yang di-sync.
+    pub fn sync_all_replica_info(&self) -> Result<usize, DAError> {
+        let hashes: Vec<String> = {
+            let metadata = self.chunk_metadata.read();
+            metadata.keys().cloned().collect()
+        };
+
+        let mut synced = 0;
+        for hash in hashes {
+            if self.sync_replica_info(&hash).is_ok() {
+                synced += 1;
+            }
+        }
+
+        debug!("Synced replica info for {} chunks", synced);
+        Ok(synced)
+    }
+
+    /// Get list of node IDs yang menyimpan replica chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash chunk
+    ///
+    /// # Returns
+    ///
+    /// Vector of node_id strings, sorted untuk determinism.
+    /// Empty vec jika chunk tidak ada.
+    ///
+    /// # Note
+    ///
+    /// - TIDAK query DA
+    /// - PURE READ, tanpa side-effect
+    pub fn get_replica_nodes(&self, chunk_hash: &str) -> Vec<String> {
+        let metadata = self.chunk_metadata.read();
+        match metadata.get(chunk_hash) {
+            Some(meta) => meta.replica_node_ids(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Check apakah node ini adalah replica holder.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash chunk
+    /// * `my_node_id` - ID node untuk dicek
+    ///
+    /// # Returns
+    ///
+    /// - `true`: Node adalah replica holder
+    /// - `false`: Bukan replica atau chunk tidak ada
+    ///
+    /// # Note
+    ///
+    /// PURE FUNCTION, tanpa side-effect.
+    pub fn am_i_replica(&self, chunk_hash: &str, my_node_id: &str) -> bool {
+        let metadata = self.chunk_metadata.read();
+        match metadata.get(chunk_hash) {
+            Some(meta) => meta.is_replica(my_node_id),
+            None => false,
+        }
+    }
+
+    /// Get replication factor info untuk chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash chunk
+    ///
+    /// # Returns
+    ///
+    /// `Some((current_rf, target_rf))` jika chunk ada, `None` jika tidak.
+    pub fn get_rf_info(&self, chunk_hash: &str) -> Option<(u8, u8)> {
+        let metadata = self.chunk_metadata.read();
+        metadata.get(chunk_hash).map(|meta| (meta.current_rf, meta.target_rf))
+    }
+
+    /// Get all chunks that are under-replicated.
+    ///
+    /// # Returns
+    ///
+    /// Vector of chunk hashes where current_rf < target_rf.
+    pub fn under_replicated_chunks(&self) -> Vec<String> {
+        let metadata = self.chunk_metadata.read();
+        metadata
+            .iter()
+            .filter(|(_, meta)| meta.current_rf < meta.target_rf)
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+
+    /// Get all chunks that meet replication factor.
+    ///
+    /// # Returns
+    ///
+    /// Vector of chunk hashes where current_rf >= target_rf.
+    pub fn fully_replicated_chunks(&self) -> Vec<String> {
+        let metadata = self.chunk_metadata.read();
+        metadata
+            .iter()
+            .filter(|(_, meta)| meta.current_rf >= meta.target_rf)
+            .map(|(hash, _)| hash.clone())
+            .collect()
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -2096,5 +2645,395 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         handle.abort();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // M. REPLICA TRACKING TESTS (14A.45)
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn create_test_event_with_rf(hash: &str, size: u64, target_rf: u8) -> ChunkDeclaredEvent {
+        ChunkDeclaredEvent::with_target_rf(
+            hash.to_string(),
+            size,
+            [0xAB; 32],
+            None,
+            1000,
+            target_rf,
+        )
+    }
+
+    #[test]
+    fn test_chunk_declared_initial_state() {
+        let storage = create_da_storage();
+
+        // Receive ChunkDeclared with target_rf = 3
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        // Check initial state
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert!(meta.replicas.is_empty()); // replicas kosong
+        assert_eq!(meta.target_rf, 3); // target_rf benar
+        assert_eq!(meta.current_rf, 0); // current_rf = 0
+    }
+
+    #[test]
+    fn test_replica_added_single() {
+        let storage = create_da_storage();
+
+        // Setup: create chunk metadata
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        // Add replica
+        let replica_event = ReplicaAddedEvent::new(
+            "chunk-1".to_string(),
+            "node-A".to_string(),
+            2000,
+            None,
+        );
+        storage.receive_replica_added(replica_event);
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check replica added
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.replicas.len(), 1);
+        assert_eq!(meta.current_rf, 1);
+        assert_eq!(meta.replicas[0].node_id, "node-A");
+    }
+
+    #[test]
+    fn test_replica_added_multiple() {
+        let storage = create_da_storage();
+
+        // Setup
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        // Add 3 replicas
+        for (i, node_id) in ["node-A", "node-B", "node-C"].iter().enumerate() {
+            let replica_event = ReplicaAddedEvent::new(
+                "chunk-1".to_string(),
+                node_id.to_string(),
+                2000 + i as u64,
+                None,
+            );
+            storage.receive_replica_added(replica_event);
+        }
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.replicas.len(), 3);
+        assert_eq!(meta.current_rf, 3);
+    }
+
+    #[test]
+    fn test_replica_removed() {
+        let storage = create_da_storage();
+
+        // Setup with 2 replicas
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "node-A".to_string(), 2000, None,
+        ));
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "node-B".to_string(), 2001, None,
+        ));
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Remove one replica
+        storage.receive_replica_removed(ReplicaRemovedEvent::new(
+            "chunk-1".to_string(), "node-A".to_string(), 3000, None,
+        ));
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.replicas.len(), 1);
+        assert_eq!(meta.current_rf, 1);
+        assert_eq!(meta.replicas[0].node_id, "node-B");
+    }
+
+    #[test]
+    fn test_replica_sync_idempotent() {
+        let storage = create_da_storage();
+
+        // Setup
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        // Add replica
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "node-A".to_string(), 2000, None,
+        ));
+
+        // Sync multiple times
+        storage.sync_replica_info("chunk-1").unwrap();
+        storage.sync_replica_info("chunk-1").unwrap();
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check - should still be 1 replica
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.replicas.len(), 1);
+        assert_eq!(meta.current_rf, 1);
+    }
+
+    #[test]
+    fn test_replica_no_duplicate() {
+        let storage = create_da_storage();
+
+        // Setup
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        // Add same replica twice (same node_id)
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "node-A".to_string(), 2000, None,
+        ));
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "node-A".to_string(), 2001, None,
+        ));
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Should only have 1 replica
+        let meta = storage.get_metadata("chunk-1").unwrap();
+        assert_eq!(meta.replicas.len(), 1);
+    }
+
+    #[test]
+    fn test_am_i_replica_true() {
+        let storage = create_da_storage();
+
+        // Setup
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "my-node".to_string(), 2000, None,
+        ));
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check
+        assert!(storage.am_i_replica("chunk-1", "my-node"));
+    }
+
+    #[test]
+    fn test_am_i_replica_false() {
+        let storage = create_da_storage();
+
+        // Setup with different node
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "other-node".to_string(), 2000, None,
+        ));
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check
+        assert!(!storage.am_i_replica("chunk-1", "my-node"));
+    }
+
+    #[test]
+    fn test_am_i_replica_chunk_not_exist() {
+        let storage = create_da_storage();
+
+        // Chunk doesn't exist
+        assert!(!storage.am_i_replica("nonexistent", "my-node"));
+    }
+
+    #[test]
+    fn test_get_replica_nodes_deterministic() {
+        let storage = create_da_storage();
+
+        // Setup
+        let event = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event);
+        storage.sync_metadata_from_da().unwrap();
+
+        // Add replicas in random order
+        for node_id in ["node-C", "node-A", "node-B"] {
+            storage.receive_replica_added(ReplicaAddedEvent::new(
+                "chunk-1".to_string(), node_id.to_string(), 2000, None,
+            ));
+        }
+        storage.sync_replica_info("chunk-1").unwrap();
+
+        // Check - should be sorted
+        let nodes = storage.get_replica_nodes("chunk-1");
+        assert_eq!(nodes, vec!["node-A", "node-B", "node-C"]);
+
+        // Call again - should be same
+        let nodes2 = storage.get_replica_nodes("chunk-1");
+        assert_eq!(nodes, nodes2);
+    }
+
+    #[test]
+    fn test_get_replica_nodes_empty() {
+        let storage = create_da_storage();
+
+        // Chunk doesn't exist
+        let nodes = storage.get_replica_nodes("nonexistent");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_under_replicated_chunks() {
+        let storage = create_da_storage();
+
+        // Chunk-1: target=3, current=1 (under)
+        let event1 = create_test_event_with_rf("chunk-1", 1024, 3);
+        storage.receive_chunk_declared(event1);
+
+        // Chunk-2: target=3, current=3 (ok)
+        let event2 = create_test_event_with_rf("chunk-2", 1024, 3);
+        storage.receive_chunk_declared(event2);
+
+        storage.sync_metadata_from_da().unwrap();
+
+        // Add replicas
+        storage.receive_replica_added(ReplicaAddedEvent::new(
+            "chunk-1".to_string(), "node-A".to_string(), 2000, None,
+        ));
+        for node_id in ["node-A", "node-B", "node-C"] {
+            storage.receive_replica_added(ReplicaAddedEvent::new(
+                "chunk-2".to_string(), node_id.to_string(), 2000, None,
+            ));
+        }
+        storage.sync_all_replica_info().unwrap();
+
+        // Check
+        let under = storage.under_replicated_chunks();
+        assert_eq!(under.len(), 1);
+        assert!(under.contains(&"chunk-1".to_string()));
+
+        let full = storage.fully_replicated_chunks();
+        assert_eq!(full.len(), 1);
+        assert!(full.contains(&"chunk-2".to_string()));
+    }
+
+    #[test]
+    fn test_replica_info_struct() {
+        let replica = ReplicaInfo::new("node-1".to_string(), 12345, None);
+        assert_eq!(replica.node_id, "node-1");
+        assert_eq!(replica.added_at, 12345);
+        assert!(replica.blob_ref.is_none());
+    }
+
+    #[test]
+    fn test_replica_added_event_struct() {
+        let event = ReplicaAddedEvent::new(
+            "chunk-1".to_string(),
+            "node-A".to_string(),
+            5000,
+            None,
+        );
+        assert_eq!(event.chunk_hash, "chunk-1");
+        assert_eq!(event.node_id, "node-A");
+        assert_eq!(event.timestamp, 5000);
+    }
+
+    #[test]
+    fn test_replica_removed_event_struct() {
+        let event = ReplicaRemovedEvent::new(
+            "chunk-1".to_string(),
+            "node-A".to_string(),
+            6000,
+            None,
+        );
+        assert_eq!(event.chunk_hash, "chunk-1");
+        assert_eq!(event.node_id, "node-A");
+        assert_eq!(event.timestamp, 6000);
+    }
+
+    #[test]
+    fn test_sync_replica_info_no_metadata() {
+        let storage = create_da_storage();
+
+        // Try to sync without metadata
+        let result = storage.sync_replica_info("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_da_chunk_meta_new_fields() {
+        let meta = DAChunkMeta::new("hash-1".to_string(), 1024, [0xAB; 32]);
+
+        // Check new fields default values
+        assert!(meta.replicas.is_empty());
+        assert_eq!(meta.target_rf, 3); // default
+        assert_eq!(meta.current_rf, 0);
+    }
+
+    #[test]
+    fn test_da_chunk_meta_with_target_rf() {
+        let meta = DAChunkMeta::with_target_rf(
+            "hash-1".to_string(),
+            1024,
+            [0xAB; 32],
+            5,
+        );
+
+        assert_eq!(meta.target_rf, 5);
+        assert_eq!(meta.current_rf, 0);
+        assert!(meta.replicas.is_empty());
+    }
+
+    #[test]
+    fn test_da_chunk_meta_add_replica() {
+        let mut meta = DAChunkMeta::new("hash-1".to_string(), 1024, [0xAB; 32]);
+
+        // Add replica
+        let added = meta.add_replica(ReplicaInfo::new("node-1".to_string(), 1000, None));
+        assert!(added);
+        assert_eq!(meta.current_rf, 1);
+        assert_eq!(meta.replicas.len(), 1);
+
+        // Try to add duplicate
+        let added2 = meta.add_replica(ReplicaInfo::new("node-1".to_string(), 2000, None));
+        assert!(!added2);
+        assert_eq!(meta.current_rf, 1);
+    }
+
+    #[test]
+    fn test_da_chunk_meta_remove_replica() {
+        let mut meta = DAChunkMeta::new("hash-1".to_string(), 1024, [0xAB; 32]);
+        meta.add_replica(ReplicaInfo::new("node-1".to_string(), 1000, None));
+        meta.add_replica(ReplicaInfo::new("node-2".to_string(), 1000, None));
+
+        // Remove
+        let removed = meta.remove_replica("node-1");
+        assert!(removed);
+        assert_eq!(meta.current_rf, 1);
+
+        // Try to remove nonexistent
+        let removed2 = meta.remove_replica("node-3");
+        assert!(!removed2);
+        assert_eq!(meta.current_rf, 1);
+    }
+
+    #[test]
+    fn test_receive_replica_batch() {
+        let storage = create_da_storage();
+
+        let events = vec![
+            ReplicaAddedEvent::new("chunk-1".to_string(), "node-A".to_string(), 1000, None),
+            ReplicaAddedEvent::new("chunk-1".to_string(), "node-B".to_string(), 1001, None),
+            ReplicaAddedEvent::new("chunk-2".to_string(), "node-A".to_string(), 1002, None),
+        ];
+
+        let count = storage.receive_replica_added_batch(events);
+        assert_eq!(count, 3);
     }
 }

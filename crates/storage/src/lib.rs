@@ -51,7 +51,16 @@ pub mod proto {
 
 pub use crate::store::Storage;
 pub use crate::localfs::LocalFsStorage;
-pub use crate::da_storage::{DAStorage, DAChunkMeta, ChunkDeclaredEvent, StorageError, CommitmentReport};
+pub use crate::da_storage::{
+    DAStorage,
+    DAChunkMeta,
+    ChunkDeclaredEvent,
+    StorageError,
+    CommitmentReport,
+    ReplicaInfo,
+    ReplicaAddedEvent,
+    ReplicaRemovedEvent,
+};
 pub use crate::storage_proof::{
     StorageProof,
     generate_proof,
