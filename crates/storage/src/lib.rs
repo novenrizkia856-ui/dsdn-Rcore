@@ -10,6 +10,7 @@
 //! - `da_storage`: DA-aware storage wrapper
 //! - `storage_proof`: Storage proof generation untuk challenge-response
 //! - `gc`: Garbage collection berdasarkan DA events
+//! - `metrics`: Storage health metrics untuk observability
 //! - `rpc`: RPC services untuk komunikasi antar node
 //!
 //! ## DA-Aware Storage
@@ -50,6 +51,17 @@
 //! 2. `collect()` - Menghapus berdasarkan hasil scan
 //!
 //! Tidak ada auto-delete tanpa scan terlebih dahulu.
+//!
+//! ## Storage Metrics
+//!
+//! `StorageMetrics` menyediakan observability untuk monitoring:
+//! - Total chunks dan bytes
+//! - Status verifikasi (verified/pending/failed)
+//! - Orphaned chunks
+//! - GC pending bytes
+//! - DA sync lag
+//!
+//! Metrik read-only, tidak memodifikasi state.
 
 pub mod chunker;
 pub mod store;
@@ -57,6 +69,7 @@ pub mod localfs;
 pub mod da_storage;
 pub mod storage_proof;
 pub mod gc;
+pub mod metrics;
 pub mod rpc;
 
 // hasil generate dari tonic_build (OUT_DIR/api.rs)
@@ -88,4 +101,8 @@ pub use crate::gc::{
     GCScanResult,
     GCError,
     DeleteRequestedEvent,
+};
+pub use crate::metrics::{
+    StorageMetrics,
+    MetricsCollector,
 };
