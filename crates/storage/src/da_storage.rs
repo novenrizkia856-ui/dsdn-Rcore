@@ -47,17 +47,137 @@
 //! - verified TIDAK BOLEH otomatis berubah ke true saat sync
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::error::Error;
 
 use parking_lot::{RwLock, MappedRwLockReadGuard, RwLockReadGuard};
-use tracing::{debug, error, info};
+use sha3::{Sha3_256, Digest};
+use tracing::{debug, error, info, warn};
 
 use dsdn_common::{BlobRef, DALayer, DAError};
 
 use crate::store::Storage;
+
+// ════════════════════════════════════════════════════════════════════════════
+// STORAGE ERROR
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk operasi storage.
+///
+/// Digunakan untuk error spesifik storage yang tidak tercakup
+/// oleh error types lainnya.
+#[derive(Debug)]
+pub enum StorageError {
+    /// Chunk tidak ditemukan di storage.
+    ChunkNotFound(String),
+    /// Metadata tidak ditemukan.
+    MetadataNotFound(String),
+    /// IO error saat akses storage.
+    IoError(String),
+    /// Commitment mismatch antara data dan metadata.
+    CommitmentMismatch {
+        hash: String,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    /// Error lainnya.
+    Other(String),
+}
+
+impl Display for StorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageError::ChunkNotFound(hash) => write!(f, "Chunk not found: {}", hash),
+            StorageError::MetadataNotFound(hash) => write!(f, "Metadata not found: {}", hash),
+            StorageError::IoError(msg) => write!(f, "IO error: {}", msg),
+            StorageError::CommitmentMismatch { hash, expected, actual } => {
+                write!(
+                    f,
+                    "Commitment mismatch for {}: expected {:02x?}, got {:02x?}",
+                    hash,
+                    &expected[..4],
+                    &actual[..4]
+                )
+            }
+            StorageError::Other(msg) => write!(f, "Storage error: {}", msg),
+        }
+    }
+}
+
+impl Error for StorageError {}
+
+impl From<Box<dyn Error + Send + Sync>> for StorageError {
+    fn from(err: Box<dyn Error + Send + Sync>) -> Self {
+        StorageError::IoError(err.to_string())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// COMMITMENT REPORT
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Laporan hasil verifikasi commitment untuk semua chunks.
+///
+/// Struct ini berisi ringkasan hasil verifikasi commitment
+/// untuk semua chunks yang memiliki metadata.
+///
+/// # Fields
+///
+/// - `verified_count`: Jumlah chunks yang terverifikasi (data cocok dengan commitment)
+/// - `failed_count`: Jumlah chunks yang gagal verifikasi (data tidak cocok)
+/// - `missing_count`: Jumlah chunks yang metadata ada tapi data tidak ada
+/// - `failed_chunks`: List hash chunks yang gagal verifikasi
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommitmentReport {
+    /// Jumlah chunks yang terverifikasi (data cocok dengan commitment).
+    pub verified_count: usize,
+    /// Jumlah chunks yang gagal verifikasi (data tidak cocok).
+    pub failed_count: usize,
+    /// Jumlah chunks yang metadata ada tapi data tidak ada.
+    pub missing_count: usize,
+    /// List hash chunks yang gagal verifikasi.
+    pub failed_chunks: Vec<String>,
+}
+
+impl CommitmentReport {
+    /// Membuat CommitmentReport baru (kosong).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Total chunks yang diproses.
+    pub fn total_processed(&self) -> usize {
+        self.verified_count + self.failed_count + self.missing_count
+    }
+
+    /// Apakah semua verifikasi berhasil.
+    pub fn all_verified(&self) -> bool {
+        self.failed_count == 0 && self.missing_count == 0
+    }
+
+    /// Apakah ada yang gagal.
+    pub fn has_failures(&self) -> bool {
+        self.failed_count > 0
+    }
+
+    /// Apakah ada yang missing.
+    pub fn has_missing(&self) -> bool {
+        self.missing_count > 0
+    }
+}
+
+impl Display for CommitmentReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CommitmentReport {{ verified: {}, failed: {}, missing: {} }}",
+            self.verified_count, self.failed_count, self.missing_count
+        )
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // CHUNK DECLARED EVENT
@@ -781,6 +901,253 @@ impl DAStorage {
             .map(|(hash, _)| hash.clone())
             .collect()
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DA COMMITMENT VERIFICATION (14A.44)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Compute SHA3-256 hash of data.
+    fn compute_commitment(data: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(data);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    /// Verify commitment untuk satu chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - Chunk hash
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)`: Data cocok dengan da_commitment
+    /// - `Ok(false)`: Data tidak cocok atau chunk tidak ada
+    /// - `Err(StorageError)`: Error saat akses storage/metadata
+    ///
+    /// # Verification Process
+    ///
+    /// 1. Load chunk data dari inner storage
+    /// 2. Load metadata dari chunk_metadata
+    /// 3. Compute commitment: SHA3-256(chunk_data)
+    /// 4. Compare dengan da_commitment di metadata
+    ///
+    /// # Invariant
+    ///
+    /// - TIDAK mengubah data atau metadata
+    /// - TIDAK auto-repair
+    /// - TIDAK panic
+    pub fn verify_chunk_commitment(&self, hash: &str) -> Result<bool, StorageError> {
+        // 1. Load metadata
+        let metadata = self.chunk_metadata.read();
+        let meta = match metadata.get(hash) {
+            Some(m) => m,
+            None => {
+                debug!("Verify commitment: metadata not found for {}", hash);
+                return Err(StorageError::MetadataNotFound(hash.to_string()));
+            }
+        };
+        let expected_commitment = meta.da_commitment;
+        drop(metadata); // Release lock before IO
+
+        // 2. Load chunk data dari inner storage
+        let data = match self.inner.get_chunk(hash) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                debug!("Verify commitment: chunk not found for {}", hash);
+                return Ok(false); // Chunk tidak ada = tidak terverifikasi
+            }
+            Err(e) => {
+                return Err(StorageError::IoError(e.to_string()));
+            }
+        };
+
+        // 3. Compute commitment: SHA3-256(chunk_data)
+        let actual_commitment = Self::compute_commitment(&data);
+
+        // 4. Compare dengan da_commitment
+        if actual_commitment == expected_commitment {
+            debug!("Verify commitment: {} passed", hash);
+            Ok(true)
+        } else {
+            debug!(
+                "Verify commitment: {} FAILED - expected {:02x?}..., got {:02x?}...",
+                hash,
+                &expected_commitment[..4],
+                &actual_commitment[..4]
+            );
+            Ok(false)
+        }
+    }
+
+    /// Verify commitment untuk SEMUA chunks yang memiliki metadata.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(CommitmentReport)`: Laporan lengkap hasil verifikasi
+    /// - `Err(StorageError)`: Error fatal saat verifikasi
+    ///
+    /// # Verification Process
+    ///
+    /// Untuk setiap chunk dengan metadata:
+    /// - Jika data tidak ada → missing_count += 1
+    /// - Jika commitment cocok → verified_count += 1
+    /// - Jika tidak cocok → failed_count += 1, hash ditambahkan ke failed_chunks
+    ///
+    /// # Invariant
+    ///
+    /// - Iterasi SEMUA metadata, tidak ada early exit
+    /// - TIDAK mengubah data atau metadata
+    /// - TIDAK auto-repair atau auto-delete
+    /// - TIDAK panic
+    pub fn verify_all_commitments(&self) -> Result<CommitmentReport, StorageError> {
+        let mut report = CommitmentReport::new();
+
+        // Get all chunk hashes from metadata
+        let hashes: Vec<String> = {
+            let metadata = self.chunk_metadata.read();
+            metadata.keys().cloned().collect()
+        };
+
+        debug!("Verify all commitments: checking {} chunks", hashes.len());
+
+        for hash in hashes {
+            // Get expected commitment from metadata
+            let expected_commitment = {
+                let metadata = self.chunk_metadata.read();
+                match metadata.get(&hash) {
+                    Some(m) => m.da_commitment,
+                    None => {
+                        // Metadata removed between iteration - skip
+                        continue;
+                    }
+                }
+            };
+
+            // Load chunk data
+            let data = match self.inner.get_chunk(&hash) {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    // Data missing
+                    report.missing_count += 1;
+                    debug!("Verify all: {} - MISSING", hash);
+                    continue;
+                }
+                Err(e) => {
+                    // IO error - treat as missing
+                    warn!("Verify all: {} - IO error: {}", hash, e);
+                    report.missing_count += 1;
+                    continue;
+                }
+            };
+
+            // Compute and compare commitment
+            let actual_commitment = Self::compute_commitment(&data);
+
+            if actual_commitment == expected_commitment {
+                report.verified_count += 1;
+            } else {
+                report.failed_count += 1;
+                report.failed_chunks.push(hash.clone());
+                debug!(
+                    "Verify all: {} - FAILED (expected {:02x?}..., got {:02x?}...)",
+                    hash,
+                    &expected_commitment[..4],
+                    &actual_commitment[..4]
+                );
+            }
+        }
+
+        info!(
+            "Verify all commitments complete: {}",
+            report
+        );
+
+        Ok(report)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // BACKGROUND VERIFICATION TASK
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Start background commitment verification task.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - Interval antara verifikasi (Duration)
+    ///
+    /// # Returns
+    ///
+    /// JoinHandle untuk task. Task berhenti ketika stop_background_verification() dipanggil.
+    ///
+    /// # Behavior
+    ///
+    /// - Memanggil verify_all_commitments() secara periodik
+    /// - Logging hasil (jumlah verified/failed/missing)
+    /// - HANYA DETEKSI, tidak melakukan perbaikan
+    /// - Handle error dengan logging (tidak panic)
+    pub fn start_background_verification(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let storage = Arc::clone(self);
+        // Use separate flag for verification
+        // Note: Reusing sync_running for simplicity, but in production
+        // you might want a separate flag
+
+        tokio::spawn(async move {
+            info!("Background commitment verification started with interval {:?}", interval);
+            let mut interval_timer = tokio::time::interval(interval);
+
+            loop {
+                interval_timer.tick().await;
+
+                // Check if we should stop (using sync_running as general stop flag)
+                if !storage.sync_running.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                match storage.verify_all_commitments() {
+                    Ok(report) => {
+                        if report.has_failures() {
+                            warn!(
+                                "Background verification: {} failures detected! Failed: {:?}",
+                                report.failed_count,
+                                report.failed_chunks
+                            );
+                        } else if report.has_missing() {
+                            warn!(
+                                "Background verification: {} missing chunks",
+                                report.missing_count
+                            );
+                        } else if report.verified_count > 0 {
+                            debug!(
+                                "Background verification: all {} chunks verified",
+                                report.verified_count
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Background verification error: {}", e);
+                    }
+                }
+            }
+
+            info!("Background commitment verification stopped");
+        })
+    }
+
+    /// Stop background verification task.
+    ///
+    /// Note: This uses the same flag as stop_background_sync().
+    /// In production, you might want separate flags.
+    pub fn stop_background_verification(&self) {
+        self.sync_running.store(false, Ordering::SeqCst);
+        info!("Background verification stop requested");
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1450,5 +1817,284 @@ mod tests {
 
         let none = storage.get_declared_event("nonexistent");
         assert!(none.is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // L. COMMITMENT VERIFICATION TESTS (14A.44)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper to compute SHA3-256 for tests
+    fn compute_test_commitment(data: &[u8]) -> [u8; 32] {
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(data);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    #[test]
+    fn test_verify_chunk_commitment_valid() {
+        let storage = create_da_storage();
+        let data = b"test data for commitment";
+        let commitment = compute_test_commitment(data);
+
+        // Put chunk with correct commitment
+        storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
+
+        // Verify should pass
+        let result = storage.verify_chunk_commitment("chunk-1");
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_chunk_commitment_invalid() {
+        let storage = create_da_storage();
+        let data = b"test data";
+        let wrong_commitment = [0xFFu8; 32]; // Wrong commitment
+
+        // Put chunk with wrong commitment
+        storage.put_chunk_with_meta("chunk-1", data, wrong_commitment).unwrap();
+
+        // Verify should fail (return false)
+        let result = storage.verify_chunk_commitment("chunk-1");
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_chunk_commitment_data_modified() {
+        let storage = create_da_storage();
+        let original_data = b"original data";
+        let commitment = compute_test_commitment(original_data);
+
+        // Put chunk with correct commitment
+        storage.put_chunk_with_meta("chunk-1", original_data, commitment).unwrap();
+
+        // Modify data in storage (simulated by putting different data)
+        let modified_data = b"modified data";
+        storage.inner().put_chunk("chunk-1", modified_data).unwrap();
+
+        // Verify should fail (data changed)
+        let result = storage.verify_chunk_commitment("chunk-1");
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_chunk_commitment_missing_data() {
+        let storage = create_da_storage();
+
+        // Create metadata without data
+        let commitment = [0xABu8; 32];
+        let meta = DAChunkMeta::new("chunk-1".to_string(), 100, commitment);
+        storage.set_metadata("chunk-1", meta);
+
+        // Verify should return false (data missing)
+        let result = storage.verify_chunk_commitment("chunk-1");
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_chunk_commitment_missing_metadata() {
+        let storage = create_da_storage();
+
+        // Put data without metadata
+        storage.inner().put_chunk("chunk-1", b"data").unwrap();
+
+        // Clear metadata
+        storage.clear_metadata();
+
+        // Verify should return error (metadata not found)
+        let result = storage.verify_chunk_commitment("chunk-1");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            StorageError::MetadataNotFound(hash) => assert_eq!(hash, "chunk-1"),
+            _ => panic!("Expected MetadataNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_verify_all_commitments_all_valid() {
+        let storage = create_da_storage();
+
+        // Add multiple valid chunks
+        for i in 0..5 {
+            let data = format!("data-{}", i);
+            let commitment = compute_test_commitment(data.as_bytes());
+            storage.put_chunk_with_meta(&format!("chunk-{}", i), data.as_bytes(), commitment).unwrap();
+        }
+
+        // Verify all
+        let report = storage.verify_all_commitments().unwrap();
+
+        assert_eq!(report.verified_count, 5);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.missing_count, 0);
+        assert!(report.failed_chunks.is_empty());
+        assert!(report.all_verified());
+    }
+
+    #[test]
+    fn test_verify_all_commitments_some_invalid() {
+        let storage = create_da_storage();
+
+        // Add 3 valid chunks
+        for i in 0..3 {
+            let data = format!("valid-data-{}", i);
+            let commitment = compute_test_commitment(data.as_bytes());
+            storage.put_chunk_with_meta(&format!("valid-{}", i), data.as_bytes(), commitment).unwrap();
+        }
+
+        // Add 2 invalid chunks (wrong commitment)
+        for i in 0..2 {
+            let data = format!("invalid-data-{}", i);
+            let wrong_commitment = [0xFFu8; 32];
+            storage.put_chunk_with_meta(&format!("invalid-{}", i), data.as_bytes(), wrong_commitment).unwrap();
+        }
+
+        // Verify all
+        let report = storage.verify_all_commitments().unwrap();
+
+        assert_eq!(report.verified_count, 3);
+        assert_eq!(report.failed_count, 2);
+        assert_eq!(report.missing_count, 0);
+        assert_eq!(report.failed_chunks.len(), 2);
+        assert!(report.has_failures());
+    }
+
+    #[test]
+    fn test_verify_all_commitments_some_missing() {
+        let storage = create_da_storage();
+
+        // Add 2 valid chunks with data
+        for i in 0..2 {
+            let data = format!("data-{}", i);
+            let commitment = compute_test_commitment(data.as_bytes());
+            storage.put_chunk_with_meta(&format!("chunk-{}", i), data.as_bytes(), commitment).unwrap();
+        }
+
+        // Add 2 metadata-only entries (no data)
+        for i in 2..4 {
+            let meta = DAChunkMeta::new(format!("chunk-{}", i), 100, [0xABu8; 32]);
+            storage.set_metadata(&format!("chunk-{}", i), meta);
+        }
+
+        // Verify all
+        let report = storage.verify_all_commitments().unwrap();
+
+        assert_eq!(report.verified_count, 2);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.missing_count, 2);
+        assert!(report.has_missing());
+    }
+
+    #[test]
+    fn test_verify_all_commitments_mixed() {
+        let storage = create_da_storage();
+
+        // 2 valid
+        let data1 = b"valid data 1";
+        storage.put_chunk_with_meta("valid-1", data1, compute_test_commitment(data1)).unwrap();
+        let data2 = b"valid data 2";
+        storage.put_chunk_with_meta("valid-2", data2, compute_test_commitment(data2)).unwrap();
+
+        // 1 invalid (wrong commitment)
+        storage.put_chunk_with_meta("invalid-1", b"some data", [0xFFu8; 32]).unwrap();
+
+        // 1 missing (metadata only)
+        let meta = DAChunkMeta::new("missing-1".to_string(), 50, [0xABu8; 32]);
+        storage.set_metadata("missing-1", meta);
+
+        // Verify all
+        let report = storage.verify_all_commitments().unwrap();
+
+        assert_eq!(report.verified_count, 2);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.missing_count, 1);
+        assert_eq!(report.total_processed(), 4);
+        assert!(!report.all_verified());
+    }
+
+    #[test]
+    fn test_verify_commitment_deterministic() {
+        let storage = create_da_storage();
+        let data = b"deterministic test data";
+        let commitment = compute_test_commitment(data);
+
+        storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
+
+        // Verify multiple times - should be same result
+        let result1 = storage.verify_chunk_commitment("chunk-1").unwrap();
+        let result2 = storage.verify_chunk_commitment("chunk-1").unwrap();
+        let result3 = storage.verify_chunk_commitment("chunk-1").unwrap();
+
+        assert!(result1);
+        assert_eq!(result1, result2);
+        assert_eq!(result2, result3);
+    }
+
+    #[test]
+    fn test_verify_all_commitments_empty() {
+        let storage = create_da_storage();
+
+        // No chunks
+        let report = storage.verify_all_commitments().unwrap();
+
+        assert_eq!(report.verified_count, 0);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.missing_count, 0);
+        assert!(report.all_verified()); // Vacuously true
+    }
+
+    #[test]
+    fn test_commitment_report_display() {
+        let mut report = CommitmentReport::new();
+        report.verified_count = 10;
+        report.failed_count = 2;
+        report.missing_count = 1;
+
+        let display = format!("{}", report);
+        assert!(display.contains("verified: 10"));
+        assert!(display.contains("failed: 2"));
+        assert!(display.contains("missing: 1"));
+    }
+
+    #[test]
+    fn test_storage_error_display() {
+        let err = StorageError::ChunkNotFound("chunk-abc".to_string());
+        assert!(format!("{}", err).contains("chunk-abc"));
+
+        let err = StorageError::CommitmentMismatch {
+            hash: "chunk-1".to_string(),
+            expected: [0xAAu8; 32],
+            actual: [0xBBu8; 32],
+        };
+        assert!(format!("{}", err).contains("mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_background_verification_starts() {
+        let storage = create_arc_da_storage();
+
+        // Add a chunk
+        let data = b"background test";
+        storage.put_chunk_with_meta("chunk-1", data, compute_test_commitment(data)).unwrap();
+
+        // Start background verification
+        storage.sync_running.store(true, Ordering::SeqCst);
+        let handle = storage.start_background_verification(Duration::from_millis(50));
+
+        // Wait a bit
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Stop
+        storage.stop_background_verification();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        handle.abort();
     }
 }
