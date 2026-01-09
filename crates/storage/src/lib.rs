@@ -11,6 +11,7 @@
 //! - `storage_proof`: Storage proof generation untuk challenge-response
 //! - `gc`: Garbage collection berdasarkan DA events
 //! - `metrics`: Storage health metrics untuk observability
+//! - `recovery`: Recovery dari DA state untuk self-healing
 //! - `rpc`: RPC services untuk komunikasi antar node
 //!
 //! ## DA-Aware Storage
@@ -62,6 +63,15 @@
 //! - DA sync lag
 //!
 //! Metrik read-only, tidak memodifikasi state.
+//!
+//! ## Storage Recovery
+//!
+//! `StorageRecovery` memulihkan chunk yang hilang berdasarkan DA state:
+//! - Recovery HANYA untuk chunk yang sah (assigned via DA)
+//! - Data diverifikasi sebelum disimpan
+//! - Tidak ada overwrite chunk yang sudah ada
+//!
+//! Recovery berbasis DA, bukan auto-magic.
 
 pub mod chunker;
 pub mod store;
@@ -70,6 +80,7 @@ pub mod da_storage;
 pub mod storage_proof;
 pub mod gc;
 pub mod metrics;
+pub mod recovery;
 pub mod rpc;
 
 // hasil generate dari tonic_build (OUT_DIR/api.rs)
@@ -105,4 +116,12 @@ pub use crate::gc::{
 pub use crate::metrics::{
     StorageMetrics,
     MetricsCollector,
+};
+pub use crate::recovery::{
+    StorageRecovery,
+    SimpleStorageRecovery,
+    RecoveryReport,
+    RecoveryDetail,
+    RecoveryError,
+    PeerFetcher,
 };
