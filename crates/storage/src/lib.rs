@@ -9,6 +9,7 @@
 //! - `localfs`: Local filesystem storage implementation
 //! - `da_storage`: DA-aware storage wrapper
 //! - `storage_proof`: Storage proof generation untuk challenge-response
+//! - `gc`: Garbage collection berdasarkan DA events
 //! - `rpc`: RPC services untuk komunikasi antar node
 //!
 //! ## DA-Aware Storage
@@ -36,12 +37,26 @@
 //! ```text
 //! Proof Scheme: response = SHA3-256(chunk_data || challenge_seed)
 //! ```
+//!
+//! ## Garbage Collection
+//!
+//! `GarbageCollector` menghapus data berdasarkan DA events:
+//! - **Deleted**: Chunks dengan DeleteRequested event + grace period habis
+//! - **Orphaned**: Chunks yang tidak assigned ke node ini
+//! - **Corrupted**: Chunks dengan commitment mismatch
+//!
+//! GC beroperasi dalam 2 tahap:
+//! 1. `scan()` - Menemukan chunks yang boleh dihapus
+//! 2. `collect()` - Menghapus berdasarkan hasil scan
+//!
+//! Tidak ada auto-delete tanpa scan terlebih dahulu.
 
 pub mod chunker;
 pub mod store;
 pub mod localfs;
 pub mod da_storage;
 pub mod storage_proof;
+pub mod gc;
 pub mod rpc;
 
 // hasil generate dari tonic_build (OUT_DIR/api.rs)
@@ -67,4 +82,10 @@ pub use crate::storage_proof::{
     verify_proof,
     verify_proof_with_data,
     compute_da_commitment,
+};
+pub use crate::gc::{
+    GarbageCollector,
+    GCScanResult,
+    GCError,
+    DeleteRequestedEvent,
 };

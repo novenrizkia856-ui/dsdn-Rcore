@@ -1351,6 +1351,63 @@ impl DAStorage {
         Ok(())
     }
 
+    /// Delete chunk data and metadata.
+    ///
+    /// # Note
+    ///
+    /// Karena Storage trait tidak memiliki delete_chunk,
+    /// method ini mencoba menghapus metadata dan menandai
+    /// slot untuk penghapusan. Data fisik mungkin perlu
+    /// dibersihkan oleh storage backend secara terpisah.
+    ///
+    /// Untuk LocalFsStorage, gunakan delete_chunk_file().
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - Chunk hash
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` jika berhasil dihapus
+    /// - `Ok(false)` jika chunk tidak ada
+    /// - `Err` jika terjadi error
+    pub fn delete_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
+        // Check if chunk exists
+        let has_data = self.inner.has_chunk(hash)?;
+        let has_meta = self.has_metadata(hash);
+
+        if !has_data && !has_meta {
+            return Ok(false);
+        }
+
+        // Delete metadata first
+        self.delete_metadata(hash);
+
+        // For data deletion, we need to work with what's available.
+        // Since Storage trait doesn't have delete, we mark it as removed
+        // by clearing metadata. The actual data cleanup depends on
+        // the storage implementation.
+        //
+        // For file-based storage, the data will be orphaned until
+        // the storage backend's own cleanup runs, or manual deletion.
+
+        // Also remove from declared_chunks and replica events
+        self.declared_chunks.write().remove(hash);
+        
+        // Clear replica events for this chunk
+        {
+            let mut added = self.replica_added_events.write();
+            added.retain(|(h, _), _| h != hash);
+        }
+        {
+            let mut removed = self.replica_removed_events.write();
+            removed.retain(|(h, _), _| h != hash);
+        }
+
+        debug!("Deleted chunk: {} (had_data={}, had_meta={})", hash, has_data, has_meta);
+        Ok(true)
+    }
+
     /// Delete chunk metadata.
     ///
     /// # Note
