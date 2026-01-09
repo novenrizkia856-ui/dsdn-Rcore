@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/DSDN_logo.png" alt="DSDN Logo" width="220">
+</p>
+
 # DSDN — Distributed Storage & Data Network
 
 **DSDN** adalah sistem **data dan komputasi terdistribusi semi-desentral** yang
