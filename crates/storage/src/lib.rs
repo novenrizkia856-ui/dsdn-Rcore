@@ -1,35 +1,38 @@
-﻿//! dsdn-storage
+﻿//! # DSDN Storage Crate (14A)
 //!
-//! Crate ini mengatur chunking, penyimpanan lokal, dan RPC antar node.
+//! Storage layer untuk DSDN dengan DA awareness.
 //!
 //! ## Modules
-//!
-//! - `chunker`: Chunking logic untuk memecah data
-//! - `store`: Storage trait abstraction
-//! - `localfs`: Local filesystem storage implementation
+//! - `store`: Storage trait dan basic implementations
+//! - `localfs`: Local filesystem storage
+//! - `chunker`: File chunking utilities
+//! - `rpc`: gRPC client/server untuk chunk transfer
 //! - `da_storage`: DA-aware storage wrapper
-//! - `storage_proof`: Storage proof generation untuk challenge-response
-//! - `gc`: Garbage collection berdasarkan DA events
-//! - `metrics`: Storage health metrics untuk observability
-//! - `recovery`: Recovery dari DA state untuk self-healing
-//! - `events`: Storage event emission untuk observability
-//! - `rpc`: RPC services untuk komunikasi antar node
+//! - `storage_proof`: Proof generation untuk challenges
+//! - `gc`: Garbage collection
+//! - `recovery`: Chunk recovery dari peers
+//! - `metrics`: Storage health metrics
+//! - `events`: Storage event emission
 //!
-//! ## DA-Aware Storage
-//!
-//! `DAStorage` adalah wrapper yang menambahkan awareness terhadap
-//! Data Availability layer. Storage tetap menjadi sumber kebenaran
-//! untuk keberadaan data, sementara metadata DA digunakan untuk
-//! tracking dan verifikasi.
-//!
+//! ## DA Integration
 //! ```text
-//! ┌─────────────────────────────────────────────┐
-//! │              DAStorage                       │
-//! ├─────────────────────────────────────────────┤
-//! │  inner (Storage) ──► Data (authoritative)   │
-//! │  chunk_metadata  ──► DA tracking (derived)  │
-//! └─────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────┐
+//! │           DAStorage                  │
+//! ├─────────────────────────────────────┤
+//! │  ┌───────────────┐  ┌────────────┐ │
+//! │  │ LocalStorage  │  │ DA Client  │ │
+//! │  └───────────────┘  └────────────┘ │
+//! │          │                 │        │
+//! │          ▼                 ▼        │
+//! │  ┌───────────────────────────────┐ │
+//! │  │      Chunk Metadata           │ │
+//! │  │   (derived from DA events)    │ │
+//! │  └───────────────────────────────┘ │
+//! └─────────────────────────────────────┘
 //! ```
+//!
+//! ## Key Invariant
+//! Semua chunk metadata dapat direkonstruksi dari DA.
 //!
 //! ## Storage Proof
 //!

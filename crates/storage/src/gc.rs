@@ -594,11 +594,11 @@ mod tests {
         hash
     }
 
-    fn create_chunk_declared_event(hash: &str, size: u64, target_rf: u8) -> ChunkDeclaredEvent {
+    fn create_chunk_declared_event(hash: &str, size: u64, commitment: [u8; 32], target_rf: u8) -> ChunkDeclaredEvent {
         ChunkDeclaredEvent::with_target_rf(
             hash.to_string(),
             size,
-            [0xAB; 32],
+            commitment,
             None,
             1000,
             target_rf,
@@ -619,7 +619,7 @@ mod tests {
         gc.storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
         
         // Add replica so it's not orphaned
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "chunk-1".to_string(),
@@ -659,7 +659,7 @@ mod tests {
 
         // Setup chunk
         gc.storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "chunk-1".to_string(),
@@ -696,7 +696,7 @@ mod tests {
 
         // Put chunk with metadata but NO replica for this node
         gc.storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         
         // Add replica for DIFFERENT node
@@ -722,7 +722,7 @@ mod tests {
 
         // Put chunk with metadata AND replica for this node
         gc.storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         
         // Add replica for THIS node
@@ -751,7 +751,7 @@ mod tests {
 
         // Put chunk with WRONG commitment
         gc.storage.put_chunk_with_meta("chunk-1", data, wrong_commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, wrong_commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         
         // Add replica for this node (so it's not orphaned)
@@ -776,7 +776,7 @@ mod tests {
 
         // Put chunk with correct commitment
         gc.storage.put_chunk_with_meta("chunk-1", data, commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("chunk-1", data.len() as u64, commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         
         // Add replica for this node
@@ -805,7 +805,7 @@ mod tests {
 
         // Put valid chunk with correct commitment and replica
         gc.storage.put_chunk_with_meta("active-chunk", data, commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("active-chunk", data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("active-chunk", data.len() as u64, commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "active-chunk".to_string(),
@@ -831,7 +831,7 @@ mod tests {
 
         // Orphan - no replica for this node
         gc.storage.put_chunk_with_meta("orphan", orphan_data, [0xAB; 32]).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("orphan", orphan_data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("orphan", orphan_data.len() as u64, [0xAB; 32], 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "orphan".to_string(),
@@ -843,7 +843,7 @@ mod tests {
 
         // Active - has replica for this node
         gc.storage.put_chunk_with_meta("active", active_data, active_commitment).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("active", active_data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("active", active_data.len() as u64, active_commitment, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "active".to_string(),
@@ -880,7 +880,7 @@ mod tests {
         for i in 0..3 {
             let data = vec![0u8; (i + 1) * 100]; // 100, 200, 300 bytes
             gc.storage.put_chunk_with_meta(&format!("chunk-{}", i), &data, [0xAB; 32]).unwrap();
-            gc.storage.receive_chunk_declared(create_chunk_declared_event(&format!("chunk-{}", i), data.len() as u64, 3));
+            gc.storage.receive_chunk_declared(create_chunk_declared_event(&format!("chunk-{}", i), data.len() as u64, [0xAB; 32], 3));
         }
         gc.storage.sync_metadata_from_da().unwrap();
 
@@ -994,7 +994,7 @@ mod tests {
         let active_data = b"active";
         let active_commit = compute_test_commitment(active_data);
         gc.storage.put_chunk_with_meta("active", active_data, active_commit).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("active", active_data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("active", active_data.len() as u64, active_commit, 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "active".to_string(), "my-node-id".to_string(), 1000, None,
@@ -1004,7 +1004,7 @@ mod tests {
         // 2. Orphaned chunk
         let orphan_data = b"orphan data here";
         gc.storage.put_chunk_with_meta("orphan", orphan_data, [0xAB; 32]).unwrap();
-        gc.storage.receive_chunk_declared(create_chunk_declared_event("orphan", orphan_data.len() as u64, 3));
+        gc.storage.receive_chunk_declared(create_chunk_declared_event("orphan", orphan_data.len() as u64, [0xAB; 32], 3));
         gc.storage.sync_metadata_from_da().unwrap();
         gc.storage.receive_replica_added(ReplicaAddedEvent::new(
             "orphan".to_string(), "other-node".to_string(), 1000, None,
