@@ -58,8 +58,10 @@ impl std::error::Error for RoutingError {}
 pub struct NodeInfoFromSource {
     /// Alamat node (host:port).
     pub addr: String,
-    /// Apakah node aktif.
+    /// Apakah node aktif (healthy).
     pub active: bool,
+    /// Zone node (untuk zone affinity).
+    pub zone: Option<String>,
 }
 
 /// Trait untuk sumber data routing.
@@ -109,6 +111,44 @@ impl std::fmt::Display for DAError {
 impl std::error::Error for DAError {}
 
 // ════════════════════════════════════════════════════════════════════════════
+// ROUTER ERROR
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Error yang dapat terjadi pada operasi placement query.
+#[derive(Debug, Clone)]
+pub enum RouterError {
+    /// Chunk tidak ditemukan di placement registry.
+    ChunkNotFound(String),
+    /// Tidak ada node yang tersedia untuk chunk.
+    NoAvailableNodes(String),
+    /// Error saat mengakses data source.
+    DataSourceError(String),
+    /// Data inkonsisten (misalnya node_id ada di placement tapi tidak di registry).
+    InconsistentData(String),
+}
+
+impl std::fmt::Display for RouterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouterError::ChunkNotFound(hash) => {
+                write!(f, "chunk not found: {}", hash)
+            }
+            RouterError::NoAvailableNodes(hash) => {
+                write!(f, "no available nodes for chunk: {}", hash)
+            }
+            RouterError::DataSourceError(msg) => {
+                write!(f, "data source error: {}", msg)
+            }
+            RouterError::InconsistentData(msg) => {
+                write!(f, "inconsistent data: {}", msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouterError {}
+
+// ════════════════════════════════════════════════════════════════════════════
 // NODE INFO
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -119,14 +159,21 @@ pub struct NodeInfo {
     pub id: String,
     /// Alamat node (host:port).
     pub addr: String,
-    /// Apakah node aktif.
+    /// Apakah node aktif (healthy).
     pub active: bool,
+    /// Zone node (untuk zone affinity).
+    pub zone: Option<String>,
 }
 
 impl NodeInfo {
     /// Membuat NodeInfo baru.
     pub fn new(id: String, addr: String, active: bool) -> Self {
-        Self { id, addr, active }
+        Self { id, addr, active, zone: None }
+    }
+
+    /// Membuat NodeInfo baru dengan zone.
+    pub fn with_zone(id: String, addr: String, active: bool, zone: Option<String>) -> Self {
+        Self { id, addr, active, zone }
     }
 }
 
@@ -336,6 +383,7 @@ impl DARouter {
                     id: node_id,
                     addr: info.addr,
                     active: info.active,
+                    zone: info.zone,
                 });
             }
         }
@@ -374,6 +422,150 @@ impl DARouter {
     /// Get node by ID.
     pub fn get_node(&self, node_id: &str) -> Option<NodeInfo> {
         self.state_cache.read().get_node(node_id).cloned()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PLACEMENT QUERY (14A.52)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Get placement untuk chunk hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash dari chunk yang dicari
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<NodeInfo>)` - List node yang menyimpan chunk (hanya active nodes)
+    /// * `Err(RouterError)` - Error jika chunk tidak ditemukan atau data inkonsisten
+    ///
+    /// # Behavior
+    ///
+    /// 1. Check cache terlebih dahulu
+    /// 2. Jika cache stale/miss, fetch dari DA
+    /// 3. Resolve node_ids ke NodeInfo
+    /// 4. Filter hanya node yang active (healthy)
+    ///
+    /// # Thread Safety
+    ///
+    /// Method ini thread-safe menggunakan RwLock.
+    pub fn get_placement(&self, chunk_hash: &str) -> Result<Vec<NodeInfo>, RouterError> {
+        // Check if cache needs refresh (stale or empty)
+        let needs_refresh = {
+            let cache = self.state_cache.read();
+            cache.is_empty() || cache.is_expired(self.cache_ttl_ms)
+        };
+
+        // Refresh cache if needed
+        if needs_refresh {
+            self.refresh_cache()
+                .map_err(|e| RouterError::DataSourceError(e.to_string()))?;
+        }
+
+        // Read from cache
+        let cache = self.state_cache.read();
+
+        // Check if chunk exists in placements
+        let node_ids = cache.get_placement(chunk_hash)
+            .ok_or_else(|| RouterError::ChunkNotFound(chunk_hash.to_string()))?;
+
+        // Resolve node_ids to NodeInfo, filter active only
+        let mut nodes: Vec<NodeInfo> = Vec::new();
+        for node_id in node_ids {
+            match cache.get_node(node_id) {
+                Some(node) if node.active => {
+                    nodes.push(node.clone());
+                }
+                Some(_) => {
+                    // Node exists but inactive (unhealthy) - skip silently
+                }
+                None => {
+                    // Node ID in placement but not in registry - inconsistent data
+                    return Err(RouterError::InconsistentData(
+                        format!("node {} in placement but not in registry", node_id)
+                    ));
+                }
+            }
+        }
+
+        // Check if we have any available nodes
+        if nodes.is_empty() {
+            return Err(RouterError::NoAvailableNodes(chunk_hash.to_string()));
+        }
+
+        Ok(nodes)
+    }
+
+    /// Get best node untuk chunk hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash dari chunk yang dicari
+    /// * `client_zone` - Zone client (untuk zone affinity)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(NodeInfo)` - Node terbaik yang dipilih
+    /// * `Err(RouterError)` - Error jika tidak ada node tersedia
+    ///
+    /// # Selection Priority (URUTAN TIDAK BOLEH DIUBAH)
+    ///
+    /// 1. Zone affinity: prefer node dengan zone sama dengan client
+    /// 2. Node health: node unhealthy (active=false) TIDAK BOLEH dipilih
+    /// 3. Tie-breaker: deterministik by node ID (sorted ascending)
+    ///
+    /// # Thread Safety
+    ///
+    /// Method ini thread-safe.
+    pub fn get_best_node(
+        &self,
+        chunk_hash: &str,
+        client_zone: Option<&str>,
+    ) -> Result<NodeInfo, RouterError> {
+        // Step 1: Get all available nodes (already filtered by health/active)
+        let nodes = self.get_placement(chunk_hash)?;
+
+        // Nodes is guaranteed non-empty by get_placement
+
+        // Step 2: Apply zone affinity if client_zone is provided
+        if let Some(zone) = client_zone {
+            // Separate nodes into same-zone and different-zone
+            let (same_zone, diff_zone): (Vec<_>, Vec<_>) = nodes
+                .into_iter()
+                .partition(|n| n.zone.as_deref() == Some(zone));
+
+            // Prefer same-zone nodes if any
+            let candidates = if !same_zone.is_empty() {
+                same_zone
+            } else {
+                diff_zone
+            };
+
+            // Step 3: Deterministik selection by node ID (sorted ascending)
+            return Self::select_deterministic(candidates, chunk_hash);
+        }
+
+        // No zone affinity - just deterministic selection
+        Self::select_deterministic(nodes, chunk_hash)
+    }
+
+    /// Deterministic node selection.
+    ///
+    /// Sorts nodes by ID ascending and returns the first one.
+    /// This ensures consistent selection across calls.
+    fn select_deterministic(
+        mut nodes: Vec<NodeInfo>,
+        chunk_hash: &str,
+    ) -> Result<NodeInfo, RouterError> {
+        if nodes.is_empty() {
+            return Err(RouterError::NoAvailableNodes(chunk_hash.to_string()));
+        }
+
+        // Sort by node ID for deterministic selection
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+        // Return first node (lowest ID)
+        Ok(nodes.into_iter().next().expect("nodes is non-empty"))
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -472,6 +664,7 @@ mod tests {
     struct MockNodeInfo {
         addr: String,
         active: bool,
+        zone: Option<String>,
     }
 
     impl MockDataSource {
@@ -487,6 +680,15 @@ mod tests {
             self.nodes.write().insert(id.to_string(), MockNodeInfo {
                 addr: addr.to_string(),
                 active,
+                zone: None,
+            });
+        }
+
+        fn add_node_with_zone(&self, id: &str, addr: &str, active: bool, zone: Option<&str>) {
+            self.nodes.write().insert(id.to_string(), MockNodeInfo {
+                addr: addr.to_string(),
+                active,
+                zone: zone.map(|s| s.to_string()),
             });
         }
 
@@ -517,6 +719,7 @@ mod tests {
             Ok(self.nodes.read().get(node_id).map(|n| NodeInfoFromSource {
                 addr: n.addr.clone(),
                 active: n.active,
+                zone: n.zone.clone(),
             }))
         }
 
@@ -773,5 +976,266 @@ mod tests {
 
         // Task should complete
         handle.await.unwrap();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 11: GET_PLACEMENT CACHE HIT (NO FETCH)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_placement_cache_hit_no_fetch() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+
+        let router = DARouter::new(mock.clone());
+
+        // Pre-fill cache
+        router.refresh_cache().unwrap();
+
+        // Now set mock to fail - if get_placement fetches, it will error
+        mock.set_should_fail(true);
+
+        // get_placement should succeed (cache hit, no fetch)
+        let result = router.get_placement("chunk-abc");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 12: GET_PLACEMENT CACHE MISS → FETCH → UPDATE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_placement_cache_miss_fetch_update() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+
+        let router = DARouter::new(mock);
+
+        // Cache is empty - should trigger fetch
+        assert!(router.is_cache_empty());
+
+        // get_placement should fetch and update cache
+        let result = router.get_placement("chunk-abc");
+        assert!(result.is_ok());
+
+        // Cache should now be filled
+        assert!(!router.is_cache_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 13: GET_PLACEMENT CHUNK NOT FOUND
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_placement_chunk_not_found() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Query non-existent chunk
+        let result = router.get_placement("nonexistent-chunk");
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RouterError::ChunkNotFound(hash) => {
+                assert_eq!(hash, "nonexistent-chunk");
+            }
+            _ => panic!("Expected ChunkNotFound error"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14: GET_BEST_NODE ZONE AFFINITY PRIORITIZED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_best_node_zone_affinity_prioritized() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-1", "127.0.0.1:9001", true, Some("zone-a"));
+        mock.add_node_with_zone("node-2", "127.0.0.1:9002", true, Some("zone-b"));
+        mock.add_node_with_zone("node-3", "127.0.0.1:9003", true, Some("zone-a"));
+        mock.add_placement("chunk-abc", vec!["node-1", "node-2", "node-3"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Client in zone-a should get node from zone-a
+        let result = router.get_best_node("chunk-abc", Some("zone-a"));
+        assert!(result.is_ok());
+        let node = result.unwrap();
+        assert_eq!(node.zone, Some("zone-a".to_string()));
+
+        // Client in zone-b should get node from zone-b
+        let result = router.get_best_node("chunk-abc", Some("zone-b"));
+        assert!(result.is_ok());
+        let node = result.unwrap();
+        assert_eq!(node.id, "node-2"); // Only node in zone-b
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 15: GET_BEST_NODE UNHEALTHY NODES NOT SELECTED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_best_node_unhealthy_not_selected() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-1", "127.0.0.1:9001", false, Some("zone-a")); // unhealthy
+        mock.add_node_with_zone("node-2", "127.0.0.1:9002", true, Some("zone-a"));  // healthy
+        mock.add_placement("chunk-abc", vec!["node-1", "node-2"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Should select node-2 (healthy), not node-1 (unhealthy)
+        let result = router.get_best_node("chunk-abc", Some("zone-a"));
+        assert!(result.is_ok());
+        let node = result.unwrap();
+        assert_eq!(node.id, "node-2");
+        assert!(node.active);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 16: GET_BEST_NODE DETERMINISTIC SELECTION (SORTED BY ID)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_best_node_deterministic_selection() {
+        let mock = Arc::new(MockDataSource::new());
+        // Add nodes in non-sorted order
+        mock.add_node("node-z", "127.0.0.1:9003", true);
+        mock.add_node("node-a", "127.0.0.1:9001", true);
+        mock.add_node("node-m", "127.0.0.1:9002", true);
+        mock.add_placement("chunk-abc", vec!["node-z", "node-a", "node-m"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Should deterministically select node-a (lowest ID)
+        let result1 = router.get_best_node("chunk-abc", None);
+        assert!(result1.is_ok());
+        assert_eq!(result1.unwrap().id, "node-a");
+
+        // Call again - should be same result (deterministic)
+        let result2 = router.get_best_node("chunk-abc", None);
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap().id, "node-a");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 17: CONCURRENT READ + GET_PLACEMENT SAFE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_concurrent_read_get_placement_safe() {
+        use std::thread;
+
+        let mock = Arc::new(MockDataSource::new());
+        for i in 0..5 {
+            mock.add_node(&format!("node-{}", i), &format!("127.0.0.1:900{}", i), true);
+        }
+        mock.add_placement("chunk-abc", vec!["node-0", "node-1", "node-2"]);
+
+        let router = Arc::new(DARouter::new(mock));
+        router.refresh_cache().unwrap();
+
+        let mut handles = vec![];
+
+        // Spawn readers using get_placement
+        for _ in 0..5 {
+            let r = router.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let result = r.get_placement("chunk-abc");
+                    assert!(result.is_ok());
+                }
+            }));
+        }
+
+        // Spawn refresher
+        let r = router.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..10 {
+                let _ = r.refresh_cache();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }));
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Should not panic
+        assert!(!router.is_cache_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 18: GET_PLACEMENT ALL NODES UNHEALTHY → ERROR
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_placement_all_nodes_unhealthy() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", false); // unhealthy
+        mock.add_node("node-2", "127.0.0.1:9002", false); // unhealthy
+        mock.add_placement("chunk-abc", vec!["node-1", "node-2"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Should return error (no available nodes)
+        let result = router.get_placement("chunk-abc");
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RouterError::NoAvailableNodes(hash) => {
+                assert_eq!(hash, "chunk-abc");
+            }
+            _ => panic!("Expected NoAvailableNodes error"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 19: GET_BEST_NODE NO ZONE MATCH → FALLBACK DETERMINISTIC
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_best_node_no_zone_match_fallback() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-b", "127.0.0.1:9002", true, Some("zone-x"));
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, Some("zone-x"));
+        mock.add_placement("chunk-abc", vec!["node-b", "node-a"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Client in zone-y (no match) - should fallback to deterministic (node-a, lowest ID)
+        let result = router.get_best_node("chunk-abc", Some("zone-y"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().id, "node-a");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 20: ROUTER ERROR DISPLAY
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_router_error_display() {
+        let err = RouterError::ChunkNotFound("abc123".to_string());
+        assert!(format!("{}", err).contains("chunk not found"));
+        assert!(format!("{}", err).contains("abc123"));
+
+        let err = RouterError::NoAvailableNodes("def456".to_string());
+        assert!(format!("{}", err).contains("no available nodes"));
+
+        let err = RouterError::DataSourceError("connection failed".to_string());
+        assert!(format!("{}", err).contains("data source error"));
+
+        let err = RouterError::InconsistentData("node missing".to_string());
+        assert!(format!("{}", err).contains("inconsistent data"));
     }
 }
