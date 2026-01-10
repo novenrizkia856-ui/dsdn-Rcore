@@ -111,6 +111,47 @@ impl std::fmt::Display for DAError {
 impl std::error::Error for DAError {}
 
 // ════════════════════════════════════════════════════════════════════════════
+// DA EVENTS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// DA events yang memicu cache invalidation.
+///
+/// Setiap event memiliki semantik invalidation yang spesifik.
+#[derive(Debug, Clone)]
+pub enum DAEvent {
+    /// Replica ditambahkan ke chunk.
+    /// Aksi: Update placement cache untuk chunk.
+    ReplicaAdded {
+        chunk_hash: String,
+        node_id: String,
+    },
+    /// Replica dihapus dari chunk.
+    /// Aksi: Update placement cache untuk chunk.
+    ReplicaRemoved {
+        chunk_hash: String,
+        node_id: String,
+    },
+    /// Node terdaftar (baru atau update).
+    /// Aksi: Update node registry cache.
+    NodeRegistered {
+        node_id: String,
+        addr: String,
+        active: bool,
+        zone: Option<String>,
+    },
+    /// Node di-unregister.
+    /// Aksi: Remove dari node registry cache.
+    NodeUnregistered {
+        node_id: String,
+    },
+    /// Chunk deletion requested.
+    /// Aksi: HAPUS TOTAL placement cache untuk chunk.
+    DeleteRequested {
+        chunk_hash: String,
+    },
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // ROUTER ERROR
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -200,6 +241,12 @@ pub struct CachedRoutingState {
     pub chunk_placements: HashMap<String, Vec<String>>,
     /// Timestamp terakhir di-update (Unix milliseconds).
     pub last_updated: u64,
+    /// Chunks yang di-invalidate (soft invalidation).
+    /// Key = chunk_hash, Value = timestamp invalidation.
+    invalidated_chunks: HashMap<String, u64>,
+    /// Nodes yang di-invalidate (soft invalidation).
+    /// Key = node_id, Value = timestamp invalidation.
+    invalidated_nodes: HashMap<String, u64>,
 }
 
 impl CachedRoutingState {
@@ -217,6 +264,47 @@ impl CachedRoutingState {
     /// Check apakah cache kosong.
     pub fn is_empty(&self) -> bool {
         self.node_registry.is_empty() && self.chunk_placements.is_empty()
+    }
+
+    /// Check apakah chunk di-invalidate (soft expiry).
+    pub fn is_chunk_invalidated(&self, chunk_hash: &str) -> bool {
+        self.invalidated_chunks.contains_key(chunk_hash)
+    }
+
+    /// Check apakah node di-invalidate (soft expiry).
+    pub fn is_node_invalidated(&self, node_id: &str) -> bool {
+        self.invalidated_nodes.contains_key(node_id)
+    }
+
+    /// Mark chunk sebagai invalidated.
+    pub fn mark_chunk_invalidated(&mut self, chunk_hash: &str) {
+        self.invalidated_chunks.insert(chunk_hash.to_string(), current_timestamp_ms());
+    }
+
+    /// Mark node sebagai invalidated.
+    pub fn mark_node_invalidated(&mut self, node_id: &str) {
+        self.invalidated_nodes.insert(node_id.to_string(), current_timestamp_ms());
+    }
+
+    /// Clear invalidation flag untuk chunk.
+    pub fn clear_chunk_invalidation(&mut self, chunk_hash: &str) {
+        self.invalidated_chunks.remove(chunk_hash);
+    }
+
+    /// Clear invalidation flag untuk node.
+    pub fn clear_node_invalidation(&mut self, node_id: &str) {
+        self.invalidated_nodes.remove(node_id);
+    }
+
+    /// Clear semua invalidation flags.
+    pub fn clear_all_invalidations(&mut self) {
+        self.invalidated_chunks.clear();
+        self.invalidated_nodes.clear();
+    }
+
+    /// Check apakah ada invalidation pending.
+    pub fn has_pending_invalidations(&self) -> bool {
+        !self.invalidated_chunks.is_empty() || !self.invalidated_nodes.is_empty()
     }
 
     /// Get node by ID.
@@ -355,6 +443,8 @@ impl DARouter {
             node_registry,
             chunk_placements,
             last_updated: current_timestamp_ms(),
+            invalidated_chunks: HashMap::new(),
+            invalidated_nodes: HashMap::new(),
         };
 
         // Atomic update - replace entire cache
@@ -627,6 +717,236 @@ impl DARouter {
 
             info!("DARouter: background refresh task stopped");
         })
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CACHE INVALIDATION (14A.58)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Subscribe ke DA event stream untuk cache invalidation.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())`: Subscription berhasil
+    /// - `Err(DAError)`: Subscription gagal
+    ///
+    /// # Behavior
+    ///
+    /// - Subscribe ke DA event stream
+    /// - Proses events secara thread-safe
+    /// - Tidak memblokir routing path
+    ///
+    /// # Note
+    ///
+    /// Saat ini method ini placeholder yang selalu berhasil.
+    /// Implementasi konkret akan connect ke DA event stream.
+    #[allow(dead_code)]
+    pub fn subscribe_invalidations(&self) -> Result<(), DAError> {
+        info!("DARouter: subscribing to DA invalidation events");
+        // Placeholder - actual implementation would connect to DA event stream
+        // For now, we rely on:
+        // 1. TTL-based soft expiry
+        // 2. Manual invalidation via invalidate_chunk/invalidate_node
+        Ok(())
+    }
+
+    /// Invalidate chunk placement dari cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_hash` - Hash chunk yang akan di-invalidate
+    ///
+    /// # Behavior
+    ///
+    /// - HAPUS entry chunk dari placement cache
+    /// - Thread-safe (menggunakan write lock)
+    /// - Tidak panic jika chunk tidak ada
+    /// - Tidak mempengaruhi node registry
+    ///
+    /// # Use Cases
+    ///
+    /// - `ReplicaAdded`: Invalidate untuk force refresh dari DA
+    /// - `ReplicaRemoved`: Invalidate untuk force refresh dari DA
+    /// - `DeleteRequested`: Hapus total placement
+    pub fn invalidate_chunk(&self, chunk_hash: &str) {
+        debug!("DARouter: invalidating chunk placement: {}", chunk_hash);
+        let mut cache = self.state_cache.write();
+        cache.chunk_placements.remove(chunk_hash);
+    }
+
+    /// Invalidate node dari cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - ID node yang akan di-invalidate
+    ///
+    /// # Behavior
+    ///
+    /// - HAPUS entry node dari node registry
+    /// - Thread-safe (menggunakan write lock)
+    /// - Tidak panic jika node tidak ada
+    /// - Tidak mempengaruhi placement cache
+    ///
+    /// # Note
+    ///
+    /// Setelah invalidate node, placement yang reference node tersebut
+    /// akan mendapat InconsistentData error saat query.
+    /// Caller harus juga refresh placement atau invalidate related chunks.
+    pub fn invalidate_node(&self, node_id: &str) {
+        debug!("DARouter: invalidating node: {}", node_id);
+        let mut cache = self.state_cache.write();
+        cache.node_registry.remove(node_id);
+    }
+
+    /// Invalidate seluruh cache.
+    ///
+    /// # Behavior
+    ///
+    /// - Clear node registry
+    /// - Clear chunk placements
+    /// - Reset last_updated ke 0
+    /// - Thread-safe
+    ///
+    /// # Use Case
+    ///
+    /// - Full cache reset saat DA state tidak sinkron
+    /// - Recovery dari inconsistent state
+    pub fn invalidate_all(&self) {
+        debug!("DARouter: invalidating all cache");
+        let mut cache = self.state_cache.write();
+        cache.node_registry.clear();
+        cache.chunk_placements.clear();
+        cache.last_updated = 0;
+    }
+
+    /// Process DA event untuk cache invalidation.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - DA event yang akan diproses
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())`: Event berhasil diproses
+    /// - `Err(DAError)`: Error saat proses event (jika perlu refresh dari DA)
+    ///
+    /// # Event Handling (PERSIS sesuai spec)
+    ///
+    /// - `ReplicaAdded`: Update placement cache untuk chunk
+    /// - `ReplicaRemoved`: Update placement cache untuk chunk  
+    /// - `NodeRegistered`: Update node cache
+    /// - `DeleteRequested`: HAPUS TOTAL placement cache untuk chunk
+    ///
+    /// # Thread Safety
+    ///
+    /// Method ini thread-safe. Semua updates atomic.
+    pub fn process_da_event(&self, event: DAEvent) -> Result<(), DAError> {
+        match event {
+            DAEvent::ReplicaAdded { chunk_hash, node_id } => {
+                info!(
+                    "DARouter: processing ReplicaAdded event: chunk={}, node={}",
+                    chunk_hash, node_id
+                );
+                // Update placement: add node to chunk's placement list
+                let mut cache = self.state_cache.write();
+                cache
+                    .chunk_placements
+                    .entry(chunk_hash)
+                    .or_insert_with(Vec::new)
+                    .push(node_id);
+                Ok(())
+            }
+
+            DAEvent::ReplicaRemoved { chunk_hash, node_id } => {
+                info!(
+                    "DARouter: processing ReplicaRemoved event: chunk={}, node={}",
+                    chunk_hash, node_id
+                );
+                // Update placement: remove node from chunk's placement list
+                let mut cache = self.state_cache.write();
+                if let Some(nodes) = cache.chunk_placements.get_mut(&chunk_hash) {
+                    nodes.retain(|n| n != &node_id);
+                    // Remove chunk entry if no nodes left
+                    if nodes.is_empty() {
+                        cache.chunk_placements.remove(&chunk_hash);
+                    }
+                }
+                Ok(())
+            }
+
+            DAEvent::NodeRegistered { node_id, addr, active, zone } => {
+                info!(
+                    "DARouter: processing NodeRegistered event: node={}, active={}",
+                    node_id, active
+                );
+                // Update node registry
+                let mut cache = self.state_cache.write();
+                cache.node_registry.insert(
+                    node_id.clone(),
+                    NodeInfo {
+                        id: node_id,
+                        addr,
+                        active,
+                        zone,
+                    },
+                );
+                Ok(())
+            }
+
+            DAEvent::DeleteRequested { chunk_hash } => {
+                info!(
+                    "DARouter: processing DeleteRequested event: chunk={}",
+                    chunk_hash
+                );
+                // HAPUS TOTAL placement untuk chunk
+                let mut cache = self.state_cache.write();
+                cache.chunk_placements.remove(&chunk_hash);
+                Ok(())
+            }
+
+            DAEvent::NodeUnregistered { node_id } => {
+                info!(
+                    "DARouter: processing NodeUnregistered event: node={}",
+                    node_id
+                );
+                // Remove node dari registry
+                let mut cache = self.state_cache.write();
+                cache.node_registry.remove(&node_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Check if cache is in soft-expired state.
+    ///
+    /// Soft expiry means:
+    /// - Cache can still be read
+    /// - But should be refreshed soon
+    ///
+    /// # Returns
+    ///
+    /// - `true` if cache is past TTL but still readable
+    /// - `false` if cache is fresh or empty
+    pub fn is_soft_expired(&self) -> bool {
+        let cache = self.state_cache.read();
+        if cache.last_updated == 0 {
+            return false; // Never filled, not "soft expired"
+        }
+        cache.is_expired(self.cache_ttl_ms)
+    }
+
+    /// Get cache age in milliseconds.
+    ///
+    /// # Returns
+    ///
+    /// - Age in ms since last update
+    /// - u64::MAX if cache never updated
+    pub fn get_cache_age_ms(&self) -> u64 {
+        let cache = self.state_cache.read();
+        if cache.last_updated == 0 {
+            return u64::MAX;
+        }
+        current_timestamp_ms().saturating_sub(cache.last_updated)
     }
 }
 
@@ -1237,5 +1557,330 @@ mod tests {
 
         let err = RouterError::InconsistentData("node missing".to_string());
         assert!(format!("{}", err).contains("inconsistent data"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 21: INVALIDATION ON REPLICA ADDED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_invalidation_on_replica_added() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_node("node-2", "127.0.0.1:9002", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Initially only node-1
+        let cache = router.get_cache();
+        assert_eq!(cache.chunk_placements.get("chunk-abc").unwrap().len(), 1);
+
+        // Process ReplicaAdded event
+        let event = DAEvent::ReplicaAdded {
+            chunk_hash: "chunk-abc".to_string(),
+            node_id: "node-2".to_string(),
+        };
+        router.process_da_event(event).unwrap();
+
+        // Now should have 2 nodes
+        let cache = router.get_cache();
+        let nodes = cache.chunk_placements.get("chunk-abc").unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.contains(&"node-1".to_string()));
+        assert!(nodes.contains(&"node-2".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 22: INVALIDATION ON REPLICA REMOVED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_invalidation_on_replica_removed() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_node("node-2", "127.0.0.1:9002", true);
+        mock.add_placement("chunk-abc", vec!["node-1", "node-2"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Initially 2 nodes
+        let cache = router.get_cache();
+        assert_eq!(cache.chunk_placements.get("chunk-abc").unwrap().len(), 2);
+
+        // Process ReplicaRemoved event
+        let event = DAEvent::ReplicaRemoved {
+            chunk_hash: "chunk-abc".to_string(),
+            node_id: "node-2".to_string(),
+        };
+        router.process_da_event(event).unwrap();
+
+        // Now should have only 1 node
+        let cache = router.get_cache();
+        let nodes = cache.chunk_placements.get("chunk-abc").unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes.contains(&"node-1".to_string()));
+        assert!(!nodes.contains(&"node-2".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 23: INVALIDATION ON NODE REGISTERED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_invalidation_on_node_registered() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Initially 1 node
+        let cache = router.get_cache();
+        assert_eq!(cache.node_registry.len(), 1);
+
+        // Process NodeRegistered event for new node
+        let event = DAEvent::NodeRegistered {
+            node_id: "node-2".to_string(),
+            addr: "127.0.0.1:9002".to_string(),
+            active: true,
+            zone: Some("zone-a".to_string()),
+        };
+        router.process_da_event(event).unwrap();
+
+        // Now should have 2 nodes
+        let cache = router.get_cache();
+        assert_eq!(cache.node_registry.len(), 2);
+        let node2 = cache.node_registry.get("node-2").unwrap();
+        assert_eq!(node2.addr, "127.0.0.1:9002");
+        assert!(node2.active);
+        assert_eq!(node2.zone, Some("zone-a".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 24: REMOVAL CACHE ON DELETE REQUESTED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_removal_cache_on_delete_requested() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+        mock.add_placement("chunk-xyz", vec!["node-1"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Initially 2 placements
+        let cache = router.get_cache();
+        assert_eq!(cache.chunk_placements.len(), 2);
+        assert!(cache.chunk_placements.contains_key("chunk-abc"));
+
+        // Process DeleteRequested event
+        let event = DAEvent::DeleteRequested {
+            chunk_hash: "chunk-abc".to_string(),
+        };
+        router.process_da_event(event).unwrap();
+
+        // Now should have only 1 placement
+        let cache = router.get_cache();
+        assert_eq!(cache.chunk_placements.len(), 1);
+        assert!(!cache.chunk_placements.contains_key("chunk-abc"));
+        assert!(cache.chunk_placements.contains_key("chunk-xyz"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 25: TTL SOFT EXPIRY BEHAVIOR
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ttl_soft_expiry_behavior() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+
+        let router = DARouter::with_ttl(mock, 10); // 10ms TTL
+        
+        // Before refresh - not soft expired (never filled)
+        assert!(!router.is_soft_expired());
+        
+        // Refresh cache
+        router.refresh_cache().unwrap();
+        
+        // Immediately after refresh - not soft expired
+        assert!(!router.is_soft_expired());
+        
+        // Cache should still be readable
+        let cache = router.get_cache();
+        assert_eq!(cache.node_registry.len(), 1);
+        
+        // Wait for TTL to expire
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        
+        // Now should be soft expired
+        assert!(router.is_soft_expired());
+        
+        // But cache should still be readable (soft expiry)
+        let cache = router.get_cache();
+        assert_eq!(cache.node_registry.len(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 26: THREAD-SAFETY INVALIDATION
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_thread_safety_invalidation() {
+        use std::thread;
+
+        let mock = Arc::new(MockDataSource::new());
+        for i in 0..10 {
+            mock.add_node(&format!("node-{}", i), &format!("127.0.0.1:900{}", i), true);
+            mock.add_placement(&format!("chunk-{}", i), vec![&format!("node-{}", i)]);
+        }
+
+        let router = Arc::new(DARouter::new(mock));
+        router.refresh_cache().unwrap();
+
+        let mut handles = vec![];
+
+        // Spawn readers
+        for _ in 0..5 {
+            let r = router.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..100 {
+                    let _ = r.get_cache();
+                    let _ = r.get_nodes_for_chunk(&format!("chunk-{}", i % 10));
+                }
+            }));
+        }
+
+        // Spawn invalidators
+        for _ in 0..3 {
+            let r = router.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..50 {
+                    r.invalidate_chunk(&format!("chunk-{}", i % 10));
+                    let event = DAEvent::ReplicaAdded {
+                        chunk_hash: format!("chunk-{}", i % 10),
+                        node_id: format!("node-{}", i % 10),
+                    };
+                    let _ = r.process_da_event(event);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Should not panic or deadlock
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 27: NO STALE PLACEMENT AFTER EVENT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_no_stale_placement_after_event() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_node("node-2", "127.0.0.1:9002", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Get initial placement
+        let nodes = router.get_nodes_for_chunk("chunk-abc");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "node-1");
+
+        // Process ReplicaAdded event
+        let event = DAEvent::ReplicaAdded {
+            chunk_hash: "chunk-abc".to_string(),
+            node_id: "node-2".to_string(),
+        };
+        router.process_da_event(event).unwrap();
+
+        // Get placement again - should reflect update
+        let nodes = router.get_nodes_for_chunk("chunk-abc");
+        assert_eq!(nodes.len(), 2);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 28: NO PANIC ON INVALIDATE NONEXISTENT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_no_panic_on_invalidate_nonexistent() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Invalidate non-existent chunk - should not panic
+        router.invalidate_chunk("nonexistent-chunk");
+
+        // Invalidate non-existent node - should not panic
+        router.invalidate_node("nonexistent-node");
+
+        // Process event for non-existent chunk - should not panic
+        let event = DAEvent::ReplicaRemoved {
+            chunk_hash: "nonexistent-chunk".to_string(),
+            node_id: "node-1".to_string(),
+        };
+        router.process_da_event(event).unwrap();
+
+        // Cache should remain valid
+        assert_eq!(router.get_cache().node_registry.len(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 29: INVALIDATE ALL
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_invalidate_all() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node("node-1", "127.0.0.1:9001", true);
+        mock.add_node("node-2", "127.0.0.1:9002", true);
+        mock.add_placement("chunk-abc", vec!["node-1"]);
+        mock.add_placement("chunk-xyz", vec!["node-2"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        // Verify cache is filled
+        let cache = router.get_cache();
+        assert_eq!(cache.node_registry.len(), 2);
+        assert_eq!(cache.chunk_placements.len(), 2);
+        assert!(cache.last_updated > 0);
+
+        // Invalidate all
+        router.invalidate_all();
+
+        // Cache should be empty
+        let cache = router.get_cache();
+        assert_eq!(cache.node_registry.len(), 0);
+        assert_eq!(cache.chunk_placements.len(), 0);
+        assert_eq!(cache.last_updated, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 30: SUBSCRIBE INVALIDATIONS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_subscribe_invalidations() {
+        let mock = Arc::new(MockDataSource::new());
+        let router = DARouter::new(mock);
+
+        // Should succeed (placeholder implementation)
+        let result = router.subscribe_invalidations();
+        assert!(result.is_ok());
     }
 }
