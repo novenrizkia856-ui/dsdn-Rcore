@@ -10,7 +10,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug, instrument, Span};
 use tracing_subscriber;
 use tokio::time::timeout;
 use tokio::sync::watch;
@@ -19,9 +19,11 @@ mod coord_client;
 mod da_router;
 mod routing;
 mod fallback;
+mod metrics;
 
 use coord_client::CoordinatorClient;
 use da_router::{DARouter, DEFAULT_CACHE_TTL_MS};
+use metrics::{IngressMetrics, RequestContext};
 
 // ════════════════════════════════════════════════════════════════════════════
 // INGRESS HEALTH STRUCT
@@ -80,6 +82,8 @@ pub struct AppState {
     pub da_connected: Arc<std::sync::atomic::AtomicBool>,
     /// DA last sequence (0 jika tidak tersedia).
     pub da_last_sequence: Arc<std::sync::atomic::AtomicU64>,
+    /// Metrics collector.
+    pub metrics: Arc<IngressMetrics>,
 }
 
 impl AppState {
@@ -90,6 +94,7 @@ impl AppState {
             da_router: None,
             da_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics: Arc::new(IngressMetrics::new()),
         }
     }
 
@@ -101,6 +106,19 @@ impl AppState {
             da_router: Some(da_router),
             da_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics: Arc::new(IngressMetrics::new()),
+        }
+    }
+
+    /// Membuat AppState dengan metrics.
+    #[allow(dead_code)]
+    pub fn with_metrics(coord: Arc<CoordinatorClient>, metrics: Arc<IngressMetrics>) -> Self {
+        Self {
+            coord,
+            da_router: None,
+            da_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics,
         }
     }
 
@@ -234,16 +252,19 @@ async fn main() {
         .init();
 
     let coord_base = coordinator_base_from_env();
-    info!("ingress starting; coordinator = {}", coord_base);
+    info!(
+        coordinator = %coord_base,
+        "ingress starting"
+    );
 
     let coord = Arc::new(CoordinatorClient::new(coord_base));
 
     // DA Router infrastructure ready
     // Will be activated when DA layer is connected
     let da_ttl = da_router_ttl_from_env();
-    info!("DA router TTL configured: {}ms", da_ttl);
+    info!(da_router_ttl_ms = da_ttl, "DA router TTL configured");
 
-    // Create app state
+    // Create app state with metrics
     let app_state = AppState::new(coord);
 
     // Shutdown channel for background task lifecycle
@@ -254,10 +275,11 @@ async fn main() {
         .route("/object/:hash", get(proxy_object))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics_endpoint))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8088));
-    info!("Ingress listening on {}", addr);
+    info!(listen_addr = %addr, "Ingress listening");
 
     // Use axum::serve wrapper (works consistently across axum versions)
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
@@ -268,7 +290,7 @@ async fn main() {
     tokio::select! {
         result = server => {
             if let Err(e) = result {
-                error!("Server error: {}", e);
+                error!(error = %e, "Server error");
             }
         }
         _ = tokio::signal::ctrl_c() => {
@@ -307,13 +329,28 @@ async fn ready(
     } else {
         let health_info = state.gather_health().await;
         warn!(
-            "ready: not ready - da_connected={}, coordinator_reachable={}, healthy_nodes={}",
-            health_info.da_connected,
-            health_info.coordinator_reachable,
-            health_info.healthy_nodes
+            da_connected = health_info.da_connected,
+            coordinator_reachable = health_info.coordinator_reachable,
+            healthy_nodes = health_info.healthy_nodes,
+            "ready check failed"
         );
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")
     }
+}
+
+/// GET /metrics - Prometheus metrics endpoint
+///
+/// Returns metrics in Prometheus exposition format.
+async fn metrics_endpoint(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let output = state.metrics.to_prometheus();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, output)
 }
 
 /// GET /object/:hash
@@ -321,19 +358,38 @@ async fn ready(
 /// - map node id -> addr by querying /nodes
 /// - use dsdn_storage::rpc::client_get("http://addr", hash) to fetch bytes
 /// - return bytes with application/octet-stream
+#[instrument(skip(state), fields(trace_id, target_node, routing_strategy, latency_ms, outcome))]
 async fn proxy_object(
     Path(hash): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    info!("ingress: request for object {}", hash);
+    // Create request context with trace ID
+    let ctx = RequestContext::new();
+    let trace_id = ctx.trace_id.to_string();
+
+    // Record span fields
+    Span::current().record("trace_id", &trace_id);
+
+    // Record request in metrics
+    state.metrics.record_request();
+
+    info!(
+        trace_id = %trace_id,
+        chunk_hash = %hash,
+        "request received"
+    );
 
     // we set a small overall timeout for the ingress operation
     let overall = Duration::from_secs(5);
     // clone Arc to move into async block
     let coord = state.coord.clone();
     let hash_cl = hash.clone();
+    let metrics = state.metrics.clone();
+    let trace_id_cl = trace_id.clone();
 
     let res = timeout(overall, async move {
+        let routing_start = std::time::Instant::now();
+
         // 1) get placement (ask for 1 target)
         let placement = coord.placement_for_hash(&hash_cl, 1).await?;
         if placement.is_empty() {
@@ -341,39 +397,118 @@ async fn proxy_object(
         }
         let node_id = &placement[0];
 
+        // Record routing latency
+        let routing_latency = routing_start.elapsed().as_millis() as u64;
+        metrics.record_routing_latency(routing_latency);
+
         // 2) get nodes and find node addr
         let nodes = coord.list_nodes().await?;
         let node = nodes.into_iter().find(|n| n.id == *node_id)
             .ok_or_else(|| anyhow::anyhow!("node id {} not found in nodes list", node_id))?;
 
         let node_addr = node.addr;
-        info!("ingress: routing {} -> node {} (addr {})", hash_cl, node_id, node_addr);
+
+        // Structured logging for routing decision
+        info!(
+            trace_id = %trace_id_cl,
+            chunk_hash = %hash_cl,
+            target_node = %node_id,
+            node_addr = %node_addr,
+            routing_latency_ms = routing_latency,
+            routing_strategy = "coordinator",
+            "routing decision made"
+        );
 
         // 3) call storage gRPC client to fetch chunk; client_get expects "http://addr"
         // note: dsdn-storage rpc::client_get returns Result<Option<Vec<u8>>, _>
         let connect = format!("http://{}", node_addr);
         match dsdn_storage::rpc::client_get(connect, hash_cl.clone()).await {
             Ok(Some(data)) => {
+                debug!(
+                    trace_id = %trace_id_cl,
+                    chunk_hash = %hash_cl,
+                    target_node = %node_id,
+                    data_size = data.len(),
+                    "fetch success"
+                );
                 Ok::<Bytes, anyhow::Error>(Bytes::from(data))
             }
-            Ok(None) => Err(anyhow::anyhow!("chunk not found on node {}", node_id)),
-            Err(e) => Err(anyhow::anyhow!("rpc client_get failure: {}", e)),
+            Ok(None) => {
+                warn!(
+                    trace_id = %trace_id_cl,
+                    chunk_hash = %hash_cl,
+                    target_node = %node_id,
+                    "chunk not found on node"
+                );
+                Err(anyhow::anyhow!("chunk not found on node {}", node_id))
+            }
+            Err(e) => {
+                warn!(
+                    trace_id = %trace_id_cl,
+                    chunk_hash = %hash_cl,
+                    target_node = %node_id,
+                    error = %e,
+                    "rpc client_get failure"
+                );
+                Err(anyhow::anyhow!("rpc client_get failure: {}", e))
+            }
         }
     }).await;
 
+    // Record latency
+    let total_latency = ctx.elapsed_ms();
+    Span::current().record("latency_ms", total_latency);
+
     match res {
         Ok(Ok(bytes)) => {
+            state.metrics.record_status(200);
+            Span::current().record("outcome", "success");
+
+            info!(
+                trace_id = %trace_id,
+                chunk_hash = %hash,
+                latency_ms = total_latency,
+                outcome = "success",
+                "request completed"
+            );
+
             let mut headers = HeaderMap::new();
             headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+            headers.insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap_or_else(|_| HeaderValue::from_static("unknown")));
             (StatusCode::OK, headers, bytes).into_response()
         }
         Ok(Err(e)) => {
-            error!("ingress: fetch error: {}", e);
-            (StatusCode::BAD_GATEWAY, format!("error: {}", e)).into_response()
+            state.metrics.record_status(502);
+            Span::current().record("outcome", "error");
+
+            error!(
+                trace_id = %trace_id,
+                chunk_hash = %hash,
+                latency_ms = total_latency,
+                error = %e,
+                outcome = "error",
+                "fetch error"
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap_or_else(|_| HeaderValue::from_static("unknown")));
+            (StatusCode::BAD_GATEWAY, headers, format!("error: {}", e)).into_response()
         }
         Err(_) => {
-            error!("ingress: timeout fetching {}", hash);
-            (StatusCode::GATEWAY_TIMEOUT, "timeout").into_response()
+            state.metrics.record_status(504);
+            Span::current().record("outcome", "timeout");
+
+            error!(
+                trace_id = %trace_id,
+                chunk_hash = %hash,
+                latency_ms = total_latency,
+                outcome = "timeout",
+                "request timeout"
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap_or_else(|_| HeaderValue::from_static("unknown")));
+            (StatusCode::GATEWAY_TIMEOUT, headers, "timeout".to_string()).into_response()
         }
     }
 }
@@ -657,5 +792,44 @@ mod tests {
         assert!(!health.coordinator_reachable);
         assert_eq!(health.healthy_nodes, 0);
         assert_eq!(health.total_nodes, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 9: METRICS IN APP STATE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_metrics_in_app_state() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        // Metrics should be accessible
+        state.metrics.record_request();
+        state.metrics.record_status(200);
+        state.metrics.record_cache_hit();
+
+        assert_eq!(state.metrics.requests_total.get(), 1);
+        assert_eq!(state.metrics.requests_by_status.get(200), 1);
+        assert_eq!(state.metrics.cache_hits.get(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 10: METRICS PROMETHEUS OUTPUT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_metrics_prometheus_output() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        state.metrics.record_request();
+        state.metrics.record_status(200);
+
+        let output = state.metrics.to_prometheus();
+
+        assert!(output.contains("ingress_requests_total 1"));
+        assert!(output.contains("ingress_requests_by_status"));
+        assert!(output.contains("# HELP"));
+        assert!(output.contains("# TYPE"));
     }
 }
