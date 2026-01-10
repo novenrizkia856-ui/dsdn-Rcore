@@ -134,7 +134,7 @@ impl MicroVM for MockVMController {
                 output = async {
                     let mut guard = child_box_clone.lock().await;
 
-                    if let Some(mut c) = guard.take() {
+                    if let Some(c) = guard.take() {
                         c.wait_with_output().await
                     } else {
                         Err(std::io::Error::new(std::io::ErrorKind::Other, "child gone"))

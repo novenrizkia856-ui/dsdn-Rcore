@@ -132,6 +132,7 @@ impl From<StateError> for RebuildError {
 /// ```
 pub struct StateRebuilder {
     /// Reference to the DA layer
+    #[allow(dead_code)] // TODO: Will be used when DA read methods are implemented
     da: Arc<dyn DALayer>,
     /// Starting height (0 for genesis)
     from_height: u64,

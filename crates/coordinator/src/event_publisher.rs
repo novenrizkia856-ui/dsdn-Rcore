@@ -66,6 +66,7 @@ const DEFAULT_FLUSH_INTERVAL_MS: u64 = 5000;
 /// - Background flusher ensures events don't sit too long
 pub struct EventPublisher {
     /// Reference to the DA layer
+    #[allow(dead_code)] // TODO: Will be used when DALayer.post_blob() is implemented
     da: Arc<dyn DALayer>,
     /// Pending events awaiting publish
     pending: RwLock<Vec<DAEvent>>,

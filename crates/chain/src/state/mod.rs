@@ -4439,7 +4439,6 @@ use crate::slashing::{
     LivenessRecord,
     NodeLivenessRecord,
     SlashingEvent,
-    SlashingReason,
 };
 use crate::epoch::{EpochInfo, EpochConfig};
 use crate::economic::{DeflationConfig, EconomicMetrics, BurnEvent};

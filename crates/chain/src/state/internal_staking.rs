@@ -4,7 +4,7 @@
 use crate::types::Address;
 use anyhow::Result;
 use std::collections::HashMap;
-use super::{ChainState, Validator, ValidatorInfo, UnstakeEntry, UNSTAKE_DELAY_SECONDS};
+use super::{ChainState, Validator, UnstakeEntry, UNSTAKE_DELAY_SECONDS};
 
 impl ChainState {
     // ============================================================
