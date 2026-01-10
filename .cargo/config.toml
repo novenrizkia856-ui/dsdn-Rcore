@@ -1,34 +1,50 @@
+# .cargo/config.toml
+
 # RUSTC — STRICT CORE SAFETY
 [build]
 rustflags = [
-  "-Dunsafe_code",                # unsafe = ERROR
-  "-Coverflow-checks=yes",         # integer overflow = ERROR
+  "-Dwarnings",                   # treat all warnings as errors
+  "-Dunsafe_code",                # forbid unsafe code at compile time
+  "-Coverflow-checks=yes",        # ensure overflow checks are enabled
+  "-Cdebuginfo=2",                # include debuginfo for post-mortem
 ]
 
-
+# For nightly-specific testing (miri, sanitizers), target overrides can be placed in CI
 [target.'cfg(all())']
 rustflags = []
 
 [alias]
+# Strict clippy target; call: cargo clippy-strict
 clippy-strict = [
   "clippy",
+  "--all-targets",
+  "--workspace",
   "--",
-  "-Dclippy::unwrap_used",
-  "-Dclippy::expect_used",
-  "-Dclippy::panic",
-  "-Dclippy::todo",
-  "-Dclippy::unimplemented",
-  "-Dclippy::dbg_macro",
-
-  "-Dclippy::indexing_slicing",
-  "-Dclippy::arithmetic_side_effects",
-  "-Dclippy::integer_division",
-  "-Dclippy::float_arithmetic",
-
-  "-Dclippy::multiple_crate_versions",
-  "-Dclippy::cargo_common_metadata",
-
-  "-Wclippy::all",
-  "-Wclippy::pedantic",
-  "-Wclippy::nursery"
+  "-D",
+  "clippy::all",
+  "-D",
+  "clippy::pedantic",
+  "-D",
+  "clippy::unwrap_used",
+  "-D",
+  "clippy::expect_used",
+  "-D",
+  "clippy::panic",
+  "-D",
+  "clippy::todo",
+  "-D",
+  "clippy::unimplemented",
+  "-D",
+  "clippy::dbg_macro",
+  "-D",
+  "clippy::indexing_slicing",
+  "-D",
+  "clippy::arithmetic_side_effects",
+  "-D",
+  "clippy::integer_division",
+  "-D",
+  "clippy::float_arithmetic",
 ]
+
+# Run miri tests (requires nightly + miri component installed)
+miri-test = ["+nightly", "miri", "test"]

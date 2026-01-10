@@ -18,8 +18,8 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-org/dsdn"
+license = "MIT"
+repository = "https://github.com/novenrizkia856-ui/dsdn"
 description = "DSDN — Decentralized Storage & Data Network (infra-grade, deterministic, safety-first)"
 
 [workspace.dependencies]
@@ -57,10 +57,16 @@ debug-assertions = true
 incremental = false
 
 [profile.release]
+# Hardening for production/assurance builds:
 opt-level = 3
-lto = "fat"
+lto = "fat"               # whole-program LTO
 codegen-units = 1
-debug = false
-strip = true
+# Keep debug info in release so crash reports are useful for safety investigations:
+debug = true
+# Do NOT strip symbols in the assurance build; keep artifacts debuggable:
+strip = false
+# Panic abort to avoid unwinding non-determinism across FFI/boundaries:
+panic = "abort"
+# Always check integer overflow even in release:
 overflow-checks = true
 incremental = false
