@@ -17,8 +17,9 @@ fn add(a: u16, b: u16) -> u16 {
 }
 
 /// Compute a - b mod P
+#[allow(dead_code)]
 fn sub(a: u16, b: u16) -> u16 {
-    let mut v = (P as i32 + a as i32 - b as i32) % (P as i32);
+    let v = (P as i32 + a as i32 - b as i32) % (P as i32);
     v as u16
 }
 
@@ -96,7 +97,7 @@ pub fn recover_secret(shares: &[(u8, Vec<u8>)]) -> anyhow::Result<Vec<u8>> {
         // compute secret = sum_j y_j * l_j(0)
         let mut accum: u16 = 0;
         for j in 0..k {
-            let xj = shares[j].0 as i64;
+            let _xj = shares[j].0 as i64;
             let yj = shares[j].1[idx] as u16;
 
             // compute L_j(0) = product_{m != j} (0 - x_m) / (x_j - x_m)

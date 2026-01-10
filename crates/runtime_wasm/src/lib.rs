@@ -14,7 +14,6 @@ use thiserror::Error;
 use wasmtime::{Engine, Module, Store, Linker, Caller, Extern};
 use wasmtime_wasi::{WasiCtxBuilder, WasiCtx};
 use serde::{Serialize, Deserialize};
-use wat::parse_str as wat2wasm;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLimits {
@@ -79,7 +78,7 @@ where
 {
     // compile module first (syntax/validation)
     let engine = Engine::default();
-    let module = Module::new(&engine, module_bytes)
+    let _module = Module::new(&engine, module_bytes)
         .map_err(|e| RuntimeError::CompileError(format!("failed to compile module: {}", e)))?;
 
     // channel for thread result
@@ -217,7 +216,7 @@ mod tests {
             )
         )
         "#;
-        let wasm = wat2wasm(wat).expect("wat->wasm");
+        let wasm = parse_str(wat).expect("wat->wasm");
 
         let limits = RuntimeLimits {
             timeout_ms: 1500,

@@ -14,15 +14,23 @@ use super::internal_governance::{
 };
 
 // Gas constants
+#[allow(dead_code)]
 const FIXED_GAS_TRANSFER: u64 = 21000;
+#[allow(dead_code)]
 const FIXED_GAS_STAKE: u64 = 30000;
 const FIXED_GAS_CLAIM: u64 = 15000;
+#[allow(dead_code)]
 const FIXED_GAS_STORAGE: u64 = 25000;
+#[allow(dead_code)]
 const FIXED_GAS_COMPUTE: u64 = 40000;
+#[allow(dead_code)]
 const FIXED_GAS_REGISTRATION: u64 = 50000;
+#[allow(dead_code)]
 const FIXED_GAS_GOV: u64 = 10000;
+#[allow(dead_code)]
 const FIXED_GAS_CUSTOM: u64 = 21000;
 const PRIVATE_TX_BASE_GAS: u64 = 21000;    // Base gas untuk private tx relay (13.7.F)
+#[allow(dead_code)]
 const MIN_DELEGATOR_STAKE: u128 = 100_000;
 
 impl ChainState {

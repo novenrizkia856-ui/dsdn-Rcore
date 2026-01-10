@@ -31,9 +31,13 @@ use anyhow::Result;
 
 // CONSTANTS FOR TESTING (13.8.K)
 
+#[allow(dead_code)]
 const MIN_VALIDATOR_STAKE: u128 = 50_000;
+#[allow(dead_code)]
 const MIN_DELEGATOR_STAKE: u128 = 100_000;
+#[allow(dead_code)]
 const BLOCKS_PER_DAY: u64 = 4;  // Simulated: 1 block = 6 hours
+#[allow(dead_code)]
 const BLOCKS_FOR_7_DAYS: u64 = 28;  // 7 days = 28 blocks
 
 /// Test result structure
@@ -182,7 +186,7 @@ pub fn run_e2e_tests(module: &str, verbose: bool) -> Result<String> {
 // PROPOSER SELECTION TESTS (13.7.D)
 // ============================================================
 
-fn test_proposer_selection(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_proposer_selection(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Single validator always selected
@@ -316,7 +320,7 @@ fn test_proposer_selection(verbose: bool) -> Result<Vec<TestResult>> {
 // STAKE LOGIC TESTS (13.7.B)
 // ============================================================
 
-fn test_stake_logic(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_stake_logic(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Validator stake update
@@ -419,7 +423,7 @@ fn test_stake_logic(verbose: bool) -> Result<Vec<TestResult>> {
 // QUADRATIC VOTING TESTS (13.7.B)
 // ============================================================
 
-fn test_quadratic_voting(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_quadratic_voting(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Basic sqrt calculation
@@ -539,7 +543,7 @@ fn test_quadratic_voting(verbose: bool) -> Result<Vec<TestResult>> {
 // BLOCK PRODUCTION TESTS (13.7.E)
 // ============================================================
 
-fn test_block_production(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_block_production(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Block creation with transactions
@@ -682,7 +686,7 @@ fn test_block_production(verbose: bool) -> Result<Vec<TestResult>> {
 // MEMPOOL TESTS
 // ============================================================
 
-fn test_mempool_operations(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_mempool_operations(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Add and pop transaction
@@ -884,7 +888,7 @@ fn test_mempool_operations(verbose: bool) -> Result<Vec<TestResult>> {
 // FEE DISTRIBUTION TESTS (13.7.H)
 // ============================================================
 
-fn test_fee_distribution(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_fee_distribution(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Fee weights sum to 100
@@ -947,7 +951,7 @@ fn test_fee_distribution(verbose: bool) -> Result<Vec<TestResult>> {
         state.create_account(proposer);
         state.mint(&proposer, 1_000_000_000).unwrap();
         
-        let treasury_before = state.treasury_balance;
+        let _treasury_before = state.treasury_balance;
         
         // Check is_self_dealing
         let payload = TxPayload::Transfer {
@@ -979,7 +983,7 @@ fn test_fee_distribution(verbose: bool) -> Result<Vec<TestResult>> {
 // EPOCH ROTATION TESTS (13.7.L)
 // ============================================================
 
-fn test_epoch_rotation(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_epoch_rotation(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Should rotate at epoch boundaries
@@ -1062,7 +1066,7 @@ fn test_epoch_rotation(verbose: bool) -> Result<Vec<TestResult>> {
 // FULL NODE SYNC TESTS (13.7.J)
 // ============================================================
 
-fn test_fullnode_sync(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_fullnode_sync(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // Test 1: Block signature verification
@@ -1148,7 +1152,7 @@ fn test_fullnode_sync(verbose: bool) -> Result<Vec<TestResult>> {
 // - Delegator reward cap (1% annual)
 // ============================================================
 
-fn test_pos_delegation(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_pos_delegation(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // ─────────────────────────────────────────────────────────
@@ -1499,7 +1503,7 @@ fn test_pos_delegation(verbose: bool) -> Result<Vec<TestResult>> {
 // UNSTAKE DELAY TESTS (13.8.K)
 // ============================================================
 
-fn test_unstake_delay(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_unstake_delay(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // ─────────────────────────────────────────────────────────
@@ -1525,7 +1529,7 @@ fn test_unstake_delay(verbose: bool) -> Result<Vec<TestResult>> {
         state.register_delegator_stake(&delegator, &validator, 100_000).unwrap();
         
         // Unstake
-        let current_ts: u64 = 1_700_000_000;
+        let _current_ts: u64 = 1_700_000_000;
         state.unbond(&delegator, &validator, 50_000).unwrap();
         
         let has_pending = state.has_pending_unstake(&delegator);
@@ -1733,7 +1737,7 @@ fn test_unstake_delay(verbose: bool) -> Result<Vec<TestResult>> {
 // SLASHING COMPATIBILITY TESTS (13.8.K)
 // ============================================================
 
-fn test_slashing_compatibility(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_slashing_compatibility(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // ─────────────────────────────────────────────────────────
@@ -1931,7 +1935,7 @@ fn test_slashing_compatibility(verbose: bool) -> Result<Vec<TestResult>> {
 // FEE BY RESOURCE CLASS TESTS (13.8.K)
 // ============================================================
 
-fn test_fee_by_resource_class(verbose: bool) -> Result<Vec<TestResult>> {
+fn test_fee_by_resource_class(_verbose: bool) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     // ─────────────────────────────────────────────────────────
@@ -2623,9 +2627,9 @@ fn test_governance_e2e(verbose: bool) -> Result<Vec<TestResult>> {
         state.cast_vote(voter, pid, VoteOption::No, 1700000001).unwrap();
         
         // Capture state before persistence
-        let proposal_count_before = state.proposal_count;
-        let votes_before = state.get_proposal_votes(pid).len();
-        let state_root_before = state.compute_state_root().unwrap();
+        let _proposal_count_before = state.proposal_count;
+        let _votes_before = state.get_proposal_votes(pid).len();
+        let _state_root_before = state.compute_state_root().unwrap();
         
         // PERSIST to LMDB
         let dir = tempdir().unwrap();
@@ -2699,7 +2703,7 @@ fn test_governance_e2e(verbose: bool) -> Result<Vec<TestResult>> {
         let bootstrap_enabled = state.governance_config.bootstrap_mode;
         
         // Create proposal to update gas price
-        let original_gas_price = 100u128; // Simulated current value
+        let _original_gas_price = 100u128; // Simulated current value
         let proposed_new_price = 50u128;
         
         let pid = state.create_proposal(
@@ -2763,8 +2767,8 @@ if verbose {
 #[test]
 fn test_governance_preview_full_flow() {
     use crate::state::{
-        ChainState, ProposalType, ProposalStatus, GovernanceEvent, GovernanceEventType,
-        PreviewType, ProposalPreview,
+        ChainState, ProposalType, ProposalStatus,
+        PreviewType,
     };
     
     // SETUP: Create state with governance enabled
@@ -2832,7 +2836,7 @@ fn test_governance_passed_no_execution() {
     
     // Record initial validator count (observable state that would change if execution happened)
     let initial_validator_count = state.validators.len();
-    let initial_treasury = state.treasury_balance;
+    let _initial_treasury = state.treasury_balance;
     
     // Create proposal to update gas price
     let proposal_id = state.create_proposal(
@@ -2916,7 +2920,7 @@ fn test_governance_bootstrap_status_query() {
 #[test]
 fn test_governance_event_audit_trail() {
     use crate::state::{
-        ChainState, ProposalType, GovernanceEvent, GovernanceEventType,
+        ChainState, GovernanceEvent, GovernanceEventType,
     };
     
     // SETUP
@@ -3218,7 +3222,6 @@ fn test_slashing_validator_double_sign_full_flow() {
 /// Flow: slash validator → delegator remains safe
 #[test]
 fn test_slashing_delegator_protection() {
-    use crate::slashing::{VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT, SlashingReason};
     use crate::state::ValidatorInfo;
     
     // SETUP
@@ -3249,7 +3252,7 @@ fn test_slashing_delegator_protection() {
     state.detect_double_sign(validator, 100, vec![1], vec![2]);
     
     // EXECUTE: Process slashing (double-sign is NOT protocol failure)
-    let events = state.process_automatic_slashing(100, timestamp);
+    let _events = state.process_automatic_slashing(100, timestamp);
     
     // VERIFY: Delegator stake unchanged
     let delegator_remaining = state.delegator_stakes.get(&delegator).copied().unwrap_or(0);
@@ -3270,7 +3273,7 @@ fn test_slashing_delegator_protection() {
 fn test_slashing_treasury_burn_allocation() {
     use crate::slashing::{
         SLASHING_TREASURY_RATIO, SLASHING_BURN_RATIO, 
-        NODE_LIVENESS_SLASH_PERCENT, SlashingReason
+        SlashingReason
     };
     
     // SETUP
@@ -3321,7 +3324,6 @@ fn test_slashing_treasury_burn_allocation() {
 /// Flow: multiple violations → single process_automatic_slashing → all handled
 #[test]
 fn test_slashing_block_level_hook() {
-    use crate::slashing::SlashingReason;
     use crate::state::ValidatorInfo;
     
     // SETUP
@@ -3383,8 +3385,6 @@ fn test_slashing_block_level_hook() {
 /// Assertion: Same inputs produce same outputs.
 #[test]
 fn test_slashing_determinism() {
-    use crate::slashing::{SlashingReason, NODE_LIVENESS_SLASH_PERCENT};
-    
     // Run 1
     let mut state1 = ChainState::new();
     let node = Address::from_bytes([0xF1; 20]);
@@ -3477,7 +3477,7 @@ fn test_rpc_endpoints(verbose: bool) -> Result<Vec<TestResult>> {
 }
 
 /// Test 1: Balance query via ChainState
-fn test_rpc_balance_state(verbose: bool) -> Result<TestResult> {
+fn test_rpc_balance_state(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_balance_state".to_string();
     
@@ -3501,7 +3501,7 @@ fn test_rpc_balance_state(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 2: Nonce query via ChainState
-fn test_rpc_nonce_state(verbose: bool) -> Result<TestResult> {
+fn test_rpc_nonce_state(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_nonce_state".to_string();
     
@@ -3526,7 +3526,7 @@ fn test_rpc_nonce_state(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 3: Stake info query via ChainState
-fn test_rpc_stake_info_state(verbose: bool) -> Result<TestResult> {
+fn test_rpc_stake_info_state(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_stake_info_state".to_string();
     
@@ -3553,7 +3553,7 @@ fn test_rpc_stake_info_state(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 4: Fee split calculation for Storage (70/20/10)
-fn test_rpc_fee_split_storage_calc(verbose: bool) -> Result<TestResult> {
+fn test_rpc_fee_split_storage_calc(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_fee_split_storage".to_string();
     
@@ -3582,7 +3582,7 @@ fn test_rpc_fee_split_storage_calc(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 5: Fee split calculation for Transfer (0/100/0)
-fn test_rpc_fee_split_transfer_calc(verbose: bool) -> Result<TestResult> {
+fn test_rpc_fee_split_transfer_calc(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_fee_split_transfer".to_string();
     
@@ -3611,7 +3611,7 @@ fn test_rpc_fee_split_transfer_calc(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 6: Storage cost calculation
-fn test_rpc_storage_cost_calc(verbose: bool) -> Result<TestResult> {
+fn test_rpc_storage_cost_calc(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_storage_cost_calc".to_string();
     
@@ -3638,7 +3638,7 @@ fn test_rpc_storage_cost_calc(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 7: Compute cost calculation
-fn test_rpc_compute_cost_calc(verbose: bool) -> Result<TestResult> {
+fn test_rpc_compute_cost_calc(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_compute_cost_calc".to_string();
     
@@ -3665,7 +3665,7 @@ fn test_rpc_compute_cost_calc(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 8: Receipt status state query
-fn test_rpc_receipt_status_state(verbose: bool) -> Result<TestResult> {
+fn test_rpc_receipt_status_state(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_receipt_status_state".to_string();
     
@@ -3687,7 +3687,7 @@ fn test_rpc_receipt_status_state(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 9: Snapshot state query
-fn test_rpc_snapshot_state(verbose: bool) -> Result<TestResult> {
+fn test_rpc_snapshot_state(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_snapshot_state".to_string();
     
@@ -3716,7 +3716,7 @@ fn test_rpc_snapshot_state(verbose: bool) -> Result<TestResult> {
 }
 
 /// Test 10: Address parsing validation
-fn test_rpc_address_parsing(verbose: bool) -> Result<TestResult> {
+fn test_rpc_address_parsing(_verbose: bool) -> Result<TestResult> {
     let start = std::time::Instant::now();
     let test_name = "rpc_address_parsing".to_string();
     
@@ -4166,7 +4166,7 @@ fn test_wallet_e2e(verbose: bool) -> Result<Vec<TestResult>> {
         let start = std::time::Instant::now();
 
         // Generate two wallets (sender and recipient)
-        let sender = Wallet::generate();
+        let _sender = Wallet::generate();
         let recipient = Wallet::generate();
 
         // Generate a random file key (32 bytes)

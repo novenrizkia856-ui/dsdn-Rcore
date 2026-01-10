@@ -13,18 +13,8 @@ use dsdn_chain::types::Address;
 use dsdn_chain::state::{
     ChainState,
     ValidatorInfo,
-    ValidatorSet,
-    UnstakeEntry,
     UNSTAKE_DELAY_SECONDS,
-    Proposal,
-    Vote,
-    GovernanceConfig
 };
-use dsdn_chain::qv::{
-    compute_qv_weight,
-    compute_combined_qv_weight,
-};
-use std::collections::HashMap;
 
 
     // ════════════════════════════════════════════════════════════
@@ -51,6 +41,7 @@ use std::collections::HashMap;
     }
 
     /// Create and register a delegator with given stake to validator
+    #[allow(dead_code)]
     fn setup_delegator(
         state: &mut ChainState, 
         seed: u8, 
@@ -68,6 +59,7 @@ use std::collections::HashMap;
     }
 
     /// Simulate block production by advancing timestamps
+    #[allow(dead_code)]
     fn advance_blocks(current_ts: u64, blocks: u64) -> u64 {
         // 1 block = 6 hours = 21600 seconds
         const BLOCK_TIME: u64 = 21600;
@@ -297,7 +289,7 @@ use std::collections::HashMap;
         state.mint(&delegator, 200_000).unwrap();
         state.register_delegator_stake(&delegator, &validator, 100_000).unwrap();
         
-        let ts: u64 = 1_700_000_000;
+        let _ts: u64 = 1_700_000_000;
         state.unbond(&delegator, &validator, 50_000).unwrap();
         
         assert!(state.has_pending_unstake(&delegator), "Should have pending unstake");
@@ -429,4 +421,3 @@ use std::collections::HashMap;
         assert!(new_state.validator_set.is_validator(&validator));
         assert_eq!(new_state.delegator_to_validator.get(&delegator), Some(&validator));
     }
-

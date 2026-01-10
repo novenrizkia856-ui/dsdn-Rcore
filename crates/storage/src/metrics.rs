@@ -826,8 +826,8 @@ mod tests {
 
         // declared_chunks_count = 3, metadata_count = 1
         // lag should be 3 - 1 = 2 after checking
-        let declared = storage.declared_chunks_count();
-        let meta = storage.metadata_count();
+        let _declared = storage.declared_chunks_count();
+        let _meta = storage.metadata_count();
         
         // Since declared (3) > meta (1), lag = 2
         let metrics = StorageMetrics::collect(&storage);

@@ -238,6 +238,7 @@ pub struct GarbageCollector {
     /// DA-aware storage.
     storage: Arc<DAStorage>,
     /// DA layer untuk verifikasi lifecycle.
+    #[allow(dead_code)]
     da: Arc<dyn DALayer>,
     /// ID node ini.
     my_node_id: String,
@@ -535,7 +536,7 @@ fn current_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::da_storage::{DAStorage, DAChunkMeta, ChunkDeclaredEvent, ReplicaAddedEvent};
+    use crate::da_storage::{DAStorage, ChunkDeclaredEvent, ReplicaAddedEvent};
     use crate::store::Storage;
     use dsdn_common::MockDA;
     use parking_lot::RwLock;

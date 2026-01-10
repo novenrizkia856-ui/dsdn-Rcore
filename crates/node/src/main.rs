@@ -15,7 +15,6 @@
 //! 6. Start follower
 //! 7. Start HTTP server (health endpoint)
 
-use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,7 +26,7 @@ use uuid::Uuid;
 
 use dsdn_common::{CelestiaDA, DAConfig, DALayer, MockDA};
 use dsdn_node::{
-    DAInfo, HealthResponse, HealthStorage, NodeDerivedState, NodeHealth, ReplicaStatus,
+    DAInfo, HealthResponse, HealthStorage, NodeDerivedState, NodeHealth,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -121,6 +120,7 @@ impl NodeConfig {
 /// Simple in-memory storage implementation for health reporting.
 struct NodeStorage {
     /// Storage directory path.
+    #[allow(dead_code)]
     path: String,
     /// Simulated used bytes.
     used_bytes: RwLock<u64>,
@@ -161,6 +161,7 @@ impl HealthStorage for NodeStorage {
 /// Wrapper for DA layer to implement DAInfo trait.
 struct DAInfoWrapper {
     /// DA layer reference.
+    #[allow(dead_code)]
     da: Arc<dyn DALayer>,
     /// Latest sequence (updated by follower).
     latest_sequence: RwLock<u64>,
@@ -410,7 +411,7 @@ async fn main() {
         let node_id = config.node_id.clone();
 
         tokio::spawn(async move {
-            let namespace = [0x01; 29]; // Default namespace
+            let _namespace = [0x01; 29]; // Default namespace
 
             info!("DA follower started for node {}", node_id);
 

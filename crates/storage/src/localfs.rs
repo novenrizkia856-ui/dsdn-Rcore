@@ -11,6 +11,7 @@ use dsdn_common::Result;
 /// Local filesystem backend
 #[derive(Clone, Debug)]
 pub struct LocalFsStorage {
+    #[allow(dead_code)]
     base: PathBuf,
     objects_dir: PathBuf,
 }

@@ -3151,6 +3151,7 @@ fn format_economic_mode(mode: &crate::economic::EconomicMode) -> String {
 enum IntegrationTestStatus {
     Ok,
     Failed,
+    #[allow(dead_code)]
     Skipped,
     ExpectedFailure,
 }

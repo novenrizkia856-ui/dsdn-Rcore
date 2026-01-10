@@ -2420,7 +2420,7 @@ mod lifecycle_tests {
 
     #[test]
     fn test_calculate_quorum() {
-        let (mut state, _) = setup_state_with_proposer();
+        let (state, _) = setup_state_with_proposer();
         
         // Total QV weights = 1_000_000 (from setup)
         // Quorum percentage = 33%

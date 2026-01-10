@@ -12,14 +12,13 @@
 //! **Coordinator state can ALWAYS be reconstructed from DA.**
 //! **There is NO authoritative local state.**
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dsdn_common::MockDA;
 use dsdn_common::da::DALayer;
 
 use dsdn_coordinator::{
-    StateMachine, DAEvent, DAEventPayload, StateRebuilder,
+    StateMachine, DAEvent, DAEventPayload,
     NodeRegisteredPayload, ChunkDeclaredPayload, ReplicaAddedPayload,
     EventPublisher,
 };

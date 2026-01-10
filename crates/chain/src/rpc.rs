@@ -3326,6 +3326,7 @@ pub struct BroadcastManager {
     /// List of connected peers
     peers: Arc<RwLock<Vec<PeerInfo>>>,
     /// Local chain reference for receiving blocks
+    #[allow(dead_code)]
     chain: Option<Chain>,
 }
 

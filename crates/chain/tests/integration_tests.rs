@@ -2,18 +2,13 @@
 //! Run with: cargo test --test integration_tests
 
 use dsdn_chain::*;
-use dsdn_chain::types::{Address, Hash};
-use dsdn_chain::state::{ChainState, ValidatorInfo};
+use dsdn_chain::types::Address;
 use dsdn_chain::tx::{TxEnvelope, TxPayload, ResourceClass};
 use dsdn_chain::crypto::{generate_ed25519_keypair_bytes, sign_message_with_keypair_bytes, address_from_pubkey_bytes};
-use dsdn_chain::qv::{compute_voting_power, compute_validator_total_power};
 use dsdn_chain::tokenomics::calculate_fee_split;
-use dsdn_chain::proposer::select_block_proposer;
-use dsdn_chain::miner::Miner;
 use dsdn_chain::mempool::Mempool;
 use dsdn_chain::epoch::{should_rotate, EpochConfig};
 use tempfile::tempdir;
-use std::collections::HashMap;
 
 // ============================================================
 // CHAIN INTEGRATION TESTS

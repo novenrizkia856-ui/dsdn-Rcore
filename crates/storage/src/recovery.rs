@@ -36,9 +36,9 @@ use std::fmt::{self, Debug, Display};
 use std::sync::Arc;
 
 use sha3::{Sha3_256, Digest};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use dsdn_common::{DALayer, BlobRef};
+use dsdn_common::DALayer;
 
 use crate::da_storage::DAStorage;
 use crate::store::Storage;
@@ -279,6 +279,7 @@ pub struct StorageRecovery<F: PeerFetcher> {
     /// DA-aware storage lokal.
     storage: Arc<DAStorage>,
     /// DA layer untuk assignment info.
+    #[allow(dead_code)]
     da: Arc<dyn DALayer>,
     /// ID node ini.
     my_node_id: String,
@@ -634,6 +635,7 @@ pub struct SimpleStorageRecovery {
     /// DA-aware storage lokal.
     storage: Arc<DAStorage>,
     /// DA layer untuk assignment info.
+    #[allow(dead_code)]
     da: Arc<dyn DALayer>,
     /// ID node ini.
     my_node_id: String,
@@ -721,6 +723,7 @@ impl SimpleStorageRecovery {
     }
 
     /// Compute commitment.
+    #[allow(dead_code)]
     fn compute_commitment(&self, data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(data);
@@ -817,7 +820,7 @@ impl SimpleStorageRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::da_storage::{DAChunkMeta, ChunkDeclaredEvent, ReplicaAddedEvent};
+    use crate::da_storage::{ChunkDeclaredEvent, ReplicaAddedEvent};
     use dsdn_common::MockDA;
     use parking_lot::RwLock;
     use std::collections::HashMap as StdHashMap;

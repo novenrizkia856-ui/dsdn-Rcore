@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
             let mut f = fs::File::open(&file)?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
-            let mut to_upload = buf;
+            let to_upload = buf;
             let mut printed_key: Option<String> = None;
             let connect = format!("http://{}", node_addr);
 
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!(format!("{}", e)))?;
                 println!("uploaded -> returned {}", returned);
             }
-            if let Some(k) = printed_key {
+            if let Some(_k) = printed_key {
                 println!("Note: save this encryption key (base64) to decrypt later.");
             }
         }

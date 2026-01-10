@@ -42,6 +42,7 @@ pub fn mint(state: &mut ChainState, addr: &Address, amount: u128) -> Result<()> 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn transfer_raw(
     state: &mut ChainState,
     from: &Address,

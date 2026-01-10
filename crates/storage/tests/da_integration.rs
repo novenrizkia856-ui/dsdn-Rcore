@@ -20,22 +20,19 @@
 //! - Events bersifat observability-only, tidak mempengaruhi behavior
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use sha3::{Sha3_256, Digest};
 
-use dsdn_common::{DALayer, MockDA};
+use dsdn_common::MockDA;
 use dsdn_storage::{
     // Core
     Storage,
     DAStorage,
-    DAChunkMeta,
     // Events
     ChunkDeclaredEvent,
     ReplicaAddedEvent,
-    ReplicaRemovedEvent,
     DeleteRequestedEvent,
     // GC
     GarbageCollector,
@@ -47,7 +44,6 @@ use dsdn_storage::{
     StorageEvent,
     StorageEventListener,
     EventEmitter,
-    NoOpListener,
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
