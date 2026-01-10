@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 mod coord_client;
 mod da_router;
+mod routing;
 
 use coord_client::CoordinatorClient;
 // DARouter akan digunakan ketika DA layer connected
