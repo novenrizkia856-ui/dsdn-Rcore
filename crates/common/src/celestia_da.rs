@@ -413,6 +413,7 @@ struct BlobGetResult {
     #[allow(dead_code)]
     share_version: u32,
     /// Commitment dalam format base64
+    #[allow(dead_code)]
     commitment: String,
 }
 

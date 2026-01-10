@@ -4,8 +4,8 @@ use crate::Chain;
 use crate::types::Hash;
 use crate::sync::{SyncStatus, SyncRequest, SyncResponse};
 use crate::state::{
-    Proposal, Vote, GovernanceConfig, ProposalStatus, ProposalType, VoteOption,
-    ProposalPreview, SimulatedChange, PreviewType, BootstrapModeInfo,
+    Proposal, Vote, ProposalStatus, ProposalType, VoteOption,
+    ProposalPreview, SimulatedChange, PreviewType,
     GovernanceEvent, GovernanceEventType,
 };
 use crate::types::Address;
@@ -1135,10 +1135,9 @@ impl FullNodeRpc {
     /// Transaction ID as hex string
     pub fn submit_claim_reward(&self, receipt_json: String) -> Result<String, RpcError> {
         use crate::receipt::ResourceReceipt;
-        use crate::tx::TxPayload;
 
         // Parse JSON to ResourceReceipt
-        let receipt: ResourceReceipt = serde_json::from_str(&receipt_json).map_err(|e| RpcError {
+        let _receipt: ResourceReceipt = serde_json::from_str(&receipt_json).map_err(|e| RpcError {
             code: -32053,
             message: format!("invalid receipt JSON: {}", e),
         })?;

@@ -487,7 +487,7 @@ impl ChainState {
         
         // Priority 3: Prolonged offline
         // Check offline_since dan durasi
-        if let Some(offline_start) = record.offline_since {
+        if let Some(_offline_start) = record.offline_since {
             // Untuk check offline, kita perlu current_timestamp
             // Tapi method ini read-only tanpa timestamp parameter
             // Jadi kita check apakah offline_since sudah di-set

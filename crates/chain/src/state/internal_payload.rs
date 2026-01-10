@@ -4,13 +4,12 @@
 
 use crate::types::Address;
 use crate::tx::{TxEnvelope, TxPayload, GovernanceActionType};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::collections::HashMap;
 use super::{ChainState, Validator, ValidatorInfo};
 use super::internal_gas;
-use super::internal_receipt::ReceiptError;
 use super::internal_governance::{
-    GovernanceEvent, GovernanceEventType, GovernanceError,
+    GovernanceEvent, GovernanceEventType,
     ProposalStatus,
 };
 
@@ -205,7 +204,7 @@ impl ChainState {
                 self.unbond(delegator, validator, *amount)?;
                 (0, None)
             }
-            TxPayload::ClaimReward { receipt, fee, gas_limit, .. } => {
+            TxPayload::ClaimReward { receipt, fee, gas_limit: _, .. } => {
                 // ════════════════════════════════════════════════════════════
                 // CLAIMREWARD EXECUTION (13.10 - CONSENSUS-CRITICAL)
                 // ════════════════════════════════════════════════════════════

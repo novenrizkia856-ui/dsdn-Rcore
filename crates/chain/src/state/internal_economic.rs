@@ -881,7 +881,7 @@ impl ChainState {
     /// - TIDAK logging
     pub fn process_economic_job(
         &mut self,
-        block_height: u64,
+        _block_height: u64,
         timestamp: u64,
     ) -> Option<BurnEvent> {
         // ─────────────────────────────────────────────────────────────

@@ -12,14 +12,13 @@
 //! - Epoch Rotation
 
 use crate::types::{Address, Hash};
-use crate::state::{ChainState, ValidatorInfo, ValidatorSet};
+use crate::state::{ChainState, ValidatorInfo};
 use crate::tx::{TxEnvelope, TxPayload, ResourceClass};
 use crate::crypto::{generate_ed25519_keypair_bytes, sign_message_with_keypair_bytes, address_from_pubkey_bytes};
 use crate::qv::{compute_voting_power, compute_validator_total_power, VALIDATOR_WEIGHT_PCT, DELEGATOR_WEIGHT_PCT};
 use crate::tokenomics::{calculate_fee_split, FEE_VALIDATOR_WEIGHT, FEE_DELEGATOR_WEIGHT, FEE_TREASURY_WEIGHT};
-use crate::proposer::{select_block_proposer, choose_proposer, compute_stake_weights, load_validator_list};
+use crate::proposer::select_block_proposer;
 use crate::epoch::{should_rotate, compute_epoch_number, EpochConfig};
-use crate::slashing::{LivenessRecord, MAX_MISSED_BLOCKS, SLASH_PERCENTAGE};
 use crate::mempool::Mempool;
 use crate::miner::Miner;
 use crate::block::Block;
@@ -2416,8 +2415,7 @@ fn test_governance_e2e(verbose: bool) -> Result<Vec<TestResult>> {
     // Test 1: Full Governance Lifecycle (Create → Vote → Finalize)
     // ─────────────────────────────────────────────────────────
     {
-        use crate::state::{ChainState, ProposalType, ProposalStatus, VoteOption, GovernanceConfig};
-        use crate::state::MIN_PROPOSAL_DEPOSIT;
+        use crate::state::{ChainState, ProposalType, ProposalStatus, VoteOption};
         
         let start = std::time::Instant::now();
         
@@ -2481,7 +2479,7 @@ fn test_governance_e2e(verbose: bool) -> Result<Vec<TestResult>> {
     // Test 2: Multiple Proposals in Parallel
     // ─────────────────────────────────────────────────────────
     {
-        use crate::state::{ChainState, ProposalType, ProposalStatus, VoteOption};
+        use crate::state::{ChainState, ProposalType};
         
         let start = std::time::Instant::now();
         
@@ -2595,7 +2593,7 @@ fn test_governance_e2e(verbose: bool) -> Result<Vec<TestResult>> {
     // Test 4: Governance State Persistence (LMDB)
     // ─────────────────────────────────────────────────────────
     {
-        use crate::state::{ChainState, ProposalType, VoteOption, GovernanceConfig};
+        use crate::state::{ChainState, ProposalType, VoteOption};
         use crate::db::ChainDb;
         use tempfile::tempdir;
         
