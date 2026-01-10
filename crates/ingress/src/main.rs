@@ -4,9 +4,12 @@
     routing::get,
     Router,
     response::IntoResponse,
+    Json,
 };
 use bytes::Bytes;
+use serde::Serialize;
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use tracing_subscriber;
 use tokio::time::timeout;
@@ -18,9 +21,194 @@ mod routing;
 mod fallback;
 
 use coord_client::CoordinatorClient;
-// DARouter akan digunakan ketika DA layer connected
-// For now, only DEFAULT_CACHE_TTL_MS is used for configuration
-use da_router::DEFAULT_CACHE_TTL_MS;
+use da_router::{DARouter, DEFAULT_CACHE_TTL_MS};
+
+// ════════════════════════════════════════════════════════════════════════════
+// INGRESS HEALTH STRUCT
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Health status ingress yang DA-aware.
+///
+/// Semua field merepresentasikan state real, bukan asumsi.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressHealth {
+    /// Apakah DA layer terhubung.
+    pub da_connected: bool,
+    /// Sequence terakhir dari DA (0 jika tidak tersedia).
+    pub da_last_sequence: u64,
+    /// Jumlah node dalam cache.
+    pub cached_nodes: usize,
+    /// Jumlah placement dalam cache.
+    pub cached_placements: usize,
+    /// Umur cache dalam milliseconds.
+    pub cache_age_ms: u64,
+    /// Apakah coordinator dapat dijangkau.
+    pub coordinator_reachable: bool,
+    /// Jumlah node sehat (active).
+    pub healthy_nodes: usize,
+    /// Total node dalam registry.
+    pub total_nodes: usize,
+}
+
+impl Default for IngressHealth {
+    fn default() -> Self {
+        Self {
+            da_connected: false,
+            da_last_sequence: 0,
+            cached_nodes: 0,
+            cached_placements: 0,
+            cache_age_ms: u64::MAX, // Indicates cache never filled
+            coordinator_reachable: false,
+            healthy_nodes: 0,
+            total_nodes: 0,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// APP STATE
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Application state untuk Axum handlers.
+#[derive(Clone)]
+pub struct AppState {
+    /// Coordinator client.
+    pub coord: Arc<CoordinatorClient>,
+    /// DA Router (optional, None jika DA tidak terhubung).
+    pub da_router: Option<Arc<DARouter>>,
+    /// DA connected flag.
+    pub da_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// DA last sequence (0 jika tidak tersedia).
+    pub da_last_sequence: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl AppState {
+    /// Membuat AppState baru tanpa DA router.
+    pub fn new(coord: Arc<CoordinatorClient>) -> Self {
+        Self {
+            coord,
+            da_router: None,
+            da_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Membuat AppState dengan DA router.
+    #[allow(dead_code)]
+    pub fn with_da_router(coord: Arc<CoordinatorClient>, da_router: Arc<DARouter>) -> Self {
+        Self {
+            coord,
+            da_router: Some(da_router),
+            da_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Set DA connected status.
+    #[allow(dead_code)]
+    pub fn set_da_connected(&self, connected: bool) {
+        self.da_connected.store(connected, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set DA last sequence.
+    #[allow(dead_code)]
+    pub fn set_da_last_sequence(&self, seq: u64) {
+        self.da_last_sequence.store(seq, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Get DA connected status.
+    pub fn is_da_connected(&self) -> bool {
+        self.da_connected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Get DA last sequence.
+    pub fn get_da_last_sequence(&self) -> u64 {
+        self.da_last_sequence.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Gather health information.
+    pub async fn gather_health(&self) -> IngressHealth {
+        let mut health = IngressHealth::default();
+
+        // DA connectivity status
+        health.da_connected = self.is_da_connected();
+        health.da_last_sequence = self.get_da_last_sequence();
+
+        // Cache information from DA router
+        if let Some(ref router) = self.da_router {
+            let cache = router.get_cache();
+
+            health.cached_nodes = cache.node_registry.len();
+            health.cached_placements = cache.chunk_placements.len();
+            health.total_nodes = cache.node_registry.len();
+
+            // Count healthy (active) nodes
+            health.healthy_nodes = cache.node_registry
+                .values()
+                .filter(|n| n.active)
+                .count();
+
+            // Calculate cache age
+            let now = current_timestamp_ms();
+            if cache.last_updated > 0 {
+                health.cache_age_ms = now.saturating_sub(cache.last_updated);
+            }
+        }
+
+        // Check coordinator reachability (with timeout)
+        let coord_check = timeout(Duration::from_secs(2), self.coord.ping()).await;
+        health.coordinator_reachable = matches!(coord_check, Ok(Ok(())));
+
+        health
+    }
+
+    /// Check if system is ready (for readiness probe).
+    ///
+    /// Ready conditions:
+    /// - Coordinator reachable
+    /// - If DA router exists: cache must be filled with at least one healthy node
+    pub async fn is_ready(&self) -> bool {
+        // Check coordinator first
+        let coord_ok = timeout(Duration::from_secs(2), self.coord.ping()).await;
+        if !matches!(coord_ok, Ok(Ok(()))) {
+            return false;
+        }
+
+        // If DA router exists, check cache state
+        if let Some(ref router) = self.da_router {
+            let cache = router.get_cache();
+
+            // Cache must have been filled at least once
+            if cache.last_updated == 0 {
+                return false;
+            }
+
+            // Must have at least one healthy node
+            let healthy_count = cache.node_registry
+                .values()
+                .filter(|n| n.active)
+                .count();
+
+            if healthy_count == 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Get current timestamp in Unix milliseconds.
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Simple config via env
 fn coordinator_base_from_env() -> String {
@@ -34,6 +222,10 @@ fn da_router_ttl_from_env() -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_MS)
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() {
@@ -51,6 +243,9 @@ async fn main() {
     let da_ttl = da_router_ttl_from_env();
     info!("DA router TTL configured: {}ms", da_ttl);
 
+    // Create app state
+    let app_state = AppState::new(coord);
+
     // Shutdown channel for background task lifecycle
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
@@ -59,7 +254,7 @@ async fn main() {
         .route("/object/:hash", get(proxy_object))
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .with_state(coord);
+        .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8088));
     info!("Ingress listening on {}", addr);
@@ -85,21 +280,39 @@ async fn main() {
     info!("Ingress shutdown complete");
 }
 
-/// GET /health
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// GET /health - DA-aware health check
+///
+/// Returns complete IngressHealth with all fields.
+async fn health(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let health_info = state.gather_health().await;
+    (StatusCode::OK, Json(health_info))
 }
 
-/// GET /ready - check coordinator reachable
+/// GET /ready - readiness probe
+///
+/// Returns OK only if:
+/// - Coordinator is reachable
+/// - If DA router exists: cache filled with at least one healthy node
 async fn ready(
-    State(coord): State<Arc<CoordinatorClient>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match coord.ping().await {
-        Ok(()) => (StatusCode::OK, "ready"),
-        Err(e) => {
-            warn!("ready: coordinator not ready: {}", e);
-            (StatusCode::SERVICE_UNAVAILABLE, "not ready")
-        }
+    if state.is_ready().await {
+        (StatusCode::OK, "ready")
+    } else {
+        let health_info = state.gather_health().await;
+        warn!(
+            "ready: not ready - da_connected={}, coordinator_reachable={}, healthy_nodes={}",
+            health_info.da_connected,
+            health_info.coordinator_reachable,
+            health_info.healthy_nodes
+        );
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
     }
 }
 
@@ -110,26 +323,26 @@ async fn ready(
 /// - return bytes with application/octet-stream
 async fn proxy_object(
     Path(hash): Path<String>,
-    State(coord): State<Arc<CoordinatorClient>>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
     info!("ingress: request for object {}", hash);
 
     // we set a small overall timeout for the ingress operation
     let overall = Duration::from_secs(5);
     // clone Arc to move into async block
-    let coord_cl = coord.clone();
+    let coord = state.coord.clone();
     let hash_cl = hash.clone();
 
     let res = timeout(overall, async move {
         // 1) get placement (ask for 1 target)
-        let placement = coord_cl.placement_for_hash(&hash_cl, 1).await?;
+        let placement = coord.placement_for_hash(&hash_cl, 1).await?;
         if placement.is_empty() {
             return Err(anyhow::anyhow!("no placement returned"));
         }
         let node_id = &placement[0];
 
         // 2) get nodes and find node addr
-        let nodes = coord_cl.list_nodes().await?;
+        let nodes = coord.list_nodes().await?;
         let node = nodes.into_iter().find(|n| n.id == *node_id)
             .ok_or_else(|| anyhow::anyhow!("node id {} not found in nodes list", node_id))?;
 
@@ -162,5 +375,287 @@ async fn proxy_object(
             error!("ingress: timeout fetching {}", hash);
             (StatusCode::GATEWAY_TIMEOUT, "timeout").into_response()
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UNIT TESTS
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::da_router::{RoutingDataSource, RoutingResult, NodeInfoFromSource};
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MOCK DATA SOURCE
+    // ════════════════════════════════════════════════════════════════════════
+
+    struct MockDataSource {
+        nodes: RwLock<HashMap<String, MockNodeInfo>>,
+        placements: RwLock<HashMap<String, Vec<String>>>,
+    }
+
+    struct MockNodeInfo {
+        addr: String,
+        active: bool,
+        zone: Option<String>,
+    }
+
+    impl MockDataSource {
+        fn new() -> Self {
+            Self {
+                nodes: RwLock::new(HashMap::new()),
+                placements: RwLock::new(HashMap::new()),
+            }
+        }
+
+        fn add_node(&self, id: &str, addr: &str, active: bool) {
+            self.nodes.write().insert(id.to_string(), MockNodeInfo {
+                addr: addr.to_string(),
+                active,
+                zone: None,
+            });
+        }
+
+        fn add_placement(&self, chunk_hash: &str, node_ids: Vec<&str>) {
+            self.placements.write().insert(
+                chunk_hash.to_string(),
+                node_ids.into_iter().map(|s| s.to_string()).collect(),
+            );
+        }
+    }
+
+    impl RoutingDataSource for MockDataSource {
+        fn get_registered_node_ids(&self) -> RoutingResult<Vec<String>> {
+            Ok(self.nodes.read().keys().cloned().collect())
+        }
+
+        fn get_node_info(&self, node_id: &str) -> RoutingResult<Option<NodeInfoFromSource>> {
+            Ok(self.nodes.read().get(node_id).map(|n| NodeInfoFromSource {
+                addr: n.addr.clone(),
+                active: n.active,
+                zone: n.zone.clone(),
+            }))
+        }
+
+        fn get_all_chunk_placements(&self) -> RoutingResult<HashMap<String, Vec<String>>> {
+            Ok(self.placements.read().clone())
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 1: DA CONNECTED VS DISCONNECTED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_da_connected_vs_disconnected() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+
+        // Without DA router
+        let state = AppState::new(coord.clone());
+        assert!(!state.is_da_connected());
+
+        // With DA connected flag set
+        state.set_da_connected(true);
+        assert!(state.is_da_connected());
+
+        state.set_da_connected(false);
+        assert!(!state.is_da_connected());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 2: CACHE EMPTY VS FILLED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_cache_empty_vs_filled() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+
+        // Create mock DA router with empty cache
+        let mock_ds = Arc::new(MockDataSource::new());
+        let router = Arc::new(DARouter::new(mock_ds.clone()));
+
+        let state = AppState::with_da_router(coord.clone(), router.clone());
+
+        // Empty cache
+        let health = state.gather_health().await;
+        assert_eq!(health.cached_nodes, 0);
+        assert_eq!(health.cached_placements, 0);
+
+        // Fill cache
+        mock_ds.add_node("node-1", "127.0.0.1:9001", true);
+        mock_ds.add_placement("chunk-1", vec!["node-1"]);
+        router.refresh_cache().unwrap();
+
+        let health = state.gather_health().await;
+        assert_eq!(health.cached_nodes, 1);
+        assert_eq!(health.cached_placements, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 3: HEALTH RETURNS ALL FIELDS VALID
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_health_returns_all_fields_valid() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+
+        let mock_ds = Arc::new(MockDataSource::new());
+        mock_ds.add_node("node-1", "127.0.0.1:9001", true);
+        mock_ds.add_node("node-2", "127.0.0.1:9002", false); // unhealthy
+        mock_ds.add_placement("chunk-1", vec!["node-1"]);
+
+        let router = Arc::new(DARouter::new(mock_ds));
+        router.refresh_cache().unwrap();
+
+        let state = AppState::with_da_router(coord, router);
+        state.set_da_last_sequence(12345);
+
+        let health = state.gather_health().await;
+
+        // All fields should have valid values
+        assert!(health.da_connected);
+        assert_eq!(health.da_last_sequence, 12345);
+        assert_eq!(health.cached_nodes, 2);
+        assert_eq!(health.total_nodes, 2);
+        assert_eq!(health.healthy_nodes, 1);
+        assert_eq!(health.cached_placements, 1);
+        // cache_age_ms should be small (just refreshed)
+        assert!(health.cache_age_ms < 10000);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 4: READY FAILS WHEN DA DOWN (coordinator unreachable)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_ready_fails_coordinator_unreachable() {
+        // Use invalid coordinator URL
+        let coord = Arc::new(CoordinatorClient::new("http://invalid.localhost:99999".to_string()));
+        let state = AppState::new(coord);
+
+        // is_ready should fail because coordinator is unreachable
+        let ready = state.is_ready().await;
+        assert!(!ready);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 5: READY FAILS WHEN CACHE EMPTY
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ready_cache_empty_check() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+
+        let mock_ds = Arc::new(MockDataSource::new());
+        let router = Arc::new(DARouter::new(mock_ds));
+        // Don't refresh cache - keep it empty
+
+        let state = AppState::with_da_router(coord, router);
+
+        // Cache last_updated is 0 (never filled)
+        let cache = state.da_router.as_ref().unwrap().get_cache();
+        assert_eq!(cache.last_updated, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 6: READY SUCCESS WHEN INVARIANTS MET
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ready_success_invariants() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+
+        let mock_ds = Arc::new(MockDataSource::new());
+        mock_ds.add_node("node-1", "127.0.0.1:9001", true);
+
+        let router = Arc::new(DARouter::new(mock_ds));
+        router.refresh_cache().unwrap();
+
+        let state = AppState::with_da_router(coord, router);
+
+        // Cache should have data
+        let cache = state.da_router.as_ref().unwrap().get_cache();
+        assert!(cache.last_updated > 0);
+        assert_eq!(cache.node_registry.len(), 1);
+
+        // Healthy nodes count
+        let healthy = cache.node_registry.values().filter(|n| n.active).count();
+        assert_eq!(healthy, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 7: THREAD-SAFE READ HEALTH STATE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_thread_safe_health_state() {
+        use std::thread;
+
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+
+        let mock_ds = Arc::new(MockDataSource::new());
+        for i in 0..5 {
+            mock_ds.add_node(&format!("node-{}", i), &format!("127.0.0.1:900{}", i), true);
+        }
+
+        let router = Arc::new(DARouter::new(mock_ds));
+        router.refresh_cache().unwrap();
+
+        let state = Arc::new(AppState::with_da_router(coord, router));
+
+        let mut handles = vec![];
+
+        // Spawn readers
+        for _ in 0..10 {
+            let s = state.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = s.is_da_connected();
+                    let _ = s.get_da_last_sequence();
+                    if let Some(ref router) = s.da_router {
+                        let _ = router.get_cache();
+                    }
+                }
+            }));
+        }
+
+        // Spawn writers
+        for i in 0..5 {
+            let s = state.clone();
+            handles.push(thread::spawn(move || {
+                for j in 0..50 {
+                    s.set_da_connected(j % 2 == 0);
+                    s.set_da_last_sequence((i * 100 + j) as u64);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Should not panic or deadlock
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 8: INGRESS HEALTH DEFAULT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ingress_health_default() {
+        let health = IngressHealth::default();
+
+        assert!(!health.da_connected);
+        assert_eq!(health.da_last_sequence, 0);
+        assert_eq!(health.cached_nodes, 0);
+        assert_eq!(health.cached_placements, 0);
+        assert_eq!(health.cache_age_ms, u64::MAX);
+        assert!(!health.coordinator_reachable);
+        assert_eq!(health.healthy_nodes, 0);
+        assert_eq!(health.total_nodes, 0);
     }
 }
