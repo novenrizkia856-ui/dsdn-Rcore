@@ -10,13 +10,27 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use tracing::{error, info, warn};
 use tracing_subscriber;
 use tokio::time::timeout;
+use tokio::sync::watch;
 
 mod coord_client;
+mod da_router;
+
 use coord_client::CoordinatorClient;
+// DARouter akan digunakan ketika DA layer connected
+// For now, only DEFAULT_CACHE_TTL_MS is used for configuration
+use da_router::DEFAULT_CACHE_TTL_MS;
 
 /// Simple config via env
 fn coordinator_base_from_env() -> String {
     env::var("COORDINATOR_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+/// DA router TTL config via env (default 30 seconds)
+fn da_router_ttl_from_env() -> u64 {
+    env::var("DA_ROUTER_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_MS)
 }
 
 #[tokio::main]
@@ -30,6 +44,14 @@ async fn main() {
 
     let coord = Arc::new(CoordinatorClient::new(coord_base));
 
+    // DA Router infrastructure ready
+    // Will be activated when DA layer is connected
+    let da_ttl = da_router_ttl_from_env();
+    info!("DA router TTL configured: {}ms", da_ttl);
+
+    // Shutdown channel for background task lifecycle
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
     // build axum router
     let app = Router::new()
         .route("/object/:hash", get(proxy_object))
@@ -42,7 +64,23 @@ async fn main() {
 
     // Use axum::serve wrapper (works consistently across axum versions)
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
-    axum::serve(listener, app).await.unwrap();
+    
+    // Graceful shutdown handling
+    let server = axum::serve(listener, app);
+    
+    tokio::select! {
+        result = server => {
+            if let Err(e) = result {
+                error!("Server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutdown signal received");
+            let _ = shutdown_tx.send(true);
+        }
+    }
+
+    info!("Ingress shutdown complete");
 }
 
 /// GET /health
