@@ -431,6 +431,7 @@ mod tests {
     use dsdn_common::MockDA;
     use crate::da_follower::ChunkAssignment;
 
+    #[allow(dead_code)]
     const TEST_NODE: &str = "node-1";
     const CHUNK_A: &str = "chunk-a-hash";
     const CHUNK_B: &str = "chunk-b-hash";

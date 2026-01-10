@@ -549,7 +549,7 @@ mod tests {
     const TEST_HASH_1: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     // Helper to create node registered event
-    fn make_node_event(seq: u64, height: u64, node_id: &str, zone: &str) -> DAEvent {
+    fn make_node_event(seq: u64, _height: u64, node_id: &str, zone: &str) -> DAEvent {
         DAEvent {
             sequence: seq,
             timestamp: seq * 1000,

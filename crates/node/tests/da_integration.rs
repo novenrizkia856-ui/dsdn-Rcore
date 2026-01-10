@@ -12,10 +12,7 @@
 //! - C. Health exposure
 //! - D. Invariant verification
 
-use std::collections::HashMap;
 use std::sync::Arc;
-
-use parking_lot::RwLock;
 
 use dsdn_common::{DALayer, MockDA};
 use dsdn_node::{
@@ -59,6 +56,7 @@ struct TestDAInfo {
 }
 
 impl TestDAInfo {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             connected: true,

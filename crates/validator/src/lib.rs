@@ -218,6 +218,7 @@ fn is_valid_sha256_hex(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn sample_manifest_ok() -> Manifest {
         Manifest {
             name: "demo".to_string(),

@@ -1681,7 +1681,7 @@ mod tests {
         // (karena Chain membutuhkan DB path)
         
         // Verifikasi bahwa progress tracking berfungsi
-        let start = 0u64;
+        let _start = 0u64;
         let end = 100u64;
         
         // Simulasi progress

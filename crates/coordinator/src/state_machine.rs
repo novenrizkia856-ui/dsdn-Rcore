@@ -1346,6 +1346,7 @@ mod tests {
     }
 
     /// Helper to create a valid 64-char hex hash for tests
+    #[allow(dead_code)]
     fn make_valid_hash(prefix: &str) -> String {
         let base = prefix.as_bytes();
         let mut hash = String::with_capacity(64);

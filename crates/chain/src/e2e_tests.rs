@@ -3893,7 +3893,6 @@ fn test_rpc_snapshot_state_values() {
     // Verify state values
     assert!(state.total_supply > 0 || state.balances.values().sum::<u128>() > 0, 
         "Total supply should be positive");
-    assert!(state.treasury_balance >= 0, "Treasury should be non-negative");
     
     // Verify state root can be computed
     let root_result = state.compute_state_root();

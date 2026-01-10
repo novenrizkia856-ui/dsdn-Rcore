@@ -410,7 +410,6 @@ pub fn health_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::da_follower::ChunkAssignment;
 
     const TEST_NODE: &str = "test-node-1";

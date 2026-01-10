@@ -675,7 +675,7 @@ mod tests {
             // CHUNK_C never assigned - Missing
         ];
 
-        let chunk_hashes = vec![
+        let _chunk_hashes = vec![
             CHUNK_A.to_string(),
             CHUNK_B.to_string(),
             CHUNK_C.to_string(),
@@ -797,7 +797,7 @@ mod tests {
         assert_eq!(detail.status, PlacementStatus::Missing);
 
         // Empty chunk hashes
-        let mut report = PlacementReport::new();
+        let report = PlacementReport::new();
         assert_eq!(report.total_count(), 0);
     }
 
