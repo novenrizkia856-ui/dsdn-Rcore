@@ -1,4 +1,32 @@
-﻿use axum::{
+﻿//! # DSDN Ingress (14A)
+//!
+//! HTTP gateway untuk akses data DSDN.
+//!
+//! ## Architecture
+//! ```text
+//! Client → Ingress → DARouter → Node
+//!              │
+//!              └──→ Celestia DA (for placement info)
+//! ```
+//!
+//! ## Endpoints
+//! - GET /object/:hash - Fetch object by hash
+//! - GET /health - Health check
+//! - GET /ready - Readiness check
+//! - GET /metrics - Prometheus metrics
+//!
+//! ## DA Integration
+//! Ingress TIDAK query Coordinator untuk placement.
+//! Semua routing decision berdasarkan DA-derived state.
+//!
+//! ## Modules (imported)
+//! - da_router: DA-aware routing
+//! - routing: Request routing logic
+//! - fallback: Fallback & retry
+//! - rate_limit: Rate limiting
+//! - metrics: Observability
+
+use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     routing::get,
