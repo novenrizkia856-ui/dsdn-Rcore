@@ -20,10 +20,12 @@ mod da_router;
 mod routing;
 mod fallback;
 mod metrics;
+mod rate_limit;
 
 use coord_client::CoordinatorClient;
 use da_router::{DARouter, DEFAULT_CACHE_TTL_MS};
 use metrics::{IngressMetrics, RequestContext};
+use rate_limit::{RateLimiter, RateLimitState, rate_limit_middleware};
 
 // ════════════════════════════════════════════════════════════════════════════
 // INGRESS HEALTH STRUCT
@@ -267,15 +269,23 @@ async fn main() {
     // Create app state with metrics
     let app_state = AppState::new(coord);
 
+    // Create rate limiter with default limits
+    let rate_limiter = Arc::new(RateLimiter::with_defaults());
+    let rate_limit_state = RateLimitState::new(rate_limiter);
+
     // Shutdown channel for background task lifecycle
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
-    // build axum router
+    // build axum router with rate limiting middleware
     let app = Router::new()
         .route("/object/:hash", get(proxy_object))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_endpoint))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limit_state.clone(),
+            rate_limit_middleware,
+        ))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8088));
@@ -831,5 +841,28 @@ mod tests {
         assert!(output.contains("ingress_requests_by_status"));
         assert!(output.contains("# HELP"));
         assert!(output.contains("# TYPE"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 11: RATE LIMITER INTEGRATION
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_rate_limiter_integration() {
+        use crate::rate_limit::{RateLimiter, LimitConfig};
+
+        let limiter = RateLimiter::with_defaults();
+
+        // Should have default limits
+        assert!(limiter.get_limit("per_ip").is_some());
+        assert!(limiter.get_limit("global").is_some());
+
+        // Test basic rate limiting
+        let config = LimitConfig::global(10, 5);
+        for _ in 0..5 {
+            assert!(limiter.check_and_record("test_key", &config).is_ok());
+        }
+        // 6th should fail
+        assert!(limiter.check_and_record("test_key", &config).is_err());
     }
 }
