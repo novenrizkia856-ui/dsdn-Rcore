@@ -1,4 +1,53 @@
-﻿mod sss;
+﻿//! # DSDN Agent CLI (14A)
+//!
+//! Command-line interface for DSDN (Distributed Storage and Data Network).
+//!
+//! ## Commands
+//!
+//! ### Key Management
+//! - `gen-key`: Generate encryption key (32 bytes), optionally split into shares
+//! - `recover-key`: Recover key from SSS shares
+//!
+//! ### Data Operations
+//! - `upload`: Upload file to network node (with optional encryption and DA tracking)
+//! - `get`: Download file from network node (with optional decryption and DA verification)
+//! - `decrypt-file`: Decrypt local encrypted file using AES-GCM key
+//!
+//! ### DA Operations (14A)
+//! - `da status`: Check DA layer connection status and current height
+//!
+//! ### Verification (14A)
+//! - `verify state`: Verify state consistency against DA-derived state
+//! - `verify consistency`: Check node consistency with DA state
+//!
+//! ### Node/Chunk Info (14A)
+//! - `node status`: Show node status from DA events
+//! - `node list`: List all registered nodes from DA events
+//! - `node chunks`: Show chunks assigned to a node from DA events
+//! - `chunk info`: Show chunk info from DA events
+//! - `chunk replicas`: Show chunk replicas from DA events
+//! - `chunk history`: Show chunk event history from DA events
+//!
+//! ### Maintenance (14A)
+//! - `rebuild`: Rebuild state from DA events in specified height range
+//! - `health all`: Check health of all components (DA, coordinator, nodes)
+//! - `health da`: Check DA layer health only
+//! - `health coordinator`: Check coordinator health only
+//! - `health nodes`: Check all nodes health
+//!
+//! ## DA Integration
+//!
+//! Agent can query state directly from DA (Data Availability) layer.
+//! This enables read operations without requiring Coordinator connectivity.
+//! All node/chunk queries derive their data from DA events only.
+//!
+//! ## Environment Variables
+//!
+//! - `DSDN_DA_ENDPOINT`: DA layer endpoint (default: http://127.0.0.1:26658)
+//! - `DSDN_DA_NAMESPACE`: DA namespace (default: dsdn)
+//! - `DSDN_COORDINATOR_ENDPOINT`: Coordinator endpoint (default: http://127.0.0.1:8080)
+
+mod sss;
 mod crypto;
 mod cmd_da;
 mod cmd_verify;
