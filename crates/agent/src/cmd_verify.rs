@@ -616,7 +616,7 @@ fn parse_events_from_blobs(body: &str) -> Result<Vec<DAEvent>> {
 }
 
 /// Apply event to state.
-fn apply_event_to_state(state: &mut DSDNState, event: &DAEvent) {
+pub fn apply_event_to_state(state: &mut DSDNState, event: &DAEvent) {
     match event {
         DAEvent::NodeRegistered { node_id, addr, zone } => {
             state.nodes.insert(

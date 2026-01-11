@@ -2,6 +2,7 @@
 mod crypto;
 mod cmd_da;
 mod cmd_verify;
+mod cmd_chunk;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -88,6 +89,12 @@ enum Commands {
         #[command(subcommand)]
         node_cmd: NodeCommands,
     },
+
+    /// Chunk commands (ALL data derived from DA events)
+    Chunk {
+        #[command(subcommand)]
+        chunk_cmd: ChunkCommands,
+    },
 }
 
 /// DA layer subcommands
@@ -145,6 +152,35 @@ enum NodeCommands {
     Chunks {
         /// Node ID to query
         node_id: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Chunk subcommands - ALL data derived from DA events only
+#[derive(Subcommand)]
+enum ChunkCommands {
+    /// Show chunk info (derived from ChunkDeclared DA events)
+    Info {
+        /// Chunk hash to query
+        hash: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show chunk replicas (derived from ReplicaAdded/ReplicaRemoved DA events)
+    Replicas {
+        /// Chunk hash to query
+        hash: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show chunk event history (full timeline from DA events)
+    History {
+        /// Chunk hash to query
+        hash: String,
         /// Output in JSON format
         #[arg(long)]
         json: bool,
@@ -672,6 +708,20 @@ async fn main() -> Result<()> {
                 }
                 NodeCommands::Chunks { node_id, json } => {
                     handle_node_chunks(&node_id, json).await?;
+                }
+            }
+        }
+
+        Commands::Chunk { chunk_cmd } => {
+            match chunk_cmd {
+                ChunkCommands::Info { hash, json } => {
+                    cmd_chunk::handle_chunk_info(&hash, json).await?;
+                }
+                ChunkCommands::Replicas { hash, json } => {
+                    cmd_chunk::handle_chunk_replicas(&hash, json).await?;
+                }
+                ChunkCommands::History { hash, json } => {
+                    cmd_chunk::handle_chunk_history(&hash, json).await?;
                 }
             }
         }
