@@ -1,6 +1,7 @@
 ﻿mod sss;
 mod crypto;
 mod cmd_da;
+mod cmd_verify;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -74,6 +75,12 @@ enum Commands {
         #[command(subcommand)]
         da_cmd: DaCommands,
     },
+
+    /// Verify state consistency commands
+    Verify {
+        #[command(subcommand)]
+        verify_cmd: VerifyCommands,
+    },
 }
 
 /// DA layer subcommands
@@ -85,6 +92,40 @@ enum DaCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Verify subcommands
+#[derive(Subcommand)]
+enum VerifyCommands {
+    /// Verify state against DA-derived state
+    State {
+        /// Target to verify: "coordinator" or "node"
+        #[arg(long, value_parser = parse_verify_target)]
+        target: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify node consistency with DA state
+    Consistency {
+        /// Node address (host:port)
+        #[arg(long)]
+        node: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Parse and validate verify target.
+fn parse_verify_target(s: &str) -> Result<String, String> {
+    match s.to_lowercase().as_str() {
+        "coordinator" | "node" => Ok(s.to_lowercase()),
+        _ => Err(format!(
+            "invalid target '{}': must be 'coordinator' or 'node'",
+            s
+        )),
+    }
 }
 
 #[tokio::main]
@@ -225,6 +266,22 @@ async fn main() -> Result<()> {
                 DaCommands::Status { json } => {
                     cmd_da::handle_da_status(json).await?;
                 }
+            }
+        }
+
+        Commands::Verify { verify_cmd } => {
+            let is_consistent = match verify_cmd {
+                VerifyCommands::State { target, json } => {
+                    cmd_verify::handle_verify_state(&target, json).await?
+                }
+                VerifyCommands::Consistency { node, json } => {
+                    cmd_verify::handle_verify_consistency(&node, json).await?
+                }
+            };
+            
+            // Exit code: 0 = consistent, 1 = inconsistent
+            if !is_consistent {
+                std::process::exit(1);
             }
         }
     }
