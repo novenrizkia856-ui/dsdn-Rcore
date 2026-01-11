@@ -4,6 +4,7 @@ mod cmd_da;
 mod cmd_verify;
 mod cmd_chunk;
 mod cmd_rebuild;
+mod cmd_health;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -127,6 +128,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Health check commands
+    Health {
+        #[command(subcommand)]
+        health_cmd: HealthCommands,
+    },
 }
 
 /// DA layer subcommands
@@ -213,6 +220,35 @@ enum ChunkCommands {
     History {
         /// Chunk hash to query
         hash: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Health check subcommands
+#[derive(Subcommand)]
+enum HealthCommands {
+    /// Check health of all components (DA, coordinator, nodes)
+    All {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check DA layer health only
+    Da {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check coordinator health only
+    Coordinator {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check all nodes health
+    Nodes {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
@@ -1488,6 +1524,28 @@ async fn main() -> Result<()> {
 
         Commands::Rebuild { target, from, to, output, json } => {
             cmd_rebuild::handle_rebuild(&target, from, to, output, json).await?;
+        }
+
+        Commands::Health { health_cmd } => {
+            let is_healthy = match health_cmd {
+                HealthCommands::All { json } => {
+                    cmd_health::handle_health_all(json).await?
+                }
+                HealthCommands::Da { json } => {
+                    cmd_health::handle_health_da(json).await?
+                }
+                HealthCommands::Coordinator { json } => {
+                    cmd_health::handle_health_coordinator(json).await?
+                }
+                HealthCommands::Nodes { json } => {
+                    cmd_health::handle_health_nodes(json).await?
+                }
+            };
+            
+            // Exit code: 0 = healthy, 1 = unhealthy/degraded
+            if !is_healthy {
+                std::process::exit(1);
+            }
         }
     }
 
