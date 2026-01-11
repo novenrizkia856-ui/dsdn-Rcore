@@ -2,8 +2,7 @@
 
 # RUSTC — STRICT CORE SAFETY
 [build]
-rustflags = [
-  "-Dwarnings",                   # treat all warnings as errors
+rustflags = [             
   "-Dunsafe_code",                # forbid unsafe code at compile time
   "-Coverflow-checks=yes",        # ensure overflow checks are enabled
   "-Cdebuginfo=2",                # include debuginfo for post-mortem

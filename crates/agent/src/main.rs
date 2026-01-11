@@ -3,6 +3,7 @@ mod crypto;
 mod cmd_da;
 mod cmd_verify;
 mod cmd_chunk;
+mod cmd_rebuild;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -107,6 +108,25 @@ enum Commands {
         #[command(subcommand)]
         chunk_cmd: ChunkCommands,
     },
+
+    /// Rebuild state from DA events
+    Rebuild {
+        /// Target to rebuild: "coordinator" or "node"
+        #[arg(long, value_parser = parse_rebuild_target)]
+        target: String,
+        /// Starting DA height (default: 1)
+        #[arg(long)]
+        from: Option<u64>,
+        /// Ending DA height (default: current)
+        #[arg(long)]
+        to: Option<u64>,
+        /// Output file path for state JSON
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// DA layer subcommands
@@ -201,6 +221,17 @@ enum ChunkCommands {
 
 /// Parse and validate verify target.
 fn parse_verify_target(s: &str) -> Result<String, String> {
+    match s.to_lowercase().as_str() {
+        "coordinator" | "node" => Ok(s.to_lowercase()),
+        _ => Err(format!(
+            "invalid target '{}': must be 'coordinator' or 'node'",
+            s
+        )),
+    }
+}
+
+/// Parse and validate rebuild target.
+fn parse_rebuild_target(s: &str) -> Result<String, String> {
     match s.to_lowercase().as_str() {
         "coordinator" | "node" => Ok(s.to_lowercase()),
         _ => Err(format!(
@@ -1454,6 +1485,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        Commands::Rebuild { target, from, to, output, json } => {
+            cmd_rebuild::handle_rebuild(&target, from, to, output, json).await?;
+        }
     }
 
     Ok(())
@@ -2060,5 +2095,18 @@ mod tests {
 
         let table = result.to_table();
         assert!(table.contains("(none)"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 27: PARSE REBUILD TARGET
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_parse_rebuild_target() {
+        assert!(parse_rebuild_target("coordinator").is_ok());
+        assert!(parse_rebuild_target("node").is_ok());
+        assert!(parse_rebuild_target("COORDINATOR").is_ok());
+        assert!(parse_rebuild_target("NODE").is_ok());
+        assert!(parse_rebuild_target("invalid").is_err());
     }
 }
