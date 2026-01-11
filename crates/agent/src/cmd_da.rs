@@ -229,6 +229,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Error yang dapat terjadi saat query DA status.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum DAStatusError {
     /// Gagal terhubung ke DA node.
