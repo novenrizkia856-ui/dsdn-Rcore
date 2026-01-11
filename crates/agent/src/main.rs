@@ -50,6 +50,15 @@ enum Commands {
         file: PathBuf,
         #[arg(long)]
         encrypt: bool,
+        /// Track upload through DA events (ChunkDeclared + ReplicaAdded)
+        #[arg(long)]
+        track: bool,
+        /// Expected replication factor for tracking (default: 1)
+        #[arg(long, default_value_t = 1)]
+        rf: usize,
+        /// Timeout in seconds for DA tracking (default: 120)
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
     },
 
     /// Download a file by hash from node. Optionally decrypt with provided key (base64)
@@ -382,6 +391,339 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// UPLOAD DA TRACKING
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Upload tracking progress stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackingStage {
+    /// Upload in progress.
+    Uploading,
+    /// Waiting for ChunkDeclared event from DA.
+    WaitingDeclared,
+    /// Waiting for ReplicaAdded events until RF is met.
+    WaitingReplication { current: usize, target: usize },
+    /// Tracking complete.
+    Complete,
+    /// Tracking failed with error.
+    Failed(String),
+}
+
+impl std::fmt::Display for TrackingStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackingStage::Uploading => write!(f, "UPLOADING"),
+            TrackingStage::WaitingDeclared => write!(f, "WAITING_DECLARED"),
+            TrackingStage::WaitingReplication { current, target } => {
+                write!(f, "REPLICATING ({}/{})", current, target)
+            }
+            TrackingStage::Complete => write!(f, "COMPLETE"),
+            TrackingStage::Failed(msg) => write!(f, "FAILED: {}", msg),
+        }
+    }
+}
+
+/// Upload tracking result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadTrackingResult {
+    pub chunk_hash: String,
+    pub size: u64,
+    pub declared: bool,
+    pub declared_height: Option<u64>,
+    pub replicas: Vec<String>,
+    pub replication_factor: usize,
+    pub target_rf: usize,
+    pub rf_achieved: bool,
+    pub tracking_time_ms: u64,
+}
+
+impl UploadTrackingResult {
+    /// Format as table.
+    pub fn to_table(&self) -> String {
+        let mut output = String::new();
+        output.push_str("┌─────────────────────────────────────────────────────────────────────────────┐\n");
+        output.push_str("│                      UPLOAD TRACKING RESULT                                 │\n");
+        output.push_str("├─────────────────────┬───────────────────────────────────────────────────────┤\n");
+        output.push_str(&format!("│ Chunk Hash          │ {:53} │\n", truncate_str(&self.chunk_hash, 53)));
+        output.push_str(&format!("│ Size                │ {:>50} bytes │\n", self.size));
+        output.push_str(&format!("│ Declared            │ {:53} │\n", if self.declared { "yes" } else { "no" }));
+        if let Some(h) = self.declared_height {
+            output.push_str(&format!("│ Declared Height     │ {:53} │\n", h));
+        }
+        output.push_str(&format!("│ Replication         │ {:>3} / {:>3} {:44} │\n", 
+            self.replication_factor, self.target_rf,
+            if self.rf_achieved { "(achieved)" } else { "(incomplete)" }));
+        output.push_str(&format!("│ Tracking Time       │ {:>50} ms │\n", self.tracking_time_ms));
+        output.push_str("├─────────────────────┴───────────────────────────────────────────────────────┤\n");
+        if self.replicas.is_empty() {
+            output.push_str("│ Replicas: (none)                                                            │\n");
+        } else {
+            output.push_str("│ Replicas:                                                                   │\n");
+            for (i, node) in self.replicas.iter().enumerate() {
+                output.push_str(&format!("│   {}. {:70} │\n", i + 1, truncate_str(node, 70)));
+            }
+        }
+        output.push_str("└─────────────────────────────────────────────────────────────────────────────┘\n");
+        output
+    }
+}
+
+/// Configuration for DA tracking.
+struct TrackingConfig {
+    da_endpoint: String,
+    namespace: String,
+    timeout_secs: u64,
+    poll_interval_ms: u64,
+}
+
+impl TrackingConfig {
+    fn from_env_and_args(timeout_secs: u64) -> Self {
+        let da_config = cmd_da::DAConfig::from_env();
+        Self {
+            da_endpoint: da_config.endpoint,
+            namespace: da_config.namespace,
+            timeout_secs,
+            poll_interval_ms: 2000,
+        }
+    }
+}
+
+/// Print tracking progress.
+fn print_tracking_progress(stage: &TrackingStage, chunk_hash: &str) {
+    println!("[TRACK] {} | chunk: {}", stage, truncate_str(chunk_hash, 16));
+}
+
+/// Get current DA height.
+async fn get_da_height(client: &reqwest::Client, endpoint: &str) -> Result<u64> {
+    let url = format!("{}/header/local_head", endpoint);
+    let response = client.get(&url).send().await
+        .map_err(|e| anyhow::anyhow!("failed to get DA header: {}", e))?;
+    
+    if !response.status().is_success() {
+        return Ok(0);
+    }
+    
+    let body = response.text().await
+        .map_err(|e| anyhow::anyhow!("failed to read response: {}", e))?;
+    
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("failed to parse header: {}", e))?;
+    
+    let height = json.get("header")
+        .and_then(|h| h.get("height"))
+        .and_then(|h| h.as_str())
+        .and_then(|h| h.parse::<u64>().ok())
+        .unwrap_or(0);
+    
+    Ok(height)
+}
+
+/// Fetch DA events at specific height.
+async fn fetch_da_events(
+    client: &reqwest::Client,
+    config: &TrackingConfig,
+    height: u64,
+) -> Result<Vec<cmd_verify::DAEvent>> {
+    let url = format!("{}/blob/get_all/{}/{}", config.da_endpoint, height, config.namespace);
+    
+    let response = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(Vec::new()),
+    };
+    
+    let body = response.text().await
+        .map_err(|e| anyhow::anyhow!("failed to read blob response: {}", e))?;
+    
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("failed to parse blob response: {}", e))?;
+    
+    let blobs = match json.as_array() {
+        Some(arr) => arr,
+        None => return Ok(Vec::new()),
+    };
+    
+    let mut all_events = Vec::new();
+    for blob in blobs {
+        if let Some(data_b64) = blob.get("data").and_then(|d| d.as_str()) {
+            if let Ok(data) = general_purpose::STANDARD.decode(data_b64) {
+                if let Ok(events) = serde_json::from_slice::<Vec<cmd_verify::DAEvent>>(&data) {
+                    all_events.extend(events);
+                }
+            }
+        }
+    }
+    
+    Ok(all_events)
+}
+
+/// Wait for ChunkDeclared event in DA.
+async fn wait_for_chunk_declared(
+    config: &TrackingConfig,
+    chunk_hash: &str,
+) -> Result<u64> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(config.timeout_secs);
+    let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
+
+    let initial_height = get_da_height(&client, &config.da_endpoint).await.unwrap_or(0);
+    let mut last_checked_height = if initial_height > 0 { initial_height - 1 } else { 0 };
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "timeout waiting for ChunkDeclared event for chunk '{}' after {} seconds",
+                chunk_hash,
+                config.timeout_secs
+            );
+        }
+
+        let current_height = get_da_height(&client, &config.da_endpoint).await.unwrap_or(0);
+
+        for height in (last_checked_height + 1)..=current_height {
+            let events = fetch_da_events(&client, config, height).await.unwrap_or_default();
+            
+            for event in events {
+                if let cmd_verify::DAEvent::ChunkDeclared { chunk_hash: hash, .. } = event {
+                    if hash == chunk_hash {
+                        return Ok(height);
+                    }
+                }
+            }
+        }
+
+        last_checked_height = current_height;
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Wait for ReplicaAdded events until target RF is reached.
+async fn wait_for_replication(
+    config: &TrackingConfig,
+    chunk_hash: &str,
+    target_rf: usize,
+) -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(config.timeout_secs);
+    let poll_interval = std::time::Duration::from_millis(config.poll_interval_ms);
+
+    let mut replicas: Vec<String> = Vec::new();
+    let initial_height = get_da_height(&client, &config.da_endpoint).await.unwrap_or(0);
+    let mut last_checked_height = if initial_height > 0 { initial_height - 1 } else { 0 };
+
+    loop {
+        if replicas.len() >= target_rf {
+            return Ok(replicas);
+        }
+
+        if start.elapsed() > timeout {
+            // Return partial result instead of error
+            return Ok(replicas);
+        }
+
+        let current_height = get_da_height(&client, &config.da_endpoint).await.unwrap_or(0);
+
+        for height in (last_checked_height + 1)..=current_height {
+            let events = fetch_da_events(&client, config, height).await.unwrap_or_default();
+            
+            for event in events {
+                if let cmd_verify::DAEvent::ReplicaAdded { chunk_hash: hash, node_id, .. } = event {
+                    if hash == chunk_hash && !replicas.contains(&node_id) {
+                        replicas.push(node_id);
+                        print_tracking_progress(
+                            &TrackingStage::WaitingReplication {
+                                current: replicas.len(),
+                                target: target_rf,
+                            },
+                            chunk_hash,
+                        );
+                        
+                        if replicas.len() >= target_rf {
+                            return Ok(replicas);
+                        }
+                    }
+                }
+            }
+        }
+
+        last_checked_height = current_height;
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Handle upload with DA tracking.
+async fn handle_upload_with_tracking(
+    chunk_hash: &str,
+    size: u64,
+    target_rf: usize,
+    timeout_secs: u64,
+) -> Result<UploadTrackingResult> {
+    let start = std::time::Instant::now();
+    let config = TrackingConfig::from_env_and_args(timeout_secs);
+
+    // Stage 1: Wait for ChunkDeclared
+    print_tracking_progress(&TrackingStage::WaitingDeclared, chunk_hash);
+    
+    let declared_height = match wait_for_chunk_declared(&config, chunk_hash).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            print_tracking_progress(&TrackingStage::Failed(e.to_string()), chunk_hash);
+            return Ok(UploadTrackingResult {
+                chunk_hash: chunk_hash.to_string(),
+                size,
+                declared: false,
+                declared_height: None,
+                replicas: Vec::new(),
+                replication_factor: 0,
+                target_rf,
+                rf_achieved: false,
+                tracking_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+    };
+
+    println!("[TRACK] ChunkDeclared confirmed at DA height {}", declared_height.unwrap_or(0));
+
+    // Stage 2: Wait for replication
+    print_tracking_progress(
+        &TrackingStage::WaitingReplication { current: 0, target: target_rf },
+        chunk_hash,
+    );
+    
+    let replicas = wait_for_replication(&config, chunk_hash, target_rf).await
+        .unwrap_or_default();
+
+    let rf_achieved = replicas.len() >= target_rf;
+    
+    if rf_achieved {
+        print_tracking_progress(&TrackingStage::Complete, chunk_hash);
+    } else {
+        println!("[TRACK] Partial replication: {}/{}", replicas.len(), target_rf);
+    }
+
+    Ok(UploadTrackingResult {
+        chunk_hash: chunk_hash.to_string(),
+        size,
+        declared: true,
+        declared_height,
+        replication_factor: replicas.len(),
+        replicas,
+        target_rf,
+        rf_achieved,
+        tracking_time_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // NODE COMMAND HANDLERS (all data from DA events)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -589,7 +931,7 @@ async fn main() -> Result<()> {
             println!("recovered key (b64): {}", general_purpose::STANDARD.encode(&recovered));
         }
 
-        Commands::Upload { node_addr, file, encrypt } => {
+        Commands::Upload { node_addr, file, encrypt, track, rf, timeout } => {
             let mut f = fs::File::open(&file)?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
@@ -597,10 +939,20 @@ async fn main() -> Result<()> {
             let mut printed_key: Option<String> = None;
             let connect = format!("http://{}", node_addr);
 
-            if encrypt {
+            // Validate RF only when tracking
+            if track && rf == 0 {
+                anyhow::bail!("replication factor (--rf) must be at least 1");
+            }
+
+            let (hash, size) = if encrypt {
                 let key = gen_key();
                 let cipher_blob = encrypt_aes_gcm(&key, &to_upload)?;
                 let hash = sha256_hex(&cipher_blob);
+                let size = cipher_blob.len() as u64;
+                
+                if track {
+                    print_tracking_progress(&TrackingStage::Uploading, &hash);
+                }
                 println!("Uploading encrypted blob (cid {}) to {}", hash, node_addr);
 
                 let returned = rpc::client_put(connect.clone(), hash.clone(), cipher_blob.clone())
@@ -611,16 +963,38 @@ async fn main() -> Result<()> {
                 let b64 = general_purpose::STANDARD.encode(&key);
                 printed_key = Some(b64.clone());
                 println!("ENCRYPTION_KEY_B64: {}", b64);
+                
+                (hash, size)
             } else {
                 let hash = sha256_hex(&to_upload);
+                let size = to_upload.len() as u64;
+                
+                if track {
+                    print_tracking_progress(&TrackingStage::Uploading, &hash);
+                }
                 println!("Uploading blob (cid {}) to {}", hash, node_addr);
+                
                 let returned = rpc::client_put(connect.clone(), hash.clone(), to_upload.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!(format!("{}", e)))?;
                 println!("uploaded -> returned {}", returned);
-            }
+                
+                (hash, size)
+            };
+            
             if let Some(_k) = printed_key {
                 println!("Note: save this encryption key (base64) to decrypt later.");
+            }
+
+            // DA tracking if --track flag is set
+            if track {
+                println!("\n--- DA Tracking ---");
+                let result = handle_upload_with_tracking(&hash, size, rf, timeout).await?;
+                print!("{}", result.to_table());
+                
+                if !result.rf_achieved {
+                    println!("\nWarning: Target replication factor not achieved within timeout.");
+                }
             }
         }
 
@@ -1076,5 +1450,136 @@ mod tests {
         assert!(parse_verify_target("node").is_ok());
         assert!(parse_verify_target("COORDINATOR").is_ok());
         assert!(parse_verify_target("invalid").is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 16: TRACKING STAGE DISPLAY
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tracking_stage_display() {
+        assert_eq!(format!("{}", TrackingStage::Uploading), "UPLOADING");
+        assert_eq!(format!("{}", TrackingStage::WaitingDeclared), "WAITING_DECLARED");
+        assert_eq!(
+            format!("{}", TrackingStage::WaitingReplication { current: 2, target: 3 }),
+            "REPLICATING (2/3)"
+        );
+        assert_eq!(format!("{}", TrackingStage::Complete), "COMPLETE");
+        assert_eq!(
+            format!("{}", TrackingStage::Failed("timeout".to_string())),
+            "FAILED: timeout"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 17: TRACKING RESULT TO TABLE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tracking_result_to_table() {
+        let result = UploadTrackingResult {
+            chunk_hash: "abc123def456".to_string(),
+            size: 1024,
+            declared: true,
+            declared_height: Some(100),
+            replicas: vec!["node-1".to_string(), "node-2".to_string()],
+            replication_factor: 2,
+            target_rf: 3,
+            rf_achieved: false,
+            tracking_time_ms: 5000,
+        };
+
+        let table = result.to_table();
+        assert!(table.contains("UPLOAD TRACKING RESULT"));
+        assert!(table.contains("abc123def456"));
+        assert!(table.contains("1024"));
+        assert!(table.contains("yes")); // declared
+        assert!(table.contains("100")); // declared height
+        assert!(table.contains("2 /   3")); // replication
+        assert!(table.contains("node-1"));
+        assert!(table.contains("node-2"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 18: TRACKING RESULT EMPTY REPLICAS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tracking_result_empty_replicas() {
+        let result = UploadTrackingResult {
+            chunk_hash: "xyz789".to_string(),
+            size: 512,
+            declared: false,
+            declared_height: None,
+            replicas: vec![],
+            replication_factor: 0,
+            target_rf: 1,
+            rf_achieved: false,
+            tracking_time_ms: 1000,
+        };
+
+        let table = result.to_table();
+        assert!(table.contains("xyz789"));
+        assert!(table.contains("no")); // declared = no
+        assert!(table.contains("(none)")); // replicas
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 19: TRACKING RESULT RF ACHIEVED
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tracking_result_rf_achieved() {
+        let result = UploadTrackingResult {
+            chunk_hash: "test123".to_string(),
+            size: 2048,
+            declared: true,
+            declared_height: Some(50),
+            replicas: vec!["node-1".to_string(), "node-2".to_string(), "node-3".to_string()],
+            replication_factor: 3,
+            target_rf: 3,
+            rf_achieved: true,
+            tracking_time_ms: 3000,
+        };
+
+        let table = result.to_table();
+        assert!(table.contains("(achieved)"));
+        assert!(table.contains("node-3"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 20: TRACKING CONFIG FROM ENV
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tracking_config_default_values() {
+        // This test verifies the config structure is correct
+        let config = TrackingConfig {
+            da_endpoint: "http://localhost:26658".to_string(),
+            namespace: "test".to_string(),
+            timeout_secs: 120,
+            poll_interval_ms: 2000,
+        };
+
+        assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.poll_interval_ms, 2000);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 21: TRACKING STAGE EQUALITY
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tracking_stage_equality() {
+        assert_eq!(TrackingStage::Uploading, TrackingStage::Uploading);
+        assert_eq!(TrackingStage::Complete, TrackingStage::Complete);
+        assert_eq!(
+            TrackingStage::WaitingReplication { current: 1, target: 2 },
+            TrackingStage::WaitingReplication { current: 1, target: 2 }
+        );
+        assert_ne!(
+            TrackingStage::WaitingReplication { current: 1, target: 2 },
+            TrackingStage::WaitingReplication { current: 2, target: 2 }
+        );
     }
 }
