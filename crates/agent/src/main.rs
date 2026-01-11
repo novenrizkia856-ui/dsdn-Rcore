@@ -1,5 +1,6 @@
 ﻿mod sss;
 mod crypto;
+mod cmd_da;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -66,6 +67,23 @@ enum Commands {
         out_file: PathBuf,
         /// AES-GCM key in base64 (32 bytes after decode)
         key_b64: String,
+    },
+
+    /// DA (Data Availability) layer commands
+    Da {
+        #[command(subcommand)]
+        da_cmd: DaCommands,
+    },
+}
+
+/// DA layer subcommands
+#[derive(Subcommand)]
+enum DaCommands {
+    /// Show DA layer status
+    Status {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -200,6 +218,14 @@ async fn main() -> Result<()> {
             let plain = decrypt_aes_gcm(&k32, &enc)?;
             fs::write(&out_file, &plain)?;
             println!("decrypted {} -> {}", enc_file.display(), out_file.display());
+        }
+
+        Commands::Da { da_cmd } => {
+            match da_cmd {
+                DaCommands::Status { json } => {
+                    cmd_da::handle_da_status(json).await?;
+                }
+            }
         }
     }
 
