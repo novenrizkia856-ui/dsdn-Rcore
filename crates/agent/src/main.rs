@@ -599,7 +599,7 @@ impl TrackingConfig {
     fn from_env_and_args(timeout_secs: u64) -> Self {
         let da_config = cmd_da::DAConfig::from_env();
         Self {
-            da_endpoint: da_config.endpoint,
+            da_endpoint: da_config.rpc_url,
             namespace: da_config.namespace,
             timeout_secs,
             poll_interval_ms: 2000,

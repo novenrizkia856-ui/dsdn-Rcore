@@ -1766,17 +1766,19 @@ impl BlobSubscription {
 // ════════════════════════════════════════════════════════════════════════════
 
 impl DALayer for CelestiaDA {
-    fn post_blob<'a>(&'a self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + 'a>> {
+    fn post_blob(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + '_>> {
+        let data = data.to_vec(); // Clone to decouple lifetime from input
         Box::pin(async move {
             // Delegate to inherent method
-            CelestiaDA::post_blob(self, data).await
+            CelestiaDA::post_blob(self, &data).await
         })
     }
 
-    fn get_blob<'a>(&'a self, blob_ref: &'a BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + 'a>> {
+    fn get_blob(&self, blob_ref: &BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + '_>> {
+        let blob_ref = blob_ref.clone(); // Clone to decouple lifetime from input
         Box::pin(async move {
             // Delegate to inherent method
-            CelestiaDA::get_blob(self, blob_ref).await
+            CelestiaDA::get_blob(self, &blob_ref).await
         })
     }
 
@@ -1824,6 +1826,10 @@ mod tests {
             timeout_ms: 5000,
             retry_count: 3,
             retry_delay_ms: 100,
+            network: "testnet".to_string(),
+            enable_pooling: false,
+            max_connections: 1,
+            idle_timeout_ms: 30000,
         }
     }
 
@@ -3289,6 +3295,10 @@ mod tests {
             timeout_ms: 10000,
             retry_count: 5,
             retry_delay_ms: 500,
+            network: "testnet".to_string(),
+            enable_pooling: false,
+            max_connections: 1,
+            idle_timeout_ms: 30000,
         };
 
         let celestia_da = CelestiaDA::new(config).unwrap();
@@ -3387,25 +3397,44 @@ mod tests {
     // FROM_ENV TESTS
     // ════════════════════════════════════════════════════════════════════════
 
-    #[tokio::test]
+   #[tokio::test]
     async fn test_from_env_success() {
+        // Clear ALL DA-related env vars first to ensure clean state
+        // This prevents interference from .env.mainnet or other tests
+        std::env::remove_var("DA_RPC_URL");
+        std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_AUTH_TOKEN");
+        std::env::remove_var("DA_NETWORK");
+        std::env::remove_var("DA_TIMEOUT_MS");
+        std::env::remove_var("DA_RETRY_COUNT");
+        std::env::remove_var("DA_RETRY_DELAY_MS");
+        std::env::remove_var("DA_ENABLE_POOLING");
+        std::env::remove_var("DA_MAX_CONNECTIONS");
+        std::env::remove_var("DA_IDLE_TIMEOUT_MS");
+
         let mock_server = MockServer::start().await;
+        // Save URI before any potential cleanup
+        let mock_uri = mock_server.uri();
 
         Mock::given(method("HEAD"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&mock_server)
             .await;
 
-        std::env::set_var("DA_RPC_URL", mock_server.uri());
+        std::env::set_var("DA_RPC_URL", &mock_uri);
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_NETWORK", "mocha"); // Use testnet to avoid mainnet auth requirement
 
         let result = CelestiaDA::from_env();
 
+        // Cleanup env vars
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_NETWORK");
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().config().rpc_url, mock_server.uri());
+        // Assertions after cleanup
+        assert!(result.is_ok(), "from_env should succeed: {:?}", result.err());
+        assert_eq!(result.unwrap().config().rpc_url, mock_uri);
     }
 
     #[tokio::test]

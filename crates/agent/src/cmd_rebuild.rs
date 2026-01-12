@@ -537,10 +537,10 @@ pub async fn rebuild_state_to_current(target: &str) -> Result<RebuildResult> {
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
     
-    let current_height = get_da_height(&client, &da_config.endpoint).await?;
+    let current_height = get_da_height(&client, &da_config.rpc_url).await?;
     
     let config = RebuildConfig {
-        da_endpoint: da_config.endpoint,
+        da_endpoint: da_config.rpc_url,
         namespace: da_config.namespace,
         target: target.to_string(),
         from_height: 1,
@@ -577,13 +577,13 @@ pub async fn handle_rebuild(
         .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
     
     // Get current height for defaults
-    let current_height = get_da_height(&client, &da_config.endpoint).await?;
+    let current_height = get_da_height(&client, &da_config.rpc_url).await?;
     
     let from = from_height.unwrap_or(1);
     let to = to_height.unwrap_or(current_height);
     
     let config = RebuildConfig {
-        da_endpoint: da_config.endpoint,
+        da_endpoint: da_config.rpc_url,
         namespace: da_config.namespace,
         target: target_lower.clone(),
         from_height: from,

@@ -14,3 +14,4 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 parking_lot = "0.12"
 uuid = { version = "1.4", features = ["v4"] }
 futures = "0.3"
+sha3 = "0.10"

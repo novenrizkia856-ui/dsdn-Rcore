@@ -509,7 +509,7 @@ pub async fn rebuild_state_from_da(config: &DAConfig) -> Result<DSDNState> {
     let mut state = DSDNState::default();
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
+        .timeout(config.timeout())
         .build()
         .context("failed to build HTTP client")?;
 
@@ -538,7 +538,7 @@ pub async fn rebuild_state_from_da(config: &DAConfig) -> Result<DSDNState> {
 
 /// Get current DA height.
 async fn get_da_current_height(client: &reqwest::Client, config: &DAConfig) -> Result<u64> {
-    let url = format!("{}/header/local_head", config.endpoint);
+    let url = format!("{}/header/local_head", config.rpc_url);
 
     let response = client
         .get(&url)
@@ -573,7 +573,7 @@ async fn fetch_events_at_height(
 ) -> Result<Vec<DAEvent>> {
     let url = format!(
         "{}/blob/get_all/{}/{}",
-        config.endpoint, height, config.namespace
+        config.rpc_url, height, config.namespace
     );
 
     let response = client.get(&url).send().await;
@@ -683,7 +683,7 @@ pub fn apply_event_to_state(state: &mut DSDNState, event: &DAEvent) {
 /// Fetch state from coordinator.
 pub async fn fetch_coordinator_state(config: &DAConfig) -> Result<DSDNState> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
+        .timeout(config.timeout())
         .build()
         .context("failed to build HTTP client")?;
 

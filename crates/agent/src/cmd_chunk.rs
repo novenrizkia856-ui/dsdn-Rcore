@@ -417,7 +417,7 @@ async fn rebuild_state_with_history(
     let mut sequence: usize = 0;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .timeout(config.timeout())
         .build()
         .context("failed to build HTTP client")?;
 
@@ -495,7 +495,7 @@ async fn rebuild_state_with_history(
 
 /// Get current DA height.
 async fn get_da_current_height(client: &reqwest::Client, config: &DAConfig) -> Result<u64> {
-    let url = format!("{}/header/local_head", config.endpoint);
+    let url = format!("{}/header/local_head", config.rpc_url);
 
     let response = client
         .get(&url)
@@ -530,7 +530,7 @@ async fn fetch_events_at_height(
 ) -> Result<Vec<cmd_verify::DAEvent>> {
     let url = format!(
         "{}/blob/get_all/{}/{}",
-        config.endpoint, height, config.namespace
+        config.rpc_url, height, config.namespace
     );
 
     let response = client.get(&url).send().await;

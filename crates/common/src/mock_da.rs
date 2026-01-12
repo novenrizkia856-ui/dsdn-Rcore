@@ -524,7 +524,8 @@ impl Default for MockDA {
 // ════════════════════════════════════════════════════════════════════════════
 
 impl DALayer for MockDA {
-    fn post_blob<'a>(&'a self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + 'a>> {
+    fn post_blob(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + '_>> {
+        let data = data.to_vec(); // Clone to decouple lifetime from input
         Box::pin(async move {
             // Simulate latency (async, non-blocking)
             self.simulate_latency().await;
@@ -539,7 +540,7 @@ impl DALayer for MockDA {
             let _index = self.next_index.fetch_add(1, Ordering::SeqCst);
 
             // Compute commitment
-            let commitment = Self::compute_commitment(data);
+            let commitment = Self::compute_commitment(&data);
 
             let blob_ref = BlobRef {
                 height,
@@ -551,7 +552,7 @@ impl DALayer for MockDA {
             self.blobs
                 .write()
                 .unwrap()
-                .insert(blob_ref.clone(), data.to_vec());
+                .insert(blob_ref.clone(), data);
 
             debug!(
                 height,
@@ -563,7 +564,8 @@ impl DALayer for MockDA {
         })
     }
 
-    fn get_blob<'a>(&'a self, ref_: &'a BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + 'a>> {
+    fn get_blob(&self, ref_: &BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + '_>> {
+        let ref_ = ref_.clone(); // Clone to decouple lifetime from input
         Box::pin(async move {
             // Simulate latency (async, non-blocking)
             self.simulate_latency().await;
@@ -576,7 +578,7 @@ impl DALayer for MockDA {
 
             // Retrieve blob
             let blobs = self.blobs.read().unwrap();
-            match blobs.get(ref_) {
+            match blobs.get(&ref_) {
                 Some(data) => {
                     debug!(
                         height = ref_.height,

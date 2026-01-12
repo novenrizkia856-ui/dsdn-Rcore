@@ -1,1 +1,5 @@
 cargo clippy --all-targets --all-features -- -W clippy::all
+
+test sementara:
+cargo test --test celestia_mainnet_integration -- --ignored --nocapture
+celestia light start --core.ip rpc.celestia.pops.one:26657 --p2p.network celestia

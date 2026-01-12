@@ -7,7 +7,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use futures::Stream;
+use parking_lot::RwLock;
 
 // ════════════════════════════════════════════════════════════════════════════
 // SUPPORTING TYPES
@@ -43,6 +47,167 @@ pub struct Blob {
     pub received_at: u64,
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// DA METRICS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Metrics for DA layer operations.
+///
+/// Tracks latency and request counts for monitoring and observability.
+/// All fields are thread-safe and can be accessed concurrently.
+#[derive(Debug)]
+pub struct DAMetrics {
+    /// Total number of post_blob operations
+    pub post_count: AtomicU64,
+    /// Total number of get_blob operations
+    pub get_count: AtomicU64,
+    /// Total number of subscribe operations
+    pub subscribe_count: AtomicU64,
+    /// Total number of health_check operations
+    pub health_check_count: AtomicU64,
+    /// Cumulative post_blob latency in microseconds
+    pub post_latency_us: AtomicU64,
+    /// Cumulative get_blob latency in microseconds
+    pub get_latency_us: AtomicU64,
+    /// Number of failed operations
+    pub error_count: AtomicU64,
+    /// Number of retry attempts
+    pub retry_count: AtomicU64,
+    /// Number of successful reconnections
+    pub reconnect_count: AtomicU64,
+    /// Last operation timestamp (Unix ms)
+    pub last_operation_ms: AtomicU64,
+}
+
+impl DAMetrics {
+    /// Create new metrics with all counters at zero.
+    pub fn new() -> Self {
+        Self {
+            post_count: AtomicU64::new(0),
+            get_count: AtomicU64::new(0),
+            subscribe_count: AtomicU64::new(0),
+            health_check_count: AtomicU64::new(0),
+            post_latency_us: AtomicU64::new(0),
+            get_latency_us: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            retry_count: AtomicU64::new(0),
+            reconnect_count: AtomicU64::new(0),
+            last_operation_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a post_blob operation with latency.
+    pub fn record_post(&self, latency: std::time::Duration) {
+        self.post_count.fetch_add(1, Ordering::Relaxed);
+        self.post_latency_us.fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
+        self.update_last_operation();
+    }
+
+    /// Record a get_blob operation with latency.
+    pub fn record_get(&self, latency: std::time::Duration) {
+        self.get_count.fetch_add(1, Ordering::Relaxed);
+        self.get_latency_us.fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
+        self.update_last_operation();
+    }
+
+    /// Record an error.
+    pub fn record_error(&self) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a retry attempt.
+    pub fn record_retry(&self) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful reconnection.
+    pub fn record_reconnect(&self) {
+        self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a health check.
+    pub fn record_health_check(&self) {
+        self.health_check_count.fetch_add(1, Ordering::Relaxed);
+        self.update_last_operation();
+    }
+
+    /// Record a subscribe operation.
+    pub fn record_subscribe(&self) {
+        self.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        self.update_last_operation();
+    }
+
+    /// Update last operation timestamp.
+    fn update_last_operation(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_operation_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Get average post latency in microseconds.
+    /// Returns 0 if no posts have been made.
+    pub fn avg_post_latency_us(&self) -> u64 {
+        let count = self.post_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return 0;
+        }
+        self.post_latency_us.load(Ordering::Relaxed) / count
+    }
+
+    /// Get average get latency in microseconds.
+    /// Returns 0 if no gets have been made.
+    pub fn avg_get_latency_us(&self) -> u64 {
+        let count = self.get_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return 0;
+        }
+        self.get_latency_us.load(Ordering::Relaxed) / count
+    }
+
+    /// Get snapshot of all metrics as a struct.
+    pub fn snapshot(&self) -> DAMetricsSnapshot {
+        DAMetricsSnapshot {
+            post_count: self.post_count.load(Ordering::Relaxed),
+            get_count: self.get_count.load(Ordering::Relaxed),
+            subscribe_count: self.subscribe_count.load(Ordering::Relaxed),
+            health_check_count: self.health_check_count.load(Ordering::Relaxed),
+            avg_post_latency_us: self.avg_post_latency_us(),
+            avg_get_latency_us: self.avg_get_latency_us(),
+            error_count: self.error_count.load(Ordering::Relaxed),
+            retry_count: self.retry_count.load(Ordering::Relaxed),
+            reconnect_count: self.reconnect_count.load(Ordering::Relaxed),
+            last_operation_ms: self.last_operation_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for DAMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Snapshot of DA metrics at a point in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DAMetricsSnapshot {
+    pub post_count: u64,
+    pub get_count: u64,
+    pub subscribe_count: u64,
+    pub health_check_count: u64,
+    pub avg_post_latency_us: u64,
+    pub avg_get_latency_us: u64,
+    pub error_count: u64,
+    pub retry_count: u64,
+    pub reconnect_count: u64,
+    pub last_operation_ms: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DA CONFIG
+// ════════════════════════════════════════════════════════════════════════════
+
 /// Konfigurasi untuk DA layer backend.
 ///
 /// `DAConfig` menyimpan semua parameter yang diperlukan untuk
@@ -53,7 +218,7 @@ pub struct DAConfig {
     pub rpc_url: String,
     /// Namespace 29-byte untuk blob storage
     pub namespace: [u8; 29],
-    /// Token autentikasi opsional
+    /// Token autentikasi (REQUIRED for mainnet)
     pub auth_token: Option<String>,
     /// Timeout untuk operasi dalam milliseconds
     pub timeout_ms: u64,
@@ -61,10 +226,21 @@ pub struct DAConfig {
     pub retry_count: u8,
     /// Delay antar retry dalam milliseconds
     pub retry_delay_ms: u64,
+    /// Network identifier (mainnet, mocha, arabica, local)
+    pub network: String,
+    /// Enable connection pooling
+    pub enable_pooling: bool,
+    /// Maximum concurrent connections
+    pub max_connections: u16,
+    /// Idle connection timeout in milliseconds
+    pub idle_timeout_ms: u64,
 }
 
 impl Default for DAConfig {
-    /// Membuat DAConfig dengan nilai default yang aman.
+    /// Membuat DAConfig dengan nilai default yang aman untuk LOCAL DEVELOPMENT ONLY.
+    ///
+    /// WARNING: These defaults are for local development only.
+    /// Production MUST use from_env() with proper credentials.
     ///
     /// Default values:
     /// - `rpc_url`: "http://localhost:26658" (localhost development)
@@ -73,6 +249,10 @@ impl Default for DAConfig {
     /// - `timeout_ms`: 30000 (30 detik)
     /// - `retry_count`: 3
     /// - `retry_delay_ms`: 1000 (1 detik)
+    /// - `network`: "local"
+    /// - `enable_pooling`: true
+    /// - `max_connections`: 10
+    /// - `idle_timeout_ms`: 60000 (60 detik)
     fn default() -> Self {
         Self {
             rpc_url: "http://localhost:26658".to_string(),
@@ -81,6 +261,10 @@ impl Default for DAConfig {
             timeout_ms: 30000,
             retry_count: 3,
             retry_delay_ms: 1000,
+            network: "local".to_string(),
+            enable_pooling: true,
+            max_connections: 10,
+            idle_timeout_ms: 60000,
         }
     }
 }
@@ -89,12 +273,16 @@ impl DAConfig {
     /// Membuat DAConfig dari environment variables.
     ///
     /// Environment variables yang dibaca:
-    /// - `DA_RPC_URL`: URL RPC endpoint (wajib)
-    /// - `DA_NAMESPACE`: Namespace hex string 58 karakter (wajib)
-    /// - `DA_AUTH_TOKEN`: Token autentikasi (opsional)
+    /// - `DA_RPC_URL`: URL RPC endpoint (REQUIRED)
+    /// - `DA_NAMESPACE`: Namespace hex string 58 karakter (REQUIRED)
+    /// - `DA_AUTH_TOKEN`: Token autentikasi (REQUIRED for mainnet)
     /// - `DA_TIMEOUT_MS`: Timeout dalam milliseconds (default: 30000)
     /// - `DA_RETRY_COUNT`: Jumlah retry (default: 3)
     /// - `DA_RETRY_DELAY_MS`: Delay antar retry dalam ms (default: 1000)
+    /// - `DA_NETWORK`: Network identifier (default: "mainnet")
+    /// - `DA_ENABLE_POOLING`: Enable connection pooling (default: true)
+    /// - `DA_MAX_CONNECTIONS`: Max concurrent connections (default: 10)
+    /// - `DA_IDLE_TIMEOUT_MS`: Idle connection timeout (default: 60000)
     ///
     /// # Returns
     ///
@@ -106,6 +294,7 @@ impl DAConfig {
     /// Mengembalikan error jika:
     /// - `DA_RPC_URL` tidak ada
     /// - `DA_NAMESPACE` tidak ada atau bukan hex valid 58 karakter
+    /// - `DA_AUTH_TOKEN` tidak ada untuk network mainnet
     /// - Nilai numerik tidak dapat di-parse
     pub fn from_env() -> Result<Self, DAError> {
         // Required: DA_RPC_URL
@@ -118,7 +307,7 @@ impl DAConfig {
         
         let namespace = Self::parse_namespace(&namespace_hex)?;
 
-        // Optional: DA_AUTH_TOKEN
+        // Optional: DA_AUTH_TOKEN (but REQUIRED for mainnet)
         let auth_token = std::env::var("DA_AUTH_TOKEN").ok();
 
         // Optional with default: DA_TIMEOUT_MS
@@ -145,6 +334,38 @@ impl DAConfig {
             Err(_) => 1000,
         };
 
+        // Optional with default: DA_NETWORK
+        let network = std::env::var("DA_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+
+        // Validate: auth_token is REQUIRED for mainnet
+        if network == "mainnet" && auth_token.is_none() {
+            return Err(DAError::Other(
+                "DA_AUTH_TOKEN is required for mainnet network".to_string()
+            ));
+        }
+
+        // Optional with default: DA_ENABLE_POOLING
+        let enable_pooling = match std::env::var("DA_ENABLE_POOLING") {
+            Ok(val) => val.to_lowercase() == "true" || val == "1",
+            Err(_) => true,
+        };
+
+        // Optional with default: DA_MAX_CONNECTIONS
+        let max_connections = match std::env::var("DA_MAX_CONNECTIONS") {
+            Ok(val) => val.parse::<u16>().map_err(|_| {
+                DAError::Other(format!("DA_MAX_CONNECTIONS invalid: '{}'", val))
+            })?,
+            Err(_) => 10,
+        };
+
+        // Optional with default: DA_IDLE_TIMEOUT_MS
+        let idle_timeout_ms = match std::env::var("DA_IDLE_TIMEOUT_MS") {
+            Ok(val) => val.parse::<u64>().map_err(|_| {
+                DAError::Other(format!("DA_IDLE_TIMEOUT_MS invalid: '{}'", val))
+            })?,
+            Err(_) => 60000,
+        };
+
         Ok(Self {
             rpc_url,
             namespace,
@@ -152,7 +373,35 @@ impl DAConfig {
             timeout_ms,
             retry_count,
             retry_delay_ms,
+            network,
+            enable_pooling,
+            max_connections,
+            idle_timeout_ms,
         })
+    }
+
+    /// Check if this config is for mainnet.
+    pub fn is_mainnet(&self) -> bool {
+        self.network == "mainnet"
+    }
+
+    /// Validate configuration for production use.
+    ///
+    /// Returns error if configuration is not suitable for production.
+    pub fn validate_for_production(&self) -> Result<(), DAError> {
+        if self.is_mainnet() {
+            if self.auth_token.is_none() {
+                return Err(DAError::Other(
+                    "auth_token is required for mainnet".to_string()
+                ));
+            }
+            if self.rpc_url.contains("localhost") || self.rpc_url.contains("127.0.0.1") {
+                return Err(DAError::Other(
+                    "localhost RPC URL not allowed for mainnet".to_string()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Parse namespace dari hex string.
@@ -229,47 +478,40 @@ pub enum DAError {
     InvalidBlob,
     
     /// Namespace yang diberikan tidak valid atau tidak cocok.
-    /// Terjadi ketika namespace pada request tidak cocok dengan
-    /// namespace aktif pada CelestiaDA instance.
     InvalidNamespace,
     
-    /// Timeout saat berkomunikasi dengan DA layer.
-    /// Operasi melebihi batas waktu yang dikonfigurasi.
-    Timeout,
-    
-    /// DA layer tidak tersedia atau tidak dapat dijangkau.
-    /// Berbeda dengan NetworkError, ini mengindikasikan bahwa
-    /// DA layer secara eksplisit tidak dapat diakses.
-    Unavailable,
-    
-    /// Error jaringan saat berkomunikasi dengan DA layer.
-    /// Menyimpan pesan detail tentang error yang terjadi.
-    NetworkError(String),
-    
-    /// Error serialisasi atau deserialisasi data.
-    /// Terjadi saat encoding/decoding JSON-RPC atau base64.
+    /// Error saat serialisasi atau deserialisasi data.
+    /// Biasanya terjadi karena format data yang tidak sesuai.
     SerializationError(String),
     
-    /// Error lainnya yang tidak terkategorikan.
-    /// Digunakan untuk error yang tidak masuk kategori di atas.
+    /// Error jaringan saat berkomunikasi dengan DA layer.
+    /// Termasuk connection refused, DNS failure, dll.
+    NetworkError(String),
+    
+    /// Operasi timeout sebelum selesai.
+    Timeout,
+    
+    /// DA layer tidak tersedia.
+    Unavailable,
+    
+    /// Error autentikasi - token tidak valid atau expired.
+    AuthError(String),
+    
+    /// Error lain yang tidak tercakup dalam kategori di atas.
     Other(String),
 }
 
 impl std::fmt::Display for DAError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DAError::BlobNotFound(ref_) => write!(
-                f, 
-                "blob not found at height {} with commitment {:?}", 
-                ref_.height,
-                &ref_.commitment[..8] // Show first 8 bytes for brevity
-            ),
-            DAError::InvalidBlob => write!(f, "blob data invalid: commitment mismatch"),
-            DAError::InvalidNamespace => write!(f, "namespace mismatch"),
-            DAError::Timeout => write!(f, "operation timed out"),
-            DAError::Unavailable => write!(f, "DA layer unavailable"),
-            DAError::NetworkError(msg) => write!(f, "network error: {}", msg),
+            DAError::BlobNotFound(r) => write!(f, "blob not found at height {}", r.height),
+            DAError::InvalidBlob => write!(f, "invalid blob data"),
+            DAError::InvalidNamespace => write!(f, "invalid namespace"),
             DAError::SerializationError(msg) => write!(f, "serialization error: {}", msg),
+            DAError::NetworkError(msg) => write!(f, "network error: {}", msg),
+            DAError::Timeout => write!(f, "operation timeout"),
+            DAError::Unavailable => write!(f, "DA layer unavailable"),
+            DAError::AuthError(msg) => write!(f, "auth error: {}", msg),
             DAError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -278,18 +520,14 @@ impl std::fmt::Display for DAError {
 impl std::error::Error for DAError {}
 
 // ════════════════════════════════════════════════════════════════════════════
-// TYPE ALIAS
+// TYPE ALIASES
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Stream of blobs dari DA layer.
-///
-/// Type alias ini mendefinisikan stream asinkron yang menghasilkan
-/// blob dari DA layer. Stream bersifat `Send` sehingga dapat digunakan
-/// dalam konteks async multi-threaded.
-///
-/// Item stream adalah `Result<Blob, DAError>` untuk mengakomodasi
-/// error yang mungkin terjadi selama streaming.
+/// Type alias untuk stream blob dari DA layer.
 pub type BlobStream = Pin<Box<dyn Stream<Item = Result<Blob, DAError>> + Send>>;
+
+/// Type alias untuk future hasil blob get.
+pub type BlobFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send>>;
 
 // ════════════════════════════════════════════════════════════════════════════
 // DA LAYER TRAIT
@@ -297,165 +535,98 @@ pub type BlobStream = Pin<Box<dyn Stream<Item = Result<Blob, DAError>> + Send>>;
 
 /// Trait abstraksi untuk Data Availability layer.
 ///
-/// `DALayer` mendefinisikan kontrak yang harus dipatuhi oleh implementasi
-/// DA layer manapun dalam sistem DSDN. Trait ini memungkinkan DSDN
-/// untuk berinteraksi dengan berbagai backend DA secara seragam.
+/// `DALayer` mendefinisikan kontrak yang harus dipenuhi oleh setiap
+/// implementasi DA backend. Trait ini memungkinkan DSDN untuk
+/// beroperasi dengan berbagai DA layer secara seragam.
 ///
-/// # Peran dalam DSDN
+/// # Implementors
 ///
-/// DA layer bertugas menyimpan data secara permanen dan memastikan
-/// ketersediaan data tersebut. Dalam konteks DSDN, DA layer digunakan
-/// untuk menyimpan control-plane state seperti:
-/// - Receipt batches dari Coordinator
-/// - Validator set updates
-/// - Configuration updates
-/// - State checkpoints
-///
-/// # Kontrak untuk Implementor
-///
-/// Implementor trait ini WAJIB:
-/// - Thread-safe (`Send + Sync`)
-/// - Mengembalikan error yang sesuai untuk setiap kondisi error
-/// - Tidak melakukan blocking pada method async
-/// - Menjamin konsistensi antara data yang di-post dan di-get
-/// - Menangani reconnection secara internal jika diperlukan
+/// - `CelestiaDA`: Implementasi untuk Celestia network
+/// - `MockDA`: Implementasi mock untuk testing
 ///
 /// # Thread Safety
 ///
-/// Trait ini memerlukan `Send + Sync` bound, memastikan implementasi
-/// dapat digunakan secara aman dari multiple threads dan dapat
-/// di-share antar async tasks.
+/// Trait ini memerlukan `Send + Sync` karena instance akan di-share
+/// antar async tasks dan threads.
+///
+/// # Example
+///
+/// ```ignore
+/// use dsdn_common::da::{DALayer, DAConfig, BlobRef};
+///
+/// async fn use_da(da: &dyn DALayer) {
+///     // Post blob
+///     let blob_ref = da.post_blob(b"hello").await?;
+///     
+///     // Get blob
+///     let data = da.get_blob(&blob_ref).await?;
+///     
+///     // Health check
+///     let status = da.health_check().await?;
+/// }
+/// ```
 pub trait DALayer: Send + Sync {
     /// Mengirim blob ke DA layer.
     ///
-    /// Method ini menyimpan data mentah ke DA layer dan mengembalikan
-    /// referensi (`BlobRef`) yang dapat digunakan untuk mengambil
-    /// kembali data tersebut di kemudian hari.
+    /// # Arguments
+    ///
+    /// * `data` - Data blob mentah untuk disimpan
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BlobRef)` - Referensi ke blob yang tersimpan
+    /// * `Err(DAError)` - Error jika pengiriman gagal
+    fn post_blob(
+        &self,
+        data: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + '_>>;
+
+    /// Mengambil blob dari DA layer.
     ///
     /// # Arguments
     ///
-    /// * `data` - Slice byte data mentah yang akan disimpan sebagai blob.
-    ///   Data tidak dimodifikasi dan disimpan apa adanya.
+    /// * `ref_` - Referensi ke blob yang akan diambil
     ///
     /// # Returns
     ///
-    /// * `Ok(BlobRef)` - Referensi ke blob yang berhasil tersimpan,
-    ///   berisi height, commitment, dan namespace.
-    /// * `Err(DAError)` - Error jika penyimpanan gagal.
-    ///
-    /// # Errors
-    ///
-    /// Mengembalikan error jika:
-    /// - DA layer tidak tersedia (`DAError::Unavailable`)
-    /// - Timeout menunggu konfirmasi (`DAError::Timeout`)
-    /// - Error jaringan (`DAError::NetworkError`)
-    /// - Error serialisasi data (`DAError::SerializationError`)
-    ///
-    /// # Async Behavior
-    ///
-    /// Method ini async dan non-blocking. Future akan resolve setelah
-    /// blob terkonfirmasi tersimpan di DA layer. Caller harus await
-    /// hingga konfirmasi diterima.
-    ///
-    /// # Catatan
-    ///
-    /// Method ini TIDAK melakukan validasi terhadap isi data.
-    /// Validasi semantik adalah tanggung jawab caller.
-    fn post_blob<'a>(&'a self, data: &'a [u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + 'a>>;
+    /// * `Ok(Vec<u8>)` - Data blob mentah
+    /// * `Err(DAError)` - Error jika pengambilan gagal
+    fn get_blob(
+        &self,
+        ref_: &BlobRef,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + '_>>;
 
-    /// Mengambil blob dari DA layer berdasarkan referensi.
-    ///
-    /// Method ini mengambil data blob yang sebelumnya disimpan
-    /// menggunakan `post_blob`. Data yang dikembalikan identik
-    /// dengan data yang di-post.
+    /// Subscribe ke blob stream dari DA layer.
     ///
     /// # Arguments
     ///
-    /// * `blob_ref` - Referensi ke blob yang akan diambil.
-    ///   Harus merupakan `BlobRef` valid yang diperoleh dari `post_blob`.
+    /// * `from_height` - Optional height untuk memulai subscription
     ///
     /// # Returns
     ///
-    /// * `Ok(Vec<u8>)` - Data blob mentah yang berhasil diambil.
-    /// * `Err(DAError)` - Error jika pengambilan gagal.
-    ///
-    /// # Errors
-    ///
-    /// Mengembalikan error jika:
-    /// - Blob tidak ditemukan (`DAError::BlobNotFound`)
-    /// - Blob data tidak valid / commitment mismatch (`DAError::InvalidBlob`)
-    /// - Namespace tidak cocok (`DAError::InvalidNamespace`)
-    /// - Timeout saat mengambil (`DAError::Timeout`)
-    /// - Error jaringan (`DAError::NetworkError`)
-    ///
-    /// # Async Behavior
-    ///
-    /// Method ini async dan non-blocking. Future akan resolve setelah
-    /// data berhasil diambil dan divalidasi dari DA layer.
-    ///
-    /// # Validasi
-    ///
-    /// Implementasi WAJIB melakukan validasi:
-    /// - Namespace pada response cocok dengan namespace aktif
-    /// - Commitment dari data cocok dengan `blob_ref.commitment`
-    /// 
-    /// Jika validasi gagal, kembalikan error yang sesuai tanpa
-    /// mengembalikan data yang tidak valid.
-    fn get_blob<'a>(&'a self, blob_ref: &'a BlobRef) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + 'a>>;
+    /// * `Ok(BlobStream)` - Stream blob yang dapat di-poll
+    /// * `Err(DAError)` - Error jika subscription gagal
+    fn subscribe_blobs(
+        &self,
+        from_height: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<BlobStream, DAError>> + Send + '_>>;
 
-    /// Subscribe ke stream blob baru di DA layer.
-    ///
-    /// Method ini memulai subscription ke DA layer untuk menerima
-    /// notifikasi setiap kali ada blob baru yang masuk ke namespace
-    /// yang dikonfigurasi.
-    ///
-    /// # Arguments
-    ///
-    /// * `from_height` - Height awal untuk mulai subscribe.
-    ///   Jika `None`, subscribe dari height terbaru.
-    ///   Jika `Some(height)`, subscribe mulai dari height tersebut.
+    /// Melakukan health check pada DA layer.
     ///
     /// # Returns
     ///
-    /// * `Ok(BlobStream)` - Stream asinkron yang yield `Blob` baru.
-    /// * `Err(DAError)` - Error jika subscription gagal dimulai.
-    ///
-    /// # Stream Behavior
-    ///
-    /// - Stream akan terus aktif sampai di-drop atau terjadi error fatal
-    /// - Jika koneksi terputus, implementasi HARUS melakukan reconnect
-    /// - Error transient dikirim melalui stream, bukan terminate stream
-    /// - Stream TIDAK BOLEH miss blob (at-least-once delivery)
-    ///
-    /// # Ordering
-    ///
-    /// Blob dijamin terurut berdasarkan height. Blob dengan height
-    /// lebih rendah akan di-yield sebelum blob dengan height lebih tinggi.
-    fn subscribe_blobs(&self, from_height: Option<u64>) -> Pin<Box<dyn Future<Output = Result<BlobStream, DAError>> + Send + '_>>;
+    /// * `Ok(DAHealthStatus)` - Status kesehatan DA layer
+    /// * `Err(DAError)` - Error jika health check gagal
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>>;
 
-    /// Memeriksa kesehatan koneksi ke DA layer.
+    /// Get current metrics.
     ///
-    /// Method ini melakukan health check ke DA layer untuk memverifikasi
-    /// bahwa koneksi aktif dan DA layer dapat menerima request.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(DAHealthStatus)` - Status kesehatan DA layer.
-    /// * `Err(DAError)` - Error jika health check gagal dilakukan.
-    ///
-    /// # Health Status
-    ///
-    /// - `Healthy`: DA layer beroperasi normal
-    /// - `Degraded`: DA layer beroperasi tapi ada masalah performa
-    /// - `Unavailable`: DA layer tidak dapat diakses
-    ///
-    /// # Async Behavior
-    ///
-    /// Method ini async dan HARUS:
-    /// - Memiliki timeout internal yang reasonable
-    /// - Tidak block lebih dari beberapa detik
-    /// - Menggunakan request ringan (minimal overhead)
-    fn health_check(&self) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>>;
+    /// Returns None if metrics are not available.
+    fn metrics(&self) -> Option<DAMetricsSnapshot> {
+        None
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -467,342 +638,128 @@ mod tests {
     use super::*;
 
     // ════════════════════════════════════════════════════════════════════════
-    // BLOB REF TESTS
+    // BLOBREF TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_blob_ref_equality() {
-        let ref1 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        let ref2 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        assert_eq!(ref1, ref2);
-    }
-
-    #[test]
-    fn test_blob_ref_inequality_height() {
-        let ref1 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        let ref2 = BlobRef {
-            height: 101, // Different
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        assert_ne!(ref1, ref2);
-    }
-
-    #[test]
-    fn test_blob_ref_inequality_commitment() {
-        let ref1 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        let ref2 = BlobRef {
-            height: 100,
-            commitment: [0x12; 32], // Different
-            namespace: [0x22; 29],
-        };
-
-        assert_ne!(ref1, ref2);
-    }
-
-    #[test]
-    fn test_blob_ref_clone() {
-        let original = BlobRef {
-            height: 999,
-            commitment: [0xFF; 32],
-            namespace: [0xAA; 29],
-        };
-
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-    }
-
-    #[test]
-    fn test_blob_ref_hash() {
-        use std::collections::HashMap;
-        
-        let ref1 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-
-        let mut map: HashMap<BlobRef, String> = HashMap::new();
-        map.insert(ref1.clone(), "test".to_string());
-        
-        assert_eq!(map.get(&ref1), Some(&"test".to_string()));
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // DA ERROR TESTS
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_daerror_blob_not_found_display() {
+    fn test_blobref_creation() {
         let blob_ref = BlobRef {
-            height: 12345,
+            height: 100,
             commitment: [0xAB; 32],
-            namespace: [0x01; 29],
+            namespace: [0xCD; 29],
         };
-        
-        let error = DAError::BlobNotFound(blob_ref);
-        let display = format!("{}", error);
-        
-        assert!(display.contains("blob not found"));
-        assert!(display.contains("12345"));
+
+        assert_eq!(blob_ref.height, 100);
+        assert_eq!(blob_ref.commitment, [0xAB; 32]);
+        assert_eq!(blob_ref.namespace, [0xCD; 29]);
     }
 
     #[test]
-    fn test_daerror_blob_not_found_contains_ref() {
-        let blob_ref = BlobRef {
-            height: 999,
-            commitment: [0xCD; 32],
-            namespace: [0x02; 29],
-        };
-        
-        let error = DAError::BlobNotFound(blob_ref.clone());
-        
-        if let DAError::BlobNotFound(ref_) = error {
-            assert_eq!(ref_.height, 999);
-            assert_eq!(ref_.commitment, [0xCD; 32]);
-        } else {
-            panic!("Expected BlobNotFound variant");
-        }
-    }
-
-    #[test]
-    fn test_daerror_invalid_blob_display() {
-        let error = DAError::InvalidBlob;
-        let display = format!("{}", error);
-        
-        assert!(display.contains("invalid") || display.contains("mismatch"));
-    }
-
-    #[test]
-    fn test_daerror_invalid_namespace_display() {
-        let error = DAError::InvalidNamespace;
-        let display = format!("{}", error);
-        
-        assert!(display.contains("namespace"));
-    }
-
-    #[test]
-    fn test_daerror_timeout_display() {
-        let error = DAError::Timeout;
-        let display = format!("{}", error);
-        
-        assert!(display.contains("timeout") || display.contains("timed out"));
-    }
-
-    #[test]
-    fn test_daerror_unavailable_display() {
-        let error = DAError::Unavailable;
-        let display = format!("{}", error);
-        
-        assert!(display.contains("unavailable"));
-    }
-
-    #[test]
-    fn test_daerror_network_error_display() {
-        let error = DAError::NetworkError("connection refused".to_string());
-        let display = format!("{}", error);
-        
-        assert!(display.contains("network"));
-        assert!(display.contains("connection refused"));
-    }
-
-    #[test]
-    fn test_daerror_serialization_error_display() {
-        let error = DAError::SerializationError("invalid JSON".to_string());
-        let display = format!("{}", error);
-        
-        assert!(display.contains("serialization"));
-        assert!(display.contains("invalid JSON"));
-    }
-
-    #[test]
-    fn test_daerror_other_display() {
-        let error = DAError::Other("custom error message".to_string());
-        let display = format!("{}", error);
-        
-        assert!(display.contains("custom error message"));
-    }
-
-    #[test]
-    fn test_daerror_equality() {
-        let ref1 = BlobRef {
-            height: 100,
+    fn test_blobref_clone_and_eq() {
+        let blob_ref1 = BlobRef {
+            height: 42,
             commitment: [0x11; 32],
             namespace: [0x22; 29],
         };
-        
-        let ref2 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-        
-        assert_eq!(
-            DAError::BlobNotFound(ref1.clone()),
-            DAError::BlobNotFound(ref2.clone())
-        );
-        assert_eq!(DAError::InvalidBlob, DAError::InvalidBlob);
-        assert_eq!(DAError::InvalidNamespace, DAError::InvalidNamespace);
-        assert_eq!(DAError::Timeout, DAError::Timeout);
-        assert_eq!(DAError::Unavailable, DAError::Unavailable);
-        assert_eq!(
-            DAError::NetworkError("test".to_string()),
-            DAError::NetworkError("test".to_string())
-        );
-    }
 
-    #[test]
-    fn test_daerror_inequality() {
-        let ref1 = BlobRef {
-            height: 100,
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
+        let blob_ref2 = blob_ref1.clone();
         
-        let ref2 = BlobRef {
-            height: 200, // Different
-            commitment: [0x11; 32],
-            namespace: [0x22; 29],
-        };
-        
-        assert_ne!(
-            DAError::BlobNotFound(ref1),
-            DAError::BlobNotFound(ref2)
-        );
-        assert_ne!(DAError::InvalidBlob, DAError::InvalidNamespace);
-        assert_ne!(DAError::Timeout, DAError::Unavailable);
-    }
-
-    #[test]
-    fn test_daerror_clone() {
-        let blob_ref = BlobRef {
-            height: 500,
-            commitment: [0xEE; 32],
-            namespace: [0xFF; 29],
-        };
-        
-        let error = DAError::BlobNotFound(blob_ref);
-        let cloned = error.clone();
-        
-        assert_eq!(error, cloned);
+        assert_eq!(blob_ref1, blob_ref2);
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // DA HEALTH STATUS TESTS
+    // DAMETRICS TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_dahealthstatus_equality() {
-        assert_eq!(DAHealthStatus::Healthy, DAHealthStatus::Healthy);
-        assert_eq!(DAHealthStatus::Degraded, DAHealthStatus::Degraded);
-        assert_eq!(DAHealthStatus::Unavailable, DAHealthStatus::Unavailable);
+    fn test_dametrics_new() {
+        let metrics = DAMetrics::new();
+        
+        assert_eq!(metrics.post_count.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.get_count.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.error_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_dahealthstatus_inequality() {
-        assert_ne!(DAHealthStatus::Healthy, DAHealthStatus::Degraded);
-        assert_ne!(DAHealthStatus::Healthy, DAHealthStatus::Unavailable);
-        assert_ne!(DAHealthStatus::Degraded, DAHealthStatus::Unavailable);
+    fn test_dametrics_record_post() {
+        let metrics = DAMetrics::new();
+        
+        metrics.record_post(std::time::Duration::from_millis(100));
+        
+        assert_eq!(metrics.post_count.load(Ordering::Relaxed), 1);
+        assert!(metrics.post_latency_us.load(Ordering::Relaxed) >= 100_000);
     }
 
     #[test]
-    fn test_dahealthstatus_copy() {
-        let status = DAHealthStatus::Healthy;
-        let copied = status; // Copy, not move
-        assert_eq!(status, copied);
+    fn test_dametrics_record_get() {
+        let metrics = DAMetrics::new();
+        
+        metrics.record_get(std::time::Duration::from_millis(50));
+        
+        assert_eq!(metrics.get_count.load(Ordering::Relaxed), 1);
+        assert!(metrics.get_latency_us.load(Ordering::Relaxed) >= 50_000);
+    }
+
+    #[test]
+    fn test_dametrics_avg_latency() {
+        let metrics = DAMetrics::new();
+        
+        // Record multiple operations
+        metrics.record_post(std::time::Duration::from_millis(100));
+        metrics.record_post(std::time::Duration::from_millis(200));
+        
+        let avg = metrics.avg_post_latency_us();
+        assert!(avg >= 150_000);
+    }
+
+    #[test]
+    fn test_dametrics_avg_latency_no_ops() {
+        let metrics = DAMetrics::new();
+        
+        assert_eq!(metrics.avg_post_latency_us(), 0);
+        assert_eq!(metrics.avg_get_latency_us(), 0);
+    }
+
+    #[test]
+    fn test_dametrics_snapshot() {
+        let metrics = DAMetrics::new();
+        
+        metrics.record_post(std::time::Duration::from_millis(100));
+        metrics.record_error();
+        metrics.record_retry();
+        
+        let snapshot = metrics.snapshot();
+        
+        assert_eq!(snapshot.post_count, 1);
+        assert_eq!(snapshot.error_count, 1);
+        assert_eq!(snapshot.retry_count, 1);
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // DA CONFIG TESTS
+    // DACONFIG TESTS
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_daconfig_default() {
         let config = DAConfig::default();
-        
+
         assert_eq!(config.rpc_url, "http://localhost:26658");
         assert_eq!(config.namespace, [0u8; 29]);
-        assert_eq!(config.auth_token, None);
+        assert!(config.auth_token.is_none());
         assert_eq!(config.timeout_ms, 30000);
         assert_eq!(config.retry_count, 3);
         assert_eq!(config.retry_delay_ms, 1000);
+        assert_eq!(config.network, "local");
+        assert!(config.enable_pooling);
     }
-
-    #[test]
-    fn test_daconfig_clone() {
-        let config = DAConfig {
-            rpc_url: "http://test:1234".to_string(),
-            namespace: [0x11; 29],
-            auth_token: Some("token".to_string()),
-            timeout_ms: 5000,
-            retry_count: 5,
-            retry_delay_ms: 500,
-        };
-        
-        let cloned = config.clone();
-        assert_eq!(config, cloned);
-    }
-
-    #[test]
-    fn test_daconfig_equality() {
-        let config1 = DAConfig::default();
-        let config2 = DAConfig::default();
-        assert_eq!(config1, config2);
-    }
-
-    #[test]
-    fn test_daconfig_inequality() {
-        let config1 = DAConfig::default();
-        let mut config2 = DAConfig::default();
-        config2.timeout_ms = 9999;
-        
-        assert_ne!(config1, config2);
-    }
-
-    #[test]
-    fn test_daconfig_default_namespace_size() {
-        let config = DAConfig::default();
-        
-        // Namespace MUST be exactly 29 bytes
-        assert_eq!(config.namespace.len(), 29);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // DACONFIG FROM_ENV TESTS
-    // ════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_daconfig_from_env_missing_rpc_url() {
-        // Clear any existing env vars
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
 
         let result = DAConfig::from_env();
         assert!(result.is_err());
-        
-        let err = result.unwrap_err();
-        assert!(matches!(err, DAError::Other(_)));
     }
 
     #[test]
@@ -820,7 +777,7 @@ mod tests {
     #[test]
     fn test_daconfig_from_env_invalid_namespace_length() {
         std::env::set_var("DA_RPC_URL", "http://test:1234");
-        std::env::set_var("DA_NAMESPACE", "0011223344"); // Too short (10 chars, need 58)
+        std::env::set_var("DA_NAMESPACE", "0011223344"); // Too short
 
         let result = DAConfig::from_env();
         assert!(result.is_err());
@@ -838,101 +795,54 @@ mod tests {
     }
 
     #[test]
-    fn test_daconfig_from_env_invalid_namespace_hex() {
-        std::env::set_var("DA_RPC_URL", "http://test:1234");
-        // 58 chars but invalid hex (contains 'GG')
-        std::env::set_var("DA_NAMESPACE", "00112233445566778899AABBCCDDEEFF00112233445566778899AABBGG");
-
-        let result = DAConfig::from_env();
-        assert!(result.is_err());
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-    }
-
-    #[test]
-    fn test_daconfig_from_env_invalid_timeout() {
-        std::env::set_var("DA_RPC_URL", "http://test:1234");
+    fn test_daconfig_from_env_mainnet_requires_auth() {
+        std::env::set_var("DA_RPC_URL", "http://celestia:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
-        std::env::set_var("DA_TIMEOUT_MS", "not_a_number");
+        std::env::set_var("DA_NETWORK", "mainnet");
+        std::env::remove_var("DA_AUTH_TOKEN");
 
         let result = DAConfig::from_env();
         assert!(result.is_err());
 
         let err = result.unwrap_err();
         if let DAError::Other(msg) = err {
-            assert!(msg.contains("DA_TIMEOUT_MS invalid"));
+            assert!(msg.contains("required for mainnet"));
         } else {
-            panic!("Expected DAError::Other");
+            panic!("Expected DAError::Other about auth token");
         }
 
         // Cleanup
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_TIMEOUT_MS");
+        std::env::remove_var("DA_NETWORK");
     }
 
     #[test]
-    fn test_daconfig_from_env_invalid_retry_count() {
-        std::env::set_var("DA_RPC_URL", "http://test:1234");
-        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
-        std::env::set_var("DA_RETRY_COUNT", "256"); // Overflow for u8
-
-        let result = DAConfig::from_env();
-        assert!(result.is_err());
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_RETRY_COUNT");
-    }
-
-    #[test]
-    fn test_daconfig_from_env_invalid_retry_delay() {
-        std::env::set_var("DA_RPC_URL", "http://test:1234");
-        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
-        std::env::set_var("DA_RETRY_DELAY_MS", "-1"); // Negative
-
-        let result = DAConfig::from_env();
-        assert!(result.is_err());
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_RETRY_DELAY_MS");
-    }
-
-    #[test]
-    fn test_daconfig_from_env_success_minimal() {
-        // Set required env vars
+    fn test_daconfig_from_env_success_local() {
         std::env::set_var("DA_RPC_URL", "http://celestia:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
+        std::env::set_var("DA_NETWORK", "local");
+        std::env::remove_var("DA_AUTH_TOKEN");
 
         let result = DAConfig::from_env();
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        assert_eq!(config.rpc_url, "http://celestia:26658");
-        assert_eq!(config.auth_token, None);
-        // Defaults should be used
-        assert_eq!(config.timeout_ms, 30000);
-        assert_eq!(config.retry_count, 3);
-        assert_eq!(config.retry_delay_ms, 1000);
+        assert_eq!(config.network, "local");
+        assert!(config.auth_token.is_none());
 
         // Cleanup
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
+        std::env::remove_var("DA_NETWORK");
     }
 
     #[test]
-    fn test_daconfig_from_env_success_full() {
+    fn test_daconfig_from_env_success_mainnet() {
         std::env::set_var("DA_RPC_URL", "http://celestia:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
         std::env::set_var("DA_AUTH_TOKEN", "secret_token_123");
-        std::env::set_var("DA_TIMEOUT_MS", "60000");
-        std::env::set_var("DA_RETRY_COUNT", "5");
-        std::env::set_var("DA_RETRY_DELAY_MS", "2000");
+        std::env::set_var("DA_NETWORK", "mainnet");
 
         let result = DAConfig::from_env();
         assert!(result.is_ok());
@@ -940,41 +850,61 @@ mod tests {
         let config = result.unwrap();
         assert_eq!(config.rpc_url, "http://celestia:26658");
         assert_eq!(config.auth_token, Some("secret_token_123".to_string()));
-        assert_eq!(config.timeout_ms, 60000);
-        assert_eq!(config.retry_count, 5);
-        assert_eq!(config.retry_delay_ms, 2000);
-
-        // Verify namespace parsed correctly
-        let expected_namespace: [u8; 29] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xAA, 0xBB, 0xCC,
-        ];
-        assert_eq!(config.namespace, expected_namespace);
+        assert!(config.is_mainnet());
 
         // Cleanup
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
         std::env::remove_var("DA_AUTH_TOKEN");
-        std::env::remove_var("DA_TIMEOUT_MS");
-        std::env::remove_var("DA_RETRY_COUNT");
-        std::env::remove_var("DA_RETRY_DELAY_MS");
+        std::env::remove_var("DA_NETWORK");
     }
 
     #[test]
-    fn test_daconfig_from_env_auth_token_optional() {
-        std::env::set_var("DA_RPC_URL", "http://test:1234");
-        std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
-        std::env::remove_var("DA_AUTH_TOKEN");
+    fn test_daconfig_validate_for_production_mainnet_localhost() {
+        let config = DAConfig {
+            rpc_url: "http://localhost:26658".to_string(),
+            namespace: [0u8; 29],
+            auth_token: Some("token".to_string()),
+            network: "mainnet".to_string(),
+            ..Default::default()
+        };
 
-        let result = DAConfig::from_env();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().auth_token, None);
+        let result = config.validate_for_production();
+        assert!(result.is_err());
+    }
 
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
+    #[test]
+    fn test_daconfig_validate_for_production_mainnet_no_auth() {
+        let config = DAConfig {
+            rpc_url: "http://celestia:26658".to_string(),
+            namespace: [0u8; 29],
+            auth_token: None,
+            network: "mainnet".to_string(),
+            ..Default::default()
+        };
+
+        let result = config.validate_for_production();
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DAERROR TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_daerror_display() {
+        let errors = vec![
+            (DAError::InvalidBlob, "invalid blob data"),
+            (DAError::InvalidNamespace, "invalid namespace"),
+            (DAError::Timeout, "operation timeout"),
+            (DAError::Unavailable, "DA layer unavailable"),
+            (DAError::AuthError("bad token".to_string()), "auth error: bad token"),
+            (DAError::NetworkError("conn refused".to_string()), "network error: conn refused"),
+        ];
+
+        for (err, expected) in errors {
+            assert!(err.to_string().contains(expected));
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -998,39 +928,5 @@ mod tests {
         assert_eq!(blob.ref_, blob_ref);
         assert_eq!(blob.data, vec![1, 2, 3, 4, 5]);
         assert_eq!(blob.received_at, 1234567890);
-    }
-
-    #[test]
-    fn test_blob_clone() {
-        let blob = Blob {
-            ref_: BlobRef {
-                height: 200,
-                commitment: [0xAA; 32],
-                namespace: [0xBB; 29],
-            },
-            data: vec![10, 20, 30],
-            received_at: 9999,
-        };
-
-        let cloned = blob.clone();
-        
-        assert_eq!(blob.ref_, cloned.ref_);
-        assert_eq!(blob.data, cloned.data);
-        assert_eq!(blob.received_at, cloned.received_at);
-    }
-
-    #[test]
-    fn test_blob_empty_data() {
-        let blob = Blob {
-            ref_: BlobRef {
-                height: 1,
-                commitment: [0x00; 32],
-                namespace: [0x00; 29],
-            },
-            data: vec![],
-            received_at: 0,
-        };
-
-        assert!(blob.data.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-﻿//! # DSDN Node Entry Point (14A)
+﻿//! # DSDN Node Entry Point (Mainnet Ready)
 //!
 //! Production entry point for DSDN storage node.
 //!
@@ -6,10 +6,35 @@
 //! Node TIDAK menerima instruksi dari Coordinator via RPC.
 //! Semua perintah datang via DA events.
 //!
+//! ## Configuration Modes
+//!
+//! ### Mode 1: CLI Arguments (Development)
+//! ```
+//! dsdn-node <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>
+//! ```
+//!
+//! ### Mode 2: Environment Variables (Production)
+//! ```
+//! dsdn-node env
+//! ```
+//!
+//! Required environment variables for env mode:
+//! - `NODE_ID`: Unique node identifier (or "auto" for UUID)
+//! - `NODE_STORAGE_PATH`: Storage directory path
+//! - `NODE_HTTP_PORT`: HTTP server port
+//! - `DA_RPC_URL`: Celestia light node RPC endpoint
+//! - `DA_NAMESPACE`: 58-character hex namespace
+//! - `DA_AUTH_TOKEN`: Authentication token (required for mainnet)
+//!
+//! Optional:
+//! - `DA_NETWORK`: Network identifier (mainnet, mocha, local)
+//! - `DA_TIMEOUT_MS`: Operation timeout in milliseconds
+//! - `USE_MOCK_DA`: Use mock DA for development
+//!
 //! ## Initialization Flow
-//! 1. Parse CLI arguments
-//! 2. Load configuration
-//! 3. Initialize DA layer
+//! 1. Parse configuration (CLI or env)
+//! 2. Validate configuration
+//! 3. Initialize DA layer with startup health check
 //! 4. Initialize storage
 //! 5. Initialize DA follower
 //! 6. Start follower
@@ -18,13 +43,14 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tracing::{error, info, warn, Level};
 use uuid::Uuid;
 
-use dsdn_common::{CelestiaDA, DAConfig, DALayer, MockDA};
+use dsdn_common::{CelestiaDA, DAConfig, DAError, DAHealthStatus, DALayer, MockDA};
 use dsdn_node::{
     DAInfo, HealthResponse, HealthStorage, NodeDerivedState, NodeHealth,
 };
@@ -33,35 +59,43 @@ use dsdn_node::{
 // CLI CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Node configuration parsed from CLI arguments.
+/// Node configuration parsed from CLI arguments or environment.
 #[derive(Debug, Clone)]
 struct NodeConfig {
     /// Unique node identifier.
     node_id: String,
-    /// DA endpoint URL.
-    da_endpoint: String,
+    /// DA configuration.
+    da_config: DAConfig,
     /// Storage directory path.
     storage_path: String,
     /// HTTP port for health endpoint.
     http_port: u16,
     /// Whether to use mock DA for testing.
     use_mock_da: bool,
+    /// Configuration source (cli or env).
+    config_source: String,
 }
 
 impl NodeConfig {
     /// Parse configuration from CLI arguments.
     ///
     /// Usage: dsdn-node <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>
+    ///    OR: dsdn-node env
     fn from_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
 
+        if args.len() < 2 {
+            return Err(Self::usage_message(&args[0]));
+        }
+
+        // Check for "env" mode
+        if args[1] == "env" {
+            return Self::from_env();
+        }
+
+        // CLI mode requires exactly 5 arguments
         if args.len() < 5 {
-            return Err(format!(
-                "Usage: {} <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>\n\
-                 Example: {} auto http://localhost:26658 ./data/node1 8080\n\
-                 Example: {} node-1 mock ./data/node1 8080",
-                args[0], args[0], args[0]
-            ));
+            return Err(Self::usage_message(&args[0]));
         }
 
         // Parse node_id
@@ -75,6 +109,24 @@ impl NodeConfig {
         let da_endpoint = args[2].clone();
         let use_mock_da = da_endpoint == "mock";
 
+        // Build DA config for CLI mode
+        let da_config = if use_mock_da {
+            DAConfig::default()
+        } else {
+            DAConfig {
+                rpc_url: da_endpoint,
+                namespace: [0u8; 29], // Default namespace for CLI mode
+                auth_token: None,
+                timeout_ms: 30000,
+                retry_count: 3,
+                retry_delay_ms: 1000,
+                network: "local".to_string(),
+                enable_pooling: true,
+                max_connections: 10,
+                idle_timeout_ms: 60000,
+            }
+        };
+
         // Parse storage path
         let storage_path = args[3].clone();
 
@@ -85,11 +137,85 @@ impl NodeConfig {
 
         Ok(Self {
             node_id,
-            da_endpoint,
+            da_config,
             storage_path,
             http_port,
             use_mock_da,
+            config_source: "cli".to_string(),
         })
+    }
+
+    /// Parse configuration from environment variables.
+    fn from_env() -> Result<Self, String> {
+        // Check if using mock DA
+        let use_mock_da = env::var("USE_MOCK_DA")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        // Load DA config
+        let da_config = if use_mock_da {
+            DAConfig::default()
+        } else {
+            DAConfig::from_env().map_err(|e| format!("DA config error: {}", e))?
+        };
+
+        // Required: NODE_ID
+        let node_id_raw = env::var("NODE_ID")
+            .map_err(|_| "NODE_ID environment variable not set")?;
+        let node_id = if node_id_raw == "auto" {
+            Uuid::new_v4().to_string()
+        } else {
+            node_id_raw
+        };
+
+        // Required: NODE_STORAGE_PATH
+        let storage_path = env::var("NODE_STORAGE_PATH")
+            .map_err(|_| "NODE_STORAGE_PATH environment variable not set")?;
+
+        // Required: NODE_HTTP_PORT
+        let http_port: u16 = env::var("NODE_HTTP_PORT")
+            .map_err(|_| "NODE_HTTP_PORT environment variable not set")?
+            .parse()
+            .map_err(|_| "NODE_HTTP_PORT must be a valid port number")?;
+
+        Ok(Self {
+            node_id,
+            da_config,
+            storage_path,
+            http_port,
+            use_mock_da,
+            config_source: "env".to_string(),
+        })
+    }
+
+    /// Generate usage message.
+    fn usage_message(prog: &str) -> String {
+        format!(
+            "Usage:\n\
+             \n\
+             Mode 1 - CLI Arguments (Development):\n\
+             {} <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>\n\
+             \n\
+             Example:\n\
+             {} auto http://localhost:26658 ./data/node1 8080\n\
+             {} node-1 mock ./data/node1 8080\n\
+             \n\
+             Mode 2 - Environment Variables (Production):\n\
+             {} env\n\
+             \n\
+             Required environment variables for env mode:\n\
+             NODE_ID           - Unique node identifier (or 'auto')\n\
+             NODE_STORAGE_PATH - Storage directory path\n\
+             NODE_HTTP_PORT    - HTTP server port\n\
+             DA_RPC_URL        - Celestia light node RPC endpoint\n\
+             DA_NAMESPACE      - 58-character hex namespace\n\
+             DA_AUTH_TOKEN     - Authentication token (required for mainnet)\n\
+             \n\
+             Optional:\n\
+             DA_NETWORK        - Network identifier (mainnet, mocha, local)\n\
+             USE_MOCK_DA       - Use mock DA for development",
+            prog, prog, prog, prog
+        )
     }
 
     /// Validate configuration.
@@ -107,6 +233,13 @@ impl NodeConfig {
         // Validate port range
         if self.http_port == 0 {
             return Err("HTTP port cannot be 0".to_string());
+        }
+
+        // Validate for production if mainnet
+        if self.da_config.is_mainnet() {
+            self.da_config
+                .validate_for_production()
+                .map_err(|e| format!("Production validation failed: {}", e))?;
         }
 
         Ok(())
@@ -201,6 +334,49 @@ impl DAInfo for DAInfoWrapper {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// DA STARTUP HEALTH CHECK
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Perform startup DA health check with retries.
+async fn startup_da_health_check(da: &dyn DALayer) -> Result<(), DAError> {
+    let max_attempts = 3;
+    let retry_delay = Duration::from_secs(2);
+
+    for attempt in 1..=max_attempts {
+        info!("🔍 DA health check (attempt {}/{})", attempt, max_attempts);
+
+        match da.health_check().await {
+            Ok(DAHealthStatus::Healthy) => {
+                info!("✅ DA layer healthy");
+                return Ok(());
+            }
+            Ok(DAHealthStatus::Degraded) => {
+                warn!("⚠️ DA layer degraded but operational");
+                return Ok(());
+            }
+            Ok(DAHealthStatus::Unavailable) => {
+                if attempt < max_attempts {
+                    warn!("DA unavailable, retrying in {} seconds...", retry_delay.as_secs());
+                    tokio::time::sleep(retry_delay).await;
+                } else {
+                    return Err(DAError::Unavailable);
+                }
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    warn!("DA health check error: {}, retrying...", e);
+                    tokio::time::sleep(retry_delay).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Err(DAError::Unavailable)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // HTTP SERVER (HEALTH ENDPOINT)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -246,6 +422,7 @@ async fn start_http_server(
 
                             // Simple HTTP request parsing
                             let response = if request.contains("GET /health") {
+                                // Build health response
                                 let state_guard = state.read();
                                 let health = NodeHealth::check(
                                     &node_id,
@@ -253,46 +430,57 @@ async fn start_http_server(
                                     &state_guard,
                                     storage.as_ref(),
                                 );
-                                drop(state_guard);
+                                let health_response = HealthResponse::from_health(&health);
+                                let json = health_response.body;
 
-                                let hr = HealthResponse::from_health(&health);
+                                let status_line = if health_response.status_code == 200 {
+                                    "HTTP/1.1 200 OK"
+                                } else {
+                                    "HTTP/1.1 503 Service Unavailable"
+                                };
+
                                 format!(
-                                    "HTTP/1.1 {} OK\r\n\
-                                     Content-Type: {}\r\n\
-                                     Content-Length: {}\r\n\
-                                     Connection: close\r\n\
-                                     \r\n\
-                                     {}",
-                                    hr.status_code,
-                                    hr.content_type,
-                                    hr.body.len(),
-                                    hr.body
-                                )
-                            } else if request.contains("GET /") {
-                                let body = r#"{"status":"ok","endpoints":["/health"]}"#;
-                                format!(
-                                    "HTTP/1.1 200 OK\r\n\
+                                    "{}\r\n\
                                      Content-Type: application/json\r\n\
                                      Content-Length: {}\r\n\
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    body.len(),
-                                    body
+                                    status_line,
+                                    json.len(),
+                                    json
                                 )
+                            } else if request.contains("GET /ready") {
+                                // Readiness check
+                                if da_info.is_connected() {
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: text/plain\r\n\
+                                     Content-Length: 2\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     OK".to_string()
+                                } else {
+                                    "HTTP/1.1 503 Service Unavailable\r\n\
+                                     Content-Type: text/plain\r\n\
+                                     Content-Length: 11\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     Unavailable".to_string()
+                                }
                             } else {
                                 "HTTP/1.1 404 Not Found\r\n\
-                                 Content-Length: 0\r\n\
+                                 Content-Type: text/plain\r\n\
+                                 Content-Length: 9\r\n\
                                  Connection: close\r\n\
-                                 \r\n"
-                                    .to_string()
+                                 \r\n\
+                                 Not Found".to_string()
                             };
 
                             let _ = socket.write_all(response.as_bytes()).await;
                         });
                     }
                     Err(e) => {
-                        warn!("Failed to accept connection: {}", e);
+                        warn!("Accept error: {}", e);
                     }
                 }
             }
@@ -303,10 +491,6 @@ async fn start_http_server(
         }
     }
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// MAIN ENTRY POINT
-// ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() {
@@ -332,10 +516,12 @@ async fn main() {
     }
 
     info!("═══════════════════════════════════════════════════════════════");
-    info!("                    DSDN Node (14A)                            ");
+    info!("               DSDN Node (Mainnet Ready)                        ");
     info!("═══════════════════════════════════════════════════════════════");
     info!("Node ID:      {}", config.node_id);
-    info!("DA Endpoint:  {}", config.da_endpoint);
+    info!("Config Mode:  {}", config.config_source);
+    info!("DA Network:   {}", config.da_config.network);
+    info!("DA Endpoint:  {}", config.da_config.rpc_url);
     info!("Storage Path: {}", config.storage_path);
     info!("HTTP Port:    {}", config.http_port);
     info!("═══════════════════════════════════════════════════════════════");
@@ -345,19 +531,34 @@ async fn main() {
         info!("Using MockDA for testing");
         Arc::new(MockDA::new())
     } else {
-        info!("Connecting to Celestia DA at {}", config.da_endpoint);
-        let mut da_config = DAConfig::default();
-        da_config.rpc_url = config.da_endpoint.clone();
-        match CelestiaDA::new(da_config) {
+        info!("Connecting to Celestia DA...");
+        match CelestiaDA::new(config.da_config.clone()) {
             Ok(da) => Arc::new(da),
             Err(e) => {
-                error!("Failed to connect to DA: {}", e);
+                error!("❌ Failed to connect to DA: {}", e);
+                error!("");
+                error!("Troubleshooting:");
+                error!("  1. Ensure Celestia light node is running");
+                error!("  2. Verify DA_RPC_URL is correct");
+                error!("  3. Check DA_AUTH_TOKEN is valid");
+                error!("  4. Verify network connectivity");
                 std::process::exit(1);
             }
         }
     };
 
-    // Step 2: Initialize storage
+    // Step 2: Startup DA health check
+    if let Err(e) = startup_da_health_check(da.as_ref()).await {
+        error!("❌ DA health check failed: {}", e);
+        if config.da_config.is_mainnet() {
+            error!("Cannot start node on mainnet without healthy DA connection");
+            std::process::exit(1);
+        } else {
+            warn!("⚠️ Continuing in degraded mode (DA unhealthy)");
+        }
+    }
+
+    // Step 3: Initialize storage
     info!("Initializing storage at {}", config.storage_path);
     let storage = Arc::new(NodeStorage::new(&config.storage_path));
 
@@ -367,19 +568,22 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Step 3: Initialize node state
+    // Step 4: Initialize node state
     let state = Arc::new(RwLock::new(NodeDerivedState::new()));
 
-    // Step 4: Initialize DA info wrapper
+    // Step 5: Initialize DA info wrapper
     let da_info = Arc::new(DAInfoWrapper::new(da.clone()));
 
-    // Step 5: Setup shutdown signal
+    // Step 6: Setup shutdown signal
     let shutdown = Arc::new(Notify::new());
 
-    // Step 6: Start HTTP server for health endpoint
+    // Step 7: Start HTTP server for health endpoint
     let http_addr: SocketAddr = format!("0.0.0.0:{}", config.http_port)
         .parse()
-        .expect("Invalid HTTP address");
+        .unwrap_or_else(|_| {
+            error!("Invalid HTTP address");
+            std::process::exit(1);
+        });
 
     let http_handle = {
         let node_id = config.node_id.clone();
@@ -393,7 +597,7 @@ async fn main() {
         })
     };
 
-    // Step 7: Start DA follower
+    // Step 8: Start DA follower
     info!("🚀 Starting DA follower...");
     info!("");
     info!("╔═══════════════════════════════════════════════════════════════╗");
@@ -402,7 +606,7 @@ async fn main() {
     info!("╚═══════════════════════════════════════════════════════════════╝");
     info!("");
 
-    // DA follower loop (simplified - in production this would use DAFollower)
+    // DA follower loop with reconnection logic
     let follower_handle = {
         let da = da.clone();
         let da_info = da_info.clone();
@@ -411,13 +615,12 @@ async fn main() {
         let node_id = config.node_id.clone();
 
         tokio::spawn(async move {
-            let _namespace = [0x01; 29]; // Default namespace
+            let reconnect_delay = Duration::from_secs(5);
+            let health_check_interval = Duration::from_secs(30);
 
             info!("DA follower started for node {}", node_id);
 
-            // Get initial health check
-            let check_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            tokio::pin!(check_interval);
+            let mut last_health_check = std::time::Instant::now();
 
             loop {
                 tokio::select! {
@@ -425,32 +628,43 @@ async fn main() {
                         info!("DA follower shutting down");
                         break;
                     }
-                    _ = check_interval.tick() => {
-                        // Periodic health status log
-                        let health_result = da.health_check().await;
-                        match health_result {
-                            Ok(dsdn_common::DAHealthStatus::Healthy) => {
-                                da_info.set_connected(true);
-                                info!("DA health: Healthy");
-                            }
-                            Ok(dsdn_common::DAHealthStatus::Degraded) => {
-                                da_info.set_connected(true);
-                                warn!("DA health: Degraded");
-                            }
-                            Ok(dsdn_common::DAHealthStatus::Unavailable) => {
-                                da_info.set_connected(false);
-                                error!("DA health: Unavailable");
-                            }
-                            Err(e) => {
-                                da_info.set_connected(false);
-                                error!("DA health check error: {}", e);
-                            }
-                        }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        // Periodic health check
+                        if last_health_check.elapsed() >= health_check_interval {
+                            last_health_check = std::time::Instant::now();
 
-                        // Update sequence from state
-                        let state_guard = state.read();
-                        da_info.update_sequence(state_guard.last_sequence);
-                        drop(state_guard);
+                            match da.health_check().await {
+                                Ok(DAHealthStatus::Healthy) => {
+                                    if !da_info.is_connected() {
+                                        info!("✅ DA connection restored");
+                                    }
+                                    da_info.set_connected(true);
+                                }
+                                Ok(DAHealthStatus::Degraded) => {
+                                    da_info.set_connected(true);
+                                    warn!("⚠️ DA health: Degraded");
+                                }
+                                Ok(DAHealthStatus::Unavailable) => {
+                                    if da_info.is_connected() {
+                                        error!("❌ DA connection lost, will retry...");
+                                    }
+                                    da_info.set_connected(false);
+
+                                    // Wait before reconnect attempt
+                                    tokio::time::sleep(reconnect_delay).await;
+                                }
+                                Err(e) => {
+                                    if da_info.is_connected() {
+                                        error!("❌ DA health check error: {}", e);
+                                    }
+                                    da_info.set_connected(false);
+                                }
+                            }
+
+                            // Update sequence from state
+                            let state_guard = state.read();
+                            da_info.update_sequence(state_guard.last_sequence);
+                        }
                     }
                 }
             }
@@ -459,12 +673,16 @@ async fn main() {
 
     // Wait for shutdown signal (Ctrl+C)
     info!("Node running. Press Ctrl+C to shutdown.");
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {
+            info!("");
+            info!("Shutdown requested...");
+        }
+        Err(e) => {
+            error!("Failed to listen for Ctrl+C: {}", e);
+        }
+    }
 
-    info!("");
-    info!("Shutdown requested...");
     shutdown.notify_waiters();
 
     // Wait for tasks to complete
@@ -488,10 +706,11 @@ mod tests {
     fn test_config_validation_empty_node_id() {
         let config = NodeConfig {
             node_id: String::new(),
-            da_endpoint: "mock".to_string(),
+            da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
             http_port: 8080,
             use_mock_da: true,
+            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -500,10 +719,11 @@ mod tests {
     fn test_config_validation_empty_storage_path() {
         let config = NodeConfig {
             node_id: "node-1".to_string(),
-            da_endpoint: "mock".to_string(),
+            da_config: DAConfig::default(),
             storage_path: String::new(),
             http_port: 8080,
             use_mock_da: true,
+            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -512,10 +732,11 @@ mod tests {
     fn test_config_validation_zero_port() {
         let config = NodeConfig {
             node_id: "node-1".to_string(),
-            da_endpoint: "mock".to_string(),
+            da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
             http_port: 0,
             use_mock_da: true,
+            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -524,10 +745,11 @@ mod tests {
     fn test_config_validation_valid() {
         let config = NodeConfig {
             node_id: "node-1".to_string(),
-            da_endpoint: "mock".to_string(),
+            da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
             http_port: 8080,
             use_mock_da: true,
+            config_source: "test".to_string(),
         };
         assert!(config.validate().is_ok());
     }
@@ -552,5 +774,47 @@ mod tests {
 
         wrapper.set_connected(false);
         assert!(!wrapper.is_connected());
+    }
+
+    #[test]
+    fn test_config_from_env() {
+        std::env::set_var("USE_MOCK_DA", "true");
+        std::env::set_var("NODE_ID", "test-node");
+        std::env::set_var("NODE_STORAGE_PATH", "./test-data");
+        std::env::set_var("NODE_HTTP_PORT", "9090");
+
+        let config = NodeConfig::from_env().unwrap();
+        
+        assert_eq!(config.node_id, "test-node");
+        assert_eq!(config.storage_path, "./test-data");
+        assert_eq!(config.http_port, 9090);
+        assert!(config.use_mock_da);
+        assert_eq!(config.config_source, "env");
+
+        // Cleanup
+        std::env::remove_var("USE_MOCK_DA");
+        std::env::remove_var("NODE_ID");
+        std::env::remove_var("NODE_STORAGE_PATH");
+        std::env::remove_var("NODE_HTTP_PORT");
+    }
+
+    #[test]
+    fn test_config_auto_node_id() {
+        std::env::set_var("USE_MOCK_DA", "true");
+        std::env::set_var("NODE_ID", "auto");
+        std::env::set_var("NODE_STORAGE_PATH", "./test-data");
+        std::env::set_var("NODE_HTTP_PORT", "9090");
+
+        let config = NodeConfig::from_env().unwrap();
+        
+        // Should be a UUID
+        assert!(config.node_id.len() >= 32);
+        assert_ne!(config.node_id, "auto");
+
+        // Cleanup
+        std::env::remove_var("USE_MOCK_DA");
+        std::env::remove_var("NODE_ID");
+        std::env::remove_var("NODE_STORAGE_PATH");
+        std::env::remove_var("NODE_HTTP_PORT");
     }
 }

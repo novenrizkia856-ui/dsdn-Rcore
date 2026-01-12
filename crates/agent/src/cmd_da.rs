@@ -37,23 +37,35 @@ use std::time::Duration;
 /// Struct ini merepresentasikan parameter koneksi ke Celestia DA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DAConfig {
-    /// URL endpoint DA node (e.g., "http://localhost:26658")
-    pub endpoint: String,
-    /// Namespace ID untuk DSDN (hex encoded)
+    /// URL RPC endpoint DA node (e.g., "http://localhost:26658")
+    /// STANDARDIZED: renamed from 'endpoint' to match dsdn-common
+    #[serde(alias = "endpoint")]
+    pub rpc_url: String,
+    /// Namespace ID untuk DSDN (hex encoded, 58 chars = 29 bytes)
     pub namespace: String,
-    /// Auth token untuk DA node (optional)
+    /// Auth token untuk DA node (REQUIRED for mainnet)
     pub auth_token: Option<String>,
-    /// Connection timeout dalam detik
-    pub timeout_secs: u64,
+    /// Connection timeout dalam milliseconds
+    /// STANDARDIZED: renamed from timeout_secs and now in ms
+    #[serde(alias = "timeout_secs")]
+    pub timeout_ms: u64,
+    /// Network identifier (mainnet, mocha, arabica, local)
+    #[serde(default = "default_network")]
+    pub network: String,
+}
+
+fn default_network() -> String {
+    "mainnet".to_string()
 }
 
 impl Default for DAConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:26658".to_string(),
-            namespace: "0000000000000000000000000000000000000000445344".to_string(), // "DSD" in hex
+            rpc_url: "http://localhost:26658".to_string(),
+            namespace: "0000000000000000000000000000000000000000000000000000000000".to_string(), // 58 hex chars (29 bytes)
             auth_token: None,
-            timeout_secs: 10,
+            timeout_ms: 30000, // 30 seconds
+            network: "local".to_string(),
         }
     }
 }
@@ -61,23 +73,49 @@ impl Default for DAConfig {
 impl DAConfig {
     /// Membuat DAConfig dari environment variables.
     ///
-    /// Environment variables:
-    /// - DA_ENDPOINT: URL endpoint DA node
-    /// - DA_NAMESPACE: Namespace ID (hex)
-    /// - DA_AUTH_TOKEN: Auth token (optional)
-    /// - DA_TIMEOUT_SECS: Timeout dalam detik
+    /// Environment variables (STANDARDIZED dengan dsdn-common):
+    /// - DA_RPC_URL: URL RPC endpoint DA node (REQUIRED)
+    /// - DA_NAMESPACE: Namespace ID hex 58 chars (REQUIRED)
+    /// - DA_AUTH_TOKEN: Auth token (REQUIRED for mainnet)
+    /// - DA_TIMEOUT_MS: Timeout dalam milliseconds (default: 30000)
+    /// - DA_NETWORK: Network identifier (default: "mainnet")
     pub fn from_env() -> Self {
+        let network = std::env::var("DA_NETWORK")
+            .unwrap_or_else(|_| "mainnet".to_string());
+        
         Self {
-            endpoint: std::env::var("DA_ENDPOINT")
+            rpc_url: std::env::var("DA_RPC_URL")
                 .unwrap_or_else(|_| "http://localhost:26658".to_string()),
             namespace: std::env::var("DA_NAMESPACE")
-                .unwrap_or_else(|_| "0000000000000000000000000000000000000000445344".to_string()),
+                .unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000".to_string()),
             auth_token: std::env::var("DA_AUTH_TOKEN").ok(),
-            timeout_secs: std::env::var("DA_TIMEOUT_SECS")
+            timeout_ms: std::env::var("DA_TIMEOUT_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
+                .unwrap_or(30000),
+            network,
         }
+    }
+    
+    /// Get timeout as Duration.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+    
+    /// Check if this is mainnet config.
+    pub fn is_mainnet(&self) -> bool {
+        self.network == "mainnet"
+    }
+    
+    /// Validate config for mainnet usage.
+    pub fn validate_mainnet(&self) -> Result<()> {
+        if self.is_mainnet() && self.auth_token.is_none() {
+            anyhow::bail!("DA_AUTH_TOKEN is required for mainnet");
+        }
+        if self.namespace.len() != 58 {
+            anyhow::bail!("DA_NAMESPACE must be 58 hex characters (29 bytes), got {}", self.namespace.len());
+        }
+        Ok(())
     }
 }
 
@@ -169,8 +207,10 @@ pub struct DAStatus {
     pub last_event_sequence: u64,
     /// Status kesehatan DA layer.
     pub health: HealthStatus,
-    /// Endpoint yang digunakan.
-    pub endpoint: String,
+    /// RPC URL yang digunakan.
+    pub rpc_url: String,
+    /// Network identifier (mainnet, mocha, etc).
+    pub network: String,
     /// Error message jika ada (untuk diagnostik).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -185,7 +225,8 @@ impl Default for DAStatus {
             sync_status: SyncStatus::Unknown,
             last_event_sequence: 0,
             health: HealthStatus::Unknown,
-            endpoint: String::new(),
+            rpc_url: String::new(),
+            network: String::new(),
             error: None,
         }
     }
@@ -204,7 +245,8 @@ impl DAStatus {
         output.push_str(&format!("│ Sync Status         │ {:37} │\n", self.sync_status));
         output.push_str(&format!("│ Last Event Sequence │ {:37} │\n", self.last_event_sequence));
         output.push_str(&format!("│ Health              │ {:37} │\n", self.health));
-        output.push_str(&format!("│ Endpoint            │ {:37} │\n", truncate_string(&self.endpoint, 37)));
+        output.push_str(&format!("│ RPC URL             │ {:37} │\n", truncate_string(&self.rpc_url, 37)));
+        output.push_str(&format!("│ Network             │ {:37} │\n", self.network));
         if let Some(ref err) = self.error {
             output.push_str("├─────────────────────┼───────────────────────────────────────┤\n");
             output.push_str(&format!("│ Error               │ {:37} │\n", truncate_string(err, 37)));
@@ -286,14 +328,15 @@ impl std::error::Error for DAStatusError {}
 /// Fungsi ini stateless dan thread-safe.
 pub async fn da_status(config: &DAConfig) -> Result<DAStatus> {
     let mut status = DAStatus {
-        endpoint: config.endpoint.clone(),
+        rpc_url: config.rpc_url.clone(),
         namespace: config.namespace.clone(),
+        network: config.network.clone(),
         ..Default::default()
     };
 
     // Build HTTP client with timeout
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
+        .timeout(config.timeout())
         .build()
         .context("failed to build HTTP client")?;
 
@@ -331,7 +374,7 @@ struct NodeQueryResult {
 /// Query DA node untuk status.
 async fn query_da_node(client: &reqwest::Client, config: &DAConfig) -> Result<NodeQueryResult> {
     // Try JSON-RPC header endpoint (Celestia standard)
-    let header_url = format!("{}/header/local_head", config.endpoint);
+    let header_url = format!("{}/header/local_head", config.rpc_url);
     
     let response = client
         .get(&header_url)
@@ -356,7 +399,7 @@ async fn query_da_node(client: &reqwest::Client, config: &DAConfig) -> Result<No
 /// Alternate query method untuk DA node.
 async fn query_da_node_alternate(client: &reqwest::Client, config: &DAConfig) -> Result<NodeQueryResult> {
     // Try status endpoint
-    let status_url = format!("{}/status", config.endpoint);
+    let status_url = format!("{}/status", config.rpc_url);
     
     let response = client
         .get(&status_url)
@@ -775,14 +818,14 @@ pub async fn fetch_blob_raw(config: &DAConfig, height: u64, index: u32) -> Resul
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
+        .timeout(config.timeout())
         .build()
         .context("failed to build HTTP client")?;
 
     // Celestia blob.Get endpoint
     let url = format!(
         "{}/blob/get/{}/{}/{}",
-        config.endpoint,
+        config.rpc_url,
         height,
         config.namespace,
         index
@@ -874,7 +917,7 @@ pub async fn list_blobs(config: &DAConfig, from_height: u64, to_height: u64) -> 
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
+        .timeout(config.timeout())
         .build()
         .context("failed to build HTTP client")?;
 
@@ -908,7 +951,7 @@ async fn fetch_blobs_at_height(
     // Celestia blob.GetAll endpoint
     let url = format!(
         "{}/blob/get_all/{}/{}",
-        config.endpoint,
+        config.rpc_url,
         height,
         config.namespace
     );
@@ -1200,9 +1243,9 @@ mod tests {
     fn test_da_config_default() {
         let config = DAConfig::default();
         
-        assert!(!config.endpoint.is_empty());
+        assert!(!config.rpc_url.is_empty());
         assert!(!config.namespace.is_empty());
-        assert!(config.timeout_secs > 0);
+        assert!(config.timeout_ms > 0);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1233,7 +1276,8 @@ mod tests {
             sync_status: SyncStatus::Synced,
             last_event_sequence: 100,
             health: HealthStatus::Healthy,
-            endpoint: "http://localhost:26658".to_string(),
+            rpc_url: "http://localhost:26658".to_string(),
+            network: "mainnet".to_string(),
             error: None,
         };
 
@@ -1252,7 +1296,7 @@ mod tests {
         assert!(table.contains("100"));
         assert!(table.contains("Health"));
         assert!(table.contains("healthy"));
-        assert!(table.contains("Endpoint"));
+        assert!(table.contains("RPC URL"));
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1268,7 +1312,8 @@ mod tests {
             sync_status: SyncStatus::Synced,
             last_event_sequence: 100,
             health: HealthStatus::Healthy,
-            endpoint: "http://localhost:26658".to_string(),
+            rpc_url: "http://localhost:26658".to_string(),
+            network: "mainnet".to_string(),
             error: None,
         };
 
@@ -1283,7 +1328,8 @@ mod tests {
         assert_eq!(parsed.sync_status, status.sync_status);
         assert_eq!(parsed.last_event_sequence, status.last_event_sequence);
         assert_eq!(parsed.health, status.health);
-        assert_eq!(parsed.endpoint, status.endpoint);
+        assert_eq!(parsed.rpc_url, status.rpc_url);
+        assert_eq!(parsed.network, status.network);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1299,7 +1345,8 @@ mod tests {
             sync_status: SyncStatus::Syncing,
             last_event_sequence: 50,
             health: HealthStatus::Unhealthy,
-            endpoint: "http://example.com".to_string(),
+            rpc_url: "http://example.com".to_string(),
+            network: "mainnet".to_string(),
             error: Some("test error".to_string()),
         };
 
@@ -1343,7 +1390,8 @@ mod tests {
             sync_status: SyncStatus::Synced,
             last_event_sequence: u64::MAX,
             health: HealthStatus::Healthy,
-            endpoint: "b".repeat(1000),
+            rpc_url: "b".repeat(1000),
+            network: "mainnet".to_string(),
             error: Some("c".repeat(1000)),
         };
         let _ = long_status.to_table();
@@ -1403,7 +1451,8 @@ mod tests {
             sync_status: SyncStatus::Synced,
             last_event_sequence: 50,
             health: HealthStatus::Healthy,
-            endpoint: "http://test".to_string(),
+            rpc_url: "http://test".to_string(),
+            network: "mainnet".to_string(),
             error: None,
         };
 

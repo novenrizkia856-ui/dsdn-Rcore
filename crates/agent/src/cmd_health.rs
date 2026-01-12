@@ -273,7 +273,7 @@ pub async fn check_da_health() -> ComponentHealth {
     };
     
     // Check DA header endpoint
-    let url = format!("{}/header/local_head", config.endpoint);
+    let url = format!("{}/header/local_head", config.rpc_url);
     let response = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
