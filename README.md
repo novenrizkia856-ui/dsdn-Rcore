@@ -92,6 +92,9 @@ DSDN terdiri dari tiga plane utama:
 
 Kegagalan satu komponen tidak dapat mengubah kebenaran state jaringan.
 
+*jika anda ingin langkah langkah menjadi node operator*
+silahkan bukan [Langkah langkah menjadi node operator](assets/docs/README.md)
+
 ---
 
 ## Whitepaper
