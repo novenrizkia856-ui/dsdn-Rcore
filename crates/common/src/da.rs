@@ -388,18 +388,36 @@ impl DAConfig {
     /// Validate configuration for production use.
     ///
     /// Returns error if configuration is not suitable for production.
+    ///
+    /// # Validation Rules for Mainnet
+    ///
+    /// 1. `auth_token` is REQUIRED - this authenticates to the Celestia light node
+    /// 2. localhost/127.0.0.1 is ALLOWED when auth_token is present
+    ///    - This is the standard setup: local light node connects to mainnet
+    ///    - Light node handles actual mainnet P2P connection
+    ///    - Auth token proves this is intentional light node connection
+    ///
+    /// # Why localhost is allowed
+    ///
+    /// Celestia architecture: User runs light node locally, which syncs with mainnet.
+    /// DSDN connects to this local light node via RPC (localhost:26658).
+    /// The light node requires auth token for RPC access.
+    /// This is the recommended production setup per Celestia docs.
     pub fn validate_for_production(&self) -> Result<(), DAError> {
         if self.is_mainnet() {
+            // Auth token is REQUIRED for mainnet
+            // This also validates localhost setup (light node requires auth)
             if self.auth_token.is_none() {
                 return Err(DAError::Other(
-                    "auth_token is required for mainnet".to_string()
+                    "auth_token is required for mainnet (needed for light node RPC auth)".to_string()
                 ));
             }
-            if self.rpc_url.contains("localhost") || self.rpc_url.contains("127.0.0.1") {
-                return Err(DAError::Other(
-                    "localhost RPC URL not allowed for mainnet".to_string()
-                ));
-            }
+            
+            // Note: localhost IS allowed for mainnet because:
+            // - Standard setup is local Celestia light node
+            // - Light node connects to mainnet P2P network
+            // - We connect to light node via localhost RPC
+            // - Auth token requirement ensures this is intentional
         }
         Ok(())
     }
@@ -860,7 +878,8 @@ mod tests {
     }
 
     #[test]
-    fn test_daconfig_validate_for_production_mainnet_localhost() {
+    fn test_daconfig_validate_for_production_mainnet_localhost_with_auth() {
+        // localhost + auth_token = VALID (light node setup)
         let config = DAConfig {
             rpc_url: "http://localhost:26658".to_string(),
             namespace: [0u8; 29],
@@ -870,7 +889,22 @@ mod tests {
         };
 
         let result = config.validate_for_production();
-        assert!(result.is_err());
+        assert!(result.is_ok(), "localhost with auth_token should be valid for mainnet (light node setup)");
+    }
+
+    #[test]
+    fn test_daconfig_validate_for_production_mainnet_127_with_auth() {
+        // 127.0.0.1 + auth_token = VALID (light node setup)
+        let config = DAConfig {
+            rpc_url: "http://127.0.0.1:26658".to_string(),
+            namespace: [0u8; 29],
+            auth_token: Some("token".to_string()),
+            network: "mainnet".to_string(),
+            ..Default::default()
+        };
+
+        let result = config.validate_for_production();
+        assert!(result.is_ok(), "127.0.0.1 with auth_token should be valid for mainnet (light node setup)");
     }
 
     #[test]

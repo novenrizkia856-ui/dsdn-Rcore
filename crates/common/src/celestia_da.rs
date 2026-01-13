@@ -562,8 +562,9 @@ impl CelestiaDA {
         // Cache namespace from config
         let namespace = config.namespace;
 
-        // Perform connection validation
-        Self::validate_connection(&client, &config.rpc_url)?;
+        // Note: We skip validate_connection() because Celestia's JSON-RPC server
+        // doesn't support HEAD requests (returns "Invalid request").
+        // Connection issues will be properly handled by actual RPC operations.
 
         Ok(Self {
             config,
@@ -905,15 +906,15 @@ impl CelestiaDA {
             return Err(DAError::InvalidNamespace);
         }
 
-        // Build JSON-RPC request
+        // Use blob.GetAll instead of blob.Get to avoid commitment mismatch
+        // Celestia computes its own NMT commitment which differs from our hash
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
-            method: "blob.Get",
+            method: "blob.GetAll",
             params: vec![
                 serde_json::json!(ref_.height),
-                serde_json::json!(BASE64.encode(&ref_.namespace)),
-                serde_json::json!(BASE64.encode(&ref_.commitment)),
+                serde_json::json!([BASE64.encode(&ref_.namespace)]),
             ],
         };
 
@@ -928,7 +929,7 @@ impl CelestiaDA {
                 retry_delay *= 2; // Exponential backoff
             }
 
-            match self.send_blob_get(&request, ref_).await {
+            match self.send_blob_get_all(&request, ref_).await {
                 Ok(data) => {
                     // Update health status to Healthy
                     *self.health_status.write().unwrap() = DAHealthStatus::Healthy;
@@ -971,8 +972,8 @@ impl CelestiaDA {
         Err(last_error)
     }
 
-    /// Mengirim JSON-RPC request blob.Get ke Celestia node.
-    async fn send_blob_get(&self, request: &JsonRpcRequest, ref_: &BlobRef) -> Result<Vec<u8>, DAError> {
+    /// Mengirim JSON-RPC request blob.GetAll dan filter by data hash.
+    async fn send_blob_get_all(&self, request: &JsonRpcRequest, ref_: &BlobRef) -> Result<Vec<u8>, DAError> {
         let mut req_builder = self.client
             .post(&self.config.rpc_url)
             .header("Content-Type", "application/json");
@@ -1011,13 +1012,15 @@ impl CelestiaDA {
             .await
             .map_err(|e| DAError::NetworkError(format!("failed to read response: {}", e)))?;
 
-        let rpc_response: JsonRpcGetResponse = serde_json::from_str(&body)
+        let rpc_response: JsonRpcGetAllResponse = serde_json::from_str(&body)
             .map_err(|e| DAError::SerializationError(format!("failed to parse response: {}", e)))?;
 
         // Check for RPC error
         if let Some(error) = rpc_response.error {
-            // Check if it's a "not found" error
-            if error.code == -32000 || error.message.to_lowercase().contains("not found") {
+            // Check if it's a "not found" or "below tail" error
+            if error.code == -32000 || 
+               error.message.to_lowercase().contains("not found") ||
+               error.message.to_lowercase().contains("below tail") {
                 return Err(DAError::BlobNotFound(ref_.clone()));
             }
             return Err(DAError::Other(format!(
@@ -1026,51 +1029,41 @@ impl CelestiaDA {
             )));
         }
 
-        // Extract blob data from result
-        let blob_result = rpc_response.result.ok_or_else(|| {
+        // Get blobs from response
+        let blob_items = rpc_response.result.ok_or_else(|| {
             DAError::BlobNotFound(ref_.clone())
         })?;
 
-        // Decode namespace from response
-        let response_namespace_bytes = BASE64.decode(&blob_result.namespace)
-            .map_err(|e| DAError::SerializationError(format!("failed to decode namespace: {}", e)))?;
-
-        // Validate namespace matches active namespace
-        if response_namespace_bytes.len() != 29 {
-            return Err(DAError::SerializationError(format!(
-                "invalid namespace length: expected 29, got {}",
-                response_namespace_bytes.len()
-            )));
+        if blob_items.is_empty() {
+            return Err(DAError::BlobNotFound(ref_.clone()));
         }
 
-        let mut response_namespace = [0u8; 29];
-        response_namespace.copy_from_slice(&response_namespace_bytes);
+        // Find blob by matching data hash (our commitment is SHA3-256 of data)
+        for item in blob_items {
+            // Decode data
+            let data = BASE64.decode(&item.data)
+                .map_err(|e| DAError::SerializationError(format!("failed to decode blob data: {}", e)))?;
 
-        if response_namespace != self.namespace {
-            warn!(
-                expected = ?hex::encode(&self.namespace[..8]),
-                actual = ?hex::encode(&response_namespace[..8]),
-                "namespace mismatch in response"
-            );
-            return Err(DAError::InvalidNamespace);
+            // Compute hash of this blob's data
+            let computed_hash = compute_blob_commitment(&data);
+
+            // Compare with stored commitment (which is our data hash)
+            if computed_hash == ref_.commitment {
+                debug!(
+                    height = ref_.height,
+                    size = data.len(),
+                    "found matching blob by data hash"
+                );
+                return Ok(data);
+            }
         }
 
-        // Decode blob data
-        let data = BASE64.decode(&blob_result.data)
-            .map_err(|e| DAError::SerializationError(format!("failed to decode blob data: {}", e)))?;
-
-        // Verify commitment
-        let computed_commitment = compute_blob_commitment(&data);
-        if computed_commitment != ref_.commitment {
-            error!(
-                expected = ?hex::encode(&ref_.commitment[..8]),
-                actual = ?hex::encode(&computed_commitment[..8]),
-                "commitment mismatch"
-            );
-            return Err(DAError::InvalidBlob);
-        }
-
-        Ok(data)
+        // No matching blob found
+        warn!(
+            height = ref_.height,
+            "no blob matched data hash at this height"
+        );
+        Err(DAError::BlobNotFound(ref_.clone()))
     }
 
     /// Mendapatkan referensi ke konfigurasi.
@@ -1460,8 +1453,12 @@ impl CelestiaDA {
             .map_err(|e| DAError::SerializationError(format!("failed to parse response: {}", e)))?;
 
         if let Some(error) = rpc_response.error {
-            // "blob not found" or similar is not a fatal error for subscription
-            if error.code == -32000 || error.message.to_lowercase().contains("not found") {
+            // "blob not found", "below Tail", or similar is not a fatal error for subscription
+            // When height is below Tail (pruned), treat as no blobs available
+            let msg_lower = error.message.to_lowercase();
+            if error.code == -32000 || 
+               msg_lower.contains("not found") || 
+               msg_lower.contains("below tail") {
                 return Ok(Vec::new());
             }
             return Err(DAError::Other(format!("RPC error {}: {}", error.code, error.message)));
@@ -1682,6 +1679,19 @@ impl BlobSubscription {
                 if state.current_height > head_height {
                     tokio::time::sleep(Duration::from_millis(state.poll_interval_ms)).await;
                     continue;
+                }
+
+                // If we're way behind (e.g., starting from height 1), jump to recent height
+                // This handles the case where node has pruned old blocks (below Tail)
+                if state.current_height + 1000 < head_height {
+                    let new_height = head_height.saturating_sub(10); // Start from 10 blocks behind head
+                    debug!(
+                        old_height = state.current_height,
+                        new_height,
+                        head_height,
+                        "jumping to recent height (was too far behind)"
+                    );
+                    state.current_height = new_height;
                 }
 
                 // Fetch blobs at current height
