@@ -727,13 +727,14 @@ impl CelestiaDA {
         };
 
         // Build JSON-RPC request
+        // Note: gas_price must be a TxConfig object, not a plain number
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
             method: "blob.Submit",
             params: vec![
                 serde_json::json!([blob_data]),
-                serde_json::json!(0.002), // gas price
+                serde_json::json!({"gas_price": 0.002}), // TxConfig object
             ],
         };
 
