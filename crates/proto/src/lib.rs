@@ -10,6 +10,7 @@
 //! - Deterministic serialization untuk konsensus dan verifikasi
 //! - Health status dan error types untuk monitoring DA layer
 //! - Encoding helpers untuk serialization dan hashing
+//! - Fallback event types untuk DA resilience
 //!
 //! Proto crate adalah kontrak data antara komponen DSDN:
 //! - **Coordinator**: Membuat dan mengirim events ke DA layer
@@ -21,6 +22,7 @@
 //! - [`da_event`]: DAEvent enum dan semua event struct types
 //! - [`da_health`]: DAHealthStatus dan DAError types
 //! - [`encoding`]: Serialization helpers untuk deterministic encoding
+//! - [`fallback_event`]: FallbackEvent enum untuk DA fallback operations
 //!
 //! ## Event Lifecycle
 //!
@@ -120,13 +122,24 @@
 //! | `ReplicaAdded` | Replica ditambahkan ke node |
 //! | `ReplicaRemoved` | Replica dihapus dari node |
 //! | `DeleteRequested` | Request penghapusan chunk |
+//!
+//! ## Fallback Events (14A.1A)
+//!
+//! | Event | Deskripsi |
+//! |-------|-----------|
+//! | `FallbackActivated` | DA fallback layer diaktifkan |
+//! | `FallbackDeactivated` | DA fallback layer dinonaktifkan |
+//! | `ReconciliationStarted` | Proses reconciliation dimulai |
+//! | `ReconciliationCompleted` | Proses reconciliation selesai |
 
 pub mod da_event;
 pub mod da_health;
 pub mod encoding;
+pub mod fallback_event;
 
 pub use da_health::{DAHealthStatus, DAError};
 pub use encoding::*;
+pub use fallback_event::{FallbackEvent, FALLBACK_EVENT_SCHEMA_VERSION};
 
 /// Proto crate version string
 pub const PROTO_VERSION: &str = "0.1";
