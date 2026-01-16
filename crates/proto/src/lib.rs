@@ -139,7 +139,9 @@ pub mod fallback_event;
 
 pub use da_health::{DAHealthStatus, DAError};
 pub use encoding::*;
-pub use fallback_event::{FallbackEvent, FALLBACK_EVENT_SCHEMA_VERSION};
+pub use fallback_event::{
+    FallbackEvent, FallbackActivated, FallbackType, FALLBACK_EVENT_SCHEMA_VERSION,
+};
 
 /// Proto crate version string
 pub const PROTO_VERSION: &str = "0.1";
