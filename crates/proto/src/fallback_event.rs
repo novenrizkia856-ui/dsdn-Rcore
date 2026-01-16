@@ -53,6 +53,15 @@ const DEFAULT_TIMESTAMP: u64 = 0;
 /// Nilai 0 menandakan "tidak ada height terakhir yang diketahui".
 const DEFAULT_CELESTIA_HEIGHT: u64 = 0;
 
+/// Jumlah detik dalam satu menit.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// Jumlah detik dalam satu jam.
+const SECONDS_PER_HOUR: u64 = 3600;
+
+/// Jumlah detik dalam satu hari.
+const SECONDS_PER_DAY: u64 = 86400;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // FALLBACK TYPE ENUM
 // ════════════════════════════════════════════════════════════════════════════════
@@ -190,6 +199,194 @@ impl Default for FallbackActivated {
             celestia_last_height: DEFAULT_CELESTIA_HEIGHT,
             activated_at: DEFAULT_TIMESTAMP,
             fallback_type: FallbackType::default(),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// FALLBACK DEACTIVATED STRUCT
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Struktur data untuk event deaktivasi fallback (recovery Celestia).
+///
+/// Struct ini merepresentasikan informasi lengkap ketika sistem
+/// kembali dari fallback DA ke primary DA (Celestia) setelah recovery.
+///
+/// ## Fields
+///
+/// Semua fields bersifat wajib dan eksplisit:
+/// - `celestia_recovery_height`: Height Celestia saat recovery berhasil
+/// - `blobs_reconciled`: Jumlah blobs yang di-reconcile ke Celestia
+/// - `deactivated_at`: Unix timestamp saat deaktivasi
+/// - `downtime_duration_secs`: Total durasi downtime dalam detik
+///
+/// ## Serialization
+///
+/// Struct ini dapat di-serialize menggunakan bincode atau JSON.
+/// Semua fields ikut dalam serialisasi, tidak ada field tersembunyi.
+///
+/// ## Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::FallbackDeactivated;
+///
+/// let event = FallbackDeactivated {
+///     celestia_recovery_height: 12500,
+///     blobs_reconciled: 42,
+///     deactivated_at: 1704070800,
+///     downtime_duration_secs: 3600,
+/// };
+///
+/// assert_eq!(event.duration_human(), "1h 0m 0s");
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FallbackDeactivated {
+    /// Height Celestia pada saat recovery berhasil dilakukan.
+    ///
+    /// Nilai ini menandakan block height pertama yang berhasil
+    /// di-post ke Celestia setelah periode fallback berakhir.
+    ///
+    /// Digunakan untuk:
+    /// - Verifikasi bahwa Celestia kembali operasional
+    /// - Tracking titik awal sinkronisasi ulang
+    /// - Audit trail untuk debugging dan monitoring
+    pub celestia_recovery_height: u64,
+
+    /// Jumlah blobs yang berhasil di-reconcile ke Celestia.
+    ///
+    /// Merepresentasikan total blobs yang awalnya disimpan
+    /// di fallback DA dan kemudian berhasil dipindahkan ke Celestia
+    /// selama proses reconciliation.
+    ///
+    /// Nilai 0 menandakan tidak ada blobs yang perlu di-reconcile
+    /// (fallback period sangat singkat atau tidak ada aktivitas).
+    pub blobs_reconciled: u64,
+
+    /// Unix timestamp (seconds since epoch) saat fallback dinonaktifkan.
+    ///
+    /// Timestamp ini merepresentasikan waktu lokal sistem ketika
+    /// sistem kembali menggunakan primary DA (Celestia).
+    ///
+    /// Nilai 0 menandakan timestamp belum diisi (hanya untuk Default).
+    pub deactivated_at: u64,
+
+    /// Total durasi downtime Celestia dalam detik.
+    ///
+    /// Dihitung sebagai selisih antara `deactivated_at` dan
+    /// `activated_at` dari event `FallbackActivated` sebelumnya.
+    ///
+    /// Nilai ini digunakan untuk:
+    /// - Monitoring dan alerting
+    /// - SLA tracking
+    /// - Analisis performa sistem
+    ///
+    /// Nilai 0 menandakan durasi tidak diketahui atau sangat singkat.
+    pub downtime_duration_secs: u64,
+}
+
+impl FallbackDeactivated {
+    /// Mengkonversi `downtime_duration_secs` ke format string yang dapat dibaca manusia.
+    ///
+    /// ## Format Output
+    ///
+    /// Format output mengikuti pola: `{days}d {hours}h {minutes}m {seconds}s`
+    ///
+    /// Dengan ketentuan:
+    /// - Komponen dengan nilai 0 di awal tidak ditampilkan (kecuali semua 0)
+    /// - Jika durasi 0 detik, output adalah "0s"
+    /// - Jika durasi < 1 menit, output adalah "{seconds}s"
+    /// - Jika durasi < 1 jam, output adalah "{minutes}m {seconds}s"
+    /// - Jika durasi < 1 hari, output adalah "{hours}h {minutes}m {seconds}s"
+    /// - Jika durasi >= 1 hari, output adalah "{days}d {hours}h {minutes}m {seconds}s"
+    ///
+    /// ## Determinism
+    ///
+    /// Fungsi ini bersifat deterministik: input yang sama selalu
+    /// menghasilkan output yang sama, tanpa bergantung pada locale,
+    /// timezone, atau state global apapun.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use dsdn_proto::fallback_event::FallbackDeactivated;
+    ///
+    /// let event = FallbackDeactivated {
+    ///     celestia_recovery_height: 100,
+    ///     blobs_reconciled: 0,
+    ///     deactivated_at: 0,
+    ///     downtime_duration_secs: 3661,
+    /// };
+    /// assert_eq!(event.duration_human(), "1h 1m 1s");
+    ///
+    /// let event2 = FallbackDeactivated {
+    ///     celestia_recovery_height: 100,
+    ///     blobs_reconciled: 0,
+    ///     deactivated_at: 0,
+    ///     downtime_duration_secs: 0,
+    /// };
+    /// assert_eq!(event2.duration_human(), "0s");
+    /// ```
+    #[must_use]
+    pub fn duration_human(&self) -> String {
+        let total_secs = self.downtime_duration_secs;
+
+        // Handle zero case explicitly
+        if total_secs == 0 {
+            return String::from("0s");
+        }
+
+        let days = total_secs / SECONDS_PER_DAY;
+        let remaining_after_days = total_secs % SECONDS_PER_DAY;
+
+        let hours = remaining_after_days / SECONDS_PER_HOUR;
+        let remaining_after_hours = remaining_after_days % SECONDS_PER_HOUR;
+
+        let minutes = remaining_after_hours / SECONDS_PER_MINUTE;
+        let seconds = remaining_after_hours % SECONDS_PER_MINUTE;
+
+        // Build output string, omitting leading zero components
+        let mut parts: Vec<String> = Vec::with_capacity(4);
+
+        if days > 0 {
+            parts.push(format!("{}d", days));
+        }
+
+        if days > 0 || hours > 0 {
+            parts.push(format!("{}h", hours));
+        }
+
+        if days > 0 || hours > 0 || minutes > 0 {
+            parts.push(format!("{}m", minutes));
+        }
+
+        // Seconds always included (we already handled total_secs == 0)
+        parts.push(format!("{}s", seconds));
+
+        parts.join(" ")
+    }
+}
+
+impl Default for FallbackDeactivated {
+    /// Membuat instance `FallbackDeactivated` dengan nilai default.
+    ///
+    /// Nilai default bersifat:
+    /// - Deterministik (tidak bergantung pada state eksternal)
+    /// - Valid secara tipe
+    /// - Dapat diidentifikasi sebagai "belum diisi"
+    ///
+    /// ## Default Values
+    ///
+    /// - `celestia_recovery_height`: 0 (tidak ada height diketahui)
+    /// - `blobs_reconciled`: 0 (tidak ada blobs di-reconcile)
+    /// - `deactivated_at`: 0 (timestamp belum diisi)
+    /// - `downtime_duration_secs`: 0 (durasi tidak diketahui)
+    #[inline]
+    fn default() -> Self {
+        Self {
+            celestia_recovery_height: DEFAULT_CELESTIA_HEIGHT,
+            blobs_reconciled: 0,
+            deactivated_at: DEFAULT_TIMESTAMP,
+            downtime_duration_secs: 0,
         }
     }
 }
@@ -353,9 +550,9 @@ mod tests {
         assert_eq!(event, decoded, "Round-trip must produce identical result");
     }
 
-    /// Test: FallbackDeactivated dapat di-serialize dan di-deserialize.
+    /// Test: FallbackDeactivated variant dapat di-serialize dan di-deserialize.
     #[test]
-    fn test_fallback_deactivated_serialize_deserialize() {
+    fn test_fallback_deactivated_variant_serialize_deserialize() {
         let event = FallbackEvent::FallbackDeactivated {
             version: FALLBACK_EVENT_SCHEMA_VERSION,
         };
@@ -877,5 +1074,422 @@ mod tests {
         let decoded = deserialized.unwrap();
         assert_eq!(decoded.celestia_last_height, u64::MAX);
         assert_eq!(decoded.activated_at, u64::MAX);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // FALLBACK DEACTIVATED STRUCT TESTS (14A.1A.3)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Test: FallbackDeactivated struct dapat di-serialize dan di-deserialize (bincode).
+    #[test]
+    fn test_fallback_deactivated_struct_bincode_roundtrip() {
+        let original = FallbackDeactivated {
+            celestia_recovery_height: 12500,
+            blobs_reconciled: 42,
+            deactivated_at: 1704070800,
+            downtime_duration_secs: 3600,
+        };
+
+        let serialized = bincode::serialize(&original);
+        assert!(serialized.is_ok(), "FallbackDeactivated serialization must succeed");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<FallbackDeactivated, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "FallbackDeactivated deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(original, decoded, "FallbackDeactivated round-trip must be identical");
+    }
+
+    /// Test: FallbackDeactivated struct dapat di-serialize dan di-deserialize (JSON).
+    #[test]
+    fn test_fallback_deactivated_struct_json_roundtrip() {
+        let original = FallbackDeactivated {
+            celestia_recovery_height: 99999,
+            blobs_reconciled: 100,
+            deactivated_at: 1704153600,
+            downtime_duration_secs: 7200,
+        };
+
+        let json = serde_json::to_string(&original);
+        assert!(json.is_ok(), "FallbackDeactivated JSON serialization must succeed");
+
+        let json_str = json.unwrap();
+        let deserialized: Result<FallbackDeactivated, _> = serde_json::from_str(&json_str);
+        assert!(deserialized.is_ok(), "FallbackDeactivated JSON deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(original, decoded, "FallbackDeactivated JSON round-trip must be identical");
+    }
+
+    /// Test: FallbackDeactivated serialization deterministik.
+    #[test]
+    fn test_fallback_deactivated_struct_deterministic_serialization() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 1000,
+            blobs_reconciled: 50,
+            deactivated_at: 2000,
+            downtime_duration_secs: 500,
+        };
+
+        let bytes1 = bincode::serialize(&event);
+        let bytes2 = bincode::serialize(&event);
+
+        assert!(bytes1.is_ok(), "First serialization must succeed");
+        assert!(bytes2.is_ok(), "Second serialization must succeed");
+        assert_eq!(
+            bytes1.unwrap(),
+            bytes2.unwrap(),
+            "Deterministic: same input must produce same bytes"
+        );
+    }
+
+    /// Test: FallbackDeactivated Default menghasilkan nilai valid.
+    #[test]
+    fn test_fallback_deactivated_default_validity() {
+        let default_event = FallbackDeactivated::default();
+
+        assert_eq!(
+            default_event.celestia_recovery_height, 0,
+            "Default celestia_recovery_height must be 0"
+        );
+        assert_eq!(
+            default_event.blobs_reconciled, 0,
+            "Default blobs_reconciled must be 0"
+        );
+        assert_eq!(
+            default_event.deactivated_at, 0,
+            "Default deactivated_at must be 0"
+        );
+        assert_eq!(
+            default_event.downtime_duration_secs, 0,
+            "Default downtime_duration_secs must be 0"
+        );
+    }
+
+    /// Test: FallbackDeactivated Default dapat di-serialize dan di-deserialize.
+    #[test]
+    fn test_fallback_deactivated_default_serialization() {
+        let default_event = FallbackDeactivated::default();
+
+        let serialized = bincode::serialize(&default_event);
+        assert!(serialized.is_ok(), "Default FallbackDeactivated serialization must succeed");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<FallbackDeactivated, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "Default FallbackDeactivated deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(
+            default_event, decoded,
+            "Default FallbackDeactivated round-trip must be identical"
+        );
+    }
+
+    /// Test: FallbackDeactivated Default deterministik.
+    #[test]
+    fn test_fallback_deactivated_default_deterministic() {
+        let default1 = FallbackDeactivated::default();
+        let default2 = FallbackDeactivated::default();
+
+        assert_eq!(
+            default1, default2,
+            "Default must be deterministic (same value every time)"
+        );
+    }
+
+    /// Test: FallbackDeactivated PartialEq bekerja dengan benar.
+    #[test]
+    fn test_fallback_deactivated_partial_eq() {
+        let event1 = FallbackDeactivated {
+            celestia_recovery_height: 100,
+            blobs_reconciled: 10,
+            deactivated_at: 200,
+            downtime_duration_secs: 300,
+        };
+
+        let event2 = FallbackDeactivated {
+            celestia_recovery_height: 100,
+            blobs_reconciled: 10,
+            deactivated_at: 200,
+            downtime_duration_secs: 300,
+        };
+
+        let event3 = FallbackDeactivated {
+            celestia_recovery_height: 999,
+            blobs_reconciled: 10,
+            deactivated_at: 200,
+            downtime_duration_secs: 300,
+        };
+
+        assert_eq!(event1, event2, "Same values must be equal");
+        assert_ne!(event1, event3, "Different celestia_recovery_height must not be equal");
+    }
+
+    /// Test: FallbackDeactivated Clone bekerja dengan benar.
+    #[test]
+    fn test_fallback_deactivated_clone() {
+        let original = FallbackDeactivated {
+            celestia_recovery_height: 555,
+            blobs_reconciled: 66,
+            deactivated_at: 777,
+            downtime_duration_secs: 888,
+        };
+
+        let cloned = original.clone();
+        assert_eq!(original, cloned, "Clone must produce equal value");
+    }
+
+    /// Test: FallbackDeactivated Debug output mengandung semua field names.
+    #[test]
+    fn test_fallback_deactivated_debug() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 100,
+            blobs_reconciled: 20,
+            deactivated_at: 300,
+            downtime_duration_secs: 400,
+        };
+
+        let debug_str = format!("{:?}", event);
+
+        assert!(
+            debug_str.contains("celestia_recovery_height"),
+            "Debug must contain 'celestia_recovery_height'"
+        );
+        assert!(
+            debug_str.contains("blobs_reconciled"),
+            "Debug must contain 'blobs_reconciled'"
+        );
+        assert!(
+            debug_str.contains("deactivated_at"),
+            "Debug must contain 'deactivated_at'"
+        );
+        assert!(
+            debug_str.contains("downtime_duration_secs"),
+            "Debug must contain 'downtime_duration_secs'"
+        );
+    }
+
+    /// Test: FallbackDeactivated dengan nilai maksimum u64.
+    #[test]
+    fn test_fallback_deactivated_max_u64_values() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: u64::MAX,
+            blobs_reconciled: u64::MAX,
+            deactivated_at: u64::MAX,
+            downtime_duration_secs: u64::MAX,
+        };
+
+        let serialized = bincode::serialize(&event);
+        assert!(serialized.is_ok(), "Max u64 values must serialize");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<FallbackDeactivated, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "Max u64 values must deserialize");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(decoded.celestia_recovery_height, u64::MAX);
+        assert_eq!(decoded.blobs_reconciled, u64::MAX);
+        assert_eq!(decoded.deactivated_at, u64::MAX);
+        assert_eq!(decoded.downtime_duration_secs, u64::MAX);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // DURATION_HUMAN() METHOD TESTS (14A.1A.3)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Test: duration_human() returns "0s" for zero duration.
+    #[test]
+    fn test_duration_human_zero() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 0,
+        };
+
+        assert_eq!(event.duration_human(), "0s", "Zero duration must return '0s'");
+    }
+
+    /// Test: duration_human() returns correct format for seconds only.
+    #[test]
+    fn test_duration_human_seconds_only() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 45,
+        };
+
+        assert_eq!(event.duration_human(), "45s", "45 seconds must return '45s'");
+    }
+
+    /// Test: duration_human() returns correct format for minutes and seconds.
+    #[test]
+    fn test_duration_human_minutes_seconds() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 125, // 2 minutes 5 seconds
+        };
+
+        assert_eq!(event.duration_human(), "2m 5s", "125 seconds must return '2m 5s'");
+    }
+
+    /// Test: duration_human() returns correct format for hours, minutes, seconds.
+    #[test]
+    fn test_duration_human_hours_minutes_seconds() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 3661, // 1 hour 1 minute 1 second
+        };
+
+        assert_eq!(event.duration_human(), "1h 1m 1s", "3661 seconds must return '1h 1m 1s'");
+    }
+
+    /// Test: duration_human() returns correct format for days, hours, minutes, seconds.
+    #[test]
+    fn test_duration_human_days_hours_minutes_seconds() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 90061, // 1 day 1 hour 1 minute 1 second
+        };
+
+        assert_eq!(
+            event.duration_human(),
+            "1d 1h 1m 1s",
+            "90061 seconds must return '1d 1h 1m 1s'"
+        );
+    }
+
+    /// Test: duration_human() returns correct format for exact hours.
+    #[test]
+    fn test_duration_human_exact_hours() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 3600, // exactly 1 hour
+        };
+
+        assert_eq!(event.duration_human(), "1h 0m 0s", "3600 seconds must return '1h 0m 0s'");
+    }
+
+    /// Test: duration_human() returns correct format for exact days.
+    #[test]
+    fn test_duration_human_exact_days() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 86400, // exactly 1 day
+        };
+
+        assert_eq!(
+            event.duration_human(),
+            "1d 0h 0m 0s",
+            "86400 seconds must return '1d 0h 0m 0s'"
+        );
+    }
+
+    /// Test: duration_human() returns correct format for multiple days.
+    #[test]
+    fn test_duration_human_multiple_days() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 259200, // 3 days
+        };
+
+        assert_eq!(
+            event.duration_human(),
+            "3d 0h 0m 0s",
+            "259200 seconds must return '3d 0h 0m 0s'"
+        );
+    }
+
+    /// Test: duration_human() is deterministic.
+    #[test]
+    fn test_duration_human_deterministic() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 100,
+            blobs_reconciled: 10,
+            deactivated_at: 200,
+            downtime_duration_secs: 12345,
+        };
+
+        let result1 = event.duration_human();
+        let result2 = event.duration_human();
+
+        assert_eq!(
+            result1, result2,
+            "duration_human() must be deterministic (same output for same input)"
+        );
+    }
+
+    /// Test: duration_human() handles large values correctly.
+    #[test]
+    fn test_duration_human_large_value() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 31536000, // 365 days
+        };
+
+        assert_eq!(
+            event.duration_human(),
+            "365d 0h 0m 0s",
+            "31536000 seconds must return '365d 0h 0m 0s'"
+        );
+    }
+
+    /// Test: duration_human() handles boundary between minutes and hours.
+    #[test]
+    fn test_duration_human_minute_hour_boundary() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 3599, // 59 minutes 59 seconds
+        };
+
+        assert_eq!(
+            event.duration_human(),
+            "59m 59s",
+            "3599 seconds must return '59m 59s'"
+        );
+    }
+
+    /// Test: duration_human() exact one minute.
+    #[test]
+    fn test_duration_human_exact_one_minute() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 60,
+        };
+
+        assert_eq!(event.duration_human(), "1m 0s", "60 seconds must return '1m 0s'");
+    }
+
+    /// Test: duration_human() with one second.
+    #[test]
+    fn test_duration_human_one_second() {
+        let event = FallbackDeactivated {
+            celestia_recovery_height: 0,
+            blobs_reconciled: 0,
+            deactivated_at: 0,
+            downtime_duration_secs: 1,
+        };
+
+        assert_eq!(event.duration_human(), "1s", "1 second must return '1s'");
     }
 }
