@@ -136,6 +136,7 @@ pub mod da_event;
 pub mod da_health;
 pub mod encoding;
 pub mod fallback_event;
+pub mod pending_blob;
 pub mod reconcile_report;
 
 pub use da_health::{DAHealthStatus, DAError};
@@ -145,6 +146,7 @@ pub use fallback_event::{
     ReconciliationStarted, ReconciliationCompleted, FALLBACK_EVENT_SCHEMA_VERSION,
 };
 pub use reconcile_report::{ReconcileReport, ReconcileDetail, ReconcileStatus};
+pub use pending_blob::{PendingBlob, MAX_RETRY_COUNT};
 
 /// Proto crate version string
 pub const PROTO_VERSION: &str = "0.1";
