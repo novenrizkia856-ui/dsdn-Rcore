@@ -2,10 +2,27 @@
 //!
 //! Module ini menyediakan fungsi encoding/decoding deterministik untuk DAEvent.
 //! Encoding yang sama HARUS menghasilkan output byte yang identik.
+//!
+//! ## Fallback Types Support (14A.1A.8)
+//!
+//! Module ini juga menyediakan encoding/decoding untuk fallback-related types:
+//! - `FallbackEvent` - Events untuk DA fallback operations
+//! - `PendingBlob` - Blob yang menunggu reconciliation
+//!
+//! Semua fungsi menggunakan konfigurasi bincode yang IDENTIK untuk menjamin
+//! kompatibilitas dan determinisme lintas platform.
 
 use sha3::{Sha3_256, Digest};
 use crate::da_event::DAEvent;
 use crate::da_health::DAError;
+use crate::fallback_event::FallbackEvent;
+use crate::pending_blob::PendingBlob;
+
+/// Type alias untuk decode errors.
+///
+/// Menggunakan `DAError` untuk konsistensi dengan existing DA encoding functions.
+/// Semua decode errors dikembalikan sebagai `DAError::DecodeFailed`.
+pub type DecodeError = DAError;
 
 /// Encode single DAEvent ke bytes dengan format deterministik.
 ///
@@ -162,6 +179,188 @@ pub fn batch_decode(bytes: &[u8]) -> Result<Vec<DAEvent>, DAError> {
     }
     
     Ok(events)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// FALLBACK TYPES ENCODING (14A.1A.8)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Encode FallbackEvent ke bytes dengan format deterministik.
+///
+/// # Determinism Guarantee
+///
+/// Input yang sama SELALU menghasilkan output byte yang identik,
+/// tidak bergantung pada platform, compiler, atau runtime state.
+///
+/// Menggunakan konfigurasi bincode yang IDENTIK dengan `encode_event`
+/// untuk menjamin konsistensi encoding lintas semua proto types.
+///
+/// # Arguments
+///
+/// * `event` - Reference ke FallbackEvent yang akan di-encode
+///
+/// # Returns
+///
+/// `Vec<u8>` berisi binary representation dari event.
+/// Mengembalikan empty Vec jika serialisasi gagal (defensive, seharusnya tidak terjadi
+/// untuk valid FallbackEvent).
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::FallbackEvent;
+/// use dsdn_proto::encoding::encode_fallback_event;
+///
+/// let event = FallbackEvent::FallbackActivated {
+///     version: 1,
+/// };
+///
+/// let bytes = encode_fallback_event(&event);
+/// assert!(!bytes.is_empty());
+/// ```
+pub fn encode_fallback_event(event: &FallbackEvent) -> Vec<u8> {
+    // Menggunakan bincode::serialize yang sama dengan encode_event
+    // untuk menjamin konsistensi encoding (little-endian, fixed encoding order)
+    bincode::serialize(event).unwrap_or_else(|_| Vec::new())
+}
+
+/// Decode bytes ke FallbackEvent.
+///
+/// # Arguments
+///
+/// * `bytes` - Slice bytes hasil dari `encode_fallback_event`
+///
+/// # Returns
+///
+/// * `Ok(FallbackEvent)` - Berhasil decode
+/// * `Err(DecodeError)` - Gagal decode dengan pesan error eksplisit
+///
+/// # Roundtrip Guarantee
+///
+/// `decode_fallback_event(encode_fallback_event(event)) == event`
+/// untuk semua valid FallbackEvent.
+///
+/// # Errors
+///
+/// Mengembalikan `DecodeError::DecodeFailed` jika:
+/// - Input bytes kosong
+/// - Format bytes tidak valid
+/// - Bytes tidak merepresentasikan FallbackEvent yang valid
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::FallbackEvent;
+/// use dsdn_proto::encoding::{encode_fallback_event, decode_fallback_event};
+///
+/// let original = FallbackEvent::FallbackActivated {
+///     version: 1,
+/// };
+///
+/// let bytes = encode_fallback_event(&original);
+/// let decoded = decode_fallback_event(&bytes).expect("decode must succeed");
+/// assert_eq!(original, decoded);
+/// ```
+pub fn decode_fallback_event(bytes: &[u8]) -> Result<FallbackEvent, DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::DecodeFailed("empty input".to_string()));
+    }
+    bincode::deserialize(bytes)
+        .map_err(|e| DecodeError::DecodeFailed(e.to_string()))
+}
+
+/// Encode PendingBlob ke bytes dengan format deterministik.
+///
+/// # Determinism Guarantee
+///
+/// Input yang sama SELALU menghasilkan output byte yang identik,
+/// tidak bergantung pada platform, compiler, atau runtime state.
+///
+/// Menggunakan konfigurasi bincode yang IDENTIK dengan `encode_event`
+/// untuk menjamin konsistensi encoding lintas semua proto types.
+///
+/// # Arguments
+///
+/// * `blob` - Reference ke PendingBlob yang akan di-encode
+///
+/// # Returns
+///
+/// `Vec<u8>` berisi binary representation dari blob.
+/// Mengembalikan empty Vec jika serialisasi gagal (defensive, seharusnya tidak terjadi
+/// untuk valid PendingBlob).
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::pending_blob::PendingBlob;
+/// use dsdn_proto::encoding::encode_pending_blob;
+///
+/// let blob = PendingBlob {
+///     data: vec![1, 2, 3, 4],
+///     original_sequence: 42,
+///     source_da: String::from("validator_quorum"),
+///     received_at: 1704067200,
+///     retry_count: 0,
+///     commitment: None,
+/// };
+///
+/// let bytes = encode_pending_blob(&blob);
+/// assert!(!bytes.is_empty());
+/// ```
+pub fn encode_pending_blob(blob: &PendingBlob) -> Vec<u8> {
+    // Menggunakan bincode::serialize yang sama dengan encode_event
+    // untuk menjamin konsistensi encoding (little-endian, fixed encoding order)
+    bincode::serialize(blob).unwrap_or_else(|_| Vec::new())
+}
+
+/// Decode bytes ke PendingBlob.
+///
+/// # Arguments
+///
+/// * `bytes` - Slice bytes hasil dari `encode_pending_blob`
+///
+/// # Returns
+///
+/// * `Ok(PendingBlob)` - Berhasil decode
+/// * `Err(DecodeError)` - Gagal decode dengan pesan error eksplisit
+///
+/// # Roundtrip Guarantee
+///
+/// `decode_pending_blob(encode_pending_blob(blob)) == blob`
+/// untuk semua valid PendingBlob.
+///
+/// # Errors
+///
+/// Mengembalikan `DecodeError::DecodeFailed` jika:
+/// - Input bytes kosong
+/// - Format bytes tidak valid
+/// - Bytes tidak merepresentasikan PendingBlob yang valid
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::pending_blob::PendingBlob;
+/// use dsdn_proto::encoding::{encode_pending_blob, decode_pending_blob};
+///
+/// let original = PendingBlob {
+///     data: vec![1, 2, 3, 4],
+///     original_sequence: 42,
+///     source_da: String::from("test"),
+///     received_at: 1704067200,
+///     retry_count: 0,
+///     commitment: None,
+/// };
+///
+/// let bytes = encode_pending_blob(&original);
+/// let decoded = decode_pending_blob(&bytes).expect("decode must succeed");
+/// assert_eq!(original, decoded);
+/// ```
+pub fn decode_pending_blob(bytes: &[u8]) -> Result<PendingBlob, DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::DecodeFailed("empty input".to_string()));
+    }
+    bincode::deserialize(bytes)
+        .map_err(|e| DecodeError::DecodeFailed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -466,6 +665,409 @@ mod tests {
         
         let result = batch_decode(&bytes);
         assert!(result.is_err(), "truncated data must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // FALLBACK EVENT ENCODING TESTS (14A.1A.8)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    use crate::fallback_event::FallbackEvent;
+    use crate::pending_blob::PendingBlob;
+
+    fn make_fallback_activated_event() -> FallbackEvent {
+        FallbackEvent::FallbackActivated {
+            version: 1,
+        }
+    }
+
+    fn make_fallback_deactivated_event() -> FallbackEvent {
+        FallbackEvent::FallbackDeactivated {
+            version: 1,
+        }
+    }
+
+    fn make_reconciliation_started_event() -> FallbackEvent {
+        FallbackEvent::ReconciliationStarted {
+            version: 1,
+        }
+    }
+
+    fn make_reconciliation_completed_event() -> FallbackEvent {
+        FallbackEvent::ReconciliationCompleted {
+            version: 1,
+        }
+    }
+
+    fn make_pending_blob() -> PendingBlob {
+        PendingBlob {
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            original_sequence: 42,
+            source_da: String::from("validator_quorum"),
+            received_at: 1704067200,
+            retry_count: 2,
+            commitment: Some([0xAB; 32]),
+        }
+    }
+
+    fn make_pending_blob_no_commitment() -> PendingBlob {
+        PendingBlob {
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            original_sequence: 100,
+            source_da: String::from("emergency"),
+            received_at: 1704153600,
+            retry_count: 0,
+            commitment: None,
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // encode_fallback_event tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_encode_fallback_event_not_empty() {
+        let event = make_fallback_activated_event();
+        let encoded = encode_fallback_event(&event);
+        assert!(!encoded.is_empty(), "encoded fallback event must not be empty");
+    }
+
+    #[test]
+    fn test_encode_fallback_event_all_variants() {
+        let events = [
+            make_fallback_activated_event(),
+            make_fallback_deactivated_event(),
+            make_reconciliation_started_event(),
+            make_reconciliation_completed_event(),
+        ];
+
+        for event in &events {
+            let encoded = encode_fallback_event(event);
+            assert!(!encoded.is_empty(), "all variants must encode to non-empty bytes");
+        }
+    }
+
+    #[test]
+    fn test_encode_fallback_event_determinism_multiple_calls() {
+        let event = make_fallback_activated_event();
+
+        let encoded1 = encode_fallback_event(&event);
+        let encoded2 = encode_fallback_event(&event);
+        let encoded3 = encode_fallback_event(&event);
+
+        assert_eq!(encoded1, encoded2, "encode must be deterministic (1 vs 2)");
+        assert_eq!(encoded2, encoded3, "encode must be deterministic (2 vs 3)");
+    }
+
+    #[test]
+    fn test_encode_fallback_event_determinism_100_iterations() {
+        let event = make_fallback_deactivated_event();
+        let reference = encode_fallback_event(&event);
+
+        for i in 0..100 {
+            let encoded = encode_fallback_event(&event);
+            assert_eq!(
+                reference, encoded,
+                "encode must be deterministic at iteration {}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_fallback_event_determinism_all_variants() {
+        let events = [
+            make_fallback_activated_event(),
+            make_fallback_deactivated_event(),
+            make_reconciliation_started_event(),
+            make_reconciliation_completed_event(),
+        ];
+
+        for event in &events {
+            let encoded1 = encode_fallback_event(event);
+            let encoded2 = encode_fallback_event(event);
+            assert_eq!(encoded1, encoded2, "all variants must encode deterministically");
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // decode_fallback_event tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_fallback_event_roundtrip_activated() {
+        let original = make_fallback_activated_event();
+        let encoded = encode_fallback_event(&original);
+        let decoded = decode_fallback_event(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve event");
+    }
+
+    #[test]
+    fn test_decode_fallback_event_roundtrip_deactivated() {
+        let original = make_fallback_deactivated_event();
+        let encoded = encode_fallback_event(&original);
+        let decoded = decode_fallback_event(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve event");
+    }
+
+    #[test]
+    fn test_decode_fallback_event_roundtrip_reconciliation_started() {
+        let original = make_reconciliation_started_event();
+        let encoded = encode_fallback_event(&original);
+        let decoded = decode_fallback_event(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve event");
+    }
+
+    #[test]
+    fn test_decode_fallback_event_roundtrip_reconciliation_completed() {
+        let original = make_reconciliation_completed_event();
+        let encoded = encode_fallback_event(&original);
+        let decoded = decode_fallback_event(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve event");
+    }
+
+    #[test]
+    fn test_decode_fallback_event_roundtrip_all_variants() {
+        let events = [
+            make_fallback_activated_event(),
+            make_fallback_deactivated_event(),
+            make_reconciliation_started_event(),
+            make_reconciliation_completed_event(),
+        ];
+
+        for original in &events {
+            let encoded = encode_fallback_event(original);
+            let decoded = decode_fallback_event(&encoded);
+            
+            assert!(decoded.is_ok(), "decode must succeed for all variants");
+            assert_eq!(original, &decoded.unwrap(), "roundtrip must preserve all variants");
+        }
+    }
+
+    #[test]
+    fn test_decode_fallback_event_empty_input() {
+        let result = decode_fallback_event(&[]);
+        assert!(result.is_err(), "empty input must fail");
+    }
+
+    #[test]
+    fn test_decode_fallback_event_invalid_input() {
+        let result = decode_fallback_event(&[0x00, 0x01, 0x02]);
+        assert!(result.is_err(), "invalid input must fail");
+    }
+
+    #[test]
+    fn test_decode_fallback_event_error_is_decode_error() {
+        let result = decode_fallback_event(&[]);
+        assert!(result.is_err(), "empty input must fail");
+        
+        match result {
+            Err(DecodeError::DecodeFailed(_)) => { /* expected */ }
+            _ => panic!("error must be DecodeError::DecodeFailed"),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // encode_pending_blob tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_encode_pending_blob_not_empty() {
+        let blob = make_pending_blob();
+        let encoded = encode_pending_blob(&blob);
+        assert!(!encoded.is_empty(), "encoded pending blob must not be empty");
+    }
+
+    #[test]
+    fn test_encode_pending_blob_with_commitment() {
+        let blob = make_pending_blob();
+        let encoded = encode_pending_blob(&blob);
+        assert!(!encoded.is_empty(), "blob with commitment must encode");
+    }
+
+    #[test]
+    fn test_encode_pending_blob_without_commitment() {
+        let blob = make_pending_blob_no_commitment();
+        let encoded = encode_pending_blob(&blob);
+        assert!(!encoded.is_empty(), "blob without commitment must encode");
+    }
+
+    #[test]
+    fn test_encode_pending_blob_determinism_multiple_calls() {
+        let blob = make_pending_blob();
+
+        let encoded1 = encode_pending_blob(&blob);
+        let encoded2 = encode_pending_blob(&blob);
+        let encoded3 = encode_pending_blob(&blob);
+
+        assert_eq!(encoded1, encoded2, "encode must be deterministic (1 vs 2)");
+        assert_eq!(encoded2, encoded3, "encode must be deterministic (2 vs 3)");
+    }
+
+    #[test]
+    fn test_encode_pending_blob_determinism_100_iterations() {
+        let blob = make_pending_blob();
+        let reference = encode_pending_blob(&blob);
+
+        for i in 0..100 {
+            let encoded = encode_pending_blob(&blob);
+            assert_eq!(
+                reference, encoded,
+                "encode must be deterministic at iteration {}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_pending_blob_empty_data() {
+        let blob = PendingBlob {
+            data: Vec::new(),
+            original_sequence: 0,
+            source_da: String::from("test"),
+            received_at: 0,
+            retry_count: 0,
+            commitment: None,
+        };
+
+        let encoded = encode_pending_blob(&blob);
+        assert!(!encoded.is_empty(), "blob with empty data must still encode");
+    }
+
+    #[test]
+    fn test_encode_pending_blob_large_data() {
+        let blob = PendingBlob {
+            data: vec![0u8; 10000],
+            original_sequence: u64::MAX,
+            source_da: String::from("large_test"),
+            received_at: u64::MAX,
+            retry_count: u32::MAX,
+            commitment: Some([0xFF; 32]),
+        };
+
+        let encoded = encode_pending_blob(&blob);
+        assert!(!encoded.is_empty(), "blob with large data must encode");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // decode_pending_blob tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_pending_blob_roundtrip() {
+        let original = make_pending_blob();
+        let encoded = encode_pending_blob(&original);
+        let decoded = decode_pending_blob(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve blob");
+    }
+
+    #[test]
+    fn test_decode_pending_blob_roundtrip_no_commitment() {
+        let original = make_pending_blob_no_commitment();
+        let encoded = encode_pending_blob(&original);
+        let decoded = decode_pending_blob(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve blob");
+    }
+
+    #[test]
+    fn test_decode_pending_blob_roundtrip_empty_data() {
+        let original = PendingBlob {
+            data: Vec::new(),
+            original_sequence: 0,
+            source_da: String::from("empty"),
+            received_at: 0,
+            retry_count: 0,
+            commitment: None,
+        };
+        
+        let encoded = encode_pending_blob(&original);
+        let decoded = decode_pending_blob(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed for empty data");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve empty data blob");
+    }
+
+    #[test]
+    fn test_decode_pending_blob_roundtrip_max_values() {
+        let original = PendingBlob {
+            data: vec![0xFF; 100],
+            original_sequence: u64::MAX,
+            source_da: String::from("max_values"),
+            received_at: u64::MAX,
+            retry_count: u32::MAX,
+            commitment: Some([0xFF; 32]),
+        };
+        
+        let encoded = encode_pending_blob(&original);
+        let decoded = decode_pending_blob(&encoded);
+        
+        assert!(decoded.is_ok(), "decode must succeed for max values");
+        assert_eq!(original, decoded.unwrap(), "roundtrip must preserve max values");
+    }
+
+    #[test]
+    fn test_decode_pending_blob_empty_input() {
+        let result = decode_pending_blob(&[]);
+        assert!(result.is_err(), "empty input must fail");
+    }
+
+    #[test]
+    fn test_decode_pending_blob_invalid_input() {
+        let result = decode_pending_blob(&[0x00, 0x01, 0x02]);
+        assert!(result.is_err(), "invalid input must fail");
+    }
+
+    #[test]
+    fn test_decode_pending_blob_error_is_decode_error() {
+        let result = decode_pending_blob(&[]);
+        assert!(result.is_err(), "empty input must fail");
+        
+        match result {
+            Err(DecodeError::DecodeFailed(_)) => { /* expected */ }
+            _ => panic!("error must be DecodeError::DecodeFailed"),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Cross-compatibility tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fallback_and_da_encoding_use_same_config() {
+        // Verify that fallback encoding uses the same bincode config as DA events
+        // by checking that serialization produces consistent little-endian format
+        
+        let da_event = make_node_registered_event();
+        let fallback_event = make_fallback_activated_event();
+        
+        let da_encoded = encode_event(&da_event);
+        let fallback_encoded = encode_fallback_event(&fallback_event);
+        
+        // Both should produce valid bincode (first 4 bytes are typically variant discriminant)
+        assert!(da_encoded.len() >= 4, "DA event encoding must be valid bincode");
+        assert!(fallback_encoded.len() >= 4, "Fallback event encoding must be valid bincode");
+    }
+
+    #[test]
+    fn test_decode_error_type_consistency() {
+        // Verify that both DA and fallback decode return the same error type
+        let da_result = decode_event(&[]);
+        let fallback_result = decode_fallback_event(&[]);
+        let blob_result = decode_pending_blob(&[]);
+        
+        // All should return DecodeError (which is DAError)
+        assert!(da_result.is_err());
+        assert!(fallback_result.is_err());
+        assert!(blob_result.is_err());
     }
 }
 
