@@ -1,4 +1,4 @@
-﻿//! dsdn-validator
+//! dsdn-validator
 //!
 //! Library that validates application manifests for DSDN.
 //!
