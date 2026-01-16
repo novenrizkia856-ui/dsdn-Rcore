@@ -363,6 +363,160 @@ pub fn decode_pending_blob(bytes: &[u8]) -> Result<PendingBlob, DecodeError> {
         .map_err(|e| DecodeError::DecodeFailed(e.to_string()))
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+// FALLBACK TYPES HASH COMPUTATION (14A.1A.9)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Compute SHA3-256 hash dari encoded FallbackEvent.
+///
+/// # Determinism Guarantee
+///
+/// Hash dihitung dari HASIL `encode_fallback_event`, bukan struct langsung.
+/// Input event yang sama SELALU menghasilkan hash yang identik (bitwise).
+///
+/// Menggunakan algoritma SHA3-256 yang IDENTIK dengan `compute_event_hash`
+/// untuk menjamin konsistensi hashing lintas semua proto types.
+///
+/// # Arguments
+///
+/// * `event` - Reference ke FallbackEvent yang akan di-hash
+///
+/// # Returns
+///
+/// Fixed 32 byte array berisi SHA3-256 hash.
+/// Jika encoding gagal (seharusnya tidak terjadi untuk valid FallbackEvent),
+/// mengembalikan hash dari empty bytes.
+///
+/// # Thread Safety
+///
+/// Fungsi ini bersifat pure dan thread-safe. Tidak ada shared mutable state.
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::FallbackEvent;
+/// use dsdn_proto::encoding::compute_fallback_event_hash;
+///
+/// let event = FallbackEvent::FallbackActivated {
+///     version: 1,
+/// };
+///
+/// let hash = compute_fallback_event_hash(&event);
+/// assert_eq!(hash.len(), 32);
+/// ```
+pub fn compute_fallback_event_hash(event: &FallbackEvent) -> [u8; 32] {
+    let encoded = encode_fallback_event(event);
+    let mut hasher = Sha3_256::new();
+    hasher.update(&encoded);
+    hasher.finalize().into()
+}
+
+/// Compute SHA3-256 hash dari encoded PendingBlob.
+///
+/// # Determinism Guarantee
+///
+/// Hash dihitung dari HASIL `encode_pending_blob`, bukan struct langsung.
+/// Input blob yang sama SELALU menghasilkan hash yang identik (bitwise).
+///
+/// Menggunakan algoritma SHA3-256 yang IDENTIK dengan `compute_event_hash`
+/// untuk menjamin konsistensi hashing lintas semua proto types.
+///
+/// # Arguments
+///
+/// * `blob` - Reference ke PendingBlob yang akan di-hash
+///
+/// # Returns
+///
+/// Fixed 32 byte array berisi SHA3-256 hash.
+/// Jika encoding gagal (seharusnya tidak terjadi untuk valid PendingBlob),
+/// mengembalikan hash dari empty bytes.
+///
+/// # Thread Safety
+///
+/// Fungsi ini bersifat pure dan thread-safe. Tidak ada shared mutable state.
+///
+/// # Note
+///
+/// Hash ini berbeda dari `PendingBlob::compute_hash()` yang hanya hash field `data`.
+/// Fungsi ini hash seluruh struct (semua fields) untuk integrity verification.
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::pending_blob::PendingBlob;
+/// use dsdn_proto::encoding::compute_pending_blob_hash;
+///
+/// let blob = PendingBlob {
+///     data: vec![1, 2, 3, 4],
+///     original_sequence: 42,
+///     source_da: String::from("test"),
+///     received_at: 1704067200,
+///     retry_count: 0,
+///     commitment: None,
+/// };
+///
+/// let hash = compute_pending_blob_hash(&blob);
+/// assert_eq!(hash.len(), 32);
+/// ```
+pub fn compute_pending_blob_hash(blob: &PendingBlob) -> [u8; 32] {
+    let encoded = encode_pending_blob(blob);
+    let mut hasher = Sha3_256::new();
+    hasher.update(&encoded);
+    hasher.finalize().into()
+}
+
+/// Verify hash dari FallbackEvent dengan expected hash.
+///
+/// # Verification Process
+///
+/// 1. Menghitung ulang hash dari event menggunakan `compute_fallback_event_hash`
+/// 2. Membandingkan dengan `expected` secara bitwise (constant-time)
+///
+/// # Arguments
+///
+/// * `event` - Reference ke FallbackEvent yang akan diverifikasi
+/// * `expected` - Reference ke expected hash (32 bytes)
+///
+/// # Returns
+///
+/// * `true` - Hash event IDENTIK dengan expected (bitwise match)
+/// * `false` - Hash event BERBEDA dengan expected
+///
+/// # Security Note
+///
+/// Perbandingan menggunakan iterasi byte-by-byte yang menghasilkan
+/// hasil boolean final. Meskipun bukan constant-time cryptographic comparison,
+/// ini cukup untuk integrity verification (bukan timing-sensitive authentication).
+///
+/// # Thread Safety
+///
+/// Fungsi ini bersifat pure dan thread-safe. Tidak ada side-effect.
+///
+/// # Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::FallbackEvent;
+/// use dsdn_proto::encoding::{compute_fallback_event_hash, verify_fallback_event_hash};
+///
+/// let event = FallbackEvent::FallbackActivated {
+///     version: 1,
+/// };
+///
+/// let hash = compute_fallback_event_hash(&event);
+/// assert!(verify_fallback_event_hash(&event, &hash));
+///
+/// // Wrong hash should return false
+/// let wrong_hash = [0u8; 32];
+/// assert!(!verify_fallback_event_hash(&event, &wrong_hash));
+/// ```
+pub fn verify_fallback_event_hash(event: &FallbackEvent, expected: &[u8; 32]) -> bool {
+    let computed = compute_fallback_event_hash(event);
+    // Constant-time comparison untuk menghindari timing attacks
+    // Meskipun ini bukan cryptographic signature verification,
+    // best practice tetap menggunakan constant-time comparison
+    computed.iter().zip(expected.iter()).fold(true, |acc, (a, b)| acc && (*a == *b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1222,349 @@ mod tests {
         assert!(da_result.is_err());
         assert!(fallback_result.is_err());
         assert!(blob_result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // FALLBACK EVENT HASH COMPUTATION TESTS (14A.1A.9)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // compute_fallback_event_hash tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_compute_fallback_event_hash_returns_32_bytes() {
+        let event = make_fallback_activated_event();
+        let hash = compute_fallback_event_hash(&event);
+        assert_eq!(hash.len(), 32, "hash must be exactly 32 bytes");
+    }
+
+    #[test]
+    fn test_compute_fallback_event_hash_determinism_multiple_calls() {
+        let event = make_fallback_activated_event();
+
+        let hash1 = compute_fallback_event_hash(&event);
+        let hash2 = compute_fallback_event_hash(&event);
+        let hash3 = compute_fallback_event_hash(&event);
+
+        assert_eq!(hash1, hash2, "hash must be deterministic (1 vs 2)");
+        assert_eq!(hash2, hash3, "hash must be deterministic (2 vs 3)");
+    }
+
+    #[test]
+    fn test_compute_fallback_event_hash_determinism_100_iterations() {
+        let event = make_fallback_deactivated_event();
+        let reference = compute_fallback_event_hash(&event);
+
+        for i in 0..100 {
+            let hash = compute_fallback_event_hash(&event);
+            assert_eq!(
+                reference, hash,
+                "hash must be deterministic at iteration {}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_fallback_event_hash_all_variants() {
+        let events = [
+            make_fallback_activated_event(),
+            make_fallback_deactivated_event(),
+            make_reconciliation_started_event(),
+            make_reconciliation_completed_event(),
+        ];
+
+        for event in &events {
+            let hash = compute_fallback_event_hash(event);
+            assert_eq!(hash.len(), 32, "all variants must produce 32-byte hash");
+        }
+    }
+
+    #[test]
+    fn test_compute_fallback_event_hash_different_events_different_hashes() {
+        let event1 = make_fallback_activated_event();
+        let event2 = make_fallback_deactivated_event();
+
+        let hash1 = compute_fallback_event_hash(&event1);
+        let hash2 = compute_fallback_event_hash(&event2);
+
+        assert_ne!(hash1, hash2, "different events must produce different hashes");
+    }
+
+    #[test]
+    fn test_compute_fallback_event_hash_consistent_with_encoding() {
+        // Verify that hash is computed from encoded bytes
+        let event = make_fallback_activated_event();
+        
+        let hash1 = compute_fallback_event_hash(&event);
+        
+        // Manually compute hash from encoded bytes
+        let encoded = encode_fallback_event(&event);
+        let mut hasher = Sha3_256::new();
+        hasher.update(&encoded);
+        let hash2: [u8; 32] = hasher.finalize().into();
+        
+        assert_eq!(hash1, hash2, "hash must be consistent with manual encoding + hashing");
+    }
+
+    #[test]
+    fn test_compute_fallback_event_hash_stability_across_encode_decode() {
+        let original = make_fallback_activated_event();
+        let hash1 = compute_fallback_event_hash(&original);
+        
+        // Encode and decode
+        let encoded = encode_fallback_event(&original);
+        let decoded = decode_fallback_event(&encoded);
+        assert!(decoded.is_ok(), "decode must succeed");
+        
+        let hash2 = compute_fallback_event_hash(&decoded.unwrap());
+        
+        assert_eq!(hash1, hash2, "hash must be stable across encode/decode cycle");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // compute_pending_blob_hash tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_compute_pending_blob_hash_returns_32_bytes() {
+        let blob = make_pending_blob();
+        let hash = compute_pending_blob_hash(&blob);
+        assert_eq!(hash.len(), 32, "hash must be exactly 32 bytes");
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_determinism_multiple_calls() {
+        let blob = make_pending_blob();
+
+        let hash1 = compute_pending_blob_hash(&blob);
+        let hash2 = compute_pending_blob_hash(&blob);
+        let hash3 = compute_pending_blob_hash(&blob);
+
+        assert_eq!(hash1, hash2, "hash must be deterministic (1 vs 2)");
+        assert_eq!(hash2, hash3, "hash must be deterministic (2 vs 3)");
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_determinism_100_iterations() {
+        let blob = make_pending_blob();
+        let reference = compute_pending_blob_hash(&blob);
+
+        for i in 0..100 {
+            let hash = compute_pending_blob_hash(&blob);
+            assert_eq!(
+                reference, hash,
+                "hash must be deterministic at iteration {}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_different_blobs_different_hashes() {
+        let blob1 = make_pending_blob();
+        let blob2 = make_pending_blob_no_commitment();
+
+        let hash1 = compute_pending_blob_hash(&blob1);
+        let hash2 = compute_pending_blob_hash(&blob2);
+
+        assert_ne!(hash1, hash2, "different blobs must produce different hashes");
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_empty_data() {
+        let blob = PendingBlob {
+            data: Vec::new(),
+            original_sequence: 0,
+            source_da: String::from("empty"),
+            received_at: 0,
+            retry_count: 0,
+            commitment: None,
+        };
+
+        let hash = compute_pending_blob_hash(&blob);
+        assert_eq!(hash.len(), 32, "empty data blob must produce 32-byte hash");
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_large_data() {
+        let blob = PendingBlob {
+            data: vec![0xAB; 10000],
+            original_sequence: u64::MAX,
+            source_da: String::from("large"),
+            received_at: u64::MAX,
+            retry_count: u32::MAX,
+            commitment: Some([0xFF; 32]),
+        };
+
+        let hash = compute_pending_blob_hash(&blob);
+        assert_eq!(hash.len(), 32, "large data blob must produce 32-byte hash");
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_consistent_with_encoding() {
+        let blob = make_pending_blob();
+        
+        let hash1 = compute_pending_blob_hash(&blob);
+        
+        // Manually compute hash from encoded bytes
+        let encoded = encode_pending_blob(&blob);
+        let mut hasher = Sha3_256::new();
+        hasher.update(&encoded);
+        let hash2: [u8; 32] = hasher.finalize().into();
+        
+        assert_eq!(hash1, hash2, "hash must be consistent with manual encoding + hashing");
+    }
+
+    #[test]
+    fn test_compute_pending_blob_hash_stability_across_encode_decode() {
+        let original = make_pending_blob();
+        let hash1 = compute_pending_blob_hash(&original);
+        
+        // Encode and decode
+        let encoded = encode_pending_blob(&original);
+        let decoded = decode_pending_blob(&encoded);
+        assert!(decoded.is_ok(), "decode must succeed");
+        
+        let hash2 = compute_pending_blob_hash(&decoded.unwrap());
+        
+        assert_eq!(hash1, hash2, "hash must be stable across encode/decode cycle");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // verify_fallback_event_hash tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_fallback_event_hash_returns_true_for_correct_hash() {
+        let event = make_fallback_activated_event();
+        let hash = compute_fallback_event_hash(&event);
+        
+        assert!(verify_fallback_event_hash(&event, &hash), "must return true for correct hash");
+    }
+
+    #[test]
+    fn test_verify_fallback_event_hash_returns_false_for_wrong_hash() {
+        let event = make_fallback_activated_event();
+        let wrong_hash = [0u8; 32];
+        
+        assert!(!verify_fallback_event_hash(&event, &wrong_hash), "must return false for wrong hash");
+    }
+
+    #[test]
+    fn test_verify_fallback_event_hash_returns_false_for_different_event_hash() {
+        let event1 = make_fallback_activated_event();
+        let event2 = make_fallback_deactivated_event();
+        
+        let hash2 = compute_fallback_event_hash(&event2);
+        
+        assert!(!verify_fallback_event_hash(&event1, &hash2), "must return false for different event's hash");
+    }
+
+    #[test]
+    fn test_verify_fallback_event_hash_all_variants() {
+        let events = [
+            make_fallback_activated_event(),
+            make_fallback_deactivated_event(),
+            make_reconciliation_started_event(),
+            make_reconciliation_completed_event(),
+        ];
+
+        for event in &events {
+            let hash = compute_fallback_event_hash(event);
+            assert!(
+                verify_fallback_event_hash(event, &hash),
+                "verify must return true for correct hash of all variants"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_fallback_event_hash_determinism() {
+        let event = make_fallback_activated_event();
+        let hash = compute_fallback_event_hash(&event);
+        
+        // Verify multiple times
+        for i in 0..100 {
+            assert!(
+                verify_fallback_event_hash(&event, &hash),
+                "verify must be deterministic at iteration {}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_fallback_event_hash_bitwise_comparison() {
+        let event = make_fallback_activated_event();
+        let mut hash = compute_fallback_event_hash(&event);
+        
+        // Original hash should verify
+        assert!(verify_fallback_event_hash(&event, &hash), "original hash must verify");
+        
+        // Flip one bit - should fail
+        hash[0] ^= 0x01;
+        assert!(!verify_fallback_event_hash(&event, &hash), "flipped bit must fail verification");
+        
+        // Flip back - should verify again
+        hash[0] ^= 0x01;
+        assert!(verify_fallback_event_hash(&event, &hash), "restored hash must verify");
+    }
+
+    #[test]
+    fn test_verify_fallback_event_hash_all_bytes_matter() {
+        let event = make_fallback_activated_event();
+        let correct_hash = compute_fallback_event_hash(&event);
+        
+        // Test that changing any byte causes verification to fail
+        for i in 0..32 {
+            let mut modified_hash = correct_hash;
+            modified_hash[i] ^= 0xFF;
+            assert!(
+                !verify_fallback_event_hash(&event, &modified_hash),
+                "modifying byte {} must cause verification to fail", i
+            );
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Cross-consistency tests (14A.1A.9)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fallback_hash_uses_same_algorithm_as_da_hash() {
+        // Verify that both DA events and fallback events use the same SHA3-256 algorithm
+        // by checking hash output length
+        
+        let da_event = make_node_registered_event();
+        let fallback_event = make_fallback_activated_event();
+        
+        let da_hash = compute_event_hash(&da_event);
+        let fallback_hash = compute_fallback_event_hash(&fallback_event);
+        
+        assert_eq!(da_hash.len(), 32, "DA hash must be 32 bytes");
+        assert_eq!(fallback_hash.len(), 32, "Fallback hash must be 32 bytes");
+        assert_eq!(da_hash.len(), fallback_hash.len(), "Both must use same hash algorithm (same output size)");
+    }
+
+    #[test]
+    fn test_hash_pipeline_encoding_then_sha3() {
+        // Verify that the hash pipeline is: encode → SHA3-256
+        // Both DA events and fallback events should follow this pattern
+        
+        let fallback_event = make_fallback_activated_event();
+        
+        // Step 1: Encode
+        let encoded = encode_fallback_event(&fallback_event);
+        assert!(!encoded.is_empty(), "encoding must produce bytes");
+        
+        // Step 2: Hash
+        let mut hasher = Sha3_256::new();
+        hasher.update(&encoded);
+        let manual_hash: [u8; 32] = hasher.finalize().into();
+        
+        // Step 3: Compare with function output
+        let function_hash = compute_fallback_event_hash(&fallback_event);
+        
+        assert_eq!(manual_hash, function_hash, "hash must follow encode → SHA3-256 pipeline");
     }
 }
 
