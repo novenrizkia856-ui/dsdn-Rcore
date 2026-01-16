@@ -141,7 +141,7 @@ pub use da_health::{DAHealthStatus, DAError};
 pub use encoding::*;
 pub use fallback_event::{
     FallbackEvent, FallbackActivated, FallbackDeactivated, FallbackType,
-    FALLBACK_EVENT_SCHEMA_VERSION,
+    ReconciliationStarted, ReconciliationCompleted, FALLBACK_EVENT_SCHEMA_VERSION,
 };
 
 /// Proto crate version string

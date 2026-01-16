@@ -62,6 +62,11 @@ const SECONDS_PER_HOUR: u64 = 3600;
 /// Jumlah detik dalam satu hari.
 const SECONDS_PER_DAY: u64 = 86400;
 
+/// Default source DA string untuk `ReconciliationStarted` saat menggunakan `Default` trait.
+///
+/// Nilai "unspecified" dipilih untuk menandakan sumber DA belum ditentukan.
+const DEFAULT_SOURCE_DA: &str = "unspecified";
+
 // ════════════════════════════════════════════════════════════════════════════════
 // FALLBACK TYPE ENUM
 // ════════════════════════════════════════════════════════════════════════════════
@@ -392,6 +397,217 @@ impl Default for FallbackDeactivated {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// RECONCILIATION STARTED STRUCT
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Struktur data untuk event dimulainya proses reconciliation.
+///
+/// Struct ini merepresentasikan informasi lengkap ketika sistem
+/// memulai proses reconciliation dari fallback DA ke primary DA (Celestia).
+///
+/// ## Fields
+///
+/// Semua fields bersifat wajib dan eksplisit:
+/// - `pending_count`: Jumlah blobs yang menunggu untuk di-reconcile
+/// - `started_at`: Unix timestamp saat reconciliation dimulai
+/// - `source_da`: Nama atau identifier dari fallback DA sumber
+///
+/// ## Serialization
+///
+/// Struct ini dapat di-serialize menggunakan bincode atau JSON.
+/// Semua fields ikut dalam serialisasi, tidak ada field tersembunyi.
+///
+/// ## Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::ReconciliationStarted;
+///
+/// let event = ReconciliationStarted {
+///     pending_count: 150,
+///     started_at: 1704070000,
+///     source_da: String::from("validator_quorum"),
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconciliationStarted {
+    /// Jumlah blobs yang menunggu untuk di-reconcile.
+    ///
+    /// Merepresentasikan total blobs yang disimpan di fallback DA
+    /// dan perlu dipindahkan ke Celestia saat proses reconciliation dimulai.
+    ///
+    /// Nilai ini digunakan untuk:
+    /// - Estimasi durasi proses reconciliation
+    /// - Progress tracking selama reconciliation
+    /// - Audit trail untuk verifikasi completeness
+    ///
+    /// Nilai 0 menandakan tidak ada blobs yang perlu di-reconcile.
+    pub pending_count: u64,
+
+    /// Unix timestamp (seconds since epoch) saat reconciliation dimulai.
+    ///
+    /// Timestamp ini merepresentasikan waktu lokal sistem ketika
+    /// proses reconciliation secara resmi dimulai.
+    ///
+    /// Digunakan untuk:
+    /// - Menghitung durasi total reconciliation
+    /// - Audit trail dan logging
+    /// - Monitoring dan alerting
+    ///
+    /// Nilai 0 menandakan timestamp belum diisi (hanya untuk Default).
+    pub started_at: u64,
+
+    /// Nama atau identifier dari fallback DA yang menjadi sumber data.
+    ///
+    /// Berisi deskripsi singkat yang mengidentifikasi fallback DA
+    /// dari mana blobs akan di-reconcile. Contoh nilai:
+    /// - "validator_quorum": Blobs dari Validator Quorum DA
+    /// - "emergency": Blobs dari Emergency DA
+    ///
+    /// Nilai ini digunakan untuk:
+    /// - Routing logic dalam proses reconciliation
+    /// - Audit trail untuk traceability
+    /// - Debugging dan monitoring
+    pub source_da: String,
+}
+
+impl Default for ReconciliationStarted {
+    /// Membuat instance `ReconciliationStarted` dengan nilai default.
+    ///
+    /// Nilai default bersifat:
+    /// - Deterministik (tidak bergantung pada state eksternal)
+    /// - Valid secara tipe
+    /// - Dapat diidentifikasi sebagai "belum diisi"
+    ///
+    /// ## Default Values
+    ///
+    /// - `pending_count`: 0 (tidak ada blobs pending)
+    /// - `started_at`: 0 (timestamp belum diisi)
+    /// - `source_da`: "unspecified" (sumber belum ditentukan)
+    #[inline]
+    fn default() -> Self {
+        Self {
+            pending_count: 0,
+            started_at: DEFAULT_TIMESTAMP,
+            source_da: String::from(DEFAULT_SOURCE_DA),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// RECONCILIATION COMPLETED STRUCT
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Struktur data untuk event selesainya proses reconciliation.
+///
+/// Struct ini merepresentasikan informasi lengkap ketika sistem
+/// menyelesaikan proses reconciliation dari fallback DA ke primary DA (Celestia).
+///
+/// ## Fields
+///
+/// Semua fields bersifat wajib dan eksplisit:
+/// - `reconciled_count`: Jumlah blobs yang berhasil di-reconcile
+/// - `failed_count`: Jumlah blobs yang gagal di-reconcile
+/// - `completed_at`: Unix timestamp saat reconciliation selesai
+/// - `duration_ms`: Durasi total proses reconciliation dalam milidetik
+///
+/// ## Serialization
+///
+/// Struct ini dapat di-serialize menggunakan bincode atau JSON.
+/// Semua fields ikut dalam serialisasi, tidak ada field tersembunyi.
+///
+/// ## Example
+///
+/// ```
+/// use dsdn_proto::fallback_event::ReconciliationCompleted;
+///
+/// let event = ReconciliationCompleted {
+///     reconciled_count: 148,
+///     failed_count: 2,
+///     completed_at: 1704071000,
+///     duration_ms: 60000,
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconciliationCompleted {
+    /// Jumlah blobs yang berhasil di-reconcile ke Celestia.
+    ///
+    /// Merepresentasikan total blobs yang berhasil dipindahkan
+    /// dari fallback DA ke Celestia selama proses reconciliation.
+    ///
+    /// Nilai ini digunakan untuk:
+    /// - Verifikasi completeness proses reconciliation
+    /// - Audit trail dan compliance
+    /// - Monitoring dan metrics
+    ///
+    /// Nilai 0 menandakan tidak ada blobs yang berhasil di-reconcile.
+    pub reconciled_count: u64,
+
+    /// Jumlah blobs yang gagal di-reconcile ke Celestia.
+    ///
+    /// Merepresentasikan total blobs yang tidak dapat dipindahkan
+    /// dari fallback DA ke Celestia karena error atau kondisi lainnya.
+    ///
+    /// Nilai ini digunakan untuk:
+    /// - Error tracking dan alerting
+    /// - Retry logic decision
+    /// - Audit trail untuk investigasi
+    ///
+    /// Nilai 0 menandakan semua blobs berhasil di-reconcile (ideal case).
+    pub failed_count: u64,
+
+    /// Unix timestamp (seconds since epoch) saat reconciliation selesai.
+    ///
+    /// Timestamp ini merepresentasikan waktu lokal sistem ketika
+    /// proses reconciliation secara resmi selesai (baik sukses maupun partial).
+    ///
+    /// Digunakan untuk:
+    /// - Menghitung durasi total reconciliation
+    /// - Audit trail dan logging
+    /// - Monitoring dan alerting
+    ///
+    /// Nilai 0 menandakan timestamp belum diisi (hanya untuk Default).
+    pub completed_at: u64,
+
+    /// Durasi total proses reconciliation dalam milidetik.
+    ///
+    /// Dihitung sebagai selisih antara `completed_at` dan `started_at`
+    /// dari event `ReconciliationStarted` sebelumnya, dikonversi ke milidetik.
+    ///
+    /// Nilai ini digunakan untuk:
+    /// - Performance monitoring dan profiling
+    /// - SLA tracking
+    /// - Capacity planning
+    ///
+    /// Nilai 0 menandakan durasi tidak diketahui atau sangat singkat.
+    pub duration_ms: u64,
+}
+
+impl Default for ReconciliationCompleted {
+    /// Membuat instance `ReconciliationCompleted` dengan nilai default.
+    ///
+    /// Nilai default bersifat:
+    /// - Deterministik (tidak bergantung pada state eksternal)
+    /// - Valid secara tipe
+    /// - Dapat diidentifikasi sebagai "belum diisi"
+    ///
+    /// ## Default Values
+    ///
+    /// - `reconciled_count`: 0 (tidak ada blobs reconciled)
+    /// - `failed_count`: 0 (tidak ada blobs gagal)
+    /// - `completed_at`: 0 (timestamp belum diisi)
+    /// - `duration_ms`: 0 (durasi tidak diketahui)
+    #[inline]
+    fn default() -> Self {
+        Self {
+            reconciled_count: 0,
+            failed_count: 0,
+            completed_at: DEFAULT_TIMESTAMP,
+            duration_ms: 0,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // FALLBACK EVENT ENUM
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -568,9 +784,9 @@ mod tests {
         assert_eq!(event, decoded, "Round-trip must produce identical result");
     }
 
-    /// Test: ReconciliationStarted dapat di-serialize dan di-deserialize.
+    /// Test: ReconciliationStarted variant dapat di-serialize dan di-deserialize.
     #[test]
-    fn test_reconciliation_started_serialize_deserialize() {
+    fn test_reconciliation_started_variant_serialize_deserialize() {
         let event = FallbackEvent::ReconciliationStarted {
             version: FALLBACK_EVENT_SCHEMA_VERSION,
         };
@@ -586,9 +802,9 @@ mod tests {
         assert_eq!(event, decoded, "Round-trip must produce identical result");
     }
 
-    /// Test: ReconciliationCompleted dapat di-serialize dan di-deserialize.
+    /// Test: ReconciliationCompleted variant dapat di-serialize dan di-deserialize.
     #[test]
-    fn test_reconciliation_completed_serialize_deserialize() {
+    fn test_reconciliation_completed_variant_serialize_deserialize() {
         let event = FallbackEvent::ReconciliationCompleted {
             version: FALLBACK_EVENT_SCHEMA_VERSION,
         };
@@ -1491,5 +1707,496 @@ mod tests {
         };
 
         assert_eq!(event.duration_human(), "1s", "1 second must return '1s'");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // RECONCILIATION STARTED STRUCT TESTS (14A.1A.4)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Test: ReconciliationStarted struct dapat di-serialize dan di-deserialize (bincode).
+    #[test]
+    fn test_reconciliation_started_struct_bincode_roundtrip() {
+        let original = ReconciliationStarted {
+            pending_count: 150,
+            started_at: 1704070000,
+            source_da: String::from("validator_quorum"),
+        };
+
+        let serialized = bincode::serialize(&original);
+        assert!(serialized.is_ok(), "ReconciliationStarted serialization must succeed");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<ReconciliationStarted, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "ReconciliationStarted deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(original, decoded, "ReconciliationStarted round-trip must be identical");
+    }
+
+    /// Test: ReconciliationStarted struct dapat di-serialize dan di-deserialize (JSON).
+    #[test]
+    fn test_reconciliation_started_struct_json_roundtrip() {
+        let original = ReconciliationStarted {
+            pending_count: 200,
+            started_at: 1704153600,
+            source_da: String::from("emergency"),
+        };
+
+        let json = serde_json::to_string(&original);
+        assert!(json.is_ok(), "ReconciliationStarted JSON serialization must succeed");
+
+        let json_str = json.unwrap();
+        let deserialized: Result<ReconciliationStarted, _> = serde_json::from_str(&json_str);
+        assert!(deserialized.is_ok(), "ReconciliationStarted JSON deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(original, decoded, "ReconciliationStarted JSON round-trip must be identical");
+    }
+
+    /// Test: ReconciliationStarted serialization deterministik.
+    #[test]
+    fn test_reconciliation_started_struct_deterministic_serialization() {
+        let event = ReconciliationStarted {
+            pending_count: 100,
+            started_at: 2000,
+            source_da: String::from("test_da"),
+        };
+
+        let bytes1 = bincode::serialize(&event);
+        let bytes2 = bincode::serialize(&event);
+
+        assert!(bytes1.is_ok(), "First serialization must succeed");
+        assert!(bytes2.is_ok(), "Second serialization must succeed");
+        assert_eq!(
+            bytes1.unwrap(),
+            bytes2.unwrap(),
+            "Deterministic: same input must produce same bytes"
+        );
+    }
+
+    /// Test: ReconciliationStarted Default menghasilkan nilai valid.
+    #[test]
+    fn test_reconciliation_started_default_validity() {
+        let default_event = ReconciliationStarted::default();
+
+        assert_eq!(
+            default_event.pending_count, 0,
+            "Default pending_count must be 0"
+        );
+        assert_eq!(
+            default_event.started_at, 0,
+            "Default started_at must be 0"
+        );
+        assert_eq!(
+            default_event.source_da, "unspecified",
+            "Default source_da must be 'unspecified'"
+        );
+    }
+
+    /// Test: ReconciliationStarted Default dapat di-serialize dan di-deserialize.
+    #[test]
+    fn test_reconciliation_started_default_serialization() {
+        let default_event = ReconciliationStarted::default();
+
+        let serialized = bincode::serialize(&default_event);
+        assert!(serialized.is_ok(), "Default ReconciliationStarted serialization must succeed");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<ReconciliationStarted, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "Default ReconciliationStarted deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(
+            default_event, decoded,
+            "Default ReconciliationStarted round-trip must be identical"
+        );
+    }
+
+    /// Test: ReconciliationStarted Default deterministik.
+    #[test]
+    fn test_reconciliation_started_default_deterministic() {
+        let default1 = ReconciliationStarted::default();
+        let default2 = ReconciliationStarted::default();
+
+        assert_eq!(
+            default1, default2,
+            "Default must be deterministic (same value every time)"
+        );
+    }
+
+    /// Test: ReconciliationStarted PartialEq bekerja dengan benar.
+    #[test]
+    fn test_reconciliation_started_partial_eq() {
+        let event1 = ReconciliationStarted {
+            pending_count: 100,
+            started_at: 200,
+            source_da: String::from("test"),
+        };
+
+        let event2 = ReconciliationStarted {
+            pending_count: 100,
+            started_at: 200,
+            source_da: String::from("test"),
+        };
+
+        let event3 = ReconciliationStarted {
+            pending_count: 999,
+            started_at: 200,
+            source_da: String::from("test"),
+        };
+
+        assert_eq!(event1, event2, "Same values must be equal");
+        assert_ne!(event1, event3, "Different pending_count must not be equal");
+    }
+
+    /// Test: ReconciliationStarted Clone bekerja dengan benar.
+    #[test]
+    fn test_reconciliation_started_clone() {
+        let original = ReconciliationStarted {
+            pending_count: 555,
+            started_at: 666,
+            source_da: String::from("clone_test"),
+        };
+
+        let cloned = original.clone();
+        assert_eq!(original, cloned, "Clone must produce equal value");
+    }
+
+    /// Test: ReconciliationStarted Debug output mengandung semua field names.
+    #[test]
+    fn test_reconciliation_started_debug() {
+        let event = ReconciliationStarted {
+            pending_count: 100,
+            started_at: 200,
+            source_da: String::from("debug_test"),
+        };
+
+        let debug_str = format!("{:?}", event);
+
+        assert!(
+            debug_str.contains("pending_count"),
+            "Debug must contain 'pending_count'"
+        );
+        assert!(
+            debug_str.contains("started_at"),
+            "Debug must contain 'started_at'"
+        );
+        assert!(
+            debug_str.contains("source_da"),
+            "Debug must contain 'source_da'"
+        );
+    }
+
+    /// Test: ReconciliationStarted dengan nilai maksimum u64.
+    #[test]
+    fn test_reconciliation_started_max_u64_values() {
+        let event = ReconciliationStarted {
+            pending_count: u64::MAX,
+            started_at: u64::MAX,
+            source_da: String::from("max_test"),
+        };
+
+        let serialized = bincode::serialize(&event);
+        assert!(serialized.is_ok(), "Max u64 values must serialize");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<ReconciliationStarted, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "Max u64 values must deserialize");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(decoded.pending_count, u64::MAX);
+        assert_eq!(decoded.started_at, u64::MAX);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // RECONCILIATION COMPLETED STRUCT TESTS (14A.1A.4)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Test: ReconciliationCompleted struct dapat di-serialize dan di-deserialize (bincode).
+    #[test]
+    fn test_reconciliation_completed_struct_bincode_roundtrip() {
+        let original = ReconciliationCompleted {
+            reconciled_count: 148,
+            failed_count: 2,
+            completed_at: 1704071000,
+            duration_ms: 60000,
+        };
+
+        let serialized = bincode::serialize(&original);
+        assert!(serialized.is_ok(), "ReconciliationCompleted serialization must succeed");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<ReconciliationCompleted, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "ReconciliationCompleted deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(original, decoded, "ReconciliationCompleted round-trip must be identical");
+    }
+
+    /// Test: ReconciliationCompleted struct dapat di-serialize dan di-deserialize (JSON).
+    #[test]
+    fn test_reconciliation_completed_struct_json_roundtrip() {
+        let original = ReconciliationCompleted {
+            reconciled_count: 500,
+            failed_count: 0,
+            completed_at: 1704153600,
+            duration_ms: 120000,
+        };
+
+        let json = serde_json::to_string(&original);
+        assert!(json.is_ok(), "ReconciliationCompleted JSON serialization must succeed");
+
+        let json_str = json.unwrap();
+        let deserialized: Result<ReconciliationCompleted, _> = serde_json::from_str(&json_str);
+        assert!(deserialized.is_ok(), "ReconciliationCompleted JSON deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(original, decoded, "ReconciliationCompleted JSON round-trip must be identical");
+    }
+
+    /// Test: ReconciliationCompleted serialization deterministik.
+    #[test]
+    fn test_reconciliation_completed_struct_deterministic_serialization() {
+        let event = ReconciliationCompleted {
+            reconciled_count: 100,
+            failed_count: 5,
+            completed_at: 2000,
+            duration_ms: 30000,
+        };
+
+        let bytes1 = bincode::serialize(&event);
+        let bytes2 = bincode::serialize(&event);
+
+        assert!(bytes1.is_ok(), "First serialization must succeed");
+        assert!(bytes2.is_ok(), "Second serialization must succeed");
+        assert_eq!(
+            bytes1.unwrap(),
+            bytes2.unwrap(),
+            "Deterministic: same input must produce same bytes"
+        );
+    }
+
+    /// Test: ReconciliationCompleted Default menghasilkan nilai valid.
+    #[test]
+    fn test_reconciliation_completed_default_validity() {
+        let default_event = ReconciliationCompleted::default();
+
+        assert_eq!(
+            default_event.reconciled_count, 0,
+            "Default reconciled_count must be 0"
+        );
+        assert_eq!(
+            default_event.failed_count, 0,
+            "Default failed_count must be 0"
+        );
+        assert_eq!(
+            default_event.completed_at, 0,
+            "Default completed_at must be 0"
+        );
+        assert_eq!(
+            default_event.duration_ms, 0,
+            "Default duration_ms must be 0"
+        );
+    }
+
+    /// Test: ReconciliationCompleted Default dapat di-serialize dan di-deserialize.
+    #[test]
+    fn test_reconciliation_completed_default_serialization() {
+        let default_event = ReconciliationCompleted::default();
+
+        let serialized = bincode::serialize(&default_event);
+        assert!(serialized.is_ok(), "Default ReconciliationCompleted serialization must succeed");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<ReconciliationCompleted, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "Default ReconciliationCompleted deserialization must succeed");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(
+            default_event, decoded,
+            "Default ReconciliationCompleted round-trip must be identical"
+        );
+    }
+
+    /// Test: ReconciliationCompleted Default deterministik.
+    #[test]
+    fn test_reconciliation_completed_default_deterministic() {
+        let default1 = ReconciliationCompleted::default();
+        let default2 = ReconciliationCompleted::default();
+
+        assert_eq!(
+            default1, default2,
+            "Default must be deterministic (same value every time)"
+        );
+    }
+
+    /// Test: ReconciliationCompleted PartialEq bekerja dengan benar.
+    #[test]
+    fn test_reconciliation_completed_partial_eq() {
+        let event1 = ReconciliationCompleted {
+            reconciled_count: 100,
+            failed_count: 5,
+            completed_at: 200,
+            duration_ms: 1000,
+        };
+
+        let event2 = ReconciliationCompleted {
+            reconciled_count: 100,
+            failed_count: 5,
+            completed_at: 200,
+            duration_ms: 1000,
+        };
+
+        let event3 = ReconciliationCompleted {
+            reconciled_count: 999,
+            failed_count: 5,
+            completed_at: 200,
+            duration_ms: 1000,
+        };
+
+        assert_eq!(event1, event2, "Same values must be equal");
+        assert_ne!(event1, event3, "Different reconciled_count must not be equal");
+    }
+
+    /// Test: ReconciliationCompleted Clone bekerja dengan benar.
+    #[test]
+    fn test_reconciliation_completed_clone() {
+        let original = ReconciliationCompleted {
+            reconciled_count: 555,
+            failed_count: 66,
+            completed_at: 777,
+            duration_ms: 888,
+        };
+
+        let cloned = original.clone();
+        assert_eq!(original, cloned, "Clone must produce equal value");
+    }
+
+    /// Test: ReconciliationCompleted Debug output mengandung semua field names.
+    #[test]
+    fn test_reconciliation_completed_debug() {
+        let event = ReconciliationCompleted {
+            reconciled_count: 100,
+            failed_count: 5,
+            completed_at: 200,
+            duration_ms: 1000,
+        };
+
+        let debug_str = format!("{:?}", event);
+
+        assert!(
+            debug_str.contains("reconciled_count"),
+            "Debug must contain 'reconciled_count'"
+        );
+        assert!(
+            debug_str.contains("failed_count"),
+            "Debug must contain 'failed_count'"
+        );
+        assert!(
+            debug_str.contains("completed_at"),
+            "Debug must contain 'completed_at'"
+        );
+        assert!(
+            debug_str.contains("duration_ms"),
+            "Debug must contain 'duration_ms'"
+        );
+    }
+
+    /// Test: ReconciliationCompleted dengan nilai maksimum u64.
+    #[test]
+    fn test_reconciliation_completed_max_u64_values() {
+        let event = ReconciliationCompleted {
+            reconciled_count: u64::MAX,
+            failed_count: u64::MAX,
+            completed_at: u64::MAX,
+            duration_ms: u64::MAX,
+        };
+
+        let serialized = bincode::serialize(&event);
+        assert!(serialized.is_ok(), "Max u64 values must serialize");
+
+        let bytes = serialized.unwrap();
+        let deserialized: Result<ReconciliationCompleted, _> = bincode::deserialize(&bytes);
+        assert!(deserialized.is_ok(), "Max u64 values must deserialize");
+
+        let decoded = deserialized.unwrap();
+        assert_eq!(decoded.reconciled_count, u64::MAX);
+        assert_eq!(decoded.failed_count, u64::MAX);
+        assert_eq!(decoded.completed_at, u64::MAX);
+        assert_eq!(decoded.duration_ms, u64::MAX);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // FALLBACK EVENT ENUM BACKWARD COMPATIBILITY TESTS (14A.1A.4)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Test: FallbackEvent enum tetap memiliki tepat 4 variant setelah update.
+    #[test]
+    fn test_fallback_event_still_exactly_four_variants() {
+        let event = FallbackEvent::ReconciliationStarted { version: 1 };
+
+        // Exhaustive match membuktikan tepat 4 variant
+        let _variant_name = match event {
+            FallbackEvent::FallbackActivated { .. } => "FallbackActivated",
+            FallbackEvent::FallbackDeactivated { .. } => "FallbackDeactivated",
+            FallbackEvent::ReconciliationStarted { .. } => "ReconciliationStarted",
+            FallbackEvent::ReconciliationCompleted { .. } => "ReconciliationCompleted",
+        };
+        // Jika ada variant tambahan, match ini akan error saat compile
+    }
+
+    /// Test: Variant lama masih dapat di-serialize dengan format yang sama.
+    #[test]
+    fn test_old_variants_backward_compatible() {
+        // Test FallbackActivated
+        let activated = FallbackEvent::FallbackActivated { version: 1 };
+        let ser_activated = bincode::serialize(&activated);
+        assert!(ser_activated.is_ok(), "FallbackActivated must still serialize");
+
+        // Test FallbackDeactivated
+        let deactivated = FallbackEvent::FallbackDeactivated { version: 1 };
+        let ser_deactivated = bincode::serialize(&deactivated);
+        assert!(ser_deactivated.is_ok(), "FallbackDeactivated must still serialize");
+
+        // Verify roundtrip
+        let bytes = ser_activated.unwrap();
+        let decoded: Result<FallbackEvent, _> = bincode::deserialize(&bytes);
+        assert!(decoded.is_ok(), "FallbackActivated must still deserialize");
+        assert_eq!(activated, decoded.unwrap(), "FallbackActivated roundtrip must match");
+    }
+
+    /// Test: Semua variant enum dapat di-serialize dan di-deserialize.
+    #[test]
+    fn test_all_enum_variants_serializable() {
+        let variants = [
+            FallbackEvent::FallbackActivated { version: 1 },
+            FallbackEvent::FallbackDeactivated { version: 1 },
+            FallbackEvent::ReconciliationStarted { version: 1 },
+            FallbackEvent::ReconciliationCompleted { version: 1 },
+        ];
+
+        for (idx, variant) in variants.iter().enumerate() {
+            let serialized = bincode::serialize(variant);
+            assert!(
+                serialized.is_ok(),
+                "Variant {} must serialize",
+                idx
+            );
+
+            let bytes = serialized.unwrap();
+            let deserialized: Result<FallbackEvent, _> = bincode::deserialize(&bytes);
+            assert!(
+                deserialized.is_ok(),
+                "Variant {} must deserialize",
+                idx
+            );
+
+            let decoded = deserialized.unwrap();
+            assert_eq!(
+                variant, &decoded,
+                "Variant {} roundtrip must match",
+                idx
+            );
+        }
     }
 }
