@@ -418,61 +418,180 @@ impl DARouterConfig {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// DA ROUTER METRICS (14A.1A.16 + 14A.1A.17)
+// DA ROUTER METRICS (14A.1A.19)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// Metrics internal untuk DARouter.
+/// Snapshot point-in-time dari semua metrics DARouter.
 ///
-/// Melacak operasi per-path dengan atomic counters.
-///
-/// ## Tracked Metrics
-///
-/// - Post counts per path (primary, secondary, emergency)
-/// - Read counts per path (primary, secondary, emergency)
-/// - Error counts per path (post and read)
-/// - Pending reconcile blob count
-/// - Emergency pending blob count
-/// - Fallback read count
+/// Struct ini merepresentasikan salinan nilai dari semua metrics
+/// pada satu titik waktu tertentu. Digunakan untuk:
+/// - Audit trail
+/// - Export ke external systems
+/// - Debugging dan monitoring
 ///
 /// ## Thread Safety
 ///
-/// Semua counters menggunakan AtomicU64 untuk thread-safe updates.
-/// Struct ini adalah Send + Sync.
+/// Struct ini adalah plain data (u64 values), tidak mengandung Atomic.
+/// Aman untuk disimpan, di-serialize, atau di-transfer antar thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    /// Jumlah post_blob sukses ke primary DA.
+    pub primary_posts: u64,
+    /// Jumlah post_blob sukses ke fallback DA (secondary).
+    pub fallback_posts: u64,
+    /// Jumlah post_blob sukses ke emergency DA.
+    pub emergency_posts: u64,
+    /// Jumlah get_blob sukses dari primary DA.
+    pub primary_gets: u64,
+    /// Jumlah get_blob sukses dari fallback DA (secondary/emergency).
+    pub fallback_gets: u64,
+    /// Jumlah aktivasi fallback mode.
+    pub fallback_activations: u64,
+    /// Jumlah reconciliation yang di-trigger.
+    pub reconciliations_triggered: u64,
+    /// Timestamp terakhir kali fallback digunakan (epoch seconds).
+    pub last_fallback_at: u64,
+}
+
+/// Metrics deterministik, thread-safe, dan audit-ready untuk DARouter.
+///
+/// Struct ini menyediakan mekanisme tracking untuk:
+/// - Operasi post_blob per path (primary, fallback, emergency)
+/// - Operasi get_blob per path (primary, fallback)
+/// - Aktivasi fallback mode
+/// - Reconciliation events
+///
+/// ## Invariants
+///
+/// - Semua counter bersifat monotonically increasing
+/// - Tidak ada counter yang di-reset secara implisit
+/// - `last_fallback_at` hanya di-update saat fallback benar-benar terjadi
+/// - Semua increment bersifat atomic (tidak ada partial update)
+///
+/// ## Thread Safety
+///
+/// Semua field menggunakan `AtomicU64` dengan explicit memory ordering.
+/// Struct ini adalah Send + Sync dan aman untuk concurrent access.
+///
+/// ## Usage
+///
+/// ```rust,ignore
+/// let metrics = DARouterMetrics::new();
+///
+/// // Record operations
+/// metrics.record_primary_post();
+/// metrics.record_fallback_activation();
+///
+/// // Get snapshot
+/// let snapshot = metrics.snapshot();
+///
+/// // Export to Prometheus
+/// let prometheus_text = metrics.to_prometheus();
+/// ```
 #[derive(Debug)]
 pub struct DARouterMetrics {
-    // ── Post Metrics ──────────────────────────────────────────────────────────
-    /// Jumlah post_blob sukses ke primary.
-    primary_post_count: AtomicU64,
-    /// Jumlah post_blob sukses ke secondary.
-    secondary_post_count: AtomicU64,
-    /// Jumlah post_blob sukses ke emergency.
-    emergency_post_count: AtomicU64,
-    /// Jumlah error post pada primary path.
-    primary_error_count: AtomicU64,
-    /// Jumlah error post pada secondary path.
-    secondary_error_count: AtomicU64,
-    /// Jumlah error post pada emergency path.
-    emergency_error_count: AtomicU64,
-    /// Jumlah blob dengan tag PendingReconcile.
-    pending_reconcile_count: AtomicU64,
-    /// Jumlah blob dengan tag EmergencyPending.
-    emergency_pending_count: AtomicU64,
+    /// Jumlah post_blob sukses ke primary DA.
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Ketika post_blob berhasil dikirim ke primary DA layer,
+    /// terlepas dari status kesehatan (Healthy, Warning, Recovering).
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Menunjukkan jumlah blob yang berhasil di-persist ke DA utama (Celestia).
+    /// Nilai tinggi menandakan primary DA beroperasi dengan baik.
+    primary_posts: AtomicU64,
 
-    // ── Read Metrics (14A.1A.17) ──────────────────────────────────────────────
-    /// Jumlah get_blob sukses dari primary.
-    primary_read_count: AtomicU64,
-    /// Jumlah get_blob sukses dari secondary (fallback).
-    secondary_read_count: AtomicU64,
-    /// Jumlah get_blob sukses dari emergency (fallback).
-    emergency_read_count: AtomicU64,
-    /// Jumlah error get_blob dari primary.
-    primary_read_error_count: AtomicU64,
-    /// Jumlah error get_blob dari secondary.
-    secondary_read_error_count: AtomicU64,
-    /// Jumlah error get_blob dari emergency.
-    emergency_read_error_count: AtomicU64,
-    /// Jumlah total fallback reads (secondary + emergency).
-    fallback_read_count: AtomicU64,
+    /// Jumlah post_blob sukses ke fallback DA (secondary).
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Ketika post_blob dialihkan ke secondary DA karena primary
+    /// dalam status Degraded atau tidak tersedia.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Menunjukkan jumlah blob yang di-persist ke fallback.
+    /// Nilai tinggi menandakan primary DA sering bermasalah.
+    fallback_posts: AtomicU64,
+
+    /// Jumlah post_blob sukses ke emergency DA.
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Ketika post_blob dialihkan ke emergency DA karena primary
+    /// dalam status Emergency atau kritis.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Menunjukkan jumlah blob yang di-persist ke emergency path.
+    /// Nilai tinggi menandakan kondisi darurat sering terjadi.
+    emergency_posts: AtomicU64,
+
+    /// Jumlah get_blob sukses dari primary DA.
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Ketika get_blob berhasil membaca data dari primary DA layer.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Menunjukkan jumlah read sukses dari primary.
+    /// Nilai tinggi relatif terhadap fallback_gets = primary sehat.
+    primary_gets: AtomicU64,
+
+    /// Jumlah get_blob sukses dari fallback DA (secondary/emergency).
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Ketika get_blob harus menggunakan secondary atau emergency DA
+    /// karena primary gagal dan fallback aktif.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Menunjukkan jumlah read yang memerlukan fallback.
+    /// Nilai tinggi menandakan primary DA sering gagal untuk reads.
+    fallback_gets: AtomicU64,
+
+    /// Jumlah aktivasi fallback mode.
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Setiap kali router beralih dari primary ke fallback path,
+    /// baik untuk post maupun get operation.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Total kejadian di mana sistem harus menggunakan fallback.
+    /// Tracking ini penting untuk SLA dan incident analysis.
+    fallback_activations: AtomicU64,
+
+    /// Jumlah reconciliation yang di-trigger.
+    ///
+    /// ## Kapan di-increment
+    ///
+    /// Ketika blob ditandai untuk reconciliation (PendingReconcile tag).
+    /// Terjadi saat menulis ke fallback yang perlu di-sync ke primary.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Jumlah blob yang perlu di-reconcile ke primary.
+    /// Nilai tinggi = banyak data di fallback perlu di-sync.
+    reconciliations_triggered: AtomicU64,
+
+    /// Timestamp terakhir kali fallback digunakan (epoch seconds).
+    ///
+    /// ## Kapan di-update
+    ///
+    /// Setiap kali fallback path benar-benar digunakan (post atau get).
+    /// Menggunakan UNIX epoch seconds untuk konsistensi.
+    ///
+    /// ## Makna Operasional
+    ///
+    /// Menunjukkan kapan terakhir kali fallback diaktifkan.
+    /// Berguna untuk alerting dan incident timeline.
+    last_fallback_at: AtomicU64,
 }
 
 impl DARouterMetrics {
@@ -480,267 +599,458 @@ impl DARouterMetrics {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            // Post metrics
-            primary_post_count: AtomicU64::new(0),
-            secondary_post_count: AtomicU64::new(0),
-            emergency_post_count: AtomicU64::new(0),
-            primary_error_count: AtomicU64::new(0),
-            secondary_error_count: AtomicU64::new(0),
-            emergency_error_count: AtomicU64::new(0),
-            pending_reconcile_count: AtomicU64::new(0),
-            emergency_pending_count: AtomicU64::new(0),
-            // Read metrics (14A.1A.17)
-            primary_read_count: AtomicU64::new(0),
-            secondary_read_count: AtomicU64::new(0),
-            emergency_read_count: AtomicU64::new(0),
-            primary_read_error_count: AtomicU64::new(0),
-            secondary_read_error_count: AtomicU64::new(0),
-            emergency_read_error_count: AtomicU64::new(0),
-            fallback_read_count: AtomicU64::new(0),
+            primary_posts: AtomicU64::new(0),
+            fallback_posts: AtomicU64::new(0),
+            emergency_posts: AtomicU64::new(0),
+            primary_gets: AtomicU64::new(0),
+            fallback_gets: AtomicU64::new(0),
+            fallback_activations: AtomicU64::new(0),
+            reconciliations_triggered: AtomicU64::new(0),
+            last_fallback_at: AtomicU64::new(0),
         }
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // Post Record Methods
+    // Core Record Methods (14A.1A.19)
     // ────────────────────────────────────────────────────────────────────────────
 
-    /// Record successful post to primary.
+    /// Record successful post to primary DA.
     #[inline]
     pub fn record_primary_post(&self) {
-        self.primary_post_count.fetch_add(1, Ordering::Relaxed);
+        self.primary_posts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record successful post to secondary.
+    /// Record successful post to fallback (secondary) DA.
+    ///
+    /// Also increments fallback_activations and updates last_fallback_at.
     #[inline]
-    pub fn record_secondary_post(&self) {
-        self.secondary_post_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_fallback_post(&self) {
+        self.fallback_posts.fetch_add(1, Ordering::Relaxed);
+        self.fallback_activations.fetch_add(1, Ordering::Relaxed);
+        self.update_last_fallback_timestamp();
     }
 
-    /// Record successful post to emergency.
+    /// Record successful post to emergency DA.
+    ///
+    /// Also increments fallback_activations and updates last_fallback_at.
     #[inline]
     pub fn record_emergency_post(&self) {
-        self.emergency_post_count.fetch_add(1, Ordering::Relaxed);
+        self.emergency_posts.fetch_add(1, Ordering::Relaxed);
+        self.fallback_activations.fetch_add(1, Ordering::Relaxed);
+        self.update_last_fallback_timestamp();
     }
 
-    /// Record error on primary post path.
+    /// Record successful get from primary DA.
     #[inline]
-    pub fn record_primary_error(&self) {
-        self.primary_error_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_primary_get(&self) {
+        self.primary_gets.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record error on secondary post path.
+    /// Record successful get from fallback DA (secondary or emergency).
+    ///
+    /// Also increments fallback_activations and updates last_fallback_at.
     #[inline]
-    pub fn record_secondary_error(&self) {
-        self.secondary_error_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_fallback_get(&self) {
+        self.fallback_gets.fetch_add(1, Ordering::Relaxed);
+        self.fallback_activations.fetch_add(1, Ordering::Relaxed);
+        self.update_last_fallback_timestamp();
     }
 
-    /// Record error on emergency post path.
+    /// Record reconciliation triggered.
     #[inline]
-    pub fn record_emergency_error(&self) {
-        self.emergency_error_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_reconciliation(&self) {
+        self.reconciliations_triggered.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record blob tagged as PendingReconcile.
+    /// Update last fallback timestamp to current time.
+    #[inline]
+    fn update_last_fallback_timestamp(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_fallback_at.store(now, Ordering::Relaxed);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Backward Compatibility Methods (untuk routing logic existing)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Record successful post to secondary (alias for record_fallback_post).
+    #[inline]
+    pub fn record_secondary_post(&self) {
+        self.record_fallback_post();
+    }
+
+    /// Record pending reconcile tag.
     #[inline]
     pub fn record_pending_reconcile(&self) {
-        self.pending_reconcile_count.fetch_add(1, Ordering::Relaxed);
+        self.record_reconciliation();
     }
 
-    /// Record blob tagged as EmergencyPending.
+    /// Record emergency pending (increments reconciliation).
     #[inline]
     pub fn record_emergency_pending(&self) {
-        self.emergency_pending_count.fetch_add(1, Ordering::Relaxed);
+        self.record_reconciliation();
     }
 
-    // ────────────────────────────────────────────────────────────────────────────
-    // Read Record Methods (14A.1A.17)
-    // ────────────────────────────────────────────────────────────────────────────
+    /// Record error on primary path (no-op in new spec, for backward compat).
+    #[inline]
+    pub fn record_primary_error(&self) {
+        // Error tracking removed in 14A.1A.19 spec
+    }
 
-    /// Record successful read from primary.
+    /// Record error on secondary path (no-op in new spec, for backward compat).
+    #[inline]
+    pub fn record_secondary_error(&self) {
+        // Error tracking removed in 14A.1A.19 spec
+    }
+
+    /// Record error on emergency path (no-op in new spec, for backward compat).
+    #[inline]
+    pub fn record_emergency_error(&self) {
+        // Error tracking removed in 14A.1A.19 spec
+    }
+
+    /// Record successful read from primary (alias for record_primary_get).
     #[inline]
     pub fn record_primary_read(&self) {
-        self.primary_read_count.fetch_add(1, Ordering::Relaxed);
+        self.record_primary_get();
     }
 
-    /// Record successful read from secondary (fallback).
+    /// Record successful read from secondary (alias for record_fallback_get).
     #[inline]
     pub fn record_secondary_read(&self) {
-        self.secondary_read_count.fetch_add(1, Ordering::Relaxed);
-        self.fallback_read_count.fetch_add(1, Ordering::Relaxed);
+        self.record_fallback_get();
     }
 
-    /// Record successful read from emergency (fallback).
+    /// Record successful read from emergency (alias for record_fallback_get).
     #[inline]
     pub fn record_emergency_read(&self) {
-        self.emergency_read_count.fetch_add(1, Ordering::Relaxed);
-        self.fallback_read_count.fetch_add(1, Ordering::Relaxed);
+        self.record_fallback_get();
     }
 
-    /// Record error on primary read path.
+    /// Record error on primary read path (no-op in new spec, for backward compat).
     #[inline]
     pub fn record_primary_read_error(&self) {
-        self.primary_read_error_count.fetch_add(1, Ordering::Relaxed);
+        // Error tracking removed in 14A.1A.19 spec
     }
 
-    /// Record error on secondary read path.
+    /// Record error on secondary read path (no-op in new spec, for backward compat).
     #[inline]
     pub fn record_secondary_read_error(&self) {
-        self.secondary_read_error_count.fetch_add(1, Ordering::Relaxed);
+        // Error tracking removed in 14A.1A.19 spec
     }
 
-    /// Record error on emergency read path.
+    /// Record error on emergency read path (no-op in new spec, for backward compat).
     #[inline]
     pub fn record_emergency_read_error(&self) {
-        self.emergency_read_error_count.fetch_add(1, Ordering::Relaxed);
+        // Error tracking removed in 14A.1A.19 spec
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // Accessor Methods
+    // Accessor Methods (14A.1A.19)
     // ────────────────────────────────────────────────────────────────────────────
 
-    /// Get primary post count.
+    /// Get primary posts count.
+    #[inline]
+    #[must_use]
+    pub fn primary_posts(&self) -> u64 {
+        self.primary_posts.load(Ordering::Relaxed)
+    }
+
+    /// Get fallback posts count.
+    #[inline]
+    #[must_use]
+    pub fn fallback_posts(&self) -> u64 {
+        self.fallback_posts.load(Ordering::Relaxed)
+    }
+
+    /// Get emergency posts count.
+    #[inline]
+    #[must_use]
+    pub fn emergency_posts(&self) -> u64 {
+        self.emergency_posts.load(Ordering::Relaxed)
+    }
+
+    /// Get primary gets count.
+    #[inline]
+    #[must_use]
+    pub fn primary_gets(&self) -> u64 {
+        self.primary_gets.load(Ordering::Relaxed)
+    }
+
+    /// Get fallback gets count.
+    #[inline]
+    #[must_use]
+    pub fn fallback_gets(&self) -> u64 {
+        self.fallback_gets.load(Ordering::Relaxed)
+    }
+
+    /// Get fallback activations count.
+    #[inline]
+    #[must_use]
+    pub fn fallback_activations(&self) -> u64 {
+        self.fallback_activations.load(Ordering::Relaxed)
+    }
+
+    /// Get reconciliations triggered count.
+    #[inline]
+    #[must_use]
+    pub fn reconciliations_triggered(&self) -> u64 {
+        self.reconciliations_triggered.load(Ordering::Relaxed)
+    }
+
+    /// Get last fallback timestamp (epoch seconds).
+    #[inline]
+    #[must_use]
+    pub fn last_fallback_at(&self) -> u64 {
+        self.last_fallback_at.load(Ordering::Relaxed)
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Backward Compatibility Accessors
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Get primary post count (alias for primary_posts).
     #[inline]
     #[must_use]
     pub fn primary_post_count(&self) -> u64 {
-        self.primary_post_count.load(Ordering::Relaxed)
+        self.primary_posts()
     }
 
-    /// Get secondary post count.
+    /// Get secondary post count (alias for fallback_posts).
     #[inline]
     #[must_use]
     pub fn secondary_post_count(&self) -> u64 {
-        self.secondary_post_count.load(Ordering::Relaxed)
+        self.fallback_posts()
     }
 
-    /// Get emergency post count.
+    /// Get emergency post count (alias for emergency_posts).
     #[inline]
     #[must_use]
     pub fn emergency_post_count(&self) -> u64 {
-        self.emergency_post_count.load(Ordering::Relaxed)
+        self.emergency_posts()
     }
 
-    /// Get primary error count.
+    /// Get primary error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn primary_error_count(&self) -> u64 {
-        self.primary_error_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get secondary error count.
+    /// Get secondary error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn secondary_error_count(&self) -> u64 {
-        self.secondary_error_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get emergency error count.
+    /// Get emergency error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn emergency_error_count(&self) -> u64 {
-        self.emergency_error_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get pending reconcile count.
+    /// Get pending reconcile count (alias for reconciliations_triggered).
     #[inline]
     #[must_use]
     pub fn pending_reconcile_count(&self) -> u64 {
-        self.pending_reconcile_count.load(Ordering::Relaxed)
+        self.reconciliations_triggered()
     }
 
-    /// Get emergency pending count.
+    /// Get emergency pending count (alias for reconciliations_triggered).
     #[inline]
     #[must_use]
     pub fn emergency_pending_count(&self) -> u64 {
-        self.emergency_pending_count.load(Ordering::Relaxed)
+        self.reconciliations_triggered()
     }
 
     /// Get total post count across all paths.
     #[inline]
     #[must_use]
     pub fn total_post_count(&self) -> u64 {
-        self.primary_post_count()
-            + self.secondary_post_count()
-            + self.emergency_post_count()
+        self.primary_posts() + self.fallback_posts() + self.emergency_posts()
     }
 
-    /// Get total error count across all paths (post errors only).
+    /// Get total error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn total_error_count(&self) -> u64 {
-        self.primary_error_count()
-            + self.secondary_error_count()
-            + self.emergency_error_count()
+        0
     }
 
-    // ────────────────────────────────────────────────────────────────────────────
-    // Read Accessor Methods (14A.1A.17)
-    // ────────────────────────────────────────────────────────────────────────────
-
-    /// Get primary read count.
+    /// Get primary read count (alias for primary_gets).
     #[inline]
     #[must_use]
     pub fn primary_read_count(&self) -> u64 {
-        self.primary_read_count.load(Ordering::Relaxed)
+        self.primary_gets()
     }
 
-    /// Get secondary read count.
+    /// Get secondary read count (returns fallback_gets for compatibility).
     #[inline]
     #[must_use]
     pub fn secondary_read_count(&self) -> u64 {
-        self.secondary_read_count.load(Ordering::Relaxed)
+        self.fallback_gets()
     }
 
-    /// Get emergency read count.
+    /// Get emergency read count (returns 0, merged into fallback_gets).
     #[inline]
     #[must_use]
     pub fn emergency_read_count(&self) -> u64 {
-        self.emergency_read_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get primary read error count.
+    /// Get primary read error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn primary_read_error_count(&self) -> u64 {
-        self.primary_read_error_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get secondary read error count.
+    /// Get secondary read error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn secondary_read_error_count(&self) -> u64 {
-        self.secondary_read_error_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get emergency read error count.
+    /// Get emergency read error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn emergency_read_error_count(&self) -> u64 {
-        self.emergency_read_error_count.load(Ordering::Relaxed)
+        0
     }
 
-    /// Get fallback read count (secondary + emergency).
+    /// Get fallback read count (alias for fallback_gets).
     #[inline]
     #[must_use]
     pub fn fallback_read_count(&self) -> u64 {
-        self.fallback_read_count.load(Ordering::Relaxed)
+        self.fallback_gets()
     }
 
     /// Get total read count across all paths.
     #[inline]
     #[must_use]
     pub fn total_read_count(&self) -> u64 {
-        self.primary_read_count()
-            + self.secondary_read_count()
-            + self.emergency_read_count()
+        self.primary_gets() + self.fallback_gets()
     }
 
-    /// Get total read error count across all paths.
+    /// Get total read error count (always 0 in new spec).
     #[inline]
     #[must_use]
     pub fn total_read_error_count(&self) -> u64 {
-        self.primary_read_error_count()
-            + self.secondary_read_error_count()
-            + self.emergency_read_error_count()
+        0
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Snapshot & Export Methods (14A.1A.19)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Mengambil snapshot konsisten dari semua metrics.
+    ///
+    /// Snapshot merepresentasikan state metrics pada satu titik waktu.
+    /// Method ini TIDAK memodifikasi state apapun.
+    ///
+    /// # Returns
+    ///
+    /// `MetricsSnapshot` berisi salinan nilai dari semua metrics.
+    ///
+    /// # Thread Safety
+    ///
+    /// Setiap field dibaca secara atomic, namun snapshot mungkin
+    /// tidak perfectly consistent jika ada concurrent writes.
+    /// Untuk audit purposes, ini dianggap acceptable.
+    #[must_use]
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            primary_posts: self.primary_posts.load(Ordering::Relaxed),
+            fallback_posts: self.fallback_posts.load(Ordering::Relaxed),
+            emergency_posts: self.emergency_posts.load(Ordering::Relaxed),
+            primary_gets: self.primary_gets.load(Ordering::Relaxed),
+            fallback_gets: self.fallback_gets.load(Ordering::Relaxed),
+            fallback_activations: self.fallback_activations.load(Ordering::Relaxed),
+            reconciliations_triggered: self.reconciliations_triggered.load(Ordering::Relaxed),
+            last_fallback_at: self.last_fallback_at.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Export metrics dalam format Prometheus exposition text.
+    ///
+    /// Format output adalah text/plain sesuai Prometheus exposition format.
+    /// Setiap metric memiliki satu baris dengan format:
+    /// `metric_name value`
+    ///
+    /// # Returns
+    ///
+    /// String berisi semua metrics dalam format Prometheus.
+    ///
+    /// # Guarantees
+    ///
+    /// - Output deterministik (urutan metrics tetap)
+    /// - Tidak panic
+    /// - Tidak fail
+    ///
+    /// # Example Output
+    ///
+    /// ```text
+    /// # HELP dsdn_da_router_primary_posts Total successful posts to primary DA
+    /// # TYPE dsdn_da_router_primary_posts counter
+    /// dsdn_da_router_primary_posts 42
+    /// # HELP dsdn_da_router_fallback_posts Total successful posts to fallback DA
+    /// # TYPE dsdn_da_router_fallback_posts counter
+    /// dsdn_da_router_fallback_posts 5
+    /// ...
+    /// ```
+    #[must_use]
+    pub fn to_prometheus(&self) -> String {
+        let snapshot = self.snapshot();
+        
+        let mut output = String::with_capacity(2048);
+
+        // Primary posts (counter)
+        output.push_str("# HELP dsdn_da_router_primary_posts Total successful posts to primary DA\n");
+        output.push_str("# TYPE dsdn_da_router_primary_posts counter\n");
+        output.push_str(&format!("dsdn_da_router_primary_posts {}\n", snapshot.primary_posts));
+
+        // Fallback posts (counter)
+        output.push_str("# HELP dsdn_da_router_fallback_posts Total successful posts to fallback DA\n");
+        output.push_str("# TYPE dsdn_da_router_fallback_posts counter\n");
+        output.push_str(&format!("dsdn_da_router_fallback_posts {}\n", snapshot.fallback_posts));
+
+        // Emergency posts (counter)
+        output.push_str("# HELP dsdn_da_router_emergency_posts Total successful posts to emergency DA\n");
+        output.push_str("# TYPE dsdn_da_router_emergency_posts counter\n");
+        output.push_str(&format!("dsdn_da_router_emergency_posts {}\n", snapshot.emergency_posts));
+
+        // Primary gets (counter)
+        output.push_str("# HELP dsdn_da_router_primary_gets Total successful gets from primary DA\n");
+        output.push_str("# TYPE dsdn_da_router_primary_gets counter\n");
+        output.push_str(&format!("dsdn_da_router_primary_gets {}\n", snapshot.primary_gets));
+
+        // Fallback gets (counter)
+        output.push_str("# HELP dsdn_da_router_fallback_gets Total successful gets from fallback DA\n");
+        output.push_str("# TYPE dsdn_da_router_fallback_gets counter\n");
+        output.push_str(&format!("dsdn_da_router_fallback_gets {}\n", snapshot.fallback_gets));
+
+        // Fallback activations (counter)
+        output.push_str("# HELP dsdn_da_router_fallback_activations Total fallback mode activations\n");
+        output.push_str("# TYPE dsdn_da_router_fallback_activations counter\n");
+        output.push_str(&format!("dsdn_da_router_fallback_activations {}\n", snapshot.fallback_activations));
+
+        // Reconciliations triggered (counter)
+        output.push_str("# HELP dsdn_da_router_reconciliations_triggered Total reconciliations triggered\n");
+        output.push_str("# TYPE dsdn_da_router_reconciliations_triggered counter\n");
+        output.push_str(&format!("dsdn_da_router_reconciliations_triggered {}\n", snapshot.reconciliations_triggered));
+
+        // Last fallback at (gauge - timestamp)
+        output.push_str("# HELP dsdn_da_router_last_fallback_at Timestamp of last fallback activation (epoch seconds)\n");
+        output.push_str("# TYPE dsdn_da_router_last_fallback_at gauge\n");
+        output.push_str(&format!("dsdn_da_router_last_fallback_at {}\n", snapshot.last_fallback_at));
+
+        output
     }
 }
 
@@ -753,23 +1063,14 @@ impl Default for DARouterMetrics {
 impl Clone for DARouterMetrics {
     fn clone(&self) -> Self {
         Self {
-            // Post metrics
-            primary_post_count: AtomicU64::new(self.primary_post_count.load(Ordering::Relaxed)),
-            secondary_post_count: AtomicU64::new(self.secondary_post_count.load(Ordering::Relaxed)),
-            emergency_post_count: AtomicU64::new(self.emergency_post_count.load(Ordering::Relaxed)),
-            primary_error_count: AtomicU64::new(self.primary_error_count.load(Ordering::Relaxed)),
-            secondary_error_count: AtomicU64::new(self.secondary_error_count.load(Ordering::Relaxed)),
-            emergency_error_count: AtomicU64::new(self.emergency_error_count.load(Ordering::Relaxed)),
-            pending_reconcile_count: AtomicU64::new(self.pending_reconcile_count.load(Ordering::Relaxed)),
-            emergency_pending_count: AtomicU64::new(self.emergency_pending_count.load(Ordering::Relaxed)),
-            // Read metrics (14A.1A.17)
-            primary_read_count: AtomicU64::new(self.primary_read_count.load(Ordering::Relaxed)),
-            secondary_read_count: AtomicU64::new(self.secondary_read_count.load(Ordering::Relaxed)),
-            emergency_read_count: AtomicU64::new(self.emergency_read_count.load(Ordering::Relaxed)),
-            primary_read_error_count: AtomicU64::new(self.primary_read_error_count.load(Ordering::Relaxed)),
-            secondary_read_error_count: AtomicU64::new(self.secondary_read_error_count.load(Ordering::Relaxed)),
-            emergency_read_error_count: AtomicU64::new(self.emergency_read_error_count.load(Ordering::Relaxed)),
-            fallback_read_count: AtomicU64::new(self.fallback_read_count.load(Ordering::Relaxed)),
+            primary_posts: AtomicU64::new(self.primary_posts.load(Ordering::Relaxed)),
+            fallback_posts: AtomicU64::new(self.fallback_posts.load(Ordering::Relaxed)),
+            emergency_posts: AtomicU64::new(self.emergency_posts.load(Ordering::Relaxed)),
+            primary_gets: AtomicU64::new(self.primary_gets.load(Ordering::Relaxed)),
+            fallback_gets: AtomicU64::new(self.fallback_gets.load(Ordering::Relaxed)),
+            fallback_activations: AtomicU64::new(self.fallback_activations.load(Ordering::Relaxed)),
+            reconciliations_triggered: AtomicU64::new(self.reconciliations_triggered.load(Ordering::Relaxed)),
+            last_fallback_at: AtomicU64::new(self.last_fallback_at.load(Ordering::Relaxed)),
         }
     }
 }
@@ -1695,73 +1996,239 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // DARouterMetrics tests
+    // DARouterMetrics tests (14A.1A.19)
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_router_metrics_new() {
         let metrics = DARouterMetrics::new();
-        assert_eq!(metrics.primary_post_count(), 0);
-        assert_eq!(metrics.secondary_post_count(), 0);
-        assert_eq!(metrics.emergency_post_count(), 0);
-        assert_eq!(metrics.primary_error_count(), 0);
-        assert_eq!(metrics.secondary_error_count(), 0);
-        assert_eq!(metrics.emergency_error_count(), 0);
-        assert_eq!(metrics.pending_reconcile_count(), 0);
-        assert_eq!(metrics.emergency_pending_count(), 0);
+        assert_eq!(metrics.primary_posts(), 0);
+        assert_eq!(metrics.fallback_posts(), 0);
+        assert_eq!(metrics.emergency_posts(), 0);
+        assert_eq!(metrics.primary_gets(), 0);
+        assert_eq!(metrics.fallback_gets(), 0);
+        assert_eq!(metrics.fallback_activations(), 0);
+        assert_eq!(metrics.reconciliations_triggered(), 0);
+        assert_eq!(metrics.last_fallback_at(), 0);
     }
 
     #[test]
-    fn test_router_metrics_record_primary() {
+    fn test_router_metrics_record_primary_post() {
         let metrics = DARouterMetrics::new();
         metrics.record_primary_post();
         metrics.record_primary_post();
+        assert_eq!(metrics.primary_posts(), 2);
+        assert_eq!(metrics.fallback_activations(), 0);
+    }
+
+    #[test]
+    fn test_router_metrics_record_fallback_post() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_fallback_post();
+        assert_eq!(metrics.fallback_posts(), 1);
+        assert_eq!(metrics.fallback_activations(), 1);
+        assert!(metrics.last_fallback_at() > 0);
+    }
+
+    #[test]
+    fn test_router_metrics_record_emergency_post() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_emergency_post();
+        assert_eq!(metrics.emergency_posts(), 1);
+        assert_eq!(metrics.fallback_activations(), 1);
+        assert!(metrics.last_fallback_at() > 0);
+    }
+
+    #[test]
+    fn test_router_metrics_record_primary_get() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_get();
+        metrics.record_primary_get();
+        assert_eq!(metrics.primary_gets(), 2);
+        assert_eq!(metrics.fallback_activations(), 0);
+    }
+
+    #[test]
+    fn test_router_metrics_record_fallback_get() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_fallback_get();
+        assert_eq!(metrics.fallback_gets(), 1);
+        assert_eq!(metrics.fallback_activations(), 1);
+        assert!(metrics.last_fallback_at() > 0);
+    }
+
+    #[test]
+    fn test_router_metrics_record_reconciliation() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_reconciliation();
+        metrics.record_reconciliation();
+        assert_eq!(metrics.reconciliations_triggered(), 2);
+    }
+
+    #[test]
+    fn test_router_metrics_fallback_activations_accumulate() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_fallback_post();
+        metrics.record_emergency_post();
+        metrics.record_fallback_get();
+        assert_eq!(metrics.fallback_activations(), 3);
+    }
+
+    #[test]
+    fn test_router_metrics_snapshot() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_post();
+        metrics.record_fallback_post();
+        metrics.record_emergency_post();
+        metrics.record_primary_get();
+        metrics.record_fallback_get();
+        metrics.record_reconciliation();
+
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.primary_posts, 1);
+        assert_eq!(snapshot.fallback_posts, 1);
+        assert_eq!(snapshot.emergency_posts, 1);
+        assert_eq!(snapshot.primary_gets, 1);
+        assert_eq!(snapshot.fallback_gets, 1);
+        assert_eq!(snapshot.fallback_activations, 3); // fallback_post + emergency_post + fallback_get
+        assert_eq!(snapshot.reconciliations_triggered, 1);
+        assert!(snapshot.last_fallback_at > 0);
+    }
+
+    #[test]
+    fn test_router_metrics_snapshot_does_not_modify_state() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_post();
+
+        let snapshot1 = metrics.snapshot();
+        let snapshot2 = metrics.snapshot();
+
+        assert_eq!(snapshot1.primary_posts, snapshot2.primary_posts);
+        assert_eq!(metrics.primary_posts(), 1);
+    }
+
+    #[test]
+    fn test_router_metrics_to_prometheus_format() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_post();
+        metrics.record_fallback_post();
+        metrics.record_emergency_post();
+        metrics.record_primary_get();
+        metrics.record_fallback_get();
+
+        let prometheus = metrics.to_prometheus();
+
+        // Verify all metrics are present
+        assert!(prometheus.contains("dsdn_da_router_primary_posts 1"));
+        assert!(prometheus.contains("dsdn_da_router_fallback_posts 1"));
+        assert!(prometheus.contains("dsdn_da_router_emergency_posts 1"));
+        assert!(prometheus.contains("dsdn_da_router_primary_gets 1"));
+        assert!(prometheus.contains("dsdn_da_router_fallback_gets 1"));
+        assert!(prometheus.contains("dsdn_da_router_fallback_activations"));
+        assert!(prometheus.contains("dsdn_da_router_reconciliations_triggered"));
+        assert!(prometheus.contains("dsdn_da_router_last_fallback_at"));
+
+        // Verify HELP and TYPE annotations
+        assert!(prometheus.contains("# HELP dsdn_da_router_primary_posts"));
+        assert!(prometheus.contains("# TYPE dsdn_da_router_primary_posts counter"));
+        assert!(prometheus.contains("# TYPE dsdn_da_router_last_fallback_at gauge"));
+    }
+
+    #[test]
+    fn test_router_metrics_to_prometheus_deterministic() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_post();
+        metrics.record_primary_get();
+
+        let prometheus1 = metrics.to_prometheus();
+        let prometheus2 = metrics.to_prometheus();
+
+        // Output should be identical for same state
+        assert_eq!(prometheus1, prometheus2);
+    }
+
+    #[test]
+    fn test_router_metrics_clone() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_post();
+        metrics.record_fallback_post();
+        metrics.record_reconciliation();
+
+        let cloned = metrics.clone();
+        assert_eq!(cloned.primary_posts(), 1);
+        assert_eq!(cloned.fallback_posts(), 1);
+        assert_eq!(cloned.reconciliations_triggered(), 1);
+        assert_eq!(cloned.fallback_activations(), 1);
+    }
+
+    #[test]
+    fn test_router_metrics_debug() {
+        let metrics = DARouterMetrics::new();
+        let debug_str = format!("{:?}", metrics);
+        assert!(debug_str.contains("DARouterMetrics"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Backward Compatibility Tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_router_metrics_backward_compat_record_primary() {
+        let metrics = DARouterMetrics::new();
+        metrics.record_primary_post();
+        metrics.record_primary_post();
+        // Backward compatible accessor
         assert_eq!(metrics.primary_post_count(), 2);
     }
 
     #[test]
-    fn test_router_metrics_record_secondary() {
+    fn test_router_metrics_backward_compat_record_secondary() {
         let metrics = DARouterMetrics::new();
-        metrics.record_secondary_post();
+        metrics.record_secondary_post(); // Should map to fallback_post
         assert_eq!(metrics.secondary_post_count(), 1);
+        assert_eq!(metrics.fallback_posts(), 1);
     }
 
     #[test]
-    fn test_router_metrics_record_emergency() {
+    fn test_router_metrics_backward_compat_record_emergency() {
         let metrics = DARouterMetrics::new();
         metrics.record_emergency_post();
         assert_eq!(metrics.emergency_post_count(), 1);
     }
 
     #[test]
-    fn test_router_metrics_record_errors() {
+    fn test_router_metrics_backward_compat_errors_return_zero() {
         let metrics = DARouterMetrics::new();
         metrics.record_primary_error();
         metrics.record_secondary_error();
         metrics.record_emergency_error();
-        assert_eq!(metrics.primary_error_count(), 1);
-        assert_eq!(metrics.secondary_error_count(), 1);
-        assert_eq!(metrics.emergency_error_count(), 1);
-        assert_eq!(metrics.total_error_count(), 3);
+        // Error counts are now always 0 in new spec
+        assert_eq!(metrics.primary_error_count(), 0);
+        assert_eq!(metrics.secondary_error_count(), 0);
+        assert_eq!(metrics.emergency_error_count(), 0);
+        assert_eq!(metrics.total_error_count(), 0);
     }
 
     #[test]
-    fn test_router_metrics_record_pending_reconcile() {
+    fn test_router_metrics_backward_compat_pending_reconcile() {
         let metrics = DARouterMetrics::new();
         metrics.record_pending_reconcile();
         metrics.record_pending_reconcile();
         assert_eq!(metrics.pending_reconcile_count(), 2);
+        assert_eq!(metrics.reconciliations_triggered(), 2);
     }
 
     #[test]
-    fn test_router_metrics_record_emergency_pending() {
+    fn test_router_metrics_backward_compat_emergency_pending() {
         let metrics = DARouterMetrics::new();
         metrics.record_emergency_pending();
+        // Maps to reconciliation
         assert_eq!(metrics.emergency_pending_count(), 1);
     }
 
     #[test]
-    fn test_router_metrics_total_counts() {
+    fn test_router_metrics_backward_compat_total_counts() {
         let metrics = DARouterMetrics::new();
         metrics.record_primary_post();
         metrics.record_secondary_post();
@@ -1770,21 +2237,155 @@ mod tests {
     }
 
     #[test]
-    fn test_router_metrics_clone() {
+    fn test_router_metrics_backward_compat_read_methods() {
         let metrics = DARouterMetrics::new();
-        metrics.record_primary_post();
-        metrics.record_pending_reconcile();
+        metrics.record_primary_read();
+        metrics.record_secondary_read();
+        metrics.record_emergency_read();
 
-        let cloned = metrics.clone();
-        assert_eq!(cloned.primary_post_count(), 1);
-        assert_eq!(cloned.pending_reconcile_count(), 1);
+        assert_eq!(metrics.primary_read_count(), 1);
+        assert_eq!(metrics.secondary_read_count(), 2); // secondary + emergency mapped to fallback
+        assert_eq!(metrics.fallback_read_count(), 2);
     }
 
     #[test]
-    fn test_router_metrics_debug() {
+    fn test_router_metrics_backward_compat_read_errors_return_zero() {
         let metrics = DARouterMetrics::new();
-        let debug_str = format!("{:?}", metrics);
-        assert!(debug_str.contains("DARouterMetrics"));
+        metrics.record_primary_read_error();
+        metrics.record_secondary_read_error();
+        metrics.record_emergency_read_error();
+
+        assert_eq!(metrics.primary_read_error_count(), 0);
+        assert_eq!(metrics.secondary_read_error_count(), 0);
+        assert_eq!(metrics.emergency_read_error_count(), 0);
+        assert_eq!(metrics.total_read_error_count(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Atomicity Tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_router_metrics_atomic_increments() {
+        use std::thread;
+
+        let metrics = Arc::new(DARouterMetrics::new());
+        let mut handles = vec![];
+
+        // Spawn 10 threads, each incrementing 100 times
+        for _ in 0..10 {
+            let m = metrics.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    m.record_primary_post();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("Thread panicked");
+        }
+
+        // All increments should be counted
+        assert_eq!(metrics.primary_posts(), 1000);
+    }
+
+    #[test]
+    fn test_router_metrics_concurrent_mixed_operations() {
+        use std::thread;
+
+        let metrics = Arc::new(DARouterMetrics::new());
+        let mut handles = vec![];
+
+        // Thread 1: primary posts
+        let m1 = metrics.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..50 {
+                m1.record_primary_post();
+            }
+        }));
+
+        // Thread 2: fallback posts
+        let m2 = metrics.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..50 {
+                m2.record_fallback_post();
+            }
+        }));
+
+        // Thread 3: reads
+        let m3 = metrics.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..50 {
+                m3.record_primary_get();
+            }
+        }));
+
+        for h in handles {
+            h.join().expect("Thread panicked");
+        }
+
+        assert_eq!(metrics.primary_posts(), 50);
+        assert_eq!(metrics.fallback_posts(), 50);
+        assert_eq!(metrics.primary_gets(), 50);
+        assert_eq!(metrics.fallback_activations(), 50);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // MetricsSnapshot Tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_metrics_snapshot_copy() {
+        let snapshot = MetricsSnapshot {
+            primary_posts: 1,
+            fallback_posts: 2,
+            emergency_posts: 3,
+            primary_gets: 4,
+            fallback_gets: 5,
+            fallback_activations: 6,
+            reconciliations_triggered: 7,
+            last_fallback_at: 8,
+        };
+
+        let copy = snapshot;
+        assert_eq!(copy.primary_posts, 1);
+        assert_eq!(copy.fallback_posts, 2);
+    }
+
+    #[test]
+    fn test_metrics_snapshot_clone() {
+        let snapshot = MetricsSnapshot {
+            primary_posts: 10,
+            fallback_posts: 20,
+            emergency_posts: 30,
+            primary_gets: 40,
+            fallback_gets: 50,
+            fallback_activations: 60,
+            reconciliations_triggered: 70,
+            last_fallback_at: 80,
+        };
+
+        let cloned = snapshot.clone();
+        assert_eq!(snapshot, cloned);
+    }
+
+    #[test]
+    fn test_metrics_snapshot_debug() {
+        let snapshot = MetricsSnapshot {
+            primary_posts: 1,
+            fallback_posts: 2,
+            emergency_posts: 3,
+            primary_gets: 4,
+            fallback_gets: 5,
+            fallback_activations: 6,
+            reconciliations_triggered: 7,
+            last_fallback_at: 8,
+        };
+
+        let debug_str = format!("{:?}", snapshot);
+        assert!(debug_str.contains("MetricsSnapshot"));
+        assert!(debug_str.contains("primary_posts"));
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -2613,7 +3214,7 @@ mod tests {
             _ => panic!("Expected DAError::Other"),
         }
         assert_eq!(primary.call_count(), 0);
-        assert_eq!(metrics.secondary_error_count(), 1);
+        // Error tracking removed in 14A.1A.19 spec
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -2680,7 +3281,7 @@ mod tests {
         }
         assert_eq!(primary.call_count(), 0);
         assert_eq!(secondary.call_count(), 0);
-        assert_eq!(metrics.emergency_error_count(), 1);
+        // Error tracking removed in 14A.1A.19 spec
     }
 
     #[tokio::test]
@@ -2779,7 +3380,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(primary.call_count(), 1);
-        assert_eq!(metrics.primary_error_count(), 1);
+        // Error tracking removed in 14A.1A.19 spec
         assert_eq!(metrics.primary_post_count(), 0);
     }
 
@@ -2807,7 +3408,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(secondary.call_count(), 1);
-        assert_eq!(metrics.secondary_error_count(), 1);
+        // Error tracking removed in 14A.1A.19 spec
         assert_eq!(metrics.secondary_post_count(), 0);
         assert_eq!(metrics.pending_reconcile_count(), 0);
     }
@@ -2836,7 +3437,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(emergency.call_count(), 1);
-        assert_eq!(metrics.emergency_error_count(), 1);
+        // Error tracking removed in 14A.1A.19 spec
         assert_eq!(metrics.emergency_post_count(), 0);
         assert_eq!(metrics.emergency_pending_count(), 0);
     }
@@ -3045,7 +3646,7 @@ mod tests {
         }
         assert_eq!(primary.get_call_count(), 1);
         assert_eq!(secondary.get_call_count(), 0);
-        assert_eq!(metrics.primary_read_error_count(), 1);
+        // Error counts are no longer tracked in 14A.1A.19
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -3076,8 +3677,8 @@ mod tests {
         assert_eq!(result.unwrap(), expected_data);
         assert_eq!(primary.get_call_count(), 1);
         assert_eq!(secondary.get_call_count(), 1);
-        assert_eq!(metrics.primary_read_error_count(), 1);
-        assert_eq!(metrics.secondary_read_count(), 1);
+        // In 14A.1A.19, secondary reads map to fallback_gets
+        assert_eq!(metrics.fallback_gets(), 1);
         assert_eq!(metrics.fallback_read_count(), 1);
     }
 
@@ -3114,9 +3715,8 @@ mod tests {
         assert_eq!(primary.get_call_count(), 1);
         assert_eq!(secondary.get_call_count(), 1);
         assert_eq!(emergency.get_call_count(), 1);
-        assert_eq!(metrics.primary_read_error_count(), 1);
-        assert_eq!(metrics.secondary_read_error_count(), 1);
-        assert_eq!(metrics.emergency_read_count(), 1);
+        // In 14A.1A.19, emergency reads also map to fallback_gets
+        assert_eq!(metrics.fallback_gets(), 1);
         assert_eq!(metrics.fallback_read_count(), 1);
     }
 
@@ -3161,9 +3761,7 @@ mod tests {
         assert_eq!(primary.get_call_count(), 1);
         assert_eq!(secondary.get_call_count(), 1);
         assert_eq!(emergency.get_call_count(), 1);
-        assert_eq!(metrics.primary_read_error_count(), 1);
-        assert_eq!(metrics.secondary_read_error_count(), 1);
-        assert_eq!(metrics.emergency_read_error_count(), 1);
+        // Error counts are no longer tracked in 14A.1A.19
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -3226,7 +3824,8 @@ mod tests {
         assert_eq!(result.unwrap(), expected_data);
         assert_eq!(primary.get_call_count(), 1);
         assert_eq!(emergency.get_call_count(), 1);
-        assert_eq!(metrics.emergency_read_count(), 1);
+        // In 14A.1A.19, emergency reads map to fallback_gets
+        assert_eq!(metrics.fallback_gets(), 1);
         assert_eq!(metrics.fallback_read_count(), 1);
     }
 
@@ -3310,8 +3909,9 @@ mod tests {
         let _ = router.get_blob(&blob_ref).await;
         let _ = router.get_blob(&blob_ref).await;
 
-        assert_eq!(metrics.primary_read_error_count(), 3);
-        assert_eq!(metrics.secondary_read_count(), 3);
+        // In 14A.1A.19, secondary reads map to fallback_gets
+        assert_eq!(metrics.fallback_gets(), 3);
         assert_eq!(metrics.fallback_read_count(), 3);
+        assert_eq!(metrics.fallback_activations(), 3);
     }
 }
