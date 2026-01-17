@@ -317,6 +317,302 @@ impl fmt::Display for DAStatus {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// DA HEALTH CONFIG STRUCT (14A.1A.13)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Konfigurasi untuk health check dan monitoring DA layer.
+///
+/// Struct ini mendefinisikan parameter-parameter yang mengontrol:
+/// - Threshold untuk transisi status (Warning, Degraded, Emergency)
+/// - Interval health check
+/// - Batch size untuk reconciliation
+/// - Grace period untuk recovery
+///
+/// ## Environment Variables
+///
+/// Konfigurasi dapat dibaca dari environment variables dengan prefix `DSDN_DA_`:
+///
+/// | Field                      | Environment Variable                 |
+/// |----------------------------|--------------------------------------|
+/// | `warning_latency_ms`       | `DSDN_DA_WARNING_LATENCY_MS`         |
+/// | `fallback_trigger_secs`    | `DSDN_DA_FALLBACK_TRIGGER_SECS`      |
+/// | `emergency_trigger_secs`   | `DSDN_DA_EMERGENCY_TRIGGER_SECS`     |
+/// | `health_check_interval_ms` | `DSDN_DA_HEALTH_CHECK_INTERVAL_MS`   |
+/// | `max_reconcile_batch`      | `DSDN_DA_MAX_RECONCILE_BATCH`        |
+/// | `recovery_grace_period_secs` | `DSDN_DA_RECOVERY_GRACE_PERIOD_SECS` |
+///
+/// ## Thread Safety
+///
+/// Struct ini adalah plain data tanpa interior mutability.
+/// Aman untuk di-share antar thread (Send + Sync).
+///
+/// ## Default Values
+///
+/// | Field                      | Default Value |
+/// |----------------------------|---------------|
+/// | `warning_latency_ms`       | 30,000        |
+/// | `fallback_trigger_secs`    | 300           |
+/// | `emergency_trigger_secs`   | 1,800         |
+/// | `health_check_interval_ms` | 5,000         |
+/// | `max_reconcile_batch`      | 100           |
+/// | `recovery_grace_period_secs` | 60          |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DAHealthConfig {
+    /// Threshold latency dalam milliseconds untuk memicu status Warning.
+    ///
+    /// Ketika latency rata-rata ke Celestia melebihi nilai ini,
+    /// status akan berubah dari Healthy ke Warning.
+    ///
+    /// ## Dampak
+    ///
+    /// - Status Warning menandakan perlu monitoring intensif
+    /// - Fallback TIDAK diaktifkan pada threshold ini
+    /// - Operasi read dan write masih diperbolehkan
+    ///
+    /// ## Default
+    ///
+    /// 30,000 ms (30 detik)
+    pub warning_latency_ms: u64,
+
+    /// Durasi dalam detik tanpa keberhasilan sebelum fallback diaktifkan.
+    ///
+    /// Jika tidak ada operasi DA yang berhasil selama periode ini,
+    /// sistem akan beralih ke fallback mode (status Degraded).
+    ///
+    /// ## Dampak
+    ///
+    /// - Fallback mode AKTIF setelah threshold ini terlampaui
+    /// - Status berubah ke Degraded
+    /// - Operasi write di-disable untuk mencegah inconsistency
+    ///
+    /// ## Default
+    ///
+    /// 300 detik (5 menit)
+    pub fallback_trigger_secs: u64,
+
+    /// Durasi dalam detik tanpa keberhasilan sebelum status Emergency.
+    ///
+    /// Jika tidak ada operasi DA yang berhasil selama periode ini,
+    /// sistem dianggap dalam kondisi Emergency.
+    ///
+    /// ## Dampak
+    ///
+    /// - Status berubah ke Emergency
+    /// - Sistem dianggap tidak operational untuk DA
+    /// - Semua operasi bergantung pada fallback
+    ///
+    /// ## Invariant
+    ///
+    /// Nilai ini HARUS lebih besar dari `fallback_trigger_secs`.
+    ///
+    /// ## Default
+    ///
+    /// 1,800 detik (30 menit)
+    pub emergency_trigger_secs: u64,
+
+    /// Interval dalam milliseconds antara health check.
+    ///
+    /// Menentukan seberapa sering sistem melakukan pengecekan
+    /// kesehatan koneksi ke Celestia.
+    ///
+    /// ## Dampak
+    ///
+    /// - Nilai lebih kecil = deteksi masalah lebih cepat
+    /// - Nilai lebih besar = overhead lebih rendah
+    ///
+    /// ## Default
+    ///
+    /// 5,000 ms (5 detik)
+    pub health_check_interval_ms: u64,
+
+    /// Jumlah maksimum item dalam satu batch reconciliation.
+    ///
+    /// Saat recovery dari fallback, sistem perlu menyinkronkan
+    /// data yang di-queue selama fallback aktif. Nilai ini
+    /// membatasi ukuran batch per operasi reconcile.
+    ///
+    /// ## Dampak
+    ///
+    /// - Nilai lebih besar = reconciliation lebih cepat
+    /// - Nilai lebih kecil = beban lebih merata
+    ///
+    /// ## Default
+    ///
+    /// 100 items per batch
+    pub max_reconcile_batch: usize,
+
+    /// Grace period dalam detik setelah recovery dimulai.
+    ///
+    /// Setelah koneksi ke Celestia pulih, sistem tetap dalam
+    /// status Recovering selama periode ini untuk memastikan
+    /// stabilitas sebelum kembali ke operasi normal.
+    ///
+    /// ## Dampak
+    ///
+    /// - Write operations tetap disabled selama grace period
+    /// - Memberikan waktu untuk sinkronisasi state
+    /// - Mencegah flapping antara status
+    ///
+    /// ## Default
+    ///
+    /// 60 detik (1 menit)
+    pub recovery_grace_period_secs: u64,
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// DAHealthConfig Default Implementation
+// ────────────────────────────────────────────────────────────────────────────────
+
+impl Default for DAHealthConfig {
+    /// Membuat `DAHealthConfig` dengan nilai default.
+    ///
+    /// ## Default Values
+    ///
+    /// | Field                        | Value   |
+    /// |------------------------------|---------|
+    /// | `warning_latency_ms`         | 30,000  |
+    /// | `fallback_trigger_secs`      | 300     |
+    /// | `emergency_trigger_secs`     | 1,800   |
+    /// | `health_check_interval_ms`   | 5,000   |
+    /// | `max_reconcile_batch`        | 100     |
+    /// | `recovery_grace_period_secs` | 60      |
+    fn default() -> Self {
+        Self {
+            warning_latency_ms: 30_000,
+            fallback_trigger_secs: 300,
+            emergency_trigger_secs: 1_800,
+            health_check_interval_ms: 5_000,
+            max_reconcile_batch: 100,
+            recovery_grace_period_secs: 60,
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// DAHealthConfig Implementation
+// ────────────────────────────────────────────────────────────────────────────────
+
+impl DAHealthConfig {
+    /// Membuat `DAHealthConfig` dari environment variables.
+    ///
+    /// Membaca konfigurasi dari environment variables dengan prefix `DSDN_DA_`.
+    /// Jika environment variable tidak ada atau tidak valid (bukan integer desimal),
+    /// nilai default digunakan untuk field tersebut.
+    ///
+    /// ## Environment Variable Mapping
+    ///
+    /// | Field                        | Environment Variable                   |
+    /// |------------------------------|----------------------------------------|
+    /// | `warning_latency_ms`         | `DSDN_DA_WARNING_LATENCY_MS`           |
+    /// | `fallback_trigger_secs`      | `DSDN_DA_FALLBACK_TRIGGER_SECS`        |
+    /// | `emergency_trigger_secs`     | `DSDN_DA_EMERGENCY_TRIGGER_SECS`       |
+    /// | `health_check_interval_ms`   | `DSDN_DA_HEALTH_CHECK_INTERVAL_MS`     |
+    /// | `max_reconcile_batch`        | `DSDN_DA_MAX_RECONCILE_BATCH`          |
+    /// | `recovery_grace_period_secs` | `DSDN_DA_RECOVERY_GRACE_PERIOD_SECS`   |
+    ///
+    /// ## Parsing Rules
+    ///
+    /// - Format yang diterima: integer desimal positif (contoh: "30000", "300")
+    /// - Leading/trailing whitespace di-trim
+    /// - Jika parsing gagal: gunakan nilai default
+    /// - Tidak ada panic atau error propagation
+    ///
+    /// ## Guarantees
+    ///
+    /// - Tidak panic
+    /// - Tidak melakukan unwrap atau expect
+    /// - Selalu mengembalikan valid config
+    /// - Deterministik: env sama selalu menghasilkan config sama
+    ///
+    /// ## Example
+    ///
+    /// ```rust,ignore
+    /// // Set env vars
+    /// std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "60000");
+    ///
+    /// let config = DAHealthConfig::from_env();
+    /// assert_eq!(config.warning_latency_ms, 60000);
+    /// ```
+    #[must_use]
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+
+        Self {
+            warning_latency_ms: Self::parse_env_u64(
+                "DSDN_DA_WARNING_LATENCY_MS",
+                defaults.warning_latency_ms,
+            ),
+            fallback_trigger_secs: Self::parse_env_u64(
+                "DSDN_DA_FALLBACK_TRIGGER_SECS",
+                defaults.fallback_trigger_secs,
+            ),
+            emergency_trigger_secs: Self::parse_env_u64(
+                "DSDN_DA_EMERGENCY_TRIGGER_SECS",
+                defaults.emergency_trigger_secs,
+            ),
+            health_check_interval_ms: Self::parse_env_u64(
+                "DSDN_DA_HEALTH_CHECK_INTERVAL_MS",
+                defaults.health_check_interval_ms,
+            ),
+            max_reconcile_batch: Self::parse_env_usize(
+                "DSDN_DA_MAX_RECONCILE_BATCH",
+                defaults.max_reconcile_batch,
+            ),
+            recovery_grace_period_secs: Self::parse_env_u64(
+                "DSDN_DA_RECOVERY_GRACE_PERIOD_SECS",
+                defaults.recovery_grace_period_secs,
+            ),
+        }
+    }
+
+    /// Parse environment variable sebagai u64.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Nama environment variable
+    /// * `default` - Nilai default jika env tidak ada atau invalid
+    ///
+    /// # Returns
+    ///
+    /// Nilai dari env var jika valid, atau default jika tidak.
+    ///
+    /// # Parsing
+    ///
+    /// - Trim whitespace
+    /// - Parse sebagai integer desimal
+    /// - Tidak accept negative values (u64)
+    fn parse_env_u64(key: &str, default: u64) -> u64 {
+        match std::env::var(key) {
+            Ok(val) => val.trim().parse::<u64>().unwrap_or(default),
+            Err(_) => default,
+        }
+    }
+
+    /// Parse environment variable sebagai usize.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Nama environment variable
+    /// * `default` - Nilai default jika env tidak ada atau invalid
+    ///
+    /// # Returns
+    ///
+    /// Nilai dari env var jika valid, atau default jika tidak.
+    ///
+    /// # Parsing
+    ///
+    /// - Trim whitespace
+    /// - Parse sebagai integer desimal
+    /// - Tidak accept negative values (usize)
+    fn parse_env_usize(key: &str, default: usize) -> usize {
+        match std::env::var(key) {
+            Ok(val) => val.trim().parse::<usize>().unwrap_or(default),
+            Err(_) => default,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // DA HEALTH MONITOR STRUCT
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -686,6 +982,58 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // ENV VAR TEST SYNCHRONIZATION
+    // ════════════════════════════════════════════════════════════════════════════
+    //
+    // Environment variables are process-global state. When tests run in parallel
+    // (Rust's default), tests that modify env vars can interfere with each other.
+    //
+    // Solution: Use a Mutex to serialize all env var tests + RAII guard for cleanup.
+    
+    use std::sync::Mutex;
+    
+    /// Global mutex to serialize tests that modify environment variables.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    
+    /// List of DAHealthConfig-related environment variables.
+    const HEALTH_CONFIG_ENV_VARS: &[&str] = &[
+        "DSDN_DA_WARNING_LATENCY_MS",
+        "DSDN_DA_FALLBACK_TRIGGER_SECS",
+        "DSDN_DA_EMERGENCY_TRIGGER_SECS",
+        "DSDN_DA_HEALTH_CHECK_INTERVAL_MS",
+        "DSDN_DA_MAX_RECONCILE_BATCH",
+        "DSDN_DA_RECOVERY_GRACE_PERIOD_SECS",
+    ];
+    
+    /// RAII guard for environment variable tests.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original_values: Vec<(&'static str, Option<String>)>,
+    }
+    
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let original_values: Vec<_> = HEALTH_CONFIG_ENV_VARS
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect();
+            Self { _lock: lock, original_values }
+        }
+    }
+    
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, original) in &self.original_values {
+                match original {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
 
     // ────────────────────────────────────────────────────────────────────────────
     // Construction tests
@@ -1386,5 +1734,408 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // DAHealthConfig tests (14A.1A.13)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Default value tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_default_warning_latency_ms() {
+        let config = DAHealthConfig::default();
+        assert_eq!(config.warning_latency_ms, 30_000);
+    }
+
+    #[test]
+    fn test_dahealthconfig_default_fallback_trigger_secs() {
+        let config = DAHealthConfig::default();
+        assert_eq!(config.fallback_trigger_secs, 300);
+    }
+
+    #[test]
+    fn test_dahealthconfig_default_emergency_trigger_secs() {
+        let config = DAHealthConfig::default();
+        assert_eq!(config.emergency_trigger_secs, 1_800);
+    }
+
+    #[test]
+    fn test_dahealthconfig_default_health_check_interval_ms() {
+        let config = DAHealthConfig::default();
+        assert_eq!(config.health_check_interval_ms, 5_000);
+    }
+
+    #[test]
+    fn test_dahealthconfig_default_max_reconcile_batch() {
+        let config = DAHealthConfig::default();
+        assert_eq!(config.max_reconcile_batch, 100);
+    }
+
+    #[test]
+    fn test_dahealthconfig_default_recovery_grace_period_secs() {
+        let config = DAHealthConfig::default();
+        assert_eq!(config.recovery_grace_period_secs, 60);
+    }
+
+    #[test]
+    fn test_dahealthconfig_default_all_fields() {
+        // Comprehensive test ensuring all fields have correct defaults
+        let config = DAHealthConfig::default();
+        
+        assert_eq!(config.warning_latency_ms, 30_000, "warning_latency_ms default mismatch");
+        assert_eq!(config.fallback_trigger_secs, 300, "fallback_trigger_secs default mismatch");
+        assert_eq!(config.emergency_trigger_secs, 1_800, "emergency_trigger_secs default mismatch");
+        assert_eq!(config.health_check_interval_ms, 5_000, "health_check_interval_ms default mismatch");
+        assert_eq!(config.max_reconcile_batch, 100, "max_reconcile_batch default mismatch");
+        assert_eq!(config.recovery_grace_period_secs, 60, "recovery_grace_period_secs default mismatch");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // from_env() tests - empty env (uses defaults)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_empty_uses_defaults() {
+        let _guard = EnvGuard::new();
+        
+        // Clear all env vars
+        for var in HEALTH_CONFIG_ENV_VARS {
+            std::env::remove_var(var);
+        }
+
+        let config = DAHealthConfig::from_env();
+        let defaults = DAHealthConfig::default();
+        
+        assert_eq!(config, defaults, "from_env with empty env should return defaults");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // from_env() tests - valid env vars
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_warning_latency_ms() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "60000");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.warning_latency_ms, 60_000);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_fallback_trigger_secs() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_FALLBACK_TRIGGER_SECS", "600");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.fallback_trigger_secs, 600);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_emergency_trigger_secs() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_EMERGENCY_TRIGGER_SECS", "3600");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.emergency_trigger_secs, 3600);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_health_check_interval_ms() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_HEALTH_CHECK_INTERVAL_MS", "10000");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.health_check_interval_ms, 10_000);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_max_reconcile_batch() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_MAX_RECONCILE_BATCH", "200");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.max_reconcile_batch, 200);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_recovery_grace_period_secs() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_RECOVERY_GRACE_PERIOD_SECS", "120");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.recovery_grace_period_secs, 120);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_valid_all_fields() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "45000");
+        std::env::set_var("DSDN_DA_FALLBACK_TRIGGER_SECS", "450");
+        std::env::set_var("DSDN_DA_EMERGENCY_TRIGGER_SECS", "2700");
+        std::env::set_var("DSDN_DA_HEALTH_CHECK_INTERVAL_MS", "7500");
+        std::env::set_var("DSDN_DA_MAX_RECONCILE_BATCH", "150");
+        std::env::set_var("DSDN_DA_RECOVERY_GRACE_PERIOD_SECS", "90");
+        
+        let config = DAHealthConfig::from_env();
+        
+        assert_eq!(config.warning_latency_ms, 45_000);
+        assert_eq!(config.fallback_trigger_secs, 450);
+        assert_eq!(config.emergency_trigger_secs, 2_700);
+        assert_eq!(config.health_check_interval_ms, 7_500);
+        assert_eq!(config.max_reconcile_batch, 150);
+        assert_eq!(config.recovery_grace_period_secs, 90);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // from_env() tests - invalid env vars (fallback to defaults)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_invalid_warning_latency_ms() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "not_a_number");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.warning_latency_ms, 30_000, "Invalid env should fallback to default");
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_invalid_fallback_trigger_secs() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_FALLBACK_TRIGGER_SECS", "abc");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.fallback_trigger_secs, 300, "Invalid env should fallback to default");
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_invalid_emergency_trigger_secs() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_EMERGENCY_TRIGGER_SECS", "-100");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.emergency_trigger_secs, 1_800, "Negative value should fallback to default");
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_invalid_health_check_interval_ms() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_HEALTH_CHECK_INTERVAL_MS", "12.5");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.health_check_interval_ms, 5_000, "Float value should fallback to default");
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_invalid_max_reconcile_batch() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_MAX_RECONCILE_BATCH", "");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.max_reconcile_batch, 100, "Empty value should fallback to default");
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_invalid_recovery_grace_period_secs() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_RECOVERY_GRACE_PERIOD_SECS", "1e10");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.recovery_grace_period_secs, 60, "Scientific notation should fallback to default");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // from_env() tests - whitespace handling
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_whitespace_trimmed() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "  50000  ");
+        std::env::set_var("DSDN_DA_MAX_RECONCILE_BATCH", "\t250\t");
+        
+        let config = DAHealthConfig::from_env();
+        
+        assert_eq!(config.warning_latency_ms, 50_000, "Leading/trailing whitespace should be trimmed");
+        assert_eq!(config.max_reconcile_batch, 250, "Tabs should be trimmed");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // from_env() tests - partial env (mix of set and unset)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_partial() {
+        let _guard = EnvGuard::new();
+        
+        // Only set some vars
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "40000");
+        std::env::set_var("DSDN_DA_EMERGENCY_TRIGGER_SECS", "2400");
+        std::env::remove_var("DSDN_DA_FALLBACK_TRIGGER_SECS");
+        std::env::remove_var("DSDN_DA_HEALTH_CHECK_INTERVAL_MS");
+        std::env::remove_var("DSDN_DA_MAX_RECONCILE_BATCH");
+        std::env::remove_var("DSDN_DA_RECOVERY_GRACE_PERIOD_SECS");
+        
+        let config = DAHealthConfig::from_env();
+        
+        // Set vars should be overridden
+        assert_eq!(config.warning_latency_ms, 40_000);
+        assert_eq!(config.emergency_trigger_secs, 2_400);
+        
+        // Unset vars should use defaults
+        assert_eq!(config.fallback_trigger_secs, 300);
+        assert_eq!(config.health_check_interval_ms, 5_000);
+        assert_eq!(config.max_reconcile_batch, 100);
+        assert_eq!(config.recovery_grace_period_secs, 60);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // from_env() tests - no panic guarantee
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_no_panic_on_invalid() {
+        let _guard = EnvGuard::new();
+        
+        // Set all vars to invalid values
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "invalid");
+        std::env::set_var("DSDN_DA_FALLBACK_TRIGGER_SECS", "not_a_number");
+        std::env::set_var("DSDN_DA_EMERGENCY_TRIGGER_SECS", "abc123");
+        std::env::set_var("DSDN_DA_HEALTH_CHECK_INTERVAL_MS", "");
+        std::env::set_var("DSDN_DA_MAX_RECONCILE_BATCH", "-1");
+        std::env::set_var("DSDN_DA_RECOVERY_GRACE_PERIOD_SECS", "3.14159");
+        
+        // This should NOT panic
+        let result = std::panic::catch_unwind(DAHealthConfig::from_env);
+        assert!(result.is_ok(), "from_env should not panic on invalid input");
+        
+        let config = result.ok();
+        assert!(config.is_some());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Determinism tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_default_determinism() {
+        let config1 = DAHealthConfig::default();
+        let config2 = DAHealthConfig::default();
+        let config3 = DAHealthConfig::default();
+        
+        assert_eq!(config1, config2);
+        assert_eq!(config2, config3);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_determinism() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "35000");
+        
+        let config1 = DAHealthConfig::from_env();
+        let config2 = DAHealthConfig::from_env();
+        let config3 = DAHealthConfig::from_env();
+        
+        assert_eq!(config1, config2);
+        assert_eq!(config2, config3);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Trait derivation tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_clone() {
+        let config = DAHealthConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config, cloned);
+    }
+
+    #[test]
+    fn test_dahealthconfig_debug() {
+        let config = DAHealthConfig::default();
+        let debug_str = format!("{:?}", config);
+        
+        // Verify debug output contains field names
+        assert!(debug_str.contains("warning_latency_ms"));
+        assert!(debug_str.contains("fallback_trigger_secs"));
+        assert!(debug_str.contains("emergency_trigger_secs"));
+        assert!(debug_str.contains("health_check_interval_ms"));
+        assert!(debug_str.contains("max_reconcile_batch"));
+        assert!(debug_str.contains("recovery_grace_period_secs"));
+    }
+
+    #[test]
+    fn test_dahealthconfig_eq() {
+        let config1 = DAHealthConfig::default();
+        let config2 = DAHealthConfig::default();
+        
+        assert_eq!(config1, config2);
+        
+        let config3 = DAHealthConfig {
+            warning_latency_ms: 99999,
+            ..Default::default()
+        };
+        
+        assert_ne!(config1, config3);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Edge case tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dahealthconfig_from_env_zero_values() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "0");
+        std::env::set_var("DSDN_DA_MAX_RECONCILE_BATCH", "0");
+        
+        let config = DAHealthConfig::from_env();
+        
+        // Zero is a valid value for these fields
+        assert_eq!(config.warning_latency_ms, 0);
+        assert_eq!(config.max_reconcile_batch, 0);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_max_u64() {
+        let _guard = EnvGuard::new();
+        
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "18446744073709551615");
+        
+        let config = DAHealthConfig::from_env();
+        assert_eq!(config.warning_latency_ms, u64::MAX);
+    }
+
+    #[test]
+    fn test_dahealthconfig_from_env_overflow_fallback() {
+        let _guard = EnvGuard::new();
+        
+        // Value larger than u64::MAX
+        std::env::set_var("DSDN_DA_WARNING_LATENCY_MS", "99999999999999999999999");
+        
+        let config = DAHealthConfig::from_env();
+        // Should fallback to default on overflow
+        assert_eq!(config.warning_latency_ms, 30_000);
     }
 }
