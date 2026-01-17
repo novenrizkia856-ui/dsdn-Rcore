@@ -1,52 +1,188 @@
-﻿//! # DSDN Common Crate (14A)
+﻿//! # DSDN Common Crate
 //!
-//! Common utilities dan DA Abstraction Layer.
+//! Crate ini menyediakan abstraksi Data Availability (DA) Layer dan utilities
+//! untuk DSDN (Distributed Storage and Data Network).
 //!
-//! ## Modules
-//! - `da`: DALayer trait definition
-//! - `celestia_da`: Celestia implementation
-//! - `mock_da`: Mock implementation for testing
-//! - `crypto`: Cryptographic utilities
-//! - `cid`: Content addressing utilities
-//! - `config`: Configuration management
-//! - `consistent_hash`: Consistent hashing for placement
-//! - `da_health_monitor`: Thread-safe DA health monitoring (14A.1A.11)
-//! - `da_router`: DA routing abstraction (14A.1A.15)
+//! ## Peran Crate
 //!
-//! ## DA Layer Architecture
+//! `dsdn-common` adalah foundation crate yang menyediakan:
+//! - Abstraksi DA Layer untuk multiple backends (Celestia, Validator Quorum, Foundation)
+//! - Health monitoring untuk DA endpoints
+//! - Routing deterministik dengan fallback hierarchy
+//! - Cryptographic utilities
+//! - Content addressing (CID)
+//! - Configuration management
+//!
+//! ## Arsitektur Fallback & DA Routing
+//!
+//! DSDN menggunakan multi-tier DA architecture untuk high availability:
+//!
+//! | Tier | DA Layer | Kondisi Penggunaan |
+//! |------|----------|-------------------|
+//! | Primary | Celestia | Status Healthy/Warning/Recovering |
+//! | Secondary | Validator Quorum | Status Degraded (fallback level-1) |
+//! | Emergency | Foundation | Status Emergency (fallback level-2) |
+//!
+//! ### Routing Diagram
+//!
 //! ```text
 //! ┌─────────────────┐
-//! │    DALayer      │  <- Abstract trait
+//! │    DARouter     │  <- Routing abstraction
 //! └────────┬────────┘
 //!          │
-//!    ┌─────┴─────┐
-//!    │           │
-//! ┌──▼──┐    ┌───▼───┐
-//! │Celestia│  │MockDA │
-//! └──────┘    └───────┘
+//! ┌─────┴─────┬─────────────┐
+//! │           │             │
+//! ┌──▼──┐    ┌───▼───┐    ┌────▼────┐
+//! │Celestia│ │QuorumDA│   │EmergencyDA│
+//! │(Primary)│ │(Secondary)│ │(Foundation)│
+//! └────────┘ └─────────┘   └───────────┘
 //! ```
 //!
-//! ## Usage
+//! ## Komponen Utama
+//!
+//! ### DAHealthMonitor
+//!
+//! Thread-safe health monitor yang melacak status DA endpoint.
+//! Menyediakan `DAStatus` yang menentukan routing decision.
+//!
+//! Status yang di-track:
+//! - `Healthy`: Primary DA beroperasi normal
+//! - `Warning`: Primary DA mengalami latency tinggi
+//! - `Degraded`: Primary DA tidak tersedia, gunakan secondary
+//! - `Emergency`: Kondisi kritis, gunakan emergency DA
+//! - `Recovering`: Primary DA sedang recovery dari degraded/emergency
+//!
+//! ### DARouter
+//!
+//! Routing abstraction yang menentukan DA target berdasarkan status kesehatan.
+//! Keputusan routing bersifat deterministik berdasarkan `DAStatus` dari
+//! `DAStatusProvider` (biasanya `DAHealthMonitor`).
+//!
+//! Behavior per status:
+//! - `Healthy/Warning/Recovering`: Route ke primary (Celestia)
+//! - `Degraded`: Route ke secondary, tag blob sebagai `PendingReconcile`
+//! - `Emergency`: Route ke emergency, tag blob sebagai `EmergencyPending`
+//!
+//! ### DALayer Trait
+//!
+//! Abstraksi untuk DA backend. Implementasi yang tersedia:
+//! - `CelestiaDA`: Production implementation untuk Celestia
+//! - `MockDA`: Testing implementation
+//!
+//! ## Usage Patterns
+//!
+//! ### Basic DA Operations
+//!
 //! ```rust,ignore
+//! use dsdn_common::{DALayer, CelestiaDA};
+//!
+//! // Initialize DA layer
 //! let da = CelestiaDA::from_env()?;
+//!
+//! // Post blob
 //! let blob_ref = da.post_blob(data).await?;
+//!
+//! // Get blob
 //! let blob = da.get_blob(&blob_ref).await?;
 //! ```
+//!
+//! ### Using DARouter with Health Monitoring
+//!
+//! ```rust,ignore
+//! use dsdn_common::{DARouter, DARouterConfig, DARouterMetrics, DAHealthMonitor};
+//! use std::sync::Arc;
+//!
+//! // Setup health monitor sebagai status provider
+//! let health_monitor = Arc::new(DAHealthMonitor::new(config));
+//!
+//! // Setup router dengan fallback hierarchy
+//! let metrics = Arc::new(DARouterMetrics::new());
+//! let router = DARouter::new(primary_da, health_monitor, DARouterConfig::new(), metrics)
+//!     .with_fallbacks(Some(secondary_da), Some(emergency_da));
+//!
+//! // Router akan memilih DA target berdasarkan status
+//! let blob_ref = router.post_blob(data).await?;
+//! ```
+//!
+//! ### Fallback Activation
+//!
+//! Fallback diaktifkan ketika:
+//! 1. `DAHealthMonitor` melaporkan status `Degraded` atau `Emergency`
+//! 2. `DARouterConfig.enable_fallback` adalah `true` (default)
+//! 3. Fallback DA tersedia (dikonfigurasi via `with_fallbacks`)
+//!
+//! Blob yang ditulis ke fallback akan di-tag untuk reconciliation ketika
+//! primary DA kembali sehat.
+//!
+//! ## Batasan (Non-Goals)
+//!
+//! Crate ini TIDAK menyediakan:
+//! - Automatic reconciliation (hanya tagging, eksekusi di layer lain)
+//! - Network transport atau gRPC endpoints
+//! - Consensus atau finality guarantees
+//! - Persistent storage (in-memory state only)
+//! - Rate limiting atau throttling
+//!
+//! ## Modules
+//!
+//! | Module | Deskripsi |
+//! |--------|-----------|
+//! | `da` | DALayer trait definition dan types |
+//! | `celestia_da` | Celestia DA implementation |
+//! | `mock_da` | Mock implementation for testing |
+//! | `da_health_monitor` | Thread-safe DA health monitoring |
+//! | `da_router` | DA routing dengan fallback hierarchy |
+//! | `crypto` | Cryptographic utilities |
+//! | `cid` | Content addressing utilities |
+//! | `config` | Configuration management |
+//! | `consistent_hash` | Consistent hashing for placement |
 
+// ════════════════════════════════════════════════════════════════════════════════
+// MODULE DECLARATIONS
+// ════════════════════════════════════════════════════════════════════════════════
+
+// Core utilities
 pub mod crypto;
 pub mod cid;
 pub mod config;
 pub mod consistent_hash;
+
+// DA Layer abstraction
 pub mod da;
 pub mod celestia_da;
 pub mod mock_da;
+
+// DA Health & Routing (14A.1A.11 - 14A.1A.19)
 pub mod da_health_monitor;
 pub mod da_router;
 
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC API EXPORTS
+// ════════════════════════════════════════════════════════════════════════════════
+
+// DA Layer types
 pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream, DAConfig};
+
+// DA Layer implementations
 pub use celestia_da::CelestiaDA;
 pub use mock_da::MockDA;
-pub use da_health_monitor::DAHealthMonitor;
-pub use da_router::{DARouter, DARouterConfig, DARouterMetrics};
 
+// DA Health Monitor types (14A.1A.11)
+pub use da_health_monitor::{DAHealthMonitor, DAStatus, DAHealthConfig};
+
+// DA Router types (14A.1A.15 - 14A.1A.19)
+pub use da_router::{
+    DARouter,
+    DARouterConfig,
+    DARouterMetrics,
+    DAStatusProvider,
+    ReconcileTag,
+    MetricsSnapshot,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// COMMON TYPES
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Common Result type untuk crate ini.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
