@@ -1856,6 +1856,62 @@ mod tests {
     use std::sync::Arc;
 
     // ════════════════════════════════════════════════════════════════════════
+    // ENV VAR TEST SYNCHRONIZATION
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Environment variables are process-global state. When tests run in parallel
+    // (Rust's default), tests that modify env vars can interfere with each other.
+    //
+    // Solution: Use a Mutex to serialize all env var tests + RAII guard for cleanup.
+    
+    use std::sync::Mutex;
+    
+    /// Global mutex to serialize tests that modify environment variables.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    
+    /// List of DA-related environment variables that tests may modify.
+    const DA_ENV_VARS: &[&str] = &[
+        "DA_RPC_URL",
+        "DA_NAMESPACE", 
+        "DA_AUTH_TOKEN",
+        "DA_NETWORK",
+        "DA_TIMEOUT_MS",
+        "DA_RETRY_COUNT",
+        "DA_RETRY_DELAY_MS",
+        "DA_ENABLE_POOLING",
+        "DA_MAX_CONNECTIONS",
+        "DA_IDLE_TIMEOUT_MS",
+    ];
+    
+    /// RAII guard for environment variable tests.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original_values: Vec<(&'static str, Option<String>)>,
+    }
+    
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let original_values: Vec<_> = DA_ENV_VARS
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect();
+            Self { _lock: lock, original_values }
+        }
+    }
+    
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, original) in &self.original_values {
+                match original {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // HELPER FUNCTIONS
     // ════════════════════════════════════════════════════════════════════════
 
@@ -3443,21 +3499,9 @@ mod tests {
 
    #[tokio::test]
     async fn test_from_env_success() {
-        // Clear ALL DA-related env vars first to ensure clean state
-        // This prevents interference from .env.mainnet or other tests
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_AUTH_TOKEN");
-        std::env::remove_var("DA_NETWORK");
-        std::env::remove_var("DA_TIMEOUT_MS");
-        std::env::remove_var("DA_RETRY_COUNT");
-        std::env::remove_var("DA_RETRY_DELAY_MS");
-        std::env::remove_var("DA_ENABLE_POOLING");
-        std::env::remove_var("DA_MAX_CONNECTIONS");
-        std::env::remove_var("DA_IDLE_TIMEOUT_MS");
+        let _guard = EnvGuard::new();
 
         let mock_server = MockServer::start().await;
-        // Save URI before any potential cleanup
         let mock_uri = mock_server.uri();
 
         Mock::given(method("HEAD"))
@@ -3471,18 +3515,14 @@ mod tests {
 
         let result = CelestiaDA::from_env();
 
-        // Cleanup env vars
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_NETWORK");
-
-        // Assertions after cleanup
+        // Assertions (cleanup handled by EnvGuard)
         assert!(result.is_ok(), "from_env should succeed: {:?}", result.err());
         assert_eq!(result.unwrap().config().rpc_url, mock_uri);
     }
 
     #[tokio::test]
     async fn test_from_env_fails_missing_vars() {
+        let _guard = EnvGuard::new();
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
 
@@ -3492,19 +3532,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_from_env_fails_invalid_namespace() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://localhost:26658");
         std::env::set_var("DA_NAMESPACE", "invalid_hex");
 
         let result = CelestiaDA::from_env();
-
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-
         assert!(result.is_err());
+        // Cleanup handled by EnvGuard
     }
 
     #[tokio::test]
     async fn test_from_env_error_controlled() {
+        let _guard = EnvGuard::new();
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
 
@@ -3518,17 +3557,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_from_env_invalid_timeout() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://localhost:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
         std::env::set_var("DA_TIMEOUT_MS", "not_a_number");
 
         let result = CelestiaDA::from_env();
-
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_TIMEOUT_MS");
-
         assert!(result.is_err());
+        // Cleanup handled by EnvGuard
     }
 
     // ════════════════════════════════════════════════════════════════════════

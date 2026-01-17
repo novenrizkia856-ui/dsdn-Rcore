@@ -656,6 +656,88 @@ mod tests {
     use super::*;
 
     // ════════════════════════════════════════════════════════════════════════
+    // ENV VAR TEST SYNCHRONIZATION
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // Environment variables are process-global state. When tests run in parallel
+    // (Rust's default), tests that modify env vars can interfere with each other.
+    //
+    // Solution: Use a Mutex to serialize all env var tests + RAII guard for cleanup.
+    
+    use std::sync::Mutex;
+    
+    /// Global mutex to serialize tests that modify environment variables.
+    /// All tests using `EnvGuard` will be serialized.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    
+    /// List of DA-related environment variables that tests may modify.
+    const DA_ENV_VARS: &[&str] = &[
+        "DA_RPC_URL",
+        "DA_NAMESPACE", 
+        "DA_AUTH_TOKEN",
+        "DA_NETWORK",
+        "DA_TIMEOUT_MS",
+        "DA_RETRY_COUNT",
+        "DA_RETRY_DELAY_MS",
+        "DA_ENABLE_POOLING",
+        "DA_MAX_CONNECTIONS",
+        "DA_IDLE_TIMEOUT_MS",
+    ];
+    
+    /// RAII guard for environment variable tests.
+    /// 
+    /// This guard:
+    /// 1. Acquires the ENV_MUTEX lock (serializes env var tests)
+    /// 2. Saves the original values of all DA env vars
+    /// 3. On drop (even on panic), restores original values
+    /// 
+    /// # Usage
+    /// ```ignore
+    /// #[test]
+    /// fn test_env_var_something() {
+    ///     let _guard = EnvGuard::new();
+    ///     std::env::set_var("DA_RPC_URL", "http://test:1234");
+    ///     // ... test logic ...
+    ///     // Guard automatically restores env vars on drop
+    /// }
+    /// ```
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        original_values: Vec<(&'static str, Option<String>)>,
+    }
+    
+    impl EnvGuard {
+        /// Create a new EnvGuard, acquiring the mutex and saving current env var values.
+        fn new() -> Self {
+            // Acquire lock - this serializes all env var tests
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            
+            // Save original values of all DA env vars
+            let original_values: Vec<_> = DA_ENV_VARS
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect();
+            
+            Self {
+                _lock: lock,
+                original_values,
+            }
+        }
+    }
+    
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Restore all env vars to their original values
+            for (var, original) in &self.original_values {
+                match original {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // BLOBREF TESTS
     // ════════════════════════════════════════════════════════════════════════
 
@@ -773,6 +855,7 @@ mod tests {
 
     #[test]
     fn test_daconfig_from_env_missing_rpc_url() {
+        let _guard = EnvGuard::new();
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
 
@@ -782,18 +865,18 @@ mod tests {
 
     #[test]
     fn test_daconfig_from_env_missing_namespace() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://test:1234");
         std::env::remove_var("DA_NAMESPACE");
 
         let result = DAConfig::from_env();
         assert!(result.is_err());
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
+        // Cleanup handled by EnvGuard
     }
 
     #[test]
     fn test_daconfig_from_env_invalid_namespace_length() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://test:1234");
         std::env::set_var("DA_NAMESPACE", "0011223344"); // Too short
 
@@ -806,14 +889,12 @@ mod tests {
         } else {
             panic!("Expected DAError::Other");
         }
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
+        // Cleanup handled by EnvGuard
     }
 
     #[test]
     fn test_daconfig_from_env_mainnet_requires_auth() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://celestia:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
         std::env::set_var("DA_NETWORK", "mainnet");
@@ -828,53 +909,42 @@ mod tests {
         } else {
             panic!("Expected DAError::Other about auth token");
         }
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_NETWORK");
+        // Cleanup handled by EnvGuard
     }
 
     #[test]
     fn test_daconfig_from_env_success_local() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://celestia:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
         std::env::set_var("DA_NETWORK", "local");
         std::env::remove_var("DA_AUTH_TOKEN");
 
         let result = DAConfig::from_env();
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "from_env should succeed for local network without auth token");
 
         let config = result.unwrap();
         assert_eq!(config.network, "local");
         assert!(config.auth_token.is_none());
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_NETWORK");
+        // Cleanup handled by EnvGuard
     }
 
     #[test]
     fn test_daconfig_from_env_success_mainnet() {
+        let _guard = EnvGuard::new();
         std::env::set_var("DA_RPC_URL", "http://celestia:26658");
         std::env::set_var("DA_NAMESPACE", "00112233445566778899aabbccddeeff00112233445566778899aabbcc");
         std::env::set_var("DA_AUTH_TOKEN", "secret_token_123");
         std::env::set_var("DA_NETWORK", "mainnet");
 
         let result = DAConfig::from_env();
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "from_env should succeed for mainnet with auth token");
 
         let config = result.unwrap();
         assert_eq!(config.rpc_url, "http://celestia:26658");
         assert_eq!(config.auth_token, Some("secret_token_123".to_string()));
         assert!(config.is_mainnet());
-
-        // Cleanup
-        std::env::remove_var("DA_RPC_URL");
-        std::env::remove_var("DA_NAMESPACE");
-        std::env::remove_var("DA_AUTH_TOKEN");
-        std::env::remove_var("DA_NETWORK");
+        // Cleanup handled by EnvGuard
     }
 
     #[test]
