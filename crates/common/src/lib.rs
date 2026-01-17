@@ -11,6 +11,7 @@
 //! - `config`: Configuration management
 //! - `consistent_hash`: Consistent hashing for placement
 //! - `da_health_monitor`: Thread-safe DA health monitoring (14A.1A.11)
+//! - `da_router`: DA routing abstraction (14A.1A.15)
 //!
 //! ## DA Layer Architecture
 //! ```text
@@ -40,10 +41,12 @@ pub mod da;
 pub mod celestia_da;
 pub mod mock_da;
 pub mod da_health_monitor;
+pub mod da_router;
 
 pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream, DAConfig};
 pub use celestia_da::CelestiaDA;
 pub use mock_da::MockDA;
 pub use da_health_monitor::DAHealthMonitor;
+pub use da_router::{DARouter, DARouterConfig, DARouterMetrics};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
