@@ -1038,8 +1038,25 @@ impl CelestiaDA {
             return Err(DAError::BlobNotFound(ref_.clone()));
         }
 
+        // Track if we found any blob with matching namespace
+        let mut found_matching_namespace = false;
+        let expected_namespace_b64 = BASE64.encode(&ref_.namespace);
+
         // Find blob by matching data hash (our commitment is SHA3-256 of data)
         for item in blob_items {
+            // Validate namespace matches what we requested
+            if item.namespace != expected_namespace_b64 {
+                warn!(
+                    expected = %expected_namespace_b64,
+                    actual = %item.namespace,
+                    "blob namespace mismatch in response"
+                );
+                // Continue checking other blobs - maybe one matches
+                continue;
+            }
+
+            found_matching_namespace = true;
+
             // Decode data
             let data = BASE64.decode(&item.data)
                 .map_err(|e| DAError::SerializationError(format!("failed to decode blob data: {}", e)))?;
@@ -1058,12 +1075,25 @@ impl CelestiaDA {
             }
         }
 
-        // No matching blob found
+        // No matching blob found - determine appropriate error
+        if !found_matching_namespace {
+            // All blobs had wrong namespace - this is a namespace mismatch
+            warn!(
+                height = ref_.height,
+                expected_namespace = %expected_namespace_b64,
+                "no blobs matched expected namespace"
+            );
+            return Err(DAError::InvalidNamespace);
+        }
+
+        // Found blobs with correct namespace but wrong commitment
+        // This indicates data corruption or blob was overwritten
         warn!(
             height = ref_.height,
-            "no blob matched data hash at this height"
+            expected_commitment = ?hex::encode(&ref_.commitment[..8]),
+            "blob data hash mismatch - possible data corruption"
         );
-        Err(DAError::BlobNotFound(ref_.clone()))
+        Err(DAError::InvalidBlob)
     }
 
     /// Mendapatkan referensi ke konfigurasi.
@@ -1856,8 +1886,9 @@ mod tests {
     }
 
     fn create_blob_get_success_response(namespace: &[u8; 29], data: &[u8], commitment: &[u8; 32]) -> String {
+        // blob.GetAll returns an ARRAY of blobs, not a single object
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"namespace":"{}","data":"{}","share_version":0,"commitment":"{}"}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":[{{"namespace":"{}","data":"{}","share_version":0,"commitment":"{}","index":0}}]}}"#,
             BASE64.encode(namespace),
             BASE64.encode(data),
             BASE64.encode(commitment)
@@ -3361,21 +3392,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_fails_server_unreachable() {
+        // Note: CelestiaDA::new() does NOT validate connection anymore
+        // (Celestia's JSON-RPC server doesn't support HEAD requests)
+        // Connection errors will be detected during actual operations
         let config = create_test_config("http://127.0.0.1:1");
 
         let result = CelestiaDA::new(config);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        assert!(matches!(err, DAError::NetworkError(_) | DAError::Unavailable));
+        // new() should succeed - connection validation is deferred
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_new_fails_invalid_url() {
+        // Note: CelestiaDA::new() does NOT validate URL reachability
+        // Connection errors will be detected during actual operations
         let config = create_test_config("not_a_valid_url");
 
         let result = CelestiaDA::new(config);
-        assert!(result.is_err());
+        // new() should succeed with any URL format
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -3386,22 +3421,20 @@ mod tests {
             CelestiaDA::new(config)
         });
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_err());
+        assert!(result.is_ok(), "Should not panic");
+        // new() succeeds - connection validation is deferred
+        assert!(result.unwrap().is_ok());
     }
 
     #[tokio::test]
     async fn test_new_error_type_correct() {
+        // Note: CelestiaDA::new() does NOT validate connection anymore
+        // This test now verifies that new() succeeds even with unreachable URL
         let config = create_test_config("http://127.0.0.1:1");
 
         let result = CelestiaDA::new(config);
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        match err {
-            DAError::NetworkError(_) | DAError::Unavailable | DAError::Timeout => {}
-            other => panic!("Unexpected error type: {:?}", other),
-        }
+        // new() should succeed - errors occur during actual operations
+        assert!(result.is_ok());
     }
 
     // ════════════════════════════════════════════════════════════════════════
