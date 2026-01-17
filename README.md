@@ -102,6 +102,12 @@ silahkan buka [DSDN_NODE_OPERATOR_GUIDE](assets/docs/DSDN_NODE_OPERATOR_GUIDE.md
 Desain lengkap dan rasional teknis tersedia di whitepaper DSDN  
 (lihat folder `docs/`).
 
+## bahasa program
+
+dsdn menggabungkan rust dan rusts+, rust dan rusts+ di niatkan menjadi bahasa utama di dsdn, rusts+ adalah bahasa dengan backend rust dengan aturan tambahan dan sintaks berbeda, digunakan di berbagai tempat, agar dsdn makin aman secara logic dan bug
+
+[Bahasa Rusts+](https://github.com/novenrizkia856-ui/rustsp-Rlang)
+
 ---
 
 ## Lisensi
