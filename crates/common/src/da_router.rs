@@ -127,33 +127,293 @@ impl Default for ReconcileTag {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// DA ROUTER CONFIG
+// DA ROUTER CONFIG (14A.1A.18)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// Konfigurasi untuk DARouter.
+/// Konfigurasi deterministik untuk perilaku DARouter.
 ///
-/// Placeholder struct untuk tahap ini.
-/// Akan diperluas di tahap berikutnya dengan:
-/// - Routing policies
-/// - Retry configurations
-/// - Timeout settings
+/// Struct ini mendefinisikan semua parameter yang mengontrol:
+/// - Fallback behavior ketika primary DA tidak tersedia
+/// - Emergency routing behavior
+/// - Retry policy pada fallback paths
+/// - Recovery dan reconciliation behavior
+///
+/// ## Environment Variables
+///
+/// Konfigurasi dapat dibaca dari environment variables dengan prefix `DSDN_DA_ROUTER_`:
+/// - `DSDN_DA_ROUTER_ENABLE_FALLBACK` - bool ("true"/"false")
+/// - `DSDN_DA_ROUTER_ENABLE_EMERGENCY` - bool ("true"/"false")
+/// - `DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER` - f64 (decimal)
+/// - `DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK` - u32 (non-negative integer)
+/// - `DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY` - bool ("true"/"false")
+/// - `DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING` - bool ("true"/"false")
 ///
 /// ## Thread Safety
 ///
-/// Struct ini adalah plain data, Send + Sync safe.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Struct ini adalah plain data tanpa interior mutability.
+/// Aman untuk digunakan di multi-threaded context (Send + Sync).
+///
+/// ## Usage
+///
+/// ```rust,ignore
+/// // Menggunakan default values
+/// let config = DARouterConfig::default();
+///
+/// // Membaca dari environment
+/// let config = DARouterConfig::from_env();
+///
+/// // Manual construction
+/// let config = DARouterConfig::new();
+/// ```
+#[derive(Debug, Clone, PartialEq)]
 pub struct DARouterConfig {
-    /// Placeholder field untuk konfigurasi routing.
+    /// Mengaktifkan fallback ke secondary DA ketika primary gagal.
     ///
-    /// Akan diganti dengan field aktual di tahap berikutnya.
-    _placeholder: (),
+    /// ## Behavior
+    ///
+    /// - `true`: Ketika primary DA gagal, router akan mencoba secondary DA
+    /// - `false`: Hanya primary DA yang digunakan, error langsung dikembalikan
+    ///
+    /// ## Checked At
+    ///
+    /// - `post_blob`: Sebelum routing ke secondary pada status Degraded
+    /// - `get_blob`: Sebelum fallback read ke secondary
+    ///
+    /// ## Default
+    ///
+    /// `true` - Fallback diaktifkan secara default untuk high availability.
+    pub enable_fallback: bool,
+
+    /// Mengaktifkan emergency DA ketika primary dan secondary gagal.
+    ///
+    /// ## Behavior
+    ///
+    /// - `true`: Ketika primary dan secondary gagal, router akan mencoba emergency DA
+    /// - `false`: Emergency DA tidak pernah digunakan
+    ///
+    /// ## Checked At
+    ///
+    /// - `post_blob`: Sebelum routing ke emergency pada status Emergency
+    /// - `get_blob`: Sebelum fallback read ke emergency
+    ///
+    /// ## Default
+    ///
+    /// `true` - Emergency diaktifkan secara default untuk disaster recovery.
+    pub enable_emergency: bool,
+
+    /// Multiplier untuk extended timeout pada status Warning.
+    ///
+    /// ## Behavior
+    ///
+    /// Ketika DA status adalah Warning, timeout akan diperpanjang dengan multiplier ini.
+    /// Contoh: jika base timeout 5s dan multiplier 2.0, timeout menjadi 10s.
+    ///
+    /// ## Valid Range
+    ///
+    /// - Minimum: 1.0 (tidak ada perpanjangan)
+    /// - Recommended: 1.5 - 3.0
+    ///
+    /// ## Checked At
+    ///
+    /// - `post_blob`: Ketika status Warning, sebelum operasi ke primary
+    ///
+    /// ## Default
+    ///
+    /// `2.0` - Timeout digandakan pada Warning status.
+    pub extended_timeout_multiplier: f64,
+
+    /// Jumlah maksimum retry pada fallback path (secondary/emergency).
+    ///
+    /// ## Behavior
+    ///
+    /// Ketika operasi ke fallback DA gagal, router akan retry hingga
+    /// `max_retry_on_fallback` kali sebelum mengembalikan error.
+    ///
+    /// ## Valid Range
+    ///
+    /// - Minimum: 0 (tidak ada retry)
+    /// - Maximum: 10 (recommended untuk menghindari latency berlebih)
+    ///
+    /// ## Checked At
+    ///
+    /// - `post_blob`: Pada setiap retry ke secondary/emergency
+    /// - `get_blob`: Pada setiap retry read dari fallback
+    ///
+    /// ## Default
+    ///
+    /// `3` - Maksimal 3 kali retry pada fallback.
+    pub max_retry_on_fallback: u32,
+
+    /// Mengaktifkan reconciliation otomatis ketika primary kembali Healthy.
+    ///
+    /// ## Behavior
+    ///
+    /// - `true`: Blob yang ditulis ke fallback akan di-reconcile ke primary
+    ///   ketika primary kembali dari status Recovering ke Healthy
+    /// - `false`: Tidak ada reconciliation otomatis
+    ///
+    /// ## Checked At
+    ///
+    /// - Recovery handler: Ketika status berubah dari Recovering ke Healthy
+    /// - Reconciliation worker: Sebelum memproses pending reconcile queue
+    ///
+    /// ## Default
+    ///
+    /// `true` - Reconciliation diaktifkan untuk menjaga data consistency.
+    pub reconcile_on_recovery: bool,
+
+    /// Mengaktifkan parallel write ke primary dan fallback pada status Recovering.
+    ///
+    /// ## Behavior
+    ///
+    /// - `true`: Ketika status Recovering, blob ditulis ke primary DAN fallback
+    ///   secara paralel untuk menghindari data loss jika primary gagal lagi
+    /// - `false`: Hanya primary yang digunakan pada Recovering
+    ///
+    /// ## Trade-offs
+    ///
+    /// - `true`: Higher consistency, higher latency, more storage
+    /// - `false`: Lower latency, risk of data loss if primary fails again
+    ///
+    /// ## Checked At
+    ///
+    /// - `post_blob`: Ketika status Recovering, sebelum write operation
+    ///
+    /// ## Default
+    ///
+    /// `false` - Single write ke primary untuk lower latency.
+    pub parallel_post_on_recovering: bool,
+}
+
+impl Default for DARouterConfig {
+    fn default() -> Self {
+        Self {
+            enable_fallback: true,
+            enable_emergency: true,
+            extended_timeout_multiplier: 2.0,
+            max_retry_on_fallback: 3,
+            reconcile_on_recovery: true,
+            parallel_post_on_recovering: false,
+        }
+    }
 }
 
 impl DARouterConfig {
-    /// Membuat konfigurasi default.
+    /// Membuat konfigurasi dengan default values.
+    ///
+    /// # Returns
+    ///
+    /// Instance baru dengan semua field set ke default values.
+    ///
+    /// # Default Values
+    ///
+    /// - `enable_fallback`: true
+    /// - `enable_emergency`: true
+    /// - `extended_timeout_multiplier`: 2.0
+    /// - `max_retry_on_fallback`: 3
+    /// - `reconcile_on_recovery`: true
+    /// - `parallel_post_on_recovering`: false
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Membaca konfigurasi dari environment variables.
+    ///
+    /// Setiap field dibaca dari environment variable dengan prefix `DSDN_DA_ROUTER_`.
+    /// Jika environment variable tidak ada atau tidak valid, nilai default digunakan.
+    ///
+    /// # Environment Variables
+    ///
+    /// | Variable | Type | Default |
+    /// |----------|------|---------|
+    /// | `DSDN_DA_ROUTER_ENABLE_FALLBACK` | bool | true |
+    /// | `DSDN_DA_ROUTER_ENABLE_EMERGENCY` | bool | true |
+    /// | `DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER` | f64 | 2.0 |
+    /// | `DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK` | u32 | 3 |
+    /// | `DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY` | bool | true |
+    /// | `DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING` | bool | false |
+    ///
+    /// # Parsing Rules
+    ///
+    /// - **bool**: "true" atau "false" (case-insensitive)
+    /// - **f64**: decimal valid (e.g., "2.0", "1.5")
+    /// - **u32**: integer non-negative (e.g., "3", "5")
+    ///
+    /// # Returns
+    ///
+    /// Instance dengan values dari environment atau default jika tidak tersedia/invalid.
+    ///
+    /// # Guarantees
+    ///
+    /// - Tidak panic
+    /// - Tidak menggunakan unwrap/expect
+    /// - Deterministik: input sama selalu menghasilkan output sama
+    #[must_use]
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+
+        Self {
+            enable_fallback: Self::parse_env_bool(
+                "DSDN_DA_ROUTER_ENABLE_FALLBACK",
+                defaults.enable_fallback,
+            ),
+            enable_emergency: Self::parse_env_bool(
+                "DSDN_DA_ROUTER_ENABLE_EMERGENCY",
+                defaults.enable_emergency,
+            ),
+            extended_timeout_multiplier: Self::parse_env_f64(
+                "DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER",
+                defaults.extended_timeout_multiplier,
+            ),
+            max_retry_on_fallback: Self::parse_env_u32(
+                "DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK",
+                defaults.max_retry_on_fallback,
+            ),
+            reconcile_on_recovery: Self::parse_env_bool(
+                "DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY",
+                defaults.reconcile_on_recovery,
+            ),
+            parallel_post_on_recovering: Self::parse_env_bool(
+                "DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING",
+                defaults.parallel_post_on_recovering,
+            ),
+        }
+    }
+
+    /// Parse boolean dari environment variable.
+    ///
+    /// Accepts "true" atau "false" (case-insensitive).
+    /// Returns default jika tidak ada atau tidak valid.
+    fn parse_env_bool(key: &str, default: bool) -> bool {
+        match std::env::var(key) {
+            Ok(val) => match val.to_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => default,
+            },
+            Err(_) => default,
+        }
+    }
+
+    /// Parse f64 dari environment variable.
+    ///
+    /// Returns default jika tidak ada atau tidak valid.
+    fn parse_env_f64(key: &str, default: f64) -> f64 {
+        match std::env::var(key) {
+            Ok(val) => val.parse::<f64>().unwrap_or(default),
+            Err(_) => default,
+        }
+    }
+
+    /// Parse u32 dari environment variable.
+    ///
+    /// Returns default jika tidak ada atau tidak valid.
+    fn parse_env_u32(key: &str, default: u32) -> u32 {
+        match std::env::var(key) {
+            Ok(val) => val.parse::<u32>().unwrap_or(default),
+            Err(_) => default,
+        }
     }
 }
 
@@ -1528,7 +1788,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // DARouterConfig tests
+    // DARouterConfig tests (14A.1A.18)
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1549,6 +1809,303 @@ mod tests {
         let config = DARouterConfig::new();
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("DARouterConfig"));
+    }
+
+    #[test]
+    fn test_router_config_default_enable_fallback() {
+        let config = DARouterConfig::default();
+        assert!(config.enable_fallback);
+    }
+
+    #[test]
+    fn test_router_config_default_enable_emergency() {
+        let config = DARouterConfig::default();
+        assert!(config.enable_emergency);
+    }
+
+    #[test]
+    fn test_router_config_default_extended_timeout_multiplier() {
+        let config = DARouterConfig::default();
+        assert!((config.extended_timeout_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_router_config_default_max_retry_on_fallback() {
+        let config = DARouterConfig::default();
+        assert_eq!(config.max_retry_on_fallback, 3);
+    }
+
+    #[test]
+    fn test_router_config_default_reconcile_on_recovery() {
+        let config = DARouterConfig::default();
+        assert!(config.reconcile_on_recovery);
+    }
+
+    #[test]
+    fn test_router_config_default_parallel_post_on_recovering() {
+        let config = DARouterConfig::default();
+        assert!(!config.parallel_post_on_recovering);
+    }
+
+    #[test]
+    fn test_router_config_default_all_values() {
+        let config = DARouterConfig::default();
+        
+        // Verify ALL default values in one test
+        assert!(config.enable_fallback, "enable_fallback should be true");
+        assert!(config.enable_emergency, "enable_emergency should be true");
+        assert!((config.extended_timeout_multiplier - 2.0).abs() < f64::EPSILON, 
+            "extended_timeout_multiplier should be 2.0");
+        assert_eq!(config.max_retry_on_fallback, 3, "max_retry_on_fallback should be 3");
+        assert!(config.reconcile_on_recovery, "reconcile_on_recovery should be true");
+        assert!(!config.parallel_post_on_recovering, "parallel_post_on_recovering should be false");
+    }
+
+    #[test]
+    fn test_router_config_from_env_empty_returns_default() {
+        // Clear all env vars first
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY");
+        std::env::remove_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER");
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY");
+        std::env::remove_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING");
+
+        let config = DARouterConfig::from_env();
+        let default_config = DARouterConfig::default();
+
+        assert_eq!(config.enable_fallback, default_config.enable_fallback);
+        assert_eq!(config.enable_emergency, default_config.enable_emergency);
+        assert!((config.extended_timeout_multiplier - default_config.extended_timeout_multiplier).abs() < f64::EPSILON);
+        assert_eq!(config.max_retry_on_fallback, default_config.max_retry_on_fallback);
+        assert_eq!(config.reconcile_on_recovery, default_config.reconcile_on_recovery);
+        assert_eq!(config.parallel_post_on_recovering, default_config.parallel_post_on_recovering);
+    }
+
+    #[test]
+    fn test_router_config_from_env_valid_bool_true() {
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", "true");
+        std::env::set_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING", "true");
+
+        let config = DARouterConfig::from_env();
+
+        assert!(config.enable_fallback);
+        assert!(config.parallel_post_on_recovering);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING");
+    }
+
+    #[test]
+    fn test_router_config_from_env_valid_bool_false() {
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", "false");
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY", "false");
+
+        let config = DARouterConfig::from_env();
+
+        assert!(!config.enable_fallback);
+        assert!(!config.enable_emergency);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY");
+    }
+
+    #[test]
+    fn test_router_config_from_env_bool_case_insensitive() {
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", "TRUE");
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY", "FALSE");
+        std::env::set_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY", "True");
+        std::env::set_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING", "False");
+
+        let config = DARouterConfig::from_env();
+
+        assert!(config.enable_fallback);
+        assert!(!config.enable_emergency);
+        assert!(config.reconcile_on_recovery);
+        assert!(!config.parallel_post_on_recovering);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY");
+        std::env::remove_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY");
+        std::env::remove_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING");
+    }
+
+    #[test]
+    fn test_router_config_from_env_valid_f64() {
+        std::env::set_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER", "3.5");
+
+        let config = DARouterConfig::from_env();
+
+        assert!((config.extended_timeout_multiplier - 3.5).abs() < f64::EPSILON);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER");
+    }
+
+    #[test]
+    fn test_router_config_from_env_valid_u32() {
+        std::env::set_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK", "5");
+
+        let config = DARouterConfig::from_env();
+
+        assert_eq!(config.max_retry_on_fallback, 5);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
+    }
+
+    #[test]
+    fn test_router_config_from_env_invalid_bool_returns_default() {
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", "yes");
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY", "no");
+        std::env::set_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY", "1");
+        std::env::set_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING", "invalid");
+
+        let config = DARouterConfig::from_env();
+        let defaults = DARouterConfig::default();
+
+        // Invalid bools should fallback to default
+        assert_eq!(config.enable_fallback, defaults.enable_fallback);
+        assert_eq!(config.enable_emergency, defaults.enable_emergency);
+        assert_eq!(config.reconcile_on_recovery, defaults.reconcile_on_recovery);
+        assert_eq!(config.parallel_post_on_recovering, defaults.parallel_post_on_recovering);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY");
+        std::env::remove_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY");
+        std::env::remove_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING");
+    }
+
+    #[test]
+    fn test_router_config_from_env_invalid_f64_returns_default() {
+        std::env::set_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER", "not_a_number");
+
+        let config = DARouterConfig::from_env();
+        let defaults = DARouterConfig::default();
+
+        assert!((config.extended_timeout_multiplier - defaults.extended_timeout_multiplier).abs() < f64::EPSILON);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER");
+    }
+
+    #[test]
+    fn test_router_config_from_env_invalid_u32_returns_default() {
+        std::env::set_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK", "-1");
+
+        let config = DARouterConfig::from_env();
+        let defaults = DARouterConfig::default();
+
+        assert_eq!(config.max_retry_on_fallback, defaults.max_retry_on_fallback);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
+    }
+
+    #[test]
+    fn test_router_config_from_env_overflow_u32_returns_default() {
+        std::env::set_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK", "999999999999");
+
+        let config = DARouterConfig::from_env();
+        let defaults = DARouterConfig::default();
+
+        assert_eq!(config.max_retry_on_fallback, defaults.max_retry_on_fallback);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
+    }
+
+    #[test]
+    fn test_router_config_from_env_no_panic_on_any_input() {
+        // Test various potentially problematic inputs - should never panic
+        let test_values = [
+            ("", "empty string"),
+            ("   ", "whitespace"),
+            ("\n\t", "control chars"),
+            ("null", "null string"),
+            ("undefined", "undefined string"),
+            ("NaN", "NaN string"),
+            ("inf", "infinity string"),
+            ("-inf", "negative infinity"),
+            ("0x10", "hex string"),
+            ("1e100", "scientific notation"),
+        ];
+
+        for (val, _desc) in test_values {
+            std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", val);
+            std::env::set_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER", val);
+            std::env::set_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK", val);
+
+            // This should not panic
+            let _config = DARouterConfig::from_env();
+        }
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER");
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
+    }
+
+    #[test]
+    fn test_router_config_from_env_all_overrides() {
+        // Set all env vars to non-default values
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", "false");
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY", "false");
+        std::env::set_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER", "1.5");
+        std::env::set_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK", "5");
+        std::env::set_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY", "false");
+        std::env::set_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING", "true");
+
+        let config = DARouterConfig::from_env();
+
+        assert!(!config.enable_fallback);
+        assert!(!config.enable_emergency);
+        assert!((config.extended_timeout_multiplier - 1.5).abs() < f64::EPSILON);
+        assert_eq!(config.max_retry_on_fallback, 5);
+        assert!(!config.reconcile_on_recovery);
+        assert!(config.parallel_post_on_recovering);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY");
+        std::env::remove_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER");
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY");
+        std::env::remove_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING");
+    }
+
+    #[test]
+    fn test_router_config_partial_override() {
+        // Only set some env vars
+        std::env::set_var("DSDN_DA_ROUTER_ENABLE_FALLBACK", "false");
+        std::env::set_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK", "10");
+
+        // Clear others
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_EMERGENCY");
+        std::env::remove_var("DSDN_DA_ROUTER_EXTENDED_TIMEOUT_MULTIPLIER");
+        std::env::remove_var("DSDN_DA_ROUTER_RECONCILE_ON_RECOVERY");
+        std::env::remove_var("DSDN_DA_ROUTER_PARALLEL_POST_ON_RECOVERING");
+
+        let config = DARouterConfig::from_env();
+        let defaults = DARouterConfig::default();
+
+        // Overridden values
+        assert!(!config.enable_fallback);
+        assert_eq!(config.max_retry_on_fallback, 10);
+
+        // Default values
+        assert_eq!(config.enable_emergency, defaults.enable_emergency);
+        assert!((config.extended_timeout_multiplier - defaults.extended_timeout_multiplier).abs() < f64::EPSILON);
+        assert_eq!(config.reconcile_on_recovery, defaults.reconcile_on_recovery);
+        assert_eq!(config.parallel_post_on_recovering, defaults.parallel_post_on_recovering);
+
+        // Cleanup
+        std::env::remove_var("DSDN_DA_ROUTER_ENABLE_FALLBACK");
+        std::env::remove_var("DSDN_DA_ROUTER_MAX_RETRY_ON_FALLBACK");
     }
 
     // ────────────────────────────────────────────────────────────────────────────
