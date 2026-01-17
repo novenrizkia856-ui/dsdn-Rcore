@@ -29,10 +29,292 @@
 //! let status = monitor.status();
 //! ```
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use crate::da::{DAHealthStatus, DAConfig};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DA STATUS ENUM (14A.1A.12)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Status kesehatan Data Availability layer.
+///
+/// Enum ini merepresentasikan kondisi operasional DA layer secara eksplisit
+/// dan deterministik. Setiap variant memiliki semantik yang jelas terkait:
+/// - Apakah sistem masih operasional
+/// - Apakah fallback mode diperlukan
+/// - Apakah operasi write diperbolehkan
+///
+/// ## Variant Order
+///
+/// Urutan variant dari kondisi terbaik ke terburuk:
+/// 1. `Healthy` - Kondisi optimal
+/// 2. `Warning` - Ada indikasi masalah
+/// 3. `Degraded` - Performa menurun
+/// 4. `Emergency` - Kondisi kritis
+/// 5. `Recovering` - Sedang pemulihan
+///
+/// ## Thread Safety
+///
+/// Enum ini adalah `Copy` type dan aman untuk digunakan di multi-threaded context.
+/// Tidak mengandung interior mutability atau heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DAStatus {
+    /// DA layer beroperasi dalam kondisi optimal.
+    ///
+    /// ## Kondisi
+    ///
+    /// - Koneksi ke Celestia node aktif dan responsif
+    /// - Latency berada dalam threshold normal
+    /// - Tidak ada error pada operasi terakhir
+    /// - Semua health check berhasil
+    ///
+    /// ## Fallback
+    ///
+    /// Fallback mode TIDAK aktif pada status ini.
+    ///
+    /// ## Operasional
+    ///
+    /// - Sistem dianggap fully operational
+    /// - Semua operasi read dan write diperbolehkan
+    /// - Tidak ada degradasi performa
+    Healthy,
+
+    /// DA layer mendeteksi indikasi awal masalah.
+    ///
+    /// ## Kondisi
+    ///
+    /// - Latency meningkat mendekati threshold
+    /// - Terjadi retry pada beberapa operasi
+    /// - Connection pool menunjukkan tekanan
+    /// - Error rate meningkat namun masih di bawah threshold kritis
+    ///
+    /// ## Fallback
+    ///
+    /// Fallback mode TIDAK aktif pada status ini.
+    /// Sistem masih menggunakan DA layer primer.
+    ///
+    /// ## Operasional
+    ///
+    /// - Sistem masih dianggap operational
+    /// - Operasi read dan write masih diperbolehkan
+    /// - Monitoring intensif disarankan
+    Warning,
+
+    /// DA layer mengalami penurunan performa signifikan.
+    ///
+    /// ## Kondisi
+    ///
+    /// - Latency melebihi threshold normal
+    /// - Error rate tinggi namun sebagian operasi masih berhasil
+    /// - Connection timeout terjadi secara intermittent
+    /// - Beberapa operasi membutuhkan multiple retry
+    ///
+    /// ## Fallback
+    ///
+    /// Fallback mode AKTIF pada status ini.
+    /// Sistem menggunakan mekanisme fallback untuk menjaga kontinuitas.
+    ///
+    /// ## Operasional
+    ///
+    /// - Sistem masih dianggap operational dengan degradasi
+    /// - Operasi read diperbolehkan
+    /// - Operasi write TIDAK diperbolehkan untuk mencegah data inconsistency
+    Degraded,
+
+    /// DA layer dalam kondisi kritis dan tidak dapat digunakan.
+    ///
+    /// ## Kondisi
+    ///
+    /// - Koneksi ke Celestia node terputus total
+    /// - Semua operasi gagal
+    /// - Health check gagal berturut-turut
+    /// - Tidak ada response dari DA layer
+    ///
+    /// ## Fallback
+    ///
+    /// Fallback mode AKTIF pada status ini.
+    /// Sistem bergantung sepenuhnya pada mekanisme fallback.
+    ///
+    /// ## Operasional
+    ///
+    /// - Sistem TIDAK dianggap operational untuk DA operations
+    /// - Operasi read mungkin dilayani dari cache/fallback
+    /// - Operasi write TIDAK diperbolehkan
+    Emergency,
+
+    /// DA layer sedang dalam proses pemulihan.
+    ///
+    /// ## Kondisi
+    ///
+    /// - Koneksi ke Celestia mulai terbentuk kembali
+    /// - Health check mulai berhasil setelah periode kegagalan
+    /// - Sedang melakukan sinkronisasi state
+    /// - Transisi dari Emergency atau Degraded ke kondisi lebih baik
+    ///
+    /// ## Fallback
+    ///
+    /// Fallback mode AKTIF pada status ini.
+    /// Sistem masih menggunakan fallback selama proses pemulihan berlangsung.
+    ///
+    /// ## Operasional
+    ///
+    /// - Sistem dianggap operational dengan pembatasan
+    /// - Operasi read diperbolehkan
+    /// - Operasi write TIDAK diperbolehkan sampai pemulihan selesai
+    Recovering,
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// DAStatus Implementation
+// ────────────────────────────────────────────────────────────────────────────────
+
+impl DAStatus {
+    /// Memeriksa apakah sistem dianggap masih operasional.
+    ///
+    /// # Returns
+    ///
+    /// - `true` jika sistem masih dapat melayani request (meskipun terdegradasi)
+    /// - `false` jika sistem tidak dapat beroperasi sama sekali
+    ///
+    /// # Mapping per Variant
+    ///
+    /// | Variant     | is_operational |
+    /// |-------------|----------------|
+    /// | Healthy     | true           |
+    /// | Warning     | true           |
+    /// | Degraded    | true           |
+    /// | Emergency   | false          |
+    /// | Recovering  | true           |
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministik: input sama selalu menghasilkan output sama
+    /// - Tidak panic
+    /// - O(1) constant time
+    #[inline]
+    #[must_use]
+    pub const fn is_operational(&self) -> bool {
+        match self {
+            Self::Healthy => true,
+            Self::Warning => true,
+            Self::Degraded => true,
+            Self::Emergency => false,
+            Self::Recovering => true,
+        }
+    }
+
+    /// Memeriksa apakah fallback mode diperlukan.
+    ///
+    /// # Returns
+    ///
+    /// - `true` jika sistem HARUS mengaktifkan fallback mode
+    /// - `false` jika sistem dapat beroperasi tanpa fallback
+    ///
+    /// # Mapping per Variant
+    ///
+    /// | Variant     | requires_fallback |
+    /// |-------------|-------------------|
+    /// | Healthy     | false             |
+    /// | Warning     | false             |
+    /// | Degraded    | true              |
+    /// | Emergency   | true              |
+    /// | Recovering  | true              |
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministik: input sama selalu menghasilkan output sama
+    /// - Konsisten dengan dokumentasi variant
+    /// - Tidak panic
+    /// - O(1) constant time
+    #[inline]
+    #[must_use]
+    pub const fn requires_fallback(&self) -> bool {
+        match self {
+            Self::Healthy => false,
+            Self::Warning => false,
+            Self::Degraded => true,
+            Self::Emergency => true,
+            Self::Recovering => true,
+        }
+    }
+
+    /// Memeriksa apakah operasi write ke DA layer diperbolehkan.
+    ///
+    /// # Returns
+    ///
+    /// - `true` jika write operations diperbolehkan
+    /// - `false` jika write operations TIDAK diperbolehkan
+    ///
+    /// # Mapping per Variant
+    ///
+    /// | Variant     | allows_writes |
+    /// |-------------|---------------|
+    /// | Healthy     | true          |
+    /// | Warning     | true          |
+    /// | Degraded    | false         |
+    /// | Emergency   | false         |
+    /// | Recovering  | false         |
+    ///
+    /// # Rationale
+    ///
+    /// Write operations di-disable saat:
+    /// - `Degraded`: Mencegah partial writes dan data inconsistency
+    /// - `Emergency`: DA layer tidak tersedia
+    /// - `Recovering`: State belum stabil
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministik: input sama selalu menghasilkan output sama
+    /// - Tidak panic
+    /// - O(1) constant time
+    #[inline]
+    #[must_use]
+    pub const fn allows_writes(&self) -> bool {
+        match self {
+            Self::Healthy => true,
+            Self::Warning => true,
+            Self::Degraded => false,
+            Self::Emergency => false,
+            Self::Recovering => false,
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Display Implementation for DAStatus
+// ────────────────────────────────────────────────────────────────────────────────
+
+impl fmt::Display for DAStatus {
+    /// Format `DAStatus` sebagai string human-readable untuk logging.
+    ///
+    /// # Output Format
+    ///
+    /// | Variant     | Display Output |
+    /// |-------------|----------------|
+    /// | Healthy     | "healthy"      |
+    /// | Warning     | "warning"      |
+    /// | Degraded    | "degraded"     |
+    /// | Emergency   | "emergency"    |
+    /// | Recovering  | "recovering"   |
+    ///
+    /// # Stability
+    ///
+    /// Output string bersifat stabil dan tidak akan berubah antar versi.
+    /// Format lowercase dipilih untuk konsistensi dengan logging conventions.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status_str = match self {
+            Self::Healthy => "healthy",
+            Self::Warning => "warning",
+            Self::Degraded => "degraded",
+            Self::Emergency => "emergency",
+            Self::Recovering => "recovering",
+        };
+        write!(f, "{}", status_str)
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // DA HEALTH MONITOR STRUCT
@@ -750,6 +1032,359 @@ mod tests {
             assert_eq!(monitor.celestia_latency_ms(), 42);
             assert_eq!(monitor.celestia_last_blob_height(), 1000);
             assert_eq!(monitor.celestia_last_success(), 1704067200);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // DAStatus tests (14A.1A.12)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // is_operational() tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_is_operational_healthy() {
+        let status = DAStatus::Healthy;
+        assert!(status.is_operational(), "Healthy should be operational");
+    }
+
+    #[test]
+    fn test_dastatus_is_operational_warning() {
+        let status = DAStatus::Warning;
+        assert!(status.is_operational(), "Warning should be operational");
+    }
+
+    #[test]
+    fn test_dastatus_is_operational_degraded() {
+        let status = DAStatus::Degraded;
+        assert!(status.is_operational(), "Degraded should be operational");
+    }
+
+    #[test]
+    fn test_dastatus_is_operational_emergency() {
+        let status = DAStatus::Emergency;
+        assert!(!status.is_operational(), "Emergency should NOT be operational");
+    }
+
+    #[test]
+    fn test_dastatus_is_operational_recovering() {
+        let status = DAStatus::Recovering;
+        assert!(status.is_operational(), "Recovering should be operational");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // requires_fallback() tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_requires_fallback_healthy() {
+        let status = DAStatus::Healthy;
+        assert!(!status.requires_fallback(), "Healthy should NOT require fallback");
+    }
+
+    #[test]
+    fn test_dastatus_requires_fallback_warning() {
+        let status = DAStatus::Warning;
+        assert!(!status.requires_fallback(), "Warning should NOT require fallback");
+    }
+
+    #[test]
+    fn test_dastatus_requires_fallback_degraded() {
+        let status = DAStatus::Degraded;
+        assert!(status.requires_fallback(), "Degraded should require fallback");
+    }
+
+    #[test]
+    fn test_dastatus_requires_fallback_emergency() {
+        let status = DAStatus::Emergency;
+        assert!(status.requires_fallback(), "Emergency should require fallback");
+    }
+
+    #[test]
+    fn test_dastatus_requires_fallback_recovering() {
+        let status = DAStatus::Recovering;
+        assert!(status.requires_fallback(), "Recovering should require fallback");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // allows_writes() tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_allows_writes_healthy() {
+        let status = DAStatus::Healthy;
+        assert!(status.allows_writes(), "Healthy should allow writes");
+    }
+
+    #[test]
+    fn test_dastatus_allows_writes_warning() {
+        let status = DAStatus::Warning;
+        assert!(status.allows_writes(), "Warning should allow writes");
+    }
+
+    #[test]
+    fn test_dastatus_allows_writes_degraded() {
+        let status = DAStatus::Degraded;
+        assert!(!status.allows_writes(), "Degraded should NOT allow writes");
+    }
+
+    #[test]
+    fn test_dastatus_allows_writes_emergency() {
+        let status = DAStatus::Emergency;
+        assert!(!status.allows_writes(), "Emergency should NOT allow writes");
+    }
+
+    #[test]
+    fn test_dastatus_allows_writes_recovering() {
+        let status = DAStatus::Recovering;
+        assert!(!status.allows_writes(), "Recovering should NOT allow writes");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Display trait tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_display_healthy() {
+        let status = DAStatus::Healthy;
+        let displayed = format!("{}", status);
+        assert_eq!(displayed, "healthy");
+        assert!(!displayed.is_empty());
+    }
+
+    #[test]
+    fn test_dastatus_display_warning() {
+        let status = DAStatus::Warning;
+        let displayed = format!("{}", status);
+        assert_eq!(displayed, "warning");
+        assert!(!displayed.is_empty());
+    }
+
+    #[test]
+    fn test_dastatus_display_degraded() {
+        let status = DAStatus::Degraded;
+        let displayed = format!("{}", status);
+        assert_eq!(displayed, "degraded");
+        assert!(!displayed.is_empty());
+    }
+
+    #[test]
+    fn test_dastatus_display_emergency() {
+        let status = DAStatus::Emergency;
+        let displayed = format!("{}", status);
+        assert_eq!(displayed, "emergency");
+        assert!(!displayed.is_empty());
+    }
+
+    #[test]
+    fn test_dastatus_display_recovering() {
+        let status = DAStatus::Recovering;
+        let displayed = format!("{}", status);
+        assert_eq!(displayed, "recovering");
+        assert!(!displayed.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Display stability tests (tidak bergantung Debug)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_display_differs_from_debug() {
+        // Display output harus berbeda dari Debug output
+        let status = DAStatus::Healthy;
+        let display_out = format!("{}", status);
+        let debug_out = format!("{:?}", status);
+        
+        // Display adalah lowercase "healthy", Debug adalah "Healthy"
+        assert_ne!(display_out, debug_out);
+    }
+
+    #[test]
+    fn test_dastatus_display_is_lowercase() {
+        // Semua Display output harus lowercase
+        let statuses = [
+            DAStatus::Healthy,
+            DAStatus::Warning,
+            DAStatus::Degraded,
+            DAStatus::Emergency,
+            DAStatus::Recovering,
+        ];
+
+        for status in statuses {
+            let displayed = format!("{}", status);
+            assert_eq!(displayed, displayed.to_lowercase(), 
+                "Display output should be lowercase for {:?}", status);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Determinism tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_is_operational_determinism() {
+        // Multiple calls should return same result
+        let status = DAStatus::Degraded;
+        let r1 = status.is_operational();
+        let r2 = status.is_operational();
+        let r3 = status.is_operational();
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn test_dastatus_requires_fallback_determinism() {
+        // Multiple calls should return same result
+        let status = DAStatus::Emergency;
+        let r1 = status.requires_fallback();
+        let r2 = status.requires_fallback();
+        let r3 = status.requires_fallback();
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn test_dastatus_allows_writes_determinism() {
+        // Multiple calls should return same result
+        let status = DAStatus::Recovering;
+        let r1 = status.allows_writes();
+        let r2 = status.allows_writes();
+        let r3 = status.allows_writes();
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn test_dastatus_display_determinism() {
+        // Multiple format calls should return same string
+        let status = DAStatus::Warning;
+        let s1 = format!("{}", status);
+        let s2 = format!("{}", status);
+        let s3 = format!("{}", status);
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s3);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Trait derivation tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_clone() {
+        let status = DAStatus::Degraded;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_dastatus_copy() {
+        let status = DAStatus::Emergency;
+        let copied = status; // Copy semantics
+        assert_eq!(status, copied);
+    }
+
+    #[test]
+    fn test_dastatus_eq() {
+        assert_eq!(DAStatus::Healthy, DAStatus::Healthy);
+        assert_ne!(DAStatus::Healthy, DAStatus::Warning);
+        assert_ne!(DAStatus::Degraded, DAStatus::Emergency);
+    }
+
+    #[test]
+    fn test_dastatus_hash() {
+        use std::collections::HashSet;
+        
+        let mut set = HashSet::new();
+        set.insert(DAStatus::Healthy);
+        set.insert(DAStatus::Warning);
+        set.insert(DAStatus::Degraded);
+        set.insert(DAStatus::Emergency);
+        set.insert(DAStatus::Recovering);
+        
+        // All 5 variants should be unique
+        assert_eq!(set.len(), 5);
+        
+        // Duplicate insert should not increase size
+        set.insert(DAStatus::Healthy);
+        assert_eq!(set.len(), 5);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Comprehensive logic consistency tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dastatus_logic_consistency() {
+        // Verify all variants have consistent logic across methods
+        let test_cases: [(DAStatus, bool, bool, bool); 5] = [
+            // (status, is_operational, requires_fallback, allows_writes)
+            (DAStatus::Healthy,    true,  false, true),
+            (DAStatus::Warning,    true,  false, true),
+            (DAStatus::Degraded,   true,  true,  false),
+            (DAStatus::Emergency,  false, true,  false),
+            (DAStatus::Recovering, true,  true,  false),
+        ];
+
+        for (status, expected_operational, expected_fallback, expected_writes) in test_cases {
+            assert_eq!(
+                status.is_operational(), 
+                expected_operational,
+                "is_operational mismatch for {:?}", status
+            );
+            assert_eq!(
+                status.requires_fallback(), 
+                expected_fallback,
+                "requires_fallback mismatch for {:?}", status
+            );
+            assert_eq!(
+                status.allows_writes(), 
+                expected_writes,
+                "allows_writes mismatch for {:?}", status
+            );
+        }
+    }
+
+    #[test]
+    fn test_dastatus_fallback_implies_no_writes() {
+        // Invariant: If fallback is required, writes should not be allowed
+        // (except for transitional states which we don't have)
+        let statuses = [
+            DAStatus::Healthy,
+            DAStatus::Warning,
+            DAStatus::Degraded,
+            DAStatus::Emergency,
+            DAStatus::Recovering,
+        ];
+
+        for status in statuses {
+            if status.requires_fallback() {
+                assert!(
+                    !status.allows_writes(),
+                    "Status {:?} requires fallback but allows writes", status
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dastatus_allows_writes_implies_operational() {
+        // Invariant: If writes are allowed, system should be operational
+        let statuses = [
+            DAStatus::Healthy,
+            DAStatus::Warning,
+            DAStatus::Degraded,
+            DAStatus::Emergency,
+            DAStatus::Recovering,
+        ];
+
+        for status in statuses {
+            if status.allows_writes() {
+                assert!(
+                    status.is_operational(),
+                    "Status {:?} allows writes but is not operational", status
+                );
+            }
         }
     }
 }
