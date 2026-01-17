@@ -64,14 +64,29 @@ pub trait DAStatusProvider: Send + Sync {
     ///
     /// `DAStatus` yang merepresentasikan kondisi kesehatan DA layer.
     fn get_da_status(&self) -> DAStatus;
+
+    /// Memeriksa apakah fallback mode aktif.
+    ///
+    /// Fallback mode menentukan apakah read operations boleh
+    /// mencoba secondary/emergency DA ketika primary gagal.
+    ///
+    /// # Returns
+    ///
+    /// - `true` jika fallback diizinkan
+    /// - `false` jika hanya primary yang boleh digunakan
+    fn is_fallback_active(&self) -> bool;
 }
 
 /// Implementasi `DAStatusProvider` untuk `DAHealthMonitor`.
 ///
-/// Delegasi langsung ke method `get_da_status()` yang sudah ada.
+/// Delegasi langsung ke methods yang sudah ada di `DAHealthMonitor`.
 impl DAStatusProvider for DAHealthMonitor {
     fn get_da_status(&self) -> DAStatus {
         DAHealthMonitor::get_da_status(self)
+    }
+
+    fn is_fallback_active(&self) -> bool {
+        DAHealthMonitor::is_fallback_active(self)
     }
 }
 
@@ -143,7 +158,7 @@ impl DARouterConfig {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// DA ROUTER METRICS (14A.1A.16)
+// DA ROUTER METRICS (14A.1A.16 + 14A.1A.17)
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Metrics internal untuk DARouter.
@@ -153,9 +168,11 @@ impl DARouterConfig {
 /// ## Tracked Metrics
 ///
 /// - Post counts per path (primary, secondary, emergency)
-/// - Error counts per path
+/// - Read counts per path (primary, secondary, emergency)
+/// - Error counts per path (post and read)
 /// - Pending reconcile blob count
 /// - Emergency pending blob count
+/// - Fallback read count
 ///
 /// ## Thread Safety
 ///
@@ -163,22 +180,39 @@ impl DARouterConfig {
 /// Struct ini adalah Send + Sync.
 #[derive(Debug)]
 pub struct DARouterMetrics {
+    // ── Post Metrics ──────────────────────────────────────────────────────────
     /// Jumlah post_blob sukses ke primary.
     primary_post_count: AtomicU64,
     /// Jumlah post_blob sukses ke secondary.
     secondary_post_count: AtomicU64,
     /// Jumlah post_blob sukses ke emergency.
     emergency_post_count: AtomicU64,
-    /// Jumlah error pada primary path.
+    /// Jumlah error post pada primary path.
     primary_error_count: AtomicU64,
-    /// Jumlah error pada secondary path.
+    /// Jumlah error post pada secondary path.
     secondary_error_count: AtomicU64,
-    /// Jumlah error pada emergency path.
+    /// Jumlah error post pada emergency path.
     emergency_error_count: AtomicU64,
     /// Jumlah blob dengan tag PendingReconcile.
     pending_reconcile_count: AtomicU64,
     /// Jumlah blob dengan tag EmergencyPending.
     emergency_pending_count: AtomicU64,
+
+    // ── Read Metrics (14A.1A.17) ──────────────────────────────────────────────
+    /// Jumlah get_blob sukses dari primary.
+    primary_read_count: AtomicU64,
+    /// Jumlah get_blob sukses dari secondary (fallback).
+    secondary_read_count: AtomicU64,
+    /// Jumlah get_blob sukses dari emergency (fallback).
+    emergency_read_count: AtomicU64,
+    /// Jumlah error get_blob dari primary.
+    primary_read_error_count: AtomicU64,
+    /// Jumlah error get_blob dari secondary.
+    secondary_read_error_count: AtomicU64,
+    /// Jumlah error get_blob dari emergency.
+    emergency_read_error_count: AtomicU64,
+    /// Jumlah total fallback reads (secondary + emergency).
+    fallback_read_count: AtomicU64,
 }
 
 impl DARouterMetrics {
@@ -186,6 +220,7 @@ impl DARouterMetrics {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            // Post metrics
             primary_post_count: AtomicU64::new(0),
             secondary_post_count: AtomicU64::new(0),
             emergency_post_count: AtomicU64::new(0),
@@ -194,11 +229,19 @@ impl DARouterMetrics {
             emergency_error_count: AtomicU64::new(0),
             pending_reconcile_count: AtomicU64::new(0),
             emergency_pending_count: AtomicU64::new(0),
+            // Read metrics (14A.1A.17)
+            primary_read_count: AtomicU64::new(0),
+            secondary_read_count: AtomicU64::new(0),
+            emergency_read_count: AtomicU64::new(0),
+            primary_read_error_count: AtomicU64::new(0),
+            secondary_read_error_count: AtomicU64::new(0),
+            emergency_read_error_count: AtomicU64::new(0),
+            fallback_read_count: AtomicU64::new(0),
         }
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // Record Methods
+    // Post Record Methods
     // ────────────────────────────────────────────────────────────────────────────
 
     /// Record successful post to primary.
@@ -219,19 +262,19 @@ impl DARouterMetrics {
         self.emergency_post_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record error on primary path.
+    /// Record error on primary post path.
     #[inline]
     pub fn record_primary_error(&self) {
         self.primary_error_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record error on secondary path.
+    /// Record error on secondary post path.
     #[inline]
     pub fn record_secondary_error(&self) {
         self.secondary_error_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record error on emergency path.
+    /// Record error on emergency post path.
     #[inline]
     pub fn record_emergency_error(&self) {
         self.emergency_error_count.fetch_add(1, Ordering::Relaxed);
@@ -247,6 +290,48 @@ impl DARouterMetrics {
     #[inline]
     pub fn record_emergency_pending(&self) {
         self.emergency_pending_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Read Record Methods (14A.1A.17)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Record successful read from primary.
+    #[inline]
+    pub fn record_primary_read(&self) {
+        self.primary_read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record successful read from secondary (fallback).
+    #[inline]
+    pub fn record_secondary_read(&self) {
+        self.secondary_read_count.fetch_add(1, Ordering::Relaxed);
+        self.fallback_read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record successful read from emergency (fallback).
+    #[inline]
+    pub fn record_emergency_read(&self) {
+        self.emergency_read_count.fetch_add(1, Ordering::Relaxed);
+        self.fallback_read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record error on primary read path.
+    #[inline]
+    pub fn record_primary_read_error(&self) {
+        self.primary_read_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record error on secondary read path.
+    #[inline]
+    pub fn record_secondary_read_error(&self) {
+        self.secondary_read_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record error on emergency read path.
+    #[inline]
+    pub fn record_emergency_read_error(&self) {
+        self.emergency_read_error_count.fetch_add(1, Ordering::Relaxed);
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -318,13 +403,84 @@ impl DARouterMetrics {
             + self.emergency_post_count()
     }
 
-    /// Get total error count across all paths.
+    /// Get total error count across all paths (post errors only).
     #[inline]
     #[must_use]
     pub fn total_error_count(&self) -> u64 {
         self.primary_error_count()
             + self.secondary_error_count()
             + self.emergency_error_count()
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Read Accessor Methods (14A.1A.17)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Get primary read count.
+    #[inline]
+    #[must_use]
+    pub fn primary_read_count(&self) -> u64 {
+        self.primary_read_count.load(Ordering::Relaxed)
+    }
+
+    /// Get secondary read count.
+    #[inline]
+    #[must_use]
+    pub fn secondary_read_count(&self) -> u64 {
+        self.secondary_read_count.load(Ordering::Relaxed)
+    }
+
+    /// Get emergency read count.
+    #[inline]
+    #[must_use]
+    pub fn emergency_read_count(&self) -> u64 {
+        self.emergency_read_count.load(Ordering::Relaxed)
+    }
+
+    /// Get primary read error count.
+    #[inline]
+    #[must_use]
+    pub fn primary_read_error_count(&self) -> u64 {
+        self.primary_read_error_count.load(Ordering::Relaxed)
+    }
+
+    /// Get secondary read error count.
+    #[inline]
+    #[must_use]
+    pub fn secondary_read_error_count(&self) -> u64 {
+        self.secondary_read_error_count.load(Ordering::Relaxed)
+    }
+
+    /// Get emergency read error count.
+    #[inline]
+    #[must_use]
+    pub fn emergency_read_error_count(&self) -> u64 {
+        self.emergency_read_error_count.load(Ordering::Relaxed)
+    }
+
+    /// Get fallback read count (secondary + emergency).
+    #[inline]
+    #[must_use]
+    pub fn fallback_read_count(&self) -> u64 {
+        self.fallback_read_count.load(Ordering::Relaxed)
+    }
+
+    /// Get total read count across all paths.
+    #[inline]
+    #[must_use]
+    pub fn total_read_count(&self) -> u64 {
+        self.primary_read_count()
+            + self.secondary_read_count()
+            + self.emergency_read_count()
+    }
+
+    /// Get total read error count across all paths.
+    #[inline]
+    #[must_use]
+    pub fn total_read_error_count(&self) -> u64 {
+        self.primary_read_error_count()
+            + self.secondary_read_error_count()
+            + self.emergency_read_error_count()
     }
 }
 
@@ -337,6 +493,7 @@ impl Default for DARouterMetrics {
 impl Clone for DARouterMetrics {
     fn clone(&self) -> Self {
         Self {
+            // Post metrics
             primary_post_count: AtomicU64::new(self.primary_post_count.load(Ordering::Relaxed)),
             secondary_post_count: AtomicU64::new(self.secondary_post_count.load(Ordering::Relaxed)),
             emergency_post_count: AtomicU64::new(self.emergency_post_count.load(Ordering::Relaxed)),
@@ -345,6 +502,14 @@ impl Clone for DARouterMetrics {
             emergency_error_count: AtomicU64::new(self.emergency_error_count.load(Ordering::Relaxed)),
             pending_reconcile_count: AtomicU64::new(self.pending_reconcile_count.load(Ordering::Relaxed)),
             emergency_pending_count: AtomicU64::new(self.emergency_pending_count.load(Ordering::Relaxed)),
+            // Read metrics (14A.1A.17)
+            primary_read_count: AtomicU64::new(self.primary_read_count.load(Ordering::Relaxed)),
+            secondary_read_count: AtomicU64::new(self.secondary_read_count.load(Ordering::Relaxed)),
+            emergency_read_count: AtomicU64::new(self.emergency_read_count.load(Ordering::Relaxed)),
+            primary_read_error_count: AtomicU64::new(self.primary_read_error_count.load(Ordering::Relaxed)),
+            secondary_read_error_count: AtomicU64::new(self.secondary_read_error_count.load(Ordering::Relaxed)),
+            emergency_read_error_count: AtomicU64::new(self.emergency_read_error_count.load(Ordering::Relaxed)),
+            fallback_read_count: AtomicU64::new(self.fallback_read_count.load(Ordering::Relaxed)),
         }
     }
 }
@@ -798,18 +963,148 @@ impl DALayer for DARouter {
         })
     }
 
-    /// Delegate get_blob ke primary DA.
+    /// Read blob with deterministic fallback routing (14A.1A.17).
     ///
-    /// # Note
+    /// # Read Routing Logic
     ///
-    /// Get operations selalu route ke primary karena:
-    /// - BlobRef dari primary masih valid
-    /// - Secondary/emergency hanya untuk write fallback
+    /// 1. SELALU coba primary terlebih dahulu
+    /// 2. Jika primary berhasil → return data, catat metrics
+    /// 3. Jika primary gagal DAN fallback_active == true:
+    ///    - Coba secondary jika tersedia
+    ///    - Jika secondary gagal, coba emergency jika tersedia
+    /// 4. Jika semua gagal → return error eksplisit
+    ///
+    /// # Arguments
+    ///
+    /// * `ref_` - Referensi ke blob yang akan dibaca
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<u8>)` - Data blob
+    /// * `Err(DAError)` - Error dengan konteks semua path yang dicoba
+    ///
+    /// # Metrics
+    ///
+    /// Method ini mencatat:
+    /// - Read count per path (primary/secondary/emergency)
+    /// - Read error count per path
+    /// - Fallback read count
+    ///
+    /// # Caching Hint
+    ///
+    /// Blob yang berhasil dibaca dicatat di metrics untuk analisis
+    /// pola akses. Ini hanya hint, bukan cache aktif.
+    ///
+    /// # Thread Safety
+    ///
+    /// Thread-safe, menggunakan atomic counters untuk metrics.
     fn get_blob(
         &self,
         ref_: &BlobRef,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + '_>> {
-        self.primary.get_blob(ref_)
+        // Clone BlobRef untuk ownership di async block
+        let blob_ref = ref_.clone();
+        
+        Box::pin(async move {
+            // Step 1: SELALU coba primary terlebih dahulu
+            let primary_result = self.primary.get_blob(&blob_ref).await;
+            
+            match primary_result {
+                Ok(data) => {
+                    // Primary berhasil - catat metrics dan return
+                    self.metrics.record_primary_read();
+                    return Ok(data);
+                }
+                Err(primary_err) => {
+                    // Primary gagal - catat error
+                    self.metrics.record_primary_read_error();
+                    
+                    // Step 2: Evaluasi kondisi fallback
+                    if !self.health.is_fallback_active() {
+                        // Fallback tidak aktif - return error primary
+                        return Err(DAError::Other(format!(
+                            "get_blob failed: primary error ({}), fallback not active",
+                            primary_err
+                        )));
+                    }
+                    
+                    // Step 3: Coba secondary jika tersedia
+                    if let Some(ref secondary) = self.secondary {
+                        let secondary_result = secondary.get_blob(&blob_ref).await;
+                        
+                        match secondary_result {
+                            Ok(data) => {
+                                // Secondary berhasil - catat metrics dan return
+                                self.metrics.record_secondary_read();
+                                return Ok(data);
+                            }
+                            Err(secondary_err) => {
+                                // Secondary gagal - catat error dan lanjut ke emergency
+                                self.metrics.record_secondary_read_error();
+                                
+                                // Step 4: Coba emergency jika tersedia
+                                if let Some(ref emergency) = self.emergency {
+                                    let emergency_result = emergency.get_blob(&blob_ref).await;
+                                    
+                                    match emergency_result {
+                                        Ok(data) => {
+                                            // Emergency berhasil - catat metrics dan return
+                                            self.metrics.record_emergency_read();
+                                            return Ok(data);
+                                        }
+                                        Err(emergency_err) => {
+                                            // Semua gagal - catat error dan return
+                                            self.metrics.record_emergency_read_error();
+                                            return Err(DAError::Other(format!(
+                                                "get_blob failed: all paths exhausted - \
+                                                primary ({}), secondary ({}), emergency ({})",
+                                                primary_err, secondary_err, emergency_err
+                                            )));
+                                        }
+                                    }
+                                } else {
+                                    // Emergency tidak tersedia
+                                    return Err(DAError::Other(format!(
+                                        "get_blob failed: primary ({}) and secondary ({}) failed, \
+                                        emergency not configured",
+                                        primary_err, secondary_err
+                                    )));
+                                }
+                            }
+                        }
+                    } else {
+                        // Secondary tidak tersedia, coba emergency langsung
+                        if let Some(ref emergency) = self.emergency {
+                            let emergency_result = emergency.get_blob(&blob_ref).await;
+                            
+                            match emergency_result {
+                                Ok(data) => {
+                                    // Emergency berhasil - catat metrics dan return
+                                    self.metrics.record_emergency_read();
+                                    return Ok(data);
+                                }
+                                Err(emergency_err) => {
+                                    // Emergency gagal
+                                    self.metrics.record_emergency_read_error();
+                                    return Err(DAError::Other(format!(
+                                        "get_blob failed: primary ({}) failed, \
+                                        secondary not configured, emergency ({})",
+                                        primary_err, emergency_err
+                                    )));
+                                }
+                            }
+                        } else {
+                            // Tidak ada fallback tersedia
+                            return Err(DAError::Other(format!(
+                                "get_blob failed: primary ({}), \
+                                no fallback configured (secondary: none, emergency: none)",
+                                primary_err
+                            )));
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Delegate subscribe_blobs ke primary DA.
@@ -850,15 +1145,24 @@ mod tests {
 
     /// Mock implementation of DAStatusProvider untuk testing.
     ///
-    /// Memungkinkan kontrol langsung atas DAStatus yang dikembalikan.
+    /// Memungkinkan kontrol langsung atas DAStatus dan fallback_active.
     struct MockStatusProvider {
         status: RwLock<DAStatus>,
+        fallback_active: RwLock<bool>,
     }
 
     impl MockStatusProvider {
         fn new(status: DAStatus) -> Self {
             Self {
                 status: RwLock::new(status),
+                fallback_active: RwLock::new(false),
+            }
+        }
+
+        fn with_fallback_active(status: DAStatus, fallback_active: bool) -> Self {
+            Self {
+                status: RwLock::new(status),
+                fallback_active: RwLock::new(fallback_active),
             }
         }
 
@@ -866,11 +1170,20 @@ mod tests {
         fn set_status(&self, status: DAStatus) {
             *self.status.write() = status;
         }
+
+        #[allow(dead_code)]
+        fn set_fallback_active(&self, active: bool) {
+            *self.fallback_active.write() = active;
+        }
     }
 
     impl DAStatusProvider for MockStatusProvider {
         fn get_da_status(&self) -> DAStatus {
             *self.status.read()
+        }
+
+        fn is_fallback_active(&self) -> bool {
+            *self.fallback_active.read()
         }
     }
 
@@ -884,8 +1197,14 @@ mod tests {
         name: String,
         /// Counter untuk post_blob calls
         post_count: AtomicUsize,
+        /// Counter untuk get_blob calls
+        get_count: AtomicUsize,
         /// Apakah post_blob harus return error
         should_fail: bool,
+        /// Apakah get_blob harus return error
+        should_fail_get: RwLock<bool>,
+        /// Data yang akan dikembalikan oleh get_blob
+        get_blob_data: RwLock<Vec<u8>>,
     }
 
     impl TrackingMockDA {
@@ -893,7 +1212,10 @@ mod tests {
             Self {
                 name: name.to_string(),
                 post_count: AtomicUsize::new(0),
+                get_count: AtomicUsize::new(0),
                 should_fail: false,
+                should_fail_get: RwLock::new(false),
+                get_blob_data: RwLock::new(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             }
         }
 
@@ -901,12 +1223,35 @@ mod tests {
             Self {
                 name: name.to_string(),
                 post_count: AtomicUsize::new(0),
+                get_count: AtomicUsize::new(0),
                 should_fail: true,
+                should_fail_get: RwLock::new(true),
+                get_blob_data: RwLock::new(Vec::new()),
+            }
+        }
+
+        fn with_get_behavior(name: &str, should_fail_get: bool, data: Vec<u8>) -> Self {
+            Self {
+                name: name.to_string(),
+                post_count: AtomicUsize::new(0),
+                get_count: AtomicUsize::new(0),
+                should_fail: false,
+                should_fail_get: RwLock::new(should_fail_get),
+                get_blob_data: RwLock::new(data),
             }
         }
 
         fn call_count(&self) -> usize {
             self.post_count.load(Ordering::SeqCst)
+        }
+
+        fn get_call_count(&self) -> usize {
+            self.get_count.load(Ordering::SeqCst)
+        }
+
+        #[allow(dead_code)]
+        fn set_should_fail_get(&self, fail: bool) {
+            *self.should_fail_get.write() = fail;
         }
     }
 
@@ -936,7 +1281,18 @@ mod tests {
             &self,
             _ref_: &BlobRef,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + '_>> {
-            Box::pin(async { Err(DAError::Other("mock: not implemented".to_string())) })
+            self.get_count.fetch_add(1, Ordering::SeqCst);
+            let should_fail = *self.should_fail_get.read();
+            let name = self.name.clone();
+            let data = self.get_blob_data.read().clone();
+
+            Box::pin(async move {
+                if should_fail {
+                    Err(DAError::Other(format!("{}: get_blob simulated failure", name)))
+                } else {
+                    Ok(data)
+                }
+            })
         }
 
         fn subscribe_blobs(
@@ -1018,6 +1374,10 @@ mod tests {
         Arc::new(TrackingMockDA::failing(name))
     }
 
+    fn create_mock_with_get_behavior(name: &str, should_fail: bool, data: Vec<u8>) -> Arc<TrackingMockDA> {
+        Arc::new(TrackingMockDA::with_get_behavior(name, should_fail, data))
+    }
+
     fn create_health_monitor() -> Arc<dyn DAStatusProvider> {
         let config = DAConfig::default();
         Arc::new(DAHealthMonitor::new(config))
@@ -1025,6 +1385,18 @@ mod tests {
 
     fn create_mock_status_provider(status: DAStatus) -> Arc<dyn DAStatusProvider> {
         Arc::new(MockStatusProvider::new(status))
+    }
+
+    fn create_mock_status_provider_with_fallback(status: DAStatus, fallback_active: bool) -> Arc<dyn DAStatusProvider> {
+        Arc::new(MockStatusProvider::with_fallback_active(status, fallback_active))
+    }
+
+    fn create_test_blob_ref() -> BlobRef {
+        BlobRef {
+            height: 100,
+            commitment: [0xAA; 32],
+            namespace: [0xBB; 29],
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -2014,5 +2386,375 @@ mod tests {
         assert_eq!(metrics.primary_post_count(), 1);
         assert_eq!(metrics.secondary_post_count(), 1);
         assert_eq!(metrics.emergency_post_count(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // GET_BLOB ROUTING TESTS (14A.1A.17)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Primary Success - No Fallback Needed
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_primary_success_returns_data() {
+        let expected_data = vec![0x01, 0x02, 0x03, 0x04];
+        let primary = create_mock_with_get_behavior("primary", false, expected_data.clone());
+        let secondary = create_mock_with_get_behavior("secondary", false, vec![0xFF]);
+        let health = create_mock_status_provider_with_fallback(DAStatus::Healthy, false);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(Some(secondary.clone() as Arc<dyn DALayer>), None);
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_data);
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(secondary.get_call_count(), 0);
+        assert_eq!(metrics.primary_read_count(), 1);
+        assert_eq!(metrics.secondary_read_count(), 0);
+        assert_eq!(metrics.fallback_read_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_primary_success_only_calls_primary() {
+        let primary = create_tracking_mock("primary");
+        let secondary = create_tracking_mock("secondary");
+        let emergency = create_tracking_mock("emergency");
+        let health = create_mock_status_provider_with_fallback(DAStatus::Healthy, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(
+            Some(secondary.clone() as Arc<dyn DALayer>),
+            Some(emergency.clone() as Arc<dyn DALayer>),
+        );
+
+        let blob_ref = create_test_blob_ref();
+        let _ = router.get_blob(&blob_ref).await;
+
+        // Primary dipanggil, secondary dan emergency tidak
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(secondary.get_call_count(), 0);
+        assert_eq!(emergency.get_call_count(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Primary Failure, Fallback Not Active
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_primary_fails_fallback_not_active_returns_error() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let secondary = create_mock_with_get_behavior("secondary", false, vec![0xFF]);
+        let health = create_mock_status_provider_with_fallback(DAStatus::Healthy, false);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(Some(secondary.clone() as Arc<dyn DALayer>), None);
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            DAError::Other(msg) => {
+                assert!(msg.contains("primary error"));
+                assert!(msg.contains("fallback not active"));
+            }
+            _ => panic!("Expected DAError::Other"),
+        }
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(secondary.get_call_count(), 0);
+        assert_eq!(metrics.primary_read_error_count(), 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Primary Failure, Fallback to Secondary
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_fallback_to_secondary_success() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let expected_data = vec![0xAA, 0xBB, 0xCC];
+        let secondary = create_mock_with_get_behavior("secondary", false, expected_data.clone());
+        let health = create_mock_status_provider_with_fallback(DAStatus::Degraded, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(Some(secondary.clone() as Arc<dyn DALayer>), None);
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_data);
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(secondary.get_call_count(), 1);
+        assert_eq!(metrics.primary_read_error_count(), 1);
+        assert_eq!(metrics.secondary_read_count(), 1);
+        assert_eq!(metrics.fallback_read_count(), 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Cascading Fallback - Primary → Secondary → Emergency
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_cascading_fallback_to_emergency() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let secondary = create_mock_with_get_behavior("secondary", true, vec![]);
+        let expected_data = vec![0x11, 0x22, 0x33];
+        let emergency = create_mock_with_get_behavior("emergency", false, expected_data.clone());
+        let health = create_mock_status_provider_with_fallback(DAStatus::Emergency, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(
+            Some(secondary.clone() as Arc<dyn DALayer>),
+            Some(emergency.clone() as Arc<dyn DALayer>),
+        );
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_data);
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(secondary.get_call_count(), 1);
+        assert_eq!(emergency.get_call_count(), 1);
+        assert_eq!(metrics.primary_read_error_count(), 1);
+        assert_eq!(metrics.secondary_read_error_count(), 1);
+        assert_eq!(metrics.emergency_read_count(), 1);
+        assert_eq!(metrics.fallback_read_count(), 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // All Paths Fail - Error Contains All Context
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_all_paths_fail_returns_comprehensive_error() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let secondary = create_mock_with_get_behavior("secondary", true, vec![]);
+        let emergency = create_mock_with_get_behavior("emergency", true, vec![]);
+        let health = create_mock_status_provider_with_fallback(DAStatus::Emergency, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(
+            Some(secondary.clone() as Arc<dyn DALayer>),
+            Some(emergency.clone() as Arc<dyn DALayer>),
+        );
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            DAError::Other(msg) => {
+                assert!(msg.contains("primary"));
+                assert!(msg.contains("secondary"));
+                assert!(msg.contains("emergency"));
+                assert!(msg.contains("all paths exhausted"));
+            }
+            _ => panic!("Expected DAError::Other"),
+        }
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(secondary.get_call_count(), 1);
+        assert_eq!(emergency.get_call_count(), 1);
+        assert_eq!(metrics.primary_read_error_count(), 1);
+        assert_eq!(metrics.secondary_read_error_count(), 1);
+        assert_eq!(metrics.emergency_read_error_count(), 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // No Fallback Configured
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_no_fallback_configured_returns_error() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let health = create_mock_status_provider_with_fallback(DAStatus::Degraded, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        );
+        // No fallbacks configured
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            DAError::Other(msg) => {
+                assert!(msg.contains("no fallback configured"));
+            }
+            _ => panic!("Expected DAError::Other"),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Emergency Only (No Secondary)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_fallback_to_emergency_when_no_secondary() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let expected_data = vec![0xEE, 0xFF];
+        let emergency = create_mock_with_get_behavior("emergency", false, expected_data.clone());
+        let health = create_mock_status_provider_with_fallback(DAStatus::Emergency, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(None, Some(emergency.clone() as Arc<dyn DALayer>));
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_data);
+        assert_eq!(primary.get_call_count(), 1);
+        assert_eq!(emergency.get_call_count(), 1);
+        assert_eq!(metrics.emergency_read_count(), 1);
+        assert_eq!(metrics.fallback_read_count(), 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // No Panic Tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_no_panic_when_all_fallbacks_missing() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let health = create_mock_status_provider_with_fallback(DAStatus::Emergency, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        );
+
+        let blob_ref = create_test_blob_ref();
+        let result = router.get_blob(&blob_ref).await;
+
+        // Should return error, not panic
+        assert!(result.is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Metrics Isolation Tests
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_blob_metrics_not_mixed_with_post_metrics() {
+        let primary = create_tracking_mock("primary");
+        let health = create_mock_status_provider(DAStatus::Healthy);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        );
+
+        // Do a post
+        let _ = router.post_blob(b"test").await;
+        
+        // Do a get
+        let blob_ref = create_test_blob_ref();
+        let _ = router.get_blob(&blob_ref).await;
+
+        // Post metrics should be separate from read metrics
+        assert_eq!(metrics.primary_post_count(), 1);
+        assert_eq!(metrics.primary_read_count(), 1);
+        assert_eq!(metrics.total_post_count(), 1);
+        assert_eq!(metrics.total_read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_read_metrics_accumulate_correctly() {
+        let primary = create_mock_with_get_behavior("primary", true, vec![]);
+        let secondary = create_mock_with_get_behavior("secondary", false, vec![0xAA]);
+        let health = create_mock_status_provider_with_fallback(DAStatus::Degraded, true);
+        let config = DARouterConfig::new();
+        let metrics = Arc::new(DARouterMetrics::new());
+
+        let router = DARouter::new(
+            primary.clone() as Arc<dyn DALayer>,
+            health,
+            config,
+            metrics.clone(),
+        )
+        .with_fallbacks(Some(secondary.clone() as Arc<dyn DALayer>), None);
+
+        let blob_ref = create_test_blob_ref();
+        
+        // Multiple reads
+        let _ = router.get_blob(&blob_ref).await;
+        let _ = router.get_blob(&blob_ref).await;
+        let _ = router.get_blob(&blob_ref).await;
+
+        assert_eq!(metrics.primary_read_error_count(), 3);
+        assert_eq!(metrics.secondary_read_count(), 3);
+        assert_eq!(metrics.fallback_read_count(), 3);
     }
 }
