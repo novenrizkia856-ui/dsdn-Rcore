@@ -56,6 +56,12 @@ pub enum QuorumError {
 
     /// Error internal atau tidak terkategorikan.
     Internal(String),
+
+    /// Threshold tidak valid (misalnya 0).
+    ///
+    /// Terjadi ketika threshold yang diberikan tidak dapat digunakan
+    /// untuk verifikasi quorum yang meaningful.
+    InvalidThreshold(String),
 }
 
 impl fmt::Display for QuorumError {
@@ -66,6 +72,7 @@ impl fmt::Display for QuorumError {
             QuorumError::ValidatorNotFound(msg) => write!(f, "validator not found: {}", msg),
             QuorumError::NetworkError(msg) => write!(f, "network error: {}", msg),
             QuorumError::Internal(msg) => write!(f, "internal error: {}", msg),
+            QuorumError::InvalidThreshold(msg) => write!(f, "invalid threshold: {}", msg),
         }
     }
 }
@@ -399,6 +406,223 @@ pub struct ValidatorSignature {
 
     /// Unix timestamp (seconds) saat signature dibuat.
     pub timestamp: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// QUORUM VERIFICATION (14A.1A.24)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Hasil verifikasi quorum signatures.
+///
+/// Struct ini merepresentasikan hasil lengkap dari proses verifikasi
+/// quorum signatures, termasuk detail tentang signature yang valid
+/// dan tidak valid.
+///
+/// ## Fields
+///
+/// - `is_valid`: True jika quorum tercapai (threshold_met == true)
+/// - `valid_signatures`: Jumlah signature yang berhasil diverifikasi
+/// - `invalid_signatures`: Daftar (validator_id, reason) untuk signature yang gagal
+/// - `threshold_met`: True jika valid_signatures >= threshold
+///
+/// ## Perbedaan is_valid vs threshold_met
+///
+/// Saat ini keduanya memiliki nilai yang sama (`is_valid = threshold_met`).
+/// Pemisahan ini untuk future extensibility jika ada kondisi tambahan
+/// yang mempengaruhi validitas keseluruhan selain threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuorumVerification {
+    /// Apakah verifikasi keseluruhan berhasil.
+    ///
+    /// True jika dan hanya jika threshold_met == true.
+    pub is_valid: bool,
+
+    /// Jumlah signature yang valid.
+    ///
+    /// Hanya menghitung signature yang:
+    /// - Berasal dari validator yang dikenal
+    /// - Berhasil diverifikasi dengan Ed25519
+    pub valid_signatures: usize,
+
+    /// Daftar signature yang tidak valid beserta alasannya.
+    ///
+    /// Format: (validator_id, reason)
+    /// Reason harus eksplisit, tidak boleh empty.
+    pub invalid_signatures: Vec<(String, String)>,
+
+    /// Apakah threshold tercapai.
+    ///
+    /// True jika valid_signatures >= threshold.
+    pub threshold_met: bool,
+}
+
+/// Memverifikasi quorum signatures menggunakan Ed25519.
+///
+/// ## Proses Verifikasi
+///
+/// 1. Validasi threshold (harus > 0)
+/// 2. Bangun mapping validator_id -> public_key
+/// 3. Untuk setiap signature:
+///    - Cek apakah validator_id dikenal
+///    - Verifikasi signature Ed25519 terhadap data_hash
+/// 4. Hitung valid_signatures dan kumpulkan invalid_signatures
+/// 5. Tentukan threshold_met dan is_valid
+///
+/// ## Parameters
+///
+/// - `data_hash`: SHA-256 hash dari data yang di-sign (32 bytes)
+/// - `signatures`: Daftar signature dari validator
+/// - `validators`: Daftar validator dengan public key Ed25519
+/// - `threshold`: Jumlah minimum signature valid yang diperlukan
+///
+/// ## Returns
+///
+/// - `Ok(QuorumVerification)`: Hasil verifikasi lengkap
+/// - `Err(QuorumError::InvalidThreshold)`: Jika threshold == 0
+///
+/// ## Guarantees
+///
+/// - Semua signature diproses (tidak ada early return sebelum selesai)
+/// - Output deterministik untuk input yang sama
+/// - Pure function tanpa side effects
+///
+/// ## Ed25519 Verification
+///
+/// Signature diverifikasi langsung terhadap data_hash tanpa
+/// transformasi atau hashing ulang.
+pub fn verify_quorum_signatures(
+    data_hash: &[u8; 32],
+    signatures: &[ValidatorSignature],
+    validators: &[ValidatorInfo],
+    threshold: usize,
+) -> Result<QuorumVerification, QuorumError> {
+    // Step 1: Validate threshold
+    if threshold == 0 {
+        return Err(QuorumError::InvalidThreshold(
+            "threshold must be greater than 0".to_string(),
+        ));
+    }
+
+    // Step 2: Build validator_id -> public_key mapping
+    let validator_map: std::collections::HashMap<&str, &[u8]> = validators
+        .iter()
+        .map(|v| (v.id.as_str(), v.public_key.as_slice()))
+        .collect();
+
+    // Step 3 & 4: Process all signatures
+    let mut valid_signatures: usize = 0;
+    let mut invalid_signatures: Vec<(String, String)> = Vec::new();
+
+    for sig in signatures {
+        // Check if validator is known
+        let public_key = match validator_map.get(sig.validator_id.as_str()) {
+            Some(pk) => *pk,
+            None => {
+                invalid_signatures.push((
+                    sig.validator_id.clone(),
+                    "unknown validator".to_string(),
+                ));
+                continue;
+            }
+        };
+
+        // Verify Ed25519 signature
+        match verify_ed25519_signature(data_hash, &sig.signature, public_key) {
+            Ok(true) => {
+                valid_signatures += 1;
+            }
+            Ok(false) => {
+                invalid_signatures.push((
+                    sig.validator_id.clone(),
+                    "signature verification failed".to_string(),
+                ));
+            }
+            Err(reason) => {
+                invalid_signatures.push((sig.validator_id.clone(), reason));
+            }
+        }
+    }
+
+    // Step 5 & 6: Determine threshold_met and is_valid
+    let threshold_met = valid_signatures >= threshold;
+    let is_valid = threshold_met;
+
+    // Step 7: Return result
+    Ok(QuorumVerification {
+        is_valid,
+        valid_signatures,
+        invalid_signatures,
+        threshold_met,
+    })
+}
+
+/// Verifikasi Ed25519 signature.
+///
+/// ## Parameters
+///
+/// - `message`: Data yang di-sign (langsung, tanpa hashing ulang)
+/// - `signature`: Signature bytes (64 bytes untuk Ed25519)
+/// - `public_key`: Public key bytes (32 bytes untuk Ed25519)
+///
+/// ## Returns
+///
+/// - `Ok(true)`: Signature valid
+/// - `Ok(false)`: Signature invalid
+/// - `Err(String)`: Error dengan reason eksplisit
+fn verify_ed25519_signature(
+    message: &[u8],
+    signature: &[u8],
+    public_key: &[u8],
+) -> Result<bool, String> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    // Validate public key length (Ed25519 public key is 32 bytes)
+    if public_key.len() != 32 {
+        return Err(format!(
+            "invalid public key length: expected 32 bytes, got {}",
+            public_key.len()
+        ));
+    }
+
+    // Validate signature length (Ed25519 signature is 64 bytes)
+    if signature.len() != 64 {
+        return Err(format!(
+            "invalid signature length: expected 64 bytes, got {}",
+            signature.len()
+        ));
+    }
+
+    // Parse public key
+    let pk_bytes: [u8; 32] = match public_key.try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err("failed to convert public key to fixed array".to_string());
+        }
+    };
+
+    let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
+        Ok(key) => key,
+        Err(e) => {
+            return Err(format!("invalid public key format: {}", e));
+        }
+    };
+
+    // Parse signature
+    let sig_bytes: [u8; 64] = match signature.try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err("failed to convert signature to fixed array".to_string());
+        }
+    };
+
+    let sig = Signature::from_bytes(&sig_bytes);
+
+    // Verify signature
+    use ed25519_dalek::Verifier;
+    match verifying_key.verify(message, &sig) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -957,5 +1181,337 @@ mod tests {
         assert_eq!(config.validator_endpoints, vec!["http://a:1", "http://b:2"]);
 
         std::env::remove_var("QUORUM_VALIDATOR_ENDPOINTS");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // QuorumVerification Tests (14A.1A.24)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Helper: Generate Ed25519 keypair
+    fn generate_keypair() -> (SigningKey, Vec<u8>) {
+        use rand::rngs::OsRng;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key = signing_key.verifying_key().to_bytes().to_vec();
+        (signing_key, public_key)
+    }
+
+    /// Helper: Sign data with Ed25519
+    fn sign_data(signing_key: &SigningKey, data: &[u8]) -> Vec<u8> {
+        signing_key.sign(data).to_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_quorum_verification_struct_construction() {
+        let verification = QuorumVerification {
+            is_valid: true,
+            valid_signatures: 2,
+            invalid_signatures: vec![],
+            threshold_met: true,
+        };
+        assert!(verification.is_valid);
+        assert_eq!(verification.valid_signatures, 2);
+        assert!(verification.invalid_signatures.is_empty());
+        assert!(verification.threshold_met);
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_invalid_threshold_zero() {
+        let data_hash = [0u8; 32];
+        let signatures: Vec<ValidatorSignature> = vec![];
+        let validators: Vec<ValidatorInfo> = vec![];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 0);
+        assert!(result.is_err());
+        match result {
+            Err(QuorumError::InvalidThreshold(msg)) => {
+                assert!(msg.contains("greater than 0"));
+            }
+            _ => panic!("Expected InvalidThreshold error"),
+        }
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_valid_quorum() {
+        // Generate 3 keypairs
+        let (sk1, pk1) = generate_keypair();
+        let (sk2, pk2) = generate_keypair();
+        let (sk3, pk3) = generate_keypair();
+
+        let data_hash = [42u8; 32];
+
+        // Create validators
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+            ValidatorInfo { id: "v2".to_string(), public_key: pk2, weight: 1 },
+            ValidatorInfo { id: "v3".to_string(), public_key: pk3, weight: 1 },
+        ];
+
+        // Sign with 2 out of 3 validators
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+            ValidatorSignature {
+                validator_id: "v2".to_string(),
+                signature: sign_data(&sk2, &data_hash),
+                timestamp: 1700000001,
+            },
+        ];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 2);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(verification.is_valid, "Should be valid");
+        assert_eq!(verification.valid_signatures, 2, "Should have 2 valid signatures");
+        assert!(verification.invalid_signatures.is_empty(), "Should have no invalid signatures");
+        assert!(verification.threshold_met, "Threshold should be met");
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_with_invalid_signature() {
+        // Generate 3 keypairs
+        let (sk1, pk1) = generate_keypair();
+        let (_sk2, pk2) = generate_keypair();
+        let (sk3, pk3) = generate_keypair();
+
+        let data_hash = [42u8; 32];
+
+        // Create validators
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+            ValidatorInfo { id: "v2".to_string(), public_key: pk2, weight: 1 },
+            ValidatorInfo { id: "v3".to_string(), public_key: pk3, weight: 1 },
+        ];
+
+        // Create signatures - v2 has corrupted signature
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+            ValidatorSignature {
+                validator_id: "v2".to_string(),
+                signature: vec![0u8; 64], // Invalid signature (wrong bytes)
+                timestamp: 1700000001,
+            },
+            ValidatorSignature {
+                validator_id: "v3".to_string(),
+                signature: sign_data(&sk3, &data_hash),
+                timestamp: 1700000002,
+            },
+        ];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 2);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(verification.is_valid, "Should still be valid with 2 good signatures");
+        assert_eq!(verification.valid_signatures, 2, "Should have 2 valid signatures");
+        assert_eq!(verification.invalid_signatures.len(), 1, "Should have 1 invalid signature");
+
+        // Check invalid signature details
+        let (validator_id, reason) = &verification.invalid_signatures[0];
+        assert_eq!(validator_id, "v2");
+        assert!(!reason.is_empty(), "Reason must not be empty");
+        assert!(verification.threshold_met, "Threshold should be met");
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_threshold_not_met() {
+        // Generate 3 keypairs
+        let (sk1, pk1) = generate_keypair();
+        let (_sk2, pk2) = generate_keypair();
+        let (_sk3, pk3) = generate_keypair();
+
+        let data_hash = [42u8; 32];
+
+        // Create validators
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+            ValidatorInfo { id: "v2".to_string(), public_key: pk2, weight: 1 },
+            ValidatorInfo { id: "v3".to_string(), public_key: pk3, weight: 1 },
+        ];
+
+        // Only 1 valid signature, threshold is 2
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+        ];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 2);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(!verification.is_valid, "Should NOT be valid");
+        assert_eq!(verification.valid_signatures, 1, "Should have 1 valid signature");
+        assert!(!verification.threshold_met, "Threshold should NOT be met");
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_unknown_validator() {
+        let (sk1, pk1) = generate_keypair();
+
+        let data_hash = [42u8; 32];
+
+        // Only v1 is known
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+        ];
+
+        // Signature from unknown validator
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+            ValidatorSignature {
+                validator_id: "unknown".to_string(),
+                signature: vec![0u8; 64],
+                timestamp: 1700000001,
+            },
+        ];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 1);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(verification.is_valid, "Should be valid (v1 is valid)");
+        assert_eq!(verification.valid_signatures, 1);
+        assert_eq!(verification.invalid_signatures.len(), 1);
+
+        let (validator_id, reason) = &verification.invalid_signatures[0];
+        assert_eq!(validator_id, "unknown");
+        assert!(reason.contains("unknown validator"));
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_invalid_signature_length() {
+        let (_sk1, pk1) = generate_keypair();
+
+        let data_hash = [42u8; 32];
+
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+        ];
+
+        // Signature with wrong length
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: vec![0u8; 32], // Wrong length (should be 64)
+                timestamp: 1700000000,
+            },
+        ];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 1);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(!verification.is_valid, "Should not be valid");
+        assert_eq!(verification.valid_signatures, 0);
+        assert_eq!(verification.invalid_signatures.len(), 1);
+
+        let (_, reason) = &verification.invalid_signatures[0];
+        assert!(reason.contains("64 bytes"), "Should mention expected length");
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_invalid_public_key_length() {
+        let data_hash = [42u8; 32];
+
+        // Validator with wrong public key length
+        let validators = vec![
+            ValidatorInfo {
+                id: "v1".to_string(),
+                public_key: vec![0u8; 16], // Wrong length (should be 32)
+                weight: 1,
+            },
+        ];
+
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: vec![0u8; 64],
+                timestamp: 1700000000,
+            },
+        ];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 1);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(!verification.is_valid);
+        assert_eq!(verification.invalid_signatures.len(), 1);
+
+        let (_, reason) = &verification.invalid_signatures[0];
+        assert!(reason.contains("32 bytes"), "Should mention expected length");
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_empty_signatures() {
+        let data_hash = [42u8; 32];
+        let validators: Vec<ValidatorInfo> = vec![];
+        let signatures: Vec<ValidatorSignature> = vec![];
+
+        let result = verify_quorum_signatures(&data_hash, &signatures, &validators, 1);
+        assert!(result.is_ok());
+
+        let verification = result.unwrap();
+        assert!(!verification.is_valid);
+        assert_eq!(verification.valid_signatures, 0);
+        assert!(!verification.threshold_met);
+    }
+
+    #[test]
+    fn test_verify_quorum_signatures_deterministic() {
+        let (sk1, pk1) = generate_keypair();
+        let (sk2, pk2) = generate_keypair();
+
+        let data_hash = [42u8; 32];
+
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+            ValidatorInfo { id: "v2".to_string(), public_key: pk2, weight: 1 },
+        ];
+
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+            ValidatorSignature {
+                validator_id: "v2".to_string(),
+                signature: sign_data(&sk2, &data_hash),
+                timestamp: 1700000001,
+            },
+        ];
+
+        // Run verification multiple times
+        let result1 = verify_quorum_signatures(&data_hash, &signatures, &validators, 2).unwrap();
+        let result2 = verify_quorum_signatures(&data_hash, &signatures, &validators, 2).unwrap();
+        let result3 = verify_quorum_signatures(&data_hash, &signatures, &validators, 2).unwrap();
+
+        // All results should be identical
+        assert_eq!(result1, result2);
+        assert_eq!(result2, result3);
+    }
+
+    #[test]
+    fn test_quorum_error_invalid_threshold_display() {
+        let err = QuorumError::InvalidThreshold("test message".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid threshold"));
+        assert!(msg.contains("test message"));
     }
 }
