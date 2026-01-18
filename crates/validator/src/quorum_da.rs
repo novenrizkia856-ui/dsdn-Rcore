@@ -849,8 +849,15 @@ impl QuorumMetrics {
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Metadata untuk blob yang tersimpan di QuorumDA.
+///
+/// Menyimpan informasi lengkap tentang quorum yang digunakan
+/// untuk memvalidasi blob, termasuk hash data, signatures,
+/// dan status reconciliation.
 #[derive(Debug, Clone)]
 pub struct QuorumBlobMetadata {
+    /// SHA-256 hash dari data blob.
+    pub data_hash: [u8; 32],
+
     /// Jumlah signature valid saat blob di-submit.
     pub valid_signatures: usize,
 
@@ -859,6 +866,15 @@ pub struct QuorumBlobMetadata {
 
     /// Signature yang digunakan untuk quorum.
     pub signatures: Vec<ValidatorSignature>,
+
+    /// Daftar validator_id yang berpartisipasi dalam quorum.
+    pub validator_ids: Vec<String>,
+
+    /// Flag untuk menandai blob yang perlu di-reconcile dengan Celestia.
+    ///
+    /// True = blob belum di-submit ke Celestia
+    /// False = blob sudah di-submit/reconcile ke Celestia
+    pub pending_reconcile: bool,
 }
 
 /// Storage untuk blob yang di-submit via quorum.
@@ -1136,13 +1152,23 @@ impl QuorumDA for ValidatorQuorumDA {
 
         // Step 5: Store blob
         let blob_ref = Self::compute_blob_ref(data, Self::default_namespace());
+
+        // Extract validator IDs
+        let validator_ids: Vec<String> = sigs
+            .iter()
+            .map(|s| s.validator_id.clone())
+            .collect();
+
         let metadata = QuorumBlobMetadata {
+            data_hash,
             valid_signatures: verification.valid_signatures,
             stored_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             signatures: sigs,
+            validator_ids,
+            pending_reconcile: true,
         };
 
         match self.storage.store(&blob_ref, data.to_vec(), metadata) {
@@ -1241,28 +1267,157 @@ impl QuorumDA for ValidatorQuorumDA {
 // DALayer implementation for ValidatorQuorumDA
 // All methods return Pin<Box<dyn Future<...>>>
 impl dsdn_common::DALayer for ValidatorQuorumDA {
+    /// Post blob to QuorumDA with quorum-based validation.
+    ///
+    /// ## Alur Operasi (14A.1A.26)
+    ///
+    /// 1. VALIDASI INPUT - Cek data tidak kosong
+    /// 2. COMPUTE HASH - SHA-256 hash untuk signature verification
+    /// 3. COLLECT SIGNATURES - Kumpulkan signature dari validator
+    /// 4. VERIFY QUORUM - Verifikasi quorum tercapai
+    /// 5. STORE BLOB - Simpan dengan metadata lengkap
+    /// 6. TAGGING - Set pending_reconcile = true
+    /// 7. RETURN BlobRef - Deterministik dan verifiable
+    ///
+    /// ## Error Handling
+    ///
+    /// - InvalidBlob: Data kosong
+    /// - Other("quorum collection failed: ..."): Gagal collect signatures
+    /// - Other("quorum not reached: ..."): Quorum tidak tercapai
+    /// - Other("storage failure: ..."): Gagal menyimpan blob
     fn post_blob(
         &self,
         data: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<dsdn_common::BlobRef, dsdn_common::DAError>> + Send + '_>> {
         use sha2::{Sha256, Digest};
+
+        // ════════════════════════════════════════════════════════════════════════
+        // STEP 1: VALIDASI INPUT
+        // ════════════════════════════════════════════════════════════════════════
         
-        // Clone data for async block
+        // Validasi data tidak kosong
+        if data.is_empty() {
+            return Box::pin(async move {
+                Err(dsdn_common::DAError::InvalidBlob)
+            });
+        }
+
+        // Clone data untuk async block
         let data_owned = data.to_vec();
+
+        // ════════════════════════════════════════════════════════════════════════
+        // STEP 2: COMPUTE HASH
+        // ════════════════════════════════════════════════════════════════════════
         
-        // Compute data hash
+        // Hitung SHA-256 hash - konsisten dengan quorum verification
         let mut hasher = Sha256::new();
         hasher.update(&data_owned);
         let data_hash: [u8; 32] = hasher.finalize().into();
-        
-        Box::pin(async move {
-            // Collect signatures (sync for now, could be async in future)
-            let signatures = self.collect_signatures(&data_hash)
-                .map_err(|e| dsdn_common::DAError::Other(e.to_string()))?;
 
-            // Submit with signatures
-            self.submit_with_signatures(&data_owned, signatures)
-                .map_err(|e| dsdn_common::DAError::Other(e.to_string()))
+        Box::pin(async move {
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 3: COLLECT SIGNATURES
+            // ════════════════════════════════════════════════════════════════════
+            //
+            // PENTING: Kita langsung await collector.collect() di sini karena:
+            // - Kita sudah di dalam async context
+            // - Memanggil self.collect_signatures() akan menyebabkan nested block_on
+            //   karena collect_signatures() adalah sync function yang internally
+            //   menggunakan block_on
+            // - Nested block_on akan panic dengan "Cannot start a runtime from within a runtime"
+            //
+            let signatures = match self.collector.collect(&data_hash).await {
+                Ok(sigs) => {
+                    self.metrics.record_signatures_collected(sigs.len());
+                    sigs
+                }
+                Err(e) => {
+                    self.metrics.record_quorum_failure();
+                    return Err(dsdn_common::DAError::Other(format!(
+                        "quorum collection failed: {}",
+                        e
+                    )));
+                }
+            };
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 4: VERIFY QUORUM
+            // ════════════════════════════════════════════════════════════════════
+            
+            let threshold = self.quorum_threshold();
+            let verification = match verify_quorum_signatures(
+                &data_hash,
+                &signatures,
+                &self.validators,
+                threshold,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.metrics.record_quorum_failure();
+                    return Err(dsdn_common::DAError::Other(format!(
+                        "quorum verification error: {}",
+                        e
+                    )));
+                }
+            };
+
+            // Cek quorum tercapai
+            if !verification.is_valid {
+                self.metrics.record_quorum_failure();
+                return Err(dsdn_common::DAError::Other(format!(
+                    "quorum not reached: {} valid signatures, need {}",
+                    verification.valid_signatures,
+                    threshold
+                )));
+            }
+
+            // Record success metrics
+            self.metrics.record_quorum_success();
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 5 & 6: STORE BLOB WITH METADATA + TAGGING
+            // ════════════════════════════════════════════════════════════════════
+            
+            // Compute BlobRef
+            let blob_ref = Self::compute_blob_ref(&data_owned, Self::default_namespace());
+
+            // Extract validator IDs yang berpartisipasi
+            let validator_ids: Vec<String> = signatures
+                .iter()
+                .map(|s| s.validator_id.clone())
+                .collect();
+
+            // Build metadata dengan pending_reconcile = true
+            let metadata = QuorumBlobMetadata {
+                data_hash,
+                valid_signatures: verification.valid_signatures,
+                stored_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                signatures,
+                validator_ids,
+                pending_reconcile: true, // TAGGING: Blob perlu di-reconcile ke Celestia
+            };
+
+            // Store blob
+            match self.storage.store(&blob_ref, data_owned, metadata) {
+                Ok(()) => {
+                    self.metrics.record_blob_submitted();
+                }
+                Err(e) => {
+                    return Err(dsdn_common::DAError::Other(format!(
+                        "storage failure: {}",
+                        e
+                    )));
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 7: RETURN BlobRef
+            // ════════════════════════════════════════════════════════════════════
+            
+            Ok(blob_ref)
         })
     }
 
@@ -2130,9 +2285,12 @@ mod tests {
         
         let data = vec![1, 2, 3, 4];
         let metadata = QuorumBlobMetadata {
+            data_hash: [0x11; 32],
             valid_signatures: 2,
             stored_at: 1700000000,
             signatures: vec![],
+            validator_ids: vec!["v1".to_string(), "v2".to_string()],
+            pending_reconcile: true,
         };
 
         // Store
@@ -2160,9 +2318,12 @@ mod tests {
         };
         
         let metadata = QuorumBlobMetadata {
+            data_hash: [0x11; 32],
             valid_signatures: 2,
             stored_at: 1700000000,
             signatures: vec![],
+            validator_ids: vec![],
+            pending_reconcile: true,
         };
 
         // First store succeeds
@@ -2188,9 +2349,12 @@ mod tests {
         assert!(!storage.contains(&blob_ref));
 
         let metadata = QuorumBlobMetadata {
+            data_hash: [0x11; 32],
             valid_signatures: 2,
             stored_at: 1700000000,
             signatures: vec![],
+            validator_ids: vec![],
+            pending_reconcile: true,
         };
         let _ = storage.store(&blob_ref, vec![1, 2, 3], metadata);
 
@@ -2208,9 +2372,12 @@ mod tests {
         };
         
         let metadata = QuorumBlobMetadata {
+            data_hash: [0x11; 32],
             valid_signatures: 2,
             stored_at: 1700000000,
             signatures: vec![],
+            validator_ids: vec![],
+            pending_reconcile: true,
         };
         let _ = storage.store(&blob_ref, vec![1, 2, 3], metadata);
         assert_eq!(storage.len(), 1);
@@ -2527,5 +2694,136 @@ mod tests {
 
         let result = da.verify_quorum(&blob_ref);
         assert!(result.is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // DALayer::post_blob Tests (14A.1A.26)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_post_blob_empty_data_returns_invalid_blob() {
+        let config = QuorumDAConfig::default();
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            vec![],
+            runtime.handle().clone(),
+        );
+
+        // Empty data should return InvalidBlob
+        // Use block_on from OUTSIDE async context
+        let result = runtime.block_on(da.post_blob(&[]));
+        assert!(result.is_err());
+
+        match result {
+            Err(dsdn_common::DAError::InvalidBlob) => {
+                // Expected
+            }
+            other => panic!("Expected InvalidBlob, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_post_blob_quorum_not_reached() {
+        let config = QuorumDAConfig {
+            min_validators: 2,
+            quorum_fraction: 0.67,
+            signature_timeout_ms: 100,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+
+        // Create collector with unreachable endpoints
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![
+                crate::signature_collector::ValidatorEndpoint {
+                    id: "v1".to_string(),
+                    url: "http://127.0.0.1:1".to_string(), // Invalid
+                    public_key: vec![1; 32],
+                },
+            ],
+            config.clone(),
+            client,
+        );
+
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: vec![1; 32], weight: 1 },
+        ];
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            validators,
+            runtime.handle().clone(),
+        );
+
+        // Quorum not reached should return error
+        // Use block_on from OUTSIDE async context
+        let result = runtime.block_on(da.post_blob(b"test data"));
+        assert!(result.is_err());
+
+        match result {
+            Err(dsdn_common::DAError::Other(msg)) => {
+                assert!(
+                    msg.contains("quorum") || msg.contains("collection"),
+                    "Error should mention quorum or collection: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected Other error, got {:?}", other),
+        }
+
+        // Storage should be empty
+        assert!(da.storage().is_empty());
+    }
+
+    #[test]
+    fn test_quorum_blob_metadata_has_required_fields() {
+        use sha2::{Sha256, Digest};
+        
+        let data = b"test data";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let data_hash: [u8; 32] = hasher.finalize().into();
+
+        let metadata = QuorumBlobMetadata {
+            data_hash,
+            valid_signatures: 2,
+            stored_at: 1700000000,
+            signatures: vec![],
+            validator_ids: vec!["v1".to_string(), "v2".to_string()],
+            pending_reconcile: true,
+        };
+
+        // Verify all required fields per spec
+        assert_eq!(metadata.data_hash, data_hash);
+        assert_eq!(metadata.valid_signatures, 2);
+        assert!(metadata.stored_at > 0);
+        assert!(metadata.pending_reconcile, "pending_reconcile should be true");
+        assert_eq!(metadata.validator_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_quorum_blob_metadata_pending_reconcile_flag() {
+        let metadata = QuorumBlobMetadata {
+            data_hash: [0u8; 32],
+            valid_signatures: 1,
+            stored_at: 1700000000,
+            signatures: vec![],
+            validator_ids: vec!["v1".to_string()],
+            pending_reconcile: true,
+        };
+
+        // pending_reconcile should be explicitly readable
+        assert!(metadata.pending_reconcile);
     }
 }
