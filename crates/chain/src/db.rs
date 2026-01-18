@@ -1,4 +1,4 @@
-use crate::block::{Block, Receipt};
+use crate::block::{Block, Receipt}; //block.rss adalah program rusts+ bukan rust normal
 use crate::tx::TxEnvelope;
 use crate::types::{Address, Hash};
 use crate::state::{ChainState, Validator, ValidatorSet, ValidatorInfo as StateValidatorInfo, Proposal, Vote, GovernanceConfig};

@@ -26,7 +26,7 @@ use std::collections::{VecDeque, HashSet, HashMap};
 use anyhow::Result;
 
 use crate::types::Hash;
-use crate::block::{Block, BlockHeader};
+use crate::block::{Block, BlockHeader}; //block.rss adalah program rusts+
 use crate::db::ChainDb;
 use crate::state::ChainState;
 use crate::Chain;
