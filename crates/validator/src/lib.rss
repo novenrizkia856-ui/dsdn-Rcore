@@ -2,16 +2,62 @@
 //!
 //! Library that validates application manifests for DSDN.
 //!
+//! ## Modules
+//!
+//! ### Manifest Validation
+//!
 //! Checks performed (declarative):
 //! - syntactic validation of SHA-256 hex hashes
 //! - banned-hash detection
 //! - signature presence/format (mock verification)
 //! - basic SBOM presence check (mock)
 //!
-//! Public API:
+//! ### QuorumDA (14A.1A.21)
+//!
+//! Trait definition untuk Data Availability berbasis quorum validator.
+//!
+//! ## Peran QuorumDA dalam Arsitektur DSDN
+//!
+//! QuorumDA adalah secondary DA layer dalam DSDN fallback hierarchy:
+//!
+//! | Priority | DA Layer | Kondisi |
+//! |----------|----------|---------|
+//! | Primary | Celestia | DAStatus::Healthy/Warning/Recovering |
+//! | Secondary | QuorumDA | DAStatus::Degraded |
+//! | Emergency | Foundation | DAStatus::Emergency |
+//!
+//! Ketika DARouter mendeteksi primary DA (Celestia) tidak tersedia,
+//! routing dialihkan ke QuorumDA sebagai fallback level-1.
+//!
+//! ## Hubungan dengan DARouter
+//!
+//! DARouter menggunakan implementasi QuorumDA sebagai secondary DA:
+//! - DARouter menerima `Arc<dyn DALayer>` untuk secondary
+//! - QuorumDA meng-extend DALayer, sehingga compatible
+//! - Blob yang ditulis ke QuorumDA di-tag sebagai PendingReconcile
+//!
+//! ## Perbedaan QuorumDA vs Celestia DA
+//!
+//! | Aspek | Celestia DA | QuorumDA |
+//! |-------|-------------|----------|
+//! | Trust Model | External consensus | Validator quorum |
+//! | Availability | Public network | DSDN validators |
+//! | Latency | Higher (external) | Lower (internal) |
+//! | Durability | Celestia guarantees | Quorum guarantees |
+//! | Reconciliation | N/A (primary) | Required (secondary) |
+//!
+//! ## Public API
+//!
+//! ### Manifest Validation
 //! - Validator::new() -> Validator
 //! - Validator::ban_hash / unban_hash
 //! - Validator::validate_manifest(&Manifest) -> ValidationResult
+//!
+//! ### QuorumDA Types
+//! - QuorumDA trait (extends DALayer)
+//! - ValidatorSignature struct
+//! - ValidatorInfo struct
+//! - QuorumError enum
 
 //RUSTS+ CODE
 use std::collections::{HashMap, HashSet}
@@ -20,6 +66,27 @@ use serde::{Deserialize, Serialize}
 use thiserror::Error
 use std::sync::Arc
 use hex::FromHex
+
+// ════════════════════════════════════════════════════════════════════════════════
+// MODULE DECLARATIONS
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub mod quorum_da
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - QuorumDA (14A.1A.21)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use quorum_da::{
+    QuorumDA
+    QuorumError
+    ValidatorInfo
+    ValidatorSignature
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// MANIFEST VALIDATION TYPES
+// ════════════════════════════════════════════════════════════════════════════════
 
 /// Manifest types
 #[derive(Debug, Clone, Serialize, Deserialize)]

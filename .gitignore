@@ -44,6 +44,5 @@ chaindb/*
 
 # === Node State ===
 data/
-state/
 snapshot/
 checkpoints/
