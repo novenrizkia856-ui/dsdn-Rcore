@@ -58,6 +58,25 @@
 //! - ValidatorSignature struct
 //! - ValidatorInfo struct
 //! - QuorumError enum
+//!
+//! ### SignatureCollector (14A.1A.23)
+//!
+//! Mekanisme pengumpulan signature dari validator secara parallel.
+//!
+//! ## Parallelism Model
+//!
+//! SignatureCollector mengirim request ke semua validator secara bersamaan.
+//! Request dikirim parallel, bukan sequential.
+//!
+//! ## Early Return Semantics
+//!
+//! Begitu jumlah signature valid mencapai quorum threshold,
+//! method collect() segera return tanpa menunggu validator lain.
+//!
+//! ## Types
+//! - ValidatorEndpoint: Endpoint validator (id, url, public_key)
+//! - SignatureCollector: Collector dengan parallel execution
+//! - SignatureCollectionError: Error types untuk collection
 
 //RUSTS+ CODE
 use std::collections::{HashMap, HashSet}
@@ -72,6 +91,7 @@ use hex::FromHex
 // ════════════════════════════════════════════════════════════════════════════════
 
 pub mod quorum_da
+pub mod signature_collector
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21)
@@ -82,6 +102,18 @@ pub use quorum_da::{
     QuorumError
     ValidatorInfo
     ValidatorSignature
+    QuorumDAConfig
+    ConfigError
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - SignatureCollector (14A.1A.23)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use signature_collector::{
+    SignatureCollector
+    SignatureCollectionError
+    ValidatorEndpoint
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

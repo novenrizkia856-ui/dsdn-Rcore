@@ -13,6 +13,12 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt","env-filter"] }
 axum = "0.7"
-tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "time"] }
 parking_lot = "0.12"
 hex = "0.4"
+futures = "0.3"
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+wiremock = "0.5"
+
