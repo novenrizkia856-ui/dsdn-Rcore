@@ -77,6 +77,47 @@
 //! - ValidatorEndpoint: Endpoint validator (id, url, public_key)
 //! - SignatureCollector: Collector dengan parallel execution
 //! - SignatureCollectionError: Error types untuk collection
+//!
+//! ### QuorumMetrics (14A.1A.29)
+//!
+//! Metrics tracking untuk operasi QuorumDA dengan format Prometheus.
+//!
+//! ## Metrics Fields
+//!
+//! | Field | Type | Deskripsi |
+//! |-------|------|-----------|
+//! | blobs_stored | Counter | Jumlah blob yang berhasil disimpan |
+//! | blobs_retrieved | Counter | Jumlah blob yang berhasil diambil |
+//! | signature_collections | Counter | Total operasi pengumpulan signature |
+//! | signature_failures | Counter | Jumlah kegagalan signature |
+//! | quorum_successes | Counter | Jumlah quorum berhasil |
+//! | quorum_failures | Counter | Jumlah quorum gagal |
+//! | avg_collection_time_ms | Gauge | Rata-rata waktu collection (EMA) |
+//! | validators_healthy | Gauge | Jumlah validator healthy |
+//!
+//! ## Hubungan dengan QuorumDA Lifecycle
+//!
+//! ```text
+//! post_blob() ─┬─> signature_collections++
+//!              ├─> record_collection(duration, success)
+//!              │   ├─> quorum_successes++ (if success)
+//!              │   └─> quorum_failures++ (if !success)
+//!              └─> blobs_stored++ (if success)
+//!
+//! get_blob() ──> blobs_retrieved++
+//!
+//! health_check() ──> validators_healthy = count
+//! ```
+//!
+//! ## Prometheus Export
+//!
+//! Gunakan `to_prometheus()` untuk export metrics:
+//! - Format: Prometheus text exposition
+//! - Output: Deterministic, sorted by metric name
+//! - Thread-safe: Dapat dipanggil dari multiple threads
+//!
+//! ## Types
+//! - QuorumMetrics: Main metrics struct dengan atomic counters
 
 //RUSTS+ CODE
 use std::collections::{HashMap, HashSet}
@@ -92,6 +133,7 @@ use hex::FromHex
 
 pub mod quorum_da
 pub mod signature_collector
+pub mod metrics_tracking
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21)
@@ -115,6 +157,12 @@ pub use signature_collector::{
     SignatureCollectionError
     ValidatorEndpoint
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - QuorumMetrics (14A.1A.29)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use metrics_tracking::QuorumMetrics
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MANIFEST VALIDATION TYPES

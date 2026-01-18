@@ -1751,6 +1751,11 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
+    /// Mutex untuk serialisasi tests yang mengakses environment variables.
+    /// Environment variables adalah process-global state, sehingga tests yang
+    /// memodifikasi env vars HARUS diserialisasi untuk menghindari race condition.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_quorum_error_display() {
         let err = QuorumError::InsufficientQuorum("need 3, got 2".to_string());
@@ -2059,6 +2064,9 @@ mod tests {
 
     #[test]
     fn test_from_env_with_no_env_vars_uses_defaults() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         // Clear any existing env vars that might interfere
         std::env::remove_var("QUORUM_MIN_VALIDATORS");
         std::env::remove_var("QUORUM_FRACTION");
@@ -2080,6 +2088,9 @@ mod tests {
 
     #[test]
     fn test_from_env_parses_valid_values() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("QUORUM_MIN_VALIDATORS", "5");
         std::env::set_var("QUORUM_FRACTION", "0.75");
         std::env::set_var("QUORUM_SIGNATURE_TIMEOUT_MS", "5000");
@@ -2107,6 +2118,9 @@ mod tests {
 
     #[test]
     fn test_from_env_fails_on_invalid_min_validators() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("QUORUM_MIN_VALIDATORS", "not_a_number");
 
         let result = QuorumDAConfig::from_env();
@@ -2123,6 +2137,9 @@ mod tests {
 
     #[test]
     fn test_from_env_fails_on_invalid_fraction() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("QUORUM_FRACTION", "abc");
 
         let result = QuorumDAConfig::from_env();
@@ -2133,6 +2150,9 @@ mod tests {
 
     #[test]
     fn test_from_env_fails_on_fraction_out_of_range() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("QUORUM_FRACTION", "1.5");
 
         let result = QuorumDAConfig::from_env();
@@ -2149,6 +2169,9 @@ mod tests {
 
     #[test]
     fn test_from_env_handles_empty_endpoints() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("QUORUM_VALIDATOR_ENDPOINTS", "");
 
         let config = QuorumDAConfig::from_env().expect("should succeed");
@@ -2159,6 +2182,9 @@ mod tests {
 
     #[test]
     fn test_from_env_trims_endpoint_whitespace() {
+        // Acquire mutex to prevent race condition with other env var tests
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("QUORUM_VALIDATOR_ENDPOINTS", " http://a:1 , http://b:2 ");
 
         let config = QuorumDAConfig::from_env().expect("should succeed");
