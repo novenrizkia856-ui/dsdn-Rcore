@@ -779,6 +779,18 @@ pub struct QuorumMetrics {
 
     /// Jumlah verifikasi yang gagal.
     verification_failures: std::sync::atomic::AtomicUsize,
+
+    /// Jumlah get_blob yang ditemukan di local storage (hit).
+    local_get_hits: std::sync::atomic::AtomicUsize,
+
+    /// Jumlah get_blob yang tidak ditemukan di local storage (miss).
+    local_get_miss: std::sync::atomic::AtomicUsize,
+
+    /// Jumlah fallback fetch dari validator.
+    fallback_gets: std::sync::atomic::AtomicUsize,
+
+    /// Jumlah signature re-verification yang dilakukan.
+    signature_rechecks: std::sync::atomic::AtomicUsize,
 }
 
 impl QuorumMetrics {
@@ -813,6 +825,26 @@ impl QuorumMetrics {
         self.verification_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Increment local_get_hits counter.
+    pub fn record_local_get_hit(&self) {
+        self.local_get_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment local_get_miss counter.
+    pub fn record_local_get_miss(&self) {
+        self.local_get_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment fallback_gets counter.
+    pub fn record_fallback_get(&self) {
+        self.fallback_gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment signature_rechecks counter.
+    pub fn record_signature_recheck(&self) {
+        self.signature_rechecks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Get current blobs_submitted count.
     #[must_use]
     pub fn get_blobs_submitted(&self) -> usize {
@@ -841,6 +873,30 @@ impl QuorumMetrics {
     #[must_use]
     pub fn get_verification_failures(&self) -> usize {
         self.verification_failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get current local_get_hits count.
+    #[must_use]
+    pub fn get_local_get_hits(&self) -> usize {
+        self.local_get_hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get current local_get_miss count.
+    #[must_use]
+    pub fn get_local_get_miss(&self) -> usize {
+        self.local_get_miss.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get current fallback_gets count.
+    #[must_use]
+    pub fn get_fallback_gets(&self) -> usize {
+        self.fallback_gets.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get current signature_rechecks count.
+    #[must_use]
+    pub fn get_signature_rechecks(&self) -> usize {
+        self.signature_rechecks.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1421,16 +1477,111 @@ impl dsdn_common::DALayer for ValidatorQuorumDA {
         })
     }
 
+    /// Get blob from QuorumDA with signature re-verification.
+    ///
+    /// ## Alur Operasi (14A.1A.27)
+    ///
+    /// 1. LOCAL STORAGE LOOKUP - Cari blob di storage lokal
+    /// 2. SIGNATURE RE-VERIFICATION - Verifikasi ulang quorum signatures
+    /// 3. FALLBACK (jika tidak ditemukan) - Return BlobNotFound
+    /// 4. RETURN DATA - Return data jika valid
+    ///
+    /// ## Error Handling
+    ///
+    /// - BlobNotFound: Blob tidak ada di storage lokal
+    /// - Other("quorum verification failed: ..."): Signature/quorum invalid
     fn get_blob(
         &self,
         ref_: &dsdn_common::BlobRef,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, dsdn_common::DAError>> + Send + '_>> {
         let blob_ref = ref_.clone();
+
         Box::pin(async move {
-            match self.storage.get(&blob_ref) {
-                Some((data, _)) => Ok(data),
-                None => Err(dsdn_common::DAError::BlobNotFound(blob_ref)),
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 1: LOCAL STORAGE LOOKUP
+            // ════════════════════════════════════════════════════════════════════
+
+            let (data, metadata) = match self.storage.get(&blob_ref) {
+                Some(entry) => {
+                    self.metrics.record_local_get_hit();
+                    entry
+                }
+                None => {
+                    // Cache miss - blob tidak ada di storage lokal
+                    self.metrics.record_local_get_miss();
+
+                    // Fallback fetch dari validator tidak tersedia
+                    // (tidak ada API untuk read-only fetch dari validators)
+                    // Return BlobNotFound
+                    return Err(dsdn_common::DAError::BlobNotFound(blob_ref));
+                }
+            };
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 2: SIGNATURE RE-VERIFICATION
+            // ════════════════════════════════════════════════════════════════════
+            //
+            // Re-verify quorum signatures untuk memastikan data masih valid.
+            // Ini penting untuk deteksi data corruption atau tampering.
+
+            self.metrics.record_signature_recheck();
+
+            // Ambil threshold
+            let threshold = self.quorum_threshold();
+
+            // Verifikasi ulang signatures
+            let verification = match verify_quorum_signatures(
+                &metadata.data_hash,
+                &metadata.signatures,
+                &self.validators,
+                threshold,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.metrics.record_verification_failure();
+                    return Err(dsdn_common::DAError::Other(format!(
+                        "quorum verification failed: {}",
+                        e
+                    )));
+                }
+            };
+
+            // Cek apakah quorum masih valid
+            if !verification.is_valid {
+                self.metrics.record_verification_failure();
+                return Err(dsdn_common::DAError::Other(format!(
+                    "quorum verification failed: {} valid signatures, need {}",
+                    verification.valid_signatures,
+                    threshold
+                )));
             }
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 3: VERIFY DATA HASH INTEGRITY
+            // ════════════════════════════════════════════════════════════════════
+            //
+            // Pastikan data hash dari metadata cocok dengan hash data aktual.
+            // Ini mencegah data corruption.
+
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
+            let computed_hash: [u8; 32] = hasher.finalize().into();
+
+            if computed_hash != metadata.data_hash {
+                self.metrics.record_verification_failure();
+                return Err(dsdn_common::DAError::Other(
+                    "data integrity check failed: hash mismatch".to_string()
+                ));
+            }
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 4: RETURN DATA
+            // ════════════════════════════════════════════════════════════════════
+            //
+            // Data valid, quorum valid, hash valid - return data
+
+            Ok(data)
         })
     }
 
@@ -2825,5 +2976,314 @@ mod tests {
 
         // pending_reconcile should be explicitly readable
         assert!(metadata.pending_reconcile);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // DALayer::get_blob Tests (14A.1A.27)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_blob_from_local_storage_valid() {
+        // Setup: Create DA with validators and valid signatures
+        let (sk1, pk1) = generate_keypair();
+        let (sk2, pk2) = generate_keypair();
+
+        let config = QuorumDAConfig {
+            min_validators: 1,
+            quorum_fraction: 0.5,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1.clone(), weight: 1 },
+            ValidatorInfo { id: "v2".to_string(), public_key: pk2.clone(), weight: 1 },
+        ];
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            validators,
+            runtime.handle().clone(),
+        );
+
+        // Manually store a blob with valid signatures
+        let data = b"test data for get_blob";
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let data_hash: [u8; 32] = hasher.finalize().into();
+
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+            ValidatorSignature {
+                validator_id: "v2".to_string(),
+                signature: sign_data(&sk2, &data_hash),
+                timestamp: 1700000001,
+            },
+        ];
+
+        let blob_ref = ValidatorQuorumDA::compute_blob_ref(data, ValidatorQuorumDA::default_namespace());
+        let metadata = QuorumBlobMetadata {
+            data_hash,
+            valid_signatures: 2,
+            stored_at: 1700000000,
+            signatures,
+            validator_ids: vec!["v1".to_string(), "v2".to_string()],
+            pending_reconcile: true,
+        };
+
+        // Store directly
+        da.storage().store(&blob_ref, data.to_vec(), metadata).unwrap();
+
+        // Test get_blob
+        let result = runtime.block_on(da.get_blob(&blob_ref));
+        assert!(result.is_ok(), "get_blob should succeed for valid blob");
+
+        let retrieved_data = result.unwrap();
+        assert_eq!(retrieved_data, data.to_vec());
+
+        // Check metrics
+        assert_eq!(da.metrics().get_local_get_hits(), 1);
+        assert_eq!(da.metrics().get_signature_rechecks(), 1);
+    }
+
+    #[test]
+    fn test_get_blob_not_found() {
+        let config = QuorumDAConfig::default();
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            vec![],
+            runtime.handle().clone(),
+        );
+
+        // Try to get non-existent blob
+        let blob_ref = dsdn_common::BlobRef {
+            height: 0,
+            commitment: [0xFF; 32],
+            namespace: [0u8; 29],
+        };
+
+        let result = runtime.block_on(da.get_blob(&blob_ref));
+        assert!(result.is_err(), "get_blob should fail for non-existent blob");
+
+        match result {
+            Err(dsdn_common::DAError::BlobNotFound(_)) => {
+                // Expected
+            }
+            other => panic!("Expected BlobNotFound, got {:?}", other),
+        }
+
+        // Check metrics
+        assert_eq!(da.metrics().get_local_get_miss(), 1);
+    }
+
+    #[test]
+    fn test_get_blob_signature_verification_failed() {
+        // Setup: Create DA with validators but store blob with INVALID signatures
+        let (_sk1, pk1) = generate_keypair();
+        let (_sk2, pk2) = generate_keypair();
+
+        let config = QuorumDAConfig {
+            min_validators: 1,
+            quorum_fraction: 0.5,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1, weight: 1 },
+            ValidatorInfo { id: "v2".to_string(), public_key: pk2, weight: 1 },
+        ];
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            validators,
+            runtime.handle().clone(),
+        );
+
+        // Store blob with INVALID signatures (all zeros)
+        let data = b"test data with invalid sigs";
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let data_hash: [u8; 32] = hasher.finalize().into();
+
+        let invalid_signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: vec![0u8; 64], // Invalid signature
+                timestamp: 1700000000,
+            },
+        ];
+
+        let blob_ref = ValidatorQuorumDA::compute_blob_ref(data, ValidatorQuorumDA::default_namespace());
+        let metadata = QuorumBlobMetadata {
+            data_hash,
+            valid_signatures: 1, // Claimed 1, but actually 0 valid
+            stored_at: 1700000000,
+            signatures: invalid_signatures,
+            validator_ids: vec!["v1".to_string()],
+            pending_reconcile: true,
+        };
+
+        // Store directly
+        da.storage().store(&blob_ref, data.to_vec(), metadata).unwrap();
+
+        // Test get_blob - should fail due to signature verification
+        let result = runtime.block_on(da.get_blob(&blob_ref));
+        assert!(result.is_err(), "get_blob should fail with invalid signatures");
+
+        match result {
+            Err(dsdn_common::DAError::Other(msg)) => {
+                assert!(
+                    msg.contains("quorum verification failed"),
+                    "Error should mention quorum verification: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected Other error with verification message, got {:?}", other),
+        }
+
+        // Check metrics
+        assert_eq!(da.metrics().get_local_get_hits(), 1);
+        assert_eq!(da.metrics().get_verification_failures(), 1);
+    }
+
+    #[test]
+    fn test_get_blob_data_integrity_check() {
+        // Setup: Create DA with validators and valid signatures but corrupted data
+        let (sk1, pk1) = generate_keypair();
+
+        let config = QuorumDAConfig {
+            min_validators: 1,
+            quorum_fraction: 0.5,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let validators = vec![
+            ValidatorInfo { id: "v1".to_string(), public_key: pk1.clone(), weight: 1 },
+        ];
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            validators,
+            runtime.handle().clone(),
+        );
+
+        // Original data and hash
+        let original_data = b"original data";
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(original_data);
+        let data_hash: [u8; 32] = hasher.finalize().into();
+
+        // Valid signature for original data
+        let signatures = vec![
+            ValidatorSignature {
+                validator_id: "v1".to_string(),
+                signature: sign_data(&sk1, &data_hash),
+                timestamp: 1700000000,
+            },
+        ];
+
+        let blob_ref = ValidatorQuorumDA::compute_blob_ref(original_data, ValidatorQuorumDA::default_namespace());
+        let metadata = QuorumBlobMetadata {
+            data_hash,
+            valid_signatures: 1,
+            stored_at: 1700000000,
+            signatures,
+            validator_ids: vec!["v1".to_string()],
+            pending_reconcile: true,
+        };
+
+        // Store CORRUPTED data (different from what was hashed)
+        let corrupted_data = b"corrupted data!!";
+        da.storage().store(&blob_ref, corrupted_data.to_vec(), metadata).unwrap();
+
+        // Test get_blob - should fail due to hash mismatch
+        let result = runtime.block_on(da.get_blob(&blob_ref));
+        assert!(result.is_err(), "get_blob should fail with corrupted data");
+
+        match result {
+            Err(dsdn_common::DAError::Other(msg)) => {
+                assert!(
+                    msg.contains("hash mismatch") || msg.contains("integrity"),
+                    "Error should mention hash/integrity: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected Other error with integrity message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_get_blob_metrics_update() {
+        let config = QuorumDAConfig::default();
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            vec![],
+            runtime.handle().clone(),
+        );
+
+        // Initial metrics should be 0
+        assert_eq!(da.metrics().get_local_get_hits(), 0);
+        assert_eq!(da.metrics().get_local_get_miss(), 0);
+        assert_eq!(da.metrics().get_signature_rechecks(), 0);
+
+        // Try to get non-existent blob
+        let blob_ref = dsdn_common::BlobRef {
+            height: 0,
+            commitment: [0xFF; 32],
+            namespace: [0u8; 29],
+        };
+        let _ = runtime.block_on(da.get_blob(&blob_ref));
+
+        // Check miss was recorded
+        assert_eq!(da.metrics().get_local_get_miss(), 1);
+        assert_eq!(da.metrics().get_local_get_hits(), 0);
     }
 }
