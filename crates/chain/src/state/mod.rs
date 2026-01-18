@@ -4458,7 +4458,7 @@ use crate::economic::{DeflationConfig, EconomicMetrics, BurnEvent};
 mod internal_model;
 
 /// Account management: create_account, get_balance, get_locked, get_nonce, increment_nonce, mint
-mod internal_account;
+mod internal_account; //RUSTS+ CODE
 
 /// Staking lifecycle: bond, unbond, deposit_validator_stake, register_delegator_stake, dll
 mod internal_staking;
