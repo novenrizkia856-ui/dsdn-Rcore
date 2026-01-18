@@ -1,123 +1,270 @@
 ﻿//! dsdn-validator
 //!
-//! Library that validates application manifests for DSDN.
+//! Library that validates application manifests for DSDN and provides
+//! QuorumDA - a validator-based Data Availability layer.
 //!
-//! ## Modules
+//! # Modules Overview
 //!
-//! ### Manifest Validation
+//! ## Manifest Validation
 //!
 //! Checks performed (declarative):
-//! - syntactic validation of SHA-256 hex hashes
-//! - banned-hash detection
-//! - signature presence/format (mock verification)
-//! - basic SBOM presence check (mock)
+//! - Syntactic validation of SHA-256 hex hashes
+//! - Banned-hash detection
+//! - Signature presence/format (mock verification)
+//! - Basic SBOM presence check (mock)
 //!
-//! ### QuorumDA (14A.1A.21)
+//! ## QuorumDA System (14A.1A.21 - 14A.1A.30)
 //!
-//! Trait definition untuk Data Availability berbasis quorum validator.
+//! Complete validator-based Data Availability implementation.
 //!
-//! ## Peran QuorumDA dalam Arsitektur DSDN
+//! # QuorumDA Architecture
 //!
-//! QuorumDA adalah secondary DA layer dalam DSDN fallback hierarchy:
+//! ## Peran dalam Sistem DSDN
 //!
-//! | Priority | DA Layer | Kondisi |
-//! |----------|----------|---------|
-//! | Primary | Celestia | DAStatus::Healthy/Warning/Recovering |
-//! | Secondary | QuorumDA | DAStatus::Degraded |
-//! | Emergency | Foundation | DAStatus::Emergency |
+//! QuorumDA adalah **secondary DA layer** dalam DSDN fallback hierarchy.
+//! QuorumDA BUKAN replacement untuk Celestia - ini adalah fallback mechanism
+//! yang aktif hanya ketika primary DA tidak tersedia.
 //!
-//! Ketika DARouter mendeteksi primary DA (Celestia) tidak tersedia,
-//! routing dialihkan ke QuorumDA sebagai fallback level-1.
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                    DARouter                                  │
+//! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+//! │  │  Celestia   │  │  QuorumDA   │  │  Foundation DA      │  │
+//! │  │  (Primary)  │  │ (Secondary) │  │  (Emergency)        │  │
+//! │  │  Priority 1 │  │  Priority 2 │  │  Priority 3         │  │
+//! │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
+//! └─────────────────────────────────────────────────────────────┘
+//! ```
 //!
-//! ## Hubungan dengan DARouter
+//! | Priority | DA Layer | Kondisi Aktif |
+//! |----------|----------|---------------|
+//! | 1 (Primary) | Celestia | DAStatus::Healthy, Warning, Recovering |
+//! | 2 (Secondary) | QuorumDA | DAStatus::Degraded |
+//! | 3 (Emergency) | Foundation | DAStatus::Emergency |
 //!
-//! DARouter menggunakan implementasi QuorumDA sebagai secondary DA:
-//! - DARouter menerima `Arc<dyn DALayer>` untuk secondary
-//! - QuorumDA meng-extend DALayer, sehingga compatible
-//! - Blob yang ditulis ke QuorumDA di-tag sebagai PendingReconcile
+//! ## Hubungan dengan DALayer Trait
 //!
-//! ## Perbedaan QuorumDA vs Celestia DA
+//! QuorumDA meng-extend trait `DALayer` dari `dsdn_common`:
 //!
-//! | Aspek | Celestia DA | QuorumDA |
-//! |-------|-------------|----------|
-//! | Trust Model | External consensus | Validator quorum |
-//! | Availability | Public network | DSDN validators |
-//! | Latency | Higher (external) | Lower (internal) |
-//! | Durability | Celestia guarantees | Quorum guarantees |
-//! | Reconciliation | N/A (primary) | Required (secondary) |
+//! ```text
+//! trait DALayer {
+//!     fn post_blob(&self, data: &[u8]) -> Result<BlobRef, DAError>;
+//!     fn get_blob(&self, ref_: &BlobRef) -> Result<Vec<u8>, DAError>;
+//!     fn health_check(&self) -> Result<DAHealthStatus, DAError>;
+//!     // ...
+//! }
 //!
-//! ## Public API
+//! trait QuorumDA: DALayer {
+//!     fn active_validators(&self) -> Vec<ValidatorInfo>;
+//!     fn quorum_threshold(&self) -> usize;
+//!     fn collect_signatures(&self, data_hash: &[u8; 32]) -> Result<...>;
+//!     fn verify_quorum_signatures(&self, ...) -> Result<QuorumVerification, ...>;
+//!     fn submit_with_signatures(&self, ...) -> Result<BlobRef, ...>;
+//! }
+//! ```
 //!
-//! ### Manifest Validation
-//! - Validator::new() -> Validator
-//! - Validator::ban_hash / unban_hash
-//! - Validator::validate_manifest(&Manifest) -> ValidationResult
+//! Ini memungkinkan DARouter menggunakan `Arc<dyn DALayer>` untuk
+//! QuorumDA tanpa perlu tahu implementasi spesifik.
 //!
-//! ### QuorumDA Types
-//! - QuorumDA trait (extends DALayer)
-//! - ValidatorSignature struct
-//! - ValidatorInfo struct
-//! - QuorumError enum
+//! ## Reconciliation Requirement
 //!
-//! ### SignatureCollector (14A.1A.23)
+//! Blob yang ditulis ke QuorumDA di-tag dengan `pending_reconcile = true`.
+//! Background process akan melakukan reconciliation ke Celestia
+//! ketika primary DA kembali healthy.
 //!
-//! Mekanisme pengumpulan signature dari validator secara parallel.
+//! # Signature Collection Flow
 //!
-//! ## Parallelism Model
+//! ## Alur Data Lengkap
 //!
-//! SignatureCollector mengirim request ke semua validator secara bersamaan.
-//! Request dikirim parallel, bukan sequential.
+//! ```text
+//! ┌──────────┐    ┌─────────────┐    ┌──────────────────┐
+//! │   Data   │───>│  SHA-256    │───>│  SignatureCollector
+//! │  (blob)  │    │   Hash      │    │  (parallel)      │
+//! └──────────┘    └─────────────┘    └────────┬─────────┘
+//!                                              │
+//!                     ┌────────────────────────┴──────────┐
+//!                     │                                   │
+//!              ┌──────▼──────┐                    ┌───────▼──────┐
+//!              │ Validator 1 │                    │ Validator N  │
+//!              │  (sign)     │                    │  (sign)      │
+//!              └──────┬──────┘                    └───────┬──────┘
+//!                     │                                   │
+//!                     └────────────────┬──────────────────┘
+//!                                      │
+//!                              ┌───────▼────────┐
+//!                              │ Quorum Check   │
+//!                              │ (threshold)    │
+//!                              └───────┬────────┘
+//!                                      │
+//!                     ┌────────────────┴────────────────┐
+//!                     │                                 │
+//!              ┌──────▼──────┐                  ┌───────▼──────┐
+//!              │  Success    │                  │   Failure    │
+//!              │ (>= 2/3)    │                  │  (< 2/3)     │
+//!              └──────┬──────┘                  └───────┬──────┘
+//!                     │                                 │
+//!              ┌──────▼──────┐                  ┌───────▼──────┐
+//!              │ Store Blob  │                  │ Return Error │
+//!              │ + Metadata  │                  │              │
+//!              └─────────────┘                  └──────────────┘
+//! ```
 //!
 //! ## Early Return Semantics
 //!
-//! Begitu jumlah signature valid mencapai quorum threshold,
-//! method collect() segera return tanpa menunggu validator lain.
+//! SignatureCollector mengimplementasikan early return:
+//! - Request dikirim ke SEMUA validator secara parallel
+//! - Begitu `threshold` signatures valid terkumpul, return immediately
+//! - Pending requests di-cancel (tidak ditunggu)
+//! - Ini mengoptimalkan latency: tidak perlu tunggu validator lambat
 //!
-//! ## Types
-//! - ValidatorEndpoint: Endpoint validator (id, url, public_key)
-//! - SignatureCollector: Collector dengan parallel execution
-//! - SignatureCollectionError: Error types untuk collection
+//! ## Failure Modes
 //!
-//! ### QuorumMetrics (14A.1A.29)
+//! | Mode | Penyebab | Handling |
+//! |------|----------|----------|
+//! | Timeout | Validator tidak merespon dalam `signature_timeout_ms` | Skip validator, lanjut ke yang lain |
+//! | Invalid Signature | Signature tidak match dengan public key | Reject signature, tidak dihitung |
+//! | Insufficient Quorum | Jumlah signature valid < threshold | Return QuorumError::InsufficientQuorum |
+//! | Network Error | Connection refused, DNS failure | Log error, skip validator |
 //!
-//! Metrics tracking untuk operasi QuorumDA dengan format Prometheus.
+//! # Trust Model
 //!
-//! ## Metrics Fields
+//! ## Asumsi Kepercayaan
 //!
-//! | Field | Type | Deskripsi |
-//! |-------|------|-----------|
-//! | blobs_stored | Counter | Jumlah blob yang berhasil disimpan |
-//! | blobs_retrieved | Counter | Jumlah blob yang berhasil diambil |
-//! | signature_collections | Counter | Total operasi pengumpulan signature |
-//! | signature_failures | Counter | Jumlah kegagalan signature |
-//! | quorum_successes | Counter | Jumlah quorum berhasil |
-//! | quorum_failures | Counter | Jumlah quorum gagal |
-//! | avg_collection_time_ms | Gauge | Rata-rata waktu collection (EMA) |
-//! | validators_healthy | Gauge | Jumlah validator healthy |
+//! QuorumDA mengasumsikan trust model berikut:
 //!
-//! ## Hubungan dengan QuorumDA Lifecycle
+//! 1. **Validator Honesty**: Mayoritas validator (>= 2/3) diasumsikan jujur
+//! 2. **Key Security**: Private keys validator aman dan tidak compromised
+//! 3. **Network Reliability**: Jaringan antar validator reasonable (tidak 100% partitioned)
+//! 4. **Clock Synchronization**: Timestamps validator dalam reasonable bound
+//!
+//! ## Quorum Threshold
+//!
+//! Default threshold: **67% (2/3 + 1)** dari total validator
 //!
 //! ```text
-//! post_blob() ─┬─> signature_collections++
-//!              ├─> record_collection(duration, success)
-//!              │   ├─> quorum_successes++ (if success)
-//!              │   └─> quorum_failures++ (if !success)
-//!              └─> blobs_stored++ (if success)
+//! threshold = ceil(total_validators * quorum_fraction)
+//! threshold = max(threshold, min_validators)
 //!
-//! get_blob() ──> blobs_retrieved++
-//!
-//! health_check() ──> validators_healthy = count
+//! Contoh: 10 validators, quorum_fraction = 0.67
+//! threshold = ceil(10 * 0.67) = ceil(6.7) = 7
 //! ```
 //!
-//! ## Prometheus Export
+//! ## Konsekuensi Validator Jahat / Offline
 //!
-//! Gunakan `to_prometheus()` untuk export metrics:
-//! - Format: Prometheus text exposition
-//! - Output: Deterministic, sorted by metric name
-//! - Thread-safe: Dapat dipanggil dari multiple threads
+//! | Skenario | Impact | Mitigasi |
+//! |----------|--------|----------|
+//! | < 1/3 validators jahat | Tidak bisa forge quorum | Threshold 2/3 mencegah |
+//! | >= 1/3 validators offline | Quorum tidak tercapai | Fallback ke Foundation DA |
+//! | >= 2/3 validators collude | Data bisa dimanipulasi | **TIDAK ADA MITIGASI** |
+//! | Single validator offline | Tidak ada impact | Early return dari validator lain |
 //!
-//! ## Types
-//! - QuorumMetrics: Main metrics struct dengan atomic counters
+//! ## Batasan Keamanan (EKSPLISIT)
+//!
+//! **PERINGATAN**: QuorumDA memiliki batasan keamanan berikut:
+//!
+//! 1. **Bukan Byzantine Fault Tolerant penuh**: Jika >= 2/3 validators
+//!    berkolusi, mereka dapat memanipulasi data. Tidak ada mekanisme
+//!    slashing atau accountability.
+//!
+//! 2. **Tidak ada data availability sampling**: Tidak seperti Celestia,
+//!    QuorumDA tidak memiliki mekanisme DAS. Client harus trust quorum.
+//!
+//! 3. **Centralization risk**: Validator set dikelola oleh DSDN governance.
+//!    Perubahan validator set adalah operasi terpusat.
+//!
+//! 4. **Temporary storage**: QuorumDA adalah fallback sementara.
+//!    Data HARUS di-reconcile ke Celestia untuk durability jangka panjang.
+//!
+//! 5. **No erasure coding**: Data disimpan full, bukan erasure coded.
+//!    Storage requirement = full data size * replication factor.
+//!
+//! # Usage Examples (Descriptive)
+//!
+//! ## Membuat ValidatorQuorumDA
+//!
+//! ```text
+//! // 1. Siapkan konfigurasi
+//! config = QuorumDAConfig::default()
+//!     atau
+//! config = QuorumDAConfig::from_env()  // dari environment variables
+//!
+//! // 2. Siapkan validator endpoints
+//! endpoints = [
+//!     ValidatorEndpoint { id: "v1", url: "http://...", public_key: [...] },
+//!     ValidatorEndpoint { id: "v2", url: "http://...", public_key: [...] },
+//! ]
+//!
+//! // 3. Buat SignatureCollector
+//! collector = SignatureCollector::new(endpoints, config, http_client)
+//!
+//! // 4. Buat ValidatorQuorumDA
+//! quorum_da = ValidatorQuorumDA::new(config, collector, validators, runtime)
+//! ```
+//!
+//! ## Posting Blob
+//!
+//! ```text
+//! // QuorumDA implements DALayer, so:
+//! data = [byte array]
+//! blob_ref = quorum_da.post_blob(&data).await
+//!
+//! // Internally:
+//! // 1. Compute SHA-256 hash of data
+//! // 2. Collect signatures from validators (parallel)
+//! // 3. Verify quorum threshold reached
+//! // 4. Store blob with metadata
+//! // 5. Return BlobRef
+//! ```
+//!
+//! ## Retrieving Blob
+//!
+//! ```text
+//! blob_ref = ...  // dari post_blob atau external source
+//! data = quorum_da.get_blob(&blob_ref).await
+//!
+//! // Internally:
+//! // 1. Lookup in local storage
+//! // 2. Re-verify quorum signatures
+//! // 3. Verify data hash integrity
+//! // 4. Return data
+//! ```
+//!
+//! ## Monitoring dengan Metrics
+//!
+//! ```text
+//! metrics = quorum_da.metrics()
+//!
+//! // Get individual counters
+//! blobs_stored = metrics.get_blobs_stored()
+//! quorum_failures = metrics.get_quorum_failures()
+//!
+//! // Export to Prometheus format
+//! prometheus_text = metrics.to_prometheus()
+//! // Output: "dsdn_quorum_blobs_stored_total 42\n..."
+//! ```
+//!
+//! # Public API Summary
+//!
+//! ## Manifest Validation
+//! - `Validator::new()` - Create validator instance
+//! - `Validator::ban_hash()` / `unban_hash()` - Manage banned hashes
+//! - `Validator::validate_manifest()` - Validate manifest
+//!
+//! ## QuorumDA Core
+//! - `QuorumDA` - Trait extending DALayer
+//! - `ValidatorQuorumDA` - Production implementation
+//! - `QuorumDAConfig` - Configuration struct
+//! - `ValidatorInfo` - Validator metadata
+//! - `ValidatorSignature` - Signed data from validator
+//! - `QuorumVerification` - Verification result
+//!
+//! ## Signature Collection
+//! - `SignatureCollector` - Parallel signature collector
+//! - `ValidatorEndpoint` - Validator endpoint info
+//! - `SignatureCollectionError` - Collection errors
+//!
+//! ## Metrics
+//! - `QuorumMetrics` - Metrics tracking with Prometheus export
 
 //RUSTS+ CODE
 use std::collections::{HashMap, HashSet}
@@ -136,22 +283,37 @@ pub mod signature_collector
 pub mod metrics_tracking
 
 // ════════════════════════════════════════════════════════════════════════════════
-// PUBLIC EXPORTS - QuorumDA (14A.1A.21)
+// PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
 // ════════════════════════════════════════════════════════════════════════════════
 
+/// QuorumDA trait dan types untuk validator-based Data Availability.
 pub use quorum_da::{
+    // Trait
     QuorumDA
-    QuorumError
-    ValidatorInfo
-    ValidatorSignature
+
+    // Implementation
+    ValidatorQuorumDA
+
+    // Configuration
     QuorumDAConfig
     ConfigError
+
+    // Validator types
+    ValidatorInfo
+    ValidatorSignature
+
+    // Verification
+    QuorumVerification
+
+    // Errors
+    QuorumError
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - SignatureCollector (14A.1A.23)
 // ════════════════════════════════════════════════════════════════════════════════
 
+/// SignatureCollector untuk parallel signature collection dari validators.
 pub use signature_collector::{
     SignatureCollector
     SignatureCollectionError
@@ -162,6 +324,7 @@ pub use signature_collector::{
 // PUBLIC EXPORTS - QuorumMetrics (14A.1A.29)
 // ════════════════════════════════════════════════════════════════════════════════
 
+/// Metrics tracking untuk QuorumDA dengan Prometheus export.
 pub use metrics_tracking::QuorumMetrics
 
 // ════════════════════════════════════════════════════════════════════════════════
