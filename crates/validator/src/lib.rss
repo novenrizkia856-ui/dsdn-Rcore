@@ -103,7 +103,7 @@ pub enum ValidatorError {
 
 impl Validator {
     /// Create a new validator with empty banned list and one default trusted key.
-    pub fn new() Self {
+    pub fn new() effects(alloc) Self {
         mut tk = HashSet::new()
         tk.insert("trusted-key".to_string())  // mock trusted key
         Self {
@@ -123,7 +123,7 @@ impl Validator {
     }
 
     /// List banned
-    pub fn list_banned(&self) Vec[String] {
+    pub fn list_banned(&self) effects(io, alloc) Vec[String] {
         self.banned.read().iter().cloned().collect()
     }
 
@@ -139,7 +139,7 @@ impl Validator {
 
     /// Core manifest validation (synchronous).
     /// Returns ValidationResult with details.
-    pub fn validate_manifest(&self, manifest &Manifest) Result[ValidationResult, ValidatorError] {
+    pub fn validate_manifest(&self, manifest &Manifest) effects(io, alloc) Result[ValidationResult, ValidatorError] {
         mut res = ValidationResult::ok()
 
         // 1. Basic fields
@@ -179,7 +179,7 @@ impl Validator {
             mut has_trusted = false
             for s in &manifest.signatures {
                 if self.trusted_keys.read().contains(&s.key_id) {
-                    has_trusted = true
+                    outer has_trusted = true
                 } else {
                     // heuristics: signature format length check
                     if s.sig.len() < 8 {
