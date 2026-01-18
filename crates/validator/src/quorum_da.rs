@@ -791,6 +791,12 @@ pub struct QuorumMetrics {
 
     /// Jumlah signature re-verification yang dilakukan.
     signature_rechecks: std::sync::atomic::AtomicUsize,
+
+    /// Total health checks yang telah dilakukan.
+    health_checks_total: std::sync::atomic::AtomicUsize,
+
+    /// Last health status (0=Unavailable, 1=Degraded, 2=Healthy).
+    last_health_status: std::sync::atomic::AtomicUsize,
 }
 
 impl QuorumMetrics {
@@ -897,6 +903,28 @@ impl QuorumMetrics {
     #[must_use]
     pub fn get_signature_rechecks(&self) -> usize {
         self.signature_rechecks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Increment health_checks_total counter.
+    pub fn record_health_check(&self) {
+        self.health_checks_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set last_health_status (0=Unavailable, 1=Degraded, 2=Healthy).
+    pub fn set_last_health_status(&self, status: usize) {
+        self.last_health_status.store(status, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get current health_checks_total count.
+    #[must_use]
+    pub fn get_health_checks_total(&self) -> usize {
+        self.health_checks_total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get last_health_status (0=Unavailable, 1=Degraded, 2=Healthy).
+    #[must_use]
+    pub fn get_last_health_status(&self) -> usize {
+        self.last_health_status.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1597,16 +1625,111 @@ impl dsdn_common::DALayer for ValidatorQuorumDA {
         })
     }
 
+    /// Health check for QuorumDA (14A.1A.28).
+    ///
+    /// ## Alur Operasi
+    ///
+    /// 1. Ambil daftar validator endpoints dari config
+    /// 2. Parallel connectivity check ke setiap endpoint
+    /// 3. Hitung validator yang reachable
+    /// 4. Tentukan status berdasarkan threshold:
+    ///    - Healthy: reachable >= quorum_threshold
+    ///    - Degraded: 0 < reachable < quorum_threshold
+    ///    - Unavailable: reachable == 0
+    ///
+    /// ## Metrics
+    ///
+    /// - health_checks_total: Increment setiap pemanggilan
+    /// - last_health_status: Update dengan status terakhir
     fn health_check(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<dsdn_common::DAHealthStatus, dsdn_common::DAError>> + Send + '_>> {
         Box::pin(async move {
-            // Simple health check: if we have validators, we're healthy
-            if self.validators.is_empty() {
-                Ok(dsdn_common::DAHealthStatus::Unavailable)
-            } else {
-                Ok(dsdn_common::DAHealthStatus::Healthy)
+            // Record health check
+            self.metrics.record_health_check();
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 1: AMBIL DAFTAR VALIDATOR
+            // ════════════════════════════════════════════════════════════════════
+
+            let endpoints = &self.config.validator_endpoints;
+            let total_validators = endpoints.len();
+
+            // Jika tidak ada endpoint, status = Unavailable
+            if total_validators == 0 {
+                self.metrics.set_last_health_status(0); // Unavailable
+                return Ok(dsdn_common::DAHealthStatus::Unavailable);
             }
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 2: PARALLEL CONNECTIVITY CHECK
+            // ════════════════════════════════════════════════════════════════════
+
+            let timeout_duration = std::time::Duration::from_millis(
+                self.config.signature_timeout_ms
+            );
+
+            // Create HTTP client for health checks
+            let client = reqwest::Client::builder()
+                .timeout(timeout_duration)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
+            // Spawn parallel health check requests
+            use futures::future::join_all;
+
+            let health_checks: Vec<_> = endpoints
+                .iter()
+                .map(|endpoint| {
+                    let client = client.clone();
+                    let url = endpoint.clone();
+                    async move {
+                        // Try to connect to validator health endpoint
+                        // Use HEAD request for minimal overhead
+                        let health_url = format!("{}/health", url.trim_end_matches('/'));
+                        match client.head(&health_url).send().await {
+                            Ok(response) => response.status().is_success(),
+                            Err(_) => {
+                                // Fallback: try base URL
+                                match client.head(&url).send().await {
+                                    Ok(response) => response.status().is_success(),
+                                    Err(_) => false,
+                                }
+                            }
+                        }
+                    }
+                })
+                .collect();
+
+            let results = join_all(health_checks).await;
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 3: HITUNG VALIDATOR REACHABLE
+            // ════════════════════════════════════════════════════════════════════
+
+            let reachable_count = results.iter().filter(|&&r| r).count();
+
+            // ════════════════════════════════════════════════════════════════════
+            // STEP 4: TENTUKAN STATUS
+            // ════════════════════════════════════════════════════════════════════
+
+            let quorum_threshold = self.config.calculate_quorum_threshold(total_validators);
+
+            let status = if reachable_count >= quorum_threshold {
+                // Healthy: reachable >= quorum_threshold
+                self.metrics.set_last_health_status(2); // Healthy
+                dsdn_common::DAHealthStatus::Healthy
+            } else if reachable_count > 0 {
+                // Degraded: 0 < reachable < quorum_threshold
+                self.metrics.set_last_health_status(1); // Degraded
+                dsdn_common::DAHealthStatus::Degraded
+            } else {
+                // Unavailable: reachable == 0
+                self.metrics.set_last_health_status(0); // Unavailable
+                dsdn_common::DAHealthStatus::Unavailable
+            };
+
+            Ok(status)
         })
     }
 }
@@ -3285,5 +3408,167 @@ mod tests {
         // Check miss was recorded
         assert_eq!(da.metrics().get_local_get_miss(), 1);
         assert_eq!(da.metrics().get_local_get_hits(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // DALayer::health_check Tests (14A.1A.28)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_health_check_unavailable_no_endpoints() {
+        // No validator endpoints configured
+        let config = QuorumDAConfig {
+            validator_endpoints: vec![],
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            vec![],
+            runtime.handle().clone(),
+        );
+
+        // Health check should return Unavailable
+        let result = runtime.block_on(da.health_check());
+        assert!(result.is_ok());
+        
+        match result.unwrap() {
+            dsdn_common::DAHealthStatus::Unavailable => {
+                // Expected
+            }
+            other => panic!("Expected Unavailable, got {:?}", other),
+        }
+
+        // Check metrics
+        assert_eq!(da.metrics().get_health_checks_total(), 1);
+        assert_eq!(da.metrics().get_last_health_status(), 0); // Unavailable
+    }
+
+    #[test]
+    fn test_health_check_unavailable_all_unreachable() {
+        // Configure with unreachable endpoints
+        let config = QuorumDAConfig {
+            validator_endpoints: vec![
+                "http://127.0.0.1:1".to_string(), // Invalid port
+                "http://127.0.0.1:2".to_string(), // Invalid port
+            ],
+            signature_timeout_ms: 100, // Short timeout
+            quorum_fraction: 0.67,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            vec![],
+            runtime.handle().clone(),
+        );
+
+        // Health check - all endpoints unreachable = Unavailable
+        let result = runtime.block_on(da.health_check());
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            dsdn_common::DAHealthStatus::Unavailable => {
+                // Expected - all validators unreachable
+            }
+            other => panic!("Expected Unavailable, got {:?}", other),
+        }
+
+        // Check metrics
+        assert_eq!(da.metrics().get_health_checks_total(), 1);
+        assert_eq!(da.metrics().get_last_health_status(), 0); // Unavailable
+    }
+
+    #[test]
+    fn test_health_check_metrics_increment() {
+        let config = QuorumDAConfig {
+            validator_endpoints: vec![],
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let collector = crate::signature_collector::SignatureCollector::new(
+            vec![],
+            config.clone(),
+            client,
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let da = ValidatorQuorumDA::new(
+            config,
+            collector,
+            vec![],
+            runtime.handle().clone(),
+        );
+
+        // Initial metrics
+        assert_eq!(da.metrics().get_health_checks_total(), 0);
+
+        // First health check
+        let _ = runtime.block_on(da.health_check());
+        assert_eq!(da.metrics().get_health_checks_total(), 1);
+
+        // Second health check
+        let _ = runtime.block_on(da.health_check());
+        assert_eq!(da.metrics().get_health_checks_total(), 2);
+
+        // Third health check
+        let _ = runtime.block_on(da.health_check());
+        assert_eq!(da.metrics().get_health_checks_total(), 3);
+    }
+
+    #[test]
+    fn test_health_check_status_mapping() {
+        // Test status codes: 0=Unavailable, 1=Degraded, 2=Healthy
+        let metrics = QuorumMetrics::new();
+
+        // Test Unavailable (0)
+        metrics.set_last_health_status(0);
+        assert_eq!(metrics.get_last_health_status(), 0);
+
+        // Test Degraded (1)
+        metrics.set_last_health_status(1);
+        assert_eq!(metrics.get_last_health_status(), 1);
+
+        // Test Healthy (2)
+        metrics.set_last_health_status(2);
+        assert_eq!(metrics.get_last_health_status(), 2);
+    }
+
+    #[test]
+    fn test_health_check_threshold_calculation() {
+        // Verify threshold calculation used in health check
+        let config = QuorumDAConfig {
+            quorum_fraction: 0.67,
+            min_validators: 1,
+            ..Default::default()
+        };
+
+        // 3 validators: ceil(3 * 0.67) = ceil(2.01) = 3
+        let threshold_3 = config.calculate_quorum_threshold(3);
+        assert_eq!(threshold_3, 3);
+
+        // 5 validators: ceil(5 * 0.67) = ceil(3.35) = 4
+        let threshold_5 = config.calculate_quorum_threshold(5);
+        assert_eq!(threshold_5, 4);
+
+        // 10 validators: ceil(10 * 0.67) = ceil(6.7) = 7
+        let threshold_10 = config.calculate_quorum_threshold(10);
+        assert_eq!(threshold_10, 7);
     }
 }
