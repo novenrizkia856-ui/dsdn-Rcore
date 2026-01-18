@@ -106,6 +106,8 @@ Desain lengkap dan rasional teknis tersedia di whitepaper DSDN
 
 dsdn menggabungkan rust dan rusts+, rust dan rusts+ di niatkan menjadi bahasa utama di dsdn, rusts+ adalah bahasa dengan backend rust dengan aturan tambahan dan sintaks berbeda, digunakan di berbagai tempat, agar dsdn makin aman secara logic dan bug
 
+dsdn harus menggunakan cargo rustsp
+
 [Bahasa Rusts+](https://github.com/novenrizkia856-ui/rustsp-Rlang)
 
 ---

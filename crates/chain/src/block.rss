@@ -1,4 +1,5 @@
 //! Block structure
+
 use serde::{Serialize, Deserialize}
 use crate::crypto::sha3_512_bytes
 use crate::types::{Hash, Address}
