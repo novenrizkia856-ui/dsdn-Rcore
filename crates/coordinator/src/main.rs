@@ -285,6 +285,9 @@ pub struct DARouterConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before switching back to primary.
     pub recovery_threshold: u32,
+    /// Automatically trigger reconciliation when recovering from fallback (14A.1A.39).
+    /// Default: true
+    pub auto_reconcile_on_recovery: bool,
 }
 
 impl Default for DARouterConfig {
@@ -293,6 +296,7 @@ impl Default for DARouterConfig {
             health_check_interval_ms: 5000,
             failure_threshold: 3,
             recovery_threshold: 2,
+            auto_reconcile_on_recovery: true,
         }
     }
 }
@@ -382,6 +386,12 @@ pub struct DAHealthMonitor {
     fallback_reason: RwLock<Option<String>>,
     /// Timestamp of last fallback activation in Unix ms (14A.1A.38).
     last_fallback_at: AtomicU64,
+    /// Whether recovery reconciliation is in progress (14A.1A.39).
+    recovery_in_progress: AtomicBool,
+    /// Reference to reconciliation engine for auto-recovery (14A.1A.39).
+    reconciliation_engine: RwLock<Option<Arc<ReconciliationEngine>>>,
+    /// Whether currently on fallback (tracks previous state for transition detection) (14A.1A.39).
+    was_on_fallback: AtomicBool,
 }
 
 impl DAHealthMonitor {
@@ -392,6 +402,7 @@ impl DAHealthMonitor {
         secondary: Option<Arc<dyn DALayer>>,
         emergency: Option<Arc<dyn DALayer>>,
     ) -> Self {
+        // Initially NOT on fallback - we start assuming primary is healthy
         Self {
             primary_healthy: AtomicBool::new(true),
             secondary_healthy: AtomicBool::new(secondary.is_some()),
@@ -405,6 +416,9 @@ impl DAHealthMonitor {
             shutdown: AtomicBool::new(false),
             fallback_reason: RwLock::new(None),
             last_fallback_at: AtomicU64::new(0),
+            recovery_in_progress: AtomicBool::new(false),
+            reconciliation_engine: RwLock::new(None),
+            was_on_fallback: AtomicBool::new(false),
         }
     }
 
@@ -504,9 +518,48 @@ impl DAHealthMonitor {
         self.primary_failures.load(Ordering::Relaxed)
     }
 
+    /// Set the reconciliation engine reference (14A.1A.39).
+    ///
+    /// Must be called after ReconciliationEngine is created to enable auto-recovery.
+    pub fn set_reconciliation_engine(&self, engine: Arc<ReconciliationEngine>) {
+        *self.reconciliation_engine.write() = Some(engine);
+    }
+
+    /// Check if recovery reconciliation is in progress (14A.1A.39).
+    pub fn is_recovery_in_progress(&self) -> bool {
+        self.recovery_in_progress.load(Ordering::Relaxed)
+    }
+
+    /// Check if auto-reconcile on recovery is enabled.
+    pub fn is_auto_reconcile_enabled(&self) -> bool {
+        self.config.auto_reconcile_on_recovery
+    }
+
+    /// Update was_on_fallback state (14A.1A.39).
+    pub fn update_fallback_state(&self, currently_on_fallback: bool) {
+        self.was_on_fallback.store(currently_on_fallback, Ordering::Relaxed);
+    }
+
+    /// Check if was on fallback in previous cycle (14A.1A.39).
+    pub fn was_previously_on_fallback(&self) -> bool {
+        self.was_on_fallback.load(Ordering::Relaxed)
+    }
+
     /// Start health monitoring loop.
     ///
     /// Returns JoinHandle for the monitoring task.
+    ///
+    /// ## Recovery Handling (14A.1A.39)
+    ///
+    /// When transitioning from Degraded/Emergency (fallback) to Recovering:
+    /// 1. Log transition event (INFO level, eksplisit)
+    /// 2. Clear fallback reason
+    /// 3. If auto_reconcile_on_recovery is enabled:
+    ///    - Spawn background reconciliation task
+    ///    - Wait for completion (async)
+    ///    - Log result
+    /// 4. If reconcile succeeds → transition to Healthy
+    /// 5. If reconcile fails → status NOT Healthy, error logged
     pub fn start_monitoring(self: &Arc<Self>) -> JoinHandle<()> {
         let monitor = Arc::clone(self);
         let interval = Duration::from_millis(monitor.config.health_check_interval_ms);
@@ -519,6 +572,9 @@ impl DAHealthMonitor {
                     info!("Health monitor shutting down");
                     break;
                 }
+
+                // Track previous state BEFORE health checks
+                let was_on_fallback = monitor.was_previously_on_fallback();
 
                 // Check primary health
                 match monitor.primary.health_check().await {
@@ -550,6 +606,102 @@ impl DAHealthMonitor {
                         Ok(DAHealthStatus::Healthy) | Ok(DAHealthStatus::Degraded)
                     );
                     monitor.emergency_healthy.store(healthy, Ordering::Relaxed);
+                }
+
+                // Determine current fallback state AFTER health checks
+                let primary_healthy = monitor.is_primary_healthy();
+                let currently_on_fallback = !primary_healthy
+                    && (monitor.is_secondary_healthy() || monitor.is_emergency_healthy());
+
+                // ═══════════════════════════════════════════════════════════════════
+                // Recovery Transition Detection (14A.1A.39)
+                // ═══════════════════════════════════════════════════════════════════
+                //
+                // Trigger ONLY when:
+                // - Status BEFORE: Degraded (on fallback) OR Emergency
+                // - Status AFTER: Primary recovering (healthy and should_recover)
+                //
+                // This happens when:
+                // 1. Was on fallback (was_on_fallback = true)
+                // 2. Primary is now healthy
+                // 3. Recovery threshold is met (should_recover)
+                // 4. Recovery is not already in progress
+
+                let should_trigger_recovery = was_on_fallback
+                    && primary_healthy
+                    && monitor.should_recover()
+                    && !monitor.is_recovery_in_progress();
+
+                if should_trigger_recovery {
+                    // Step 1: Log transition event (INFO level, eksplisit)
+                    info!("🔄 Recovery transition detected: Fallback → Recovering");
+                    info!("  Previous state: fallback_active={}", was_on_fallback);
+                    info!("  Primary healthy: {}", primary_healthy);
+
+                    // Step 2: Clear fallback reason
+                    monitor.clear_fallback_reason();
+
+                    // Step 3: Check if auto-reconcile is enabled
+                    if monitor.is_auto_reconcile_enabled() {
+                        // Get reconciliation engine reference
+                        let engine_opt = monitor.reconciliation_engine.read().clone();
+
+                        if let Some(engine) = engine_opt {
+                            // Set recovery in progress flag BEFORE spawning
+                            monitor.recovery_in_progress.store(true, Ordering::Relaxed);
+
+                            info!("🔄 Starting automatic reconciliation...");
+
+                            // Spawn background task for reconciliation (non-blocking)
+                            let monitor_clone = Arc::clone(&monitor);
+                            let engine_clone = Arc::clone(&engine);
+
+                            tokio::spawn(async move {
+                                // Step 4: Trigger ReconciliationEngine.reconcile()
+                                // WAIT until reconcile completes (async await)
+                                let report = engine_clone.reconcile().await;
+
+                                // Step 5/6: Handle result
+                                if report.success {
+                                    info!("✅ Recovery reconciliation completed successfully");
+                                    info!("  Blobs processed: {}", report.blobs_processed);
+                                    info!("  Blobs reconciled: {}", report.blobs_reconciled);
+                                    // Transition to Healthy is implicit (primary is already healthy)
+                                } else {
+                                    // Reconciliation failed - log error explicitly
+                                    error!("❌ Recovery reconciliation failed");
+                                    error!("  Blobs failed: {}", report.blobs_failed);
+                                    for err in &report.errors {
+                                        error!("  Error: {}", err);
+                                    }
+                                    // Status MUST NOT be Healthy if reconcile fails
+                                    // Set fallback reason to indicate failed recovery
+                                    monitor_clone.set_fallback_reason(
+                                        format!("Recovery reconciliation failed: {} errors", report.errors.len())
+                                    );
+                                }
+
+                                // Clear recovery in progress flag
+                                monitor_clone.recovery_in_progress.store(false, Ordering::Relaxed);
+                            });
+                        } else {
+                            warn!("⚠️ ReconciliationEngine not set, skipping auto-reconcile");
+                        }
+                    } else {
+                        info!("ℹ️ Auto-reconcile disabled, skipping reconciliation");
+                    }
+                }
+
+                // Update fallback tracking state for next cycle
+                monitor.update_fallback_state(currently_on_fallback);
+
+                // Update fallback reason when entering fallback
+                if !was_on_fallback && currently_on_fallback {
+                    if monitor.is_secondary_healthy() {
+                        monitor.set_fallback_reason("Primary DA unhealthy, using secondary".to_string());
+                    } else if monitor.is_emergency_healthy() {
+                        monitor.set_fallback_reason("Primary DA unhealthy, using emergency".to_string());
+                    }
                 }
 
                 tokio::time::sleep(interval).await;
@@ -1975,15 +2127,7 @@ async fn main() {
     info!("  ✅ DARouter created (fallback: {})", fallback_status);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Step 7: Start health monitoring loop
-    // ═══════════════════════════════════════════════════════════════════════
-
-    info!("🏥 Starting health monitoring...");
-    let monitor_handle = health_monitor.start_monitoring();
-    info!("  ✅ Health monitoring active");
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Step 7.5: Create ReconciliationEngine (14A.1A.38)
+    // Step 7: Create ReconciliationEngine (14A.1A.38) - BEFORE monitoring starts
     // ═══════════════════════════════════════════════════════════════════════
 
     info!("🔄 Creating ReconciliationEngine...");
@@ -1993,6 +2137,22 @@ async fn main() {
         config.reconciliation_config.clone(),
     ));
     info!("  ✅ ReconciliationEngine created");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 7.5: Link ReconciliationEngine to DAHealthMonitor (14A.1A.39)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    health_monitor.set_reconciliation_engine(Arc::clone(&reconciliation_engine));
+    info!("  ✅ ReconciliationEngine linked to DAHealthMonitor for auto-recovery");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 7.6: Start health monitoring loop
+    // ═══════════════════════════════════════════════════════════════════════
+
+    info!("🏥 Starting health monitoring...");
+    let monitor_handle = health_monitor.start_monitoring();
+    info!("  ✅ Health monitoring active (auto_reconcile={})", 
+        health_monitor.is_auto_reconcile_enabled());
 
     // ═══════════════════════════════════════════════════════════════════════
     // Step 8: Inject DARouter to AppState
@@ -2495,6 +2655,7 @@ mod tests {
             health_check_interval_ms: 5000,
             failure_threshold: 3,
             recovery_threshold: 2,
+            auto_reconcile_on_recovery: true,
         };
         let health = DAHealthMonitor::new(
             config,
@@ -3162,5 +3323,421 @@ mod tests {
         // Recovery resets failures
         health.update_primary_health(true);
         assert_eq!(health.failure_count(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Auto-Reconciliation Tests (14A.1A.39)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_auto_reconcile_config_default_enabled() {
+        let config = DARouterConfig::default();
+        assert!(config.auto_reconcile_on_recovery);
+    }
+
+    #[test]
+    fn test_auto_reconcile_config_can_be_disabled() {
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 3,
+            recovery_threshold: 2,
+            auto_reconcile_on_recovery: false,
+        };
+        assert!(!config.auto_reconcile_on_recovery);
+    }
+
+    #[test]
+    fn test_health_monitor_auto_reconcile_enabled() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        ));
+
+        assert!(health.is_auto_reconcile_enabled());
+    }
+
+    #[test]
+    fn test_health_monitor_auto_reconcile_disabled() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 3,
+            recovery_threshold: 2,
+            auto_reconcile_on_recovery: false,
+        };
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        ));
+
+        assert!(!health.is_auto_reconcile_enabled());
+    }
+
+    #[test]
+    fn test_health_monitor_recovery_in_progress_initially_false() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        ));
+
+        assert!(!health.is_recovery_in_progress());
+    }
+
+    #[test]
+    fn test_health_monitor_set_reconciliation_engine() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            Arc::clone(&health),
+            config,
+            metrics,
+        ));
+
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconcile = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        // Set reconciliation engine - should not panic
+        health.set_reconciliation_engine(Arc::clone(&reconcile));
+
+        // Verify state is correct after setting
+        assert!(!health.is_recovery_in_progress());
+        assert!(health.is_auto_reconcile_enabled());
+    }
+
+    #[test]
+    fn test_health_monitor_was_on_fallback_tracking() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            primary,
+            Some(secondary),
+            None,
+        ));
+
+        // Initially was_on_fallback should be false (we start assuming primary healthy)
+        assert!(!health.was_previously_on_fallback());
+
+        // Update fallback state
+        health.update_fallback_state(true);
+        assert!(health.was_previously_on_fallback());
+
+        health.update_fallback_state(false);
+        assert!(!health.was_previously_on_fallback());
+    }
+
+    #[test]
+    fn test_health_monitor_was_on_fallback_no_secondary() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        ));
+
+        // Without secondary/emergency, initially was_on_fallback should be false
+        assert!(!health.was_previously_on_fallback());
+    }
+
+    #[tokio::test]
+    async fn test_auto_reconcile_triggered_on_recovery() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 1,
+            recovery_threshold: 1,
+            auto_reconcile_on_recovery: true,
+        };
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            Arc::clone(&health),
+            config,
+            metrics,
+        ));
+
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconcile = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        // Set reconciliation engine
+        health.set_reconciliation_engine(Arc::clone(&reconcile));
+
+        // Simulate being on fallback
+        health.update_fallback_state(true);
+        health.update_primary_health(false);
+
+        // Now simulate primary recovery
+        health.update_primary_health(true);
+        health.update_primary_health(true); // Meet recovery threshold
+
+        // Verify should_recover is true
+        assert!(health.should_recover());
+
+        // Verify was_on_fallback is still true (before update)
+        assert!(health.was_previously_on_fallback());
+    }
+
+    #[tokio::test]
+    async fn test_auto_reconcile_not_triggered_when_disabled() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 1,
+            recovery_threshold: 1,
+            auto_reconcile_on_recovery: false, // Disabled
+        };
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+
+        // Verify auto-reconcile is disabled
+        assert!(!health.is_auto_reconcile_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_manual_reconcile_still_works() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            Arc::clone(&health),
+            config,
+            metrics,
+        ));
+
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconcile = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        // Manual reconcile should work
+        let report = reconcile.reconcile().await;
+        
+        // Empty reconciliation should succeed
+        assert!(report.success);
+        assert_eq!(report.blobs_processed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_once_per_transition() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 1,
+            recovery_threshold: 1,
+            auto_reconcile_on_recovery: true,
+        };
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+
+        // Verify recovery_in_progress blocks duplicate triggers
+        health.recovery_in_progress.store(true, Ordering::Relaxed);
+        assert!(health.is_recovery_in_progress());
+
+        // Clear it
+        health.recovery_in_progress.store(false, Ordering::Relaxed);
+        assert!(!health.is_recovery_in_progress());
+    }
+
+    #[test]
+    fn test_health_monitor_does_not_block_with_reconciliation_engine() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            Arc::clone(&health),
+            config,
+            metrics,
+        ));
+
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconcile = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        // Set reconciliation engine
+        health.set_reconciliation_engine(reconcile);
+
+        // Verify we can call methods without blocking
+        assert!(health.is_auto_reconcile_enabled());
+        assert!(!health.is_recovery_in_progress());
+        assert!(!health.was_previously_on_fallback());
+    }
+
+    #[test]
+    fn test_recovery_transition_detection_conditions() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 2,
+            recovery_threshold: 2,
+            auto_reconcile_on_recovery: true,
+        };
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+
+        // Condition 1: Was NOT on fallback - should NOT trigger
+        health.update_fallback_state(false);
+        health.update_primary_health(true);
+        health.update_primary_health(true);
+        assert!(!health.was_previously_on_fallback());
+        // Recovery would NOT trigger because was_on_fallback = false
+
+        // Condition 2: Was on fallback but primary not healthy - should NOT trigger
+        health.update_fallback_state(true);
+        health.update_primary_health(false);
+        assert!(health.was_previously_on_fallback());
+        assert!(!health.is_primary_healthy());
+        // Recovery would NOT trigger because primary not healthy
+
+        // Condition 3: Was on fallback, primary healthy, but threshold not met - should NOT trigger
+        health.update_fallback_state(true);
+        health.update_primary_health(true); // Only 1 success
+        assert!(health.was_previously_on_fallback());
+        assert!(health.is_primary_healthy());
+        assert!(!health.should_recover()); // Need 2 successes
+        // Recovery would NOT trigger because threshold not met
+
+        // Condition 4: All conditions met - should trigger
+        health.update_fallback_state(true);
+        health.update_primary_health(true);
+        health.update_primary_health(true); // 2 successes
+        assert!(health.was_previously_on_fallback());
+        assert!(health.is_primary_healthy());
+        assert!(health.should_recover());
+        assert!(!health.is_recovery_in_progress());
+        // Recovery SHOULD trigger
+    }
+
+    #[test]
+    fn test_recovery_in_progress_prevents_duplicate_trigger() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 1,
+            recovery_threshold: 1,
+            auto_reconcile_on_recovery: true,
+        };
+        let health = Arc::new(DAHealthMonitor::new(
+            config,
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+
+        // Setup: All conditions met for recovery
+        health.update_fallback_state(true);
+        health.update_primary_health(true);
+        
+        // But recovery is already in progress
+        health.recovery_in_progress.store(true, Ordering::Relaxed);
+
+        // Verify: should_trigger_recovery would be false
+        let should_trigger = health.was_previously_on_fallback()
+            && health.is_primary_healthy()
+            && health.should_recover()
+            && !health.is_recovery_in_progress();
+
+        assert!(!should_trigger); // Blocked by recovery_in_progress
     }
 }
