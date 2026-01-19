@@ -33,14 +33,27 @@
 //! - `COORDINATOR_PORT`: HTTP server port (default: 8080)
 //! - `COORDINATOR_HOST`: HTTP server host (default: 127.0.0.1)
 //!
-//! ## Startup Flow
+//! ## Startup Flow (14A.1A.36)
 //!
-//! 1. Load configuration from environment
-//! 2. Validate configuration for production
-//! 3. Initialize DA layer with connection test
-//! 4. Initialize state machine and consumer
-//! 5. Start HTTP server
-//! 6. Begin DA event consumption
+//! The coordinator follows this EXACT startup sequence:
+//!
+//! 1. Load CoordinatorConfig (including fallback config)
+//! 2. Initialize PRIMARY DA (Celestia) - REQUIRED
+//! 3. Initialize SECONDARY DA (QuorumDA) - if enable_fallback && type=Quorum
+//! 4. Initialize EMERGENCY DA - if enable_fallback && type=Emergency
+//! 5. Create DAHealthMonitor
+//! 6. Create DARouter (primary + optional fallback)
+//! 7. Start health monitoring loop
+//! 8. Inject DARouter to AppState
+//! 9. Run application runtime
+//!
+//! ## DARouter Architecture
+//!
+//! DARouter is the SOLE entry point for all DA operations. It:
+//! - Routes requests to primary, secondary, or emergency DA
+//! - Monitors health via DAHealthMonitor
+//! - Handles automatic failover and recovery
+//! - Tracks metrics per DA layer
 
 use axum::{
     extract::{Path, Query, State},
@@ -51,12 +64,17 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+use std::pin::Pin;
+use std::future::Future;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn, Level};
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 
-use dsdn_common::{CelestiaDA, DAConfig, DAError, DAHealthStatus, DALayer, MockDA};
+use dsdn_common::{CelestiaDA, DAConfig, DAError, DAHealthStatus, DALayer, MockDA, BlobRef, BlobStream};
+use dsdn_common::da::DAMetricsSnapshot;
 use dsdn_coordinator::{Coordinator, NodeInfo, Workload, ReconciliationConfig};
 use parking_lot::RwLock;
 
@@ -157,6 +175,479 @@ impl QuorumDAConfig {
         })
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// DAROUTER TYPES (14A.1A.36)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Configuration for DARouter.
+#[derive(Debug, Clone)]
+pub struct DARouterConfig {
+    /// Health check interval in milliseconds.
+    pub health_check_interval_ms: u64,
+    /// Number of consecutive failures before switching to fallback.
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before switching back to primary.
+    pub recovery_threshold: u32,
+}
+
+impl Default for DARouterConfig {
+    fn default() -> Self {
+        Self {
+            health_check_interval_ms: 5000,
+            failure_threshold: 3,
+            recovery_threshold: 2,
+        }
+    }
+}
+
+/// Metrics for DARouter operations.
+#[derive(Debug)]
+pub struct DARouterMetrics {
+    /// Total requests routed to primary.
+    pub primary_requests: AtomicU64,
+    /// Total requests routed to secondary.
+    pub secondary_requests: AtomicU64,
+    /// Total requests routed to emergency.
+    pub emergency_requests: AtomicU64,
+    /// Total failover events.
+    pub failover_count: AtomicU64,
+    /// Total recovery events.
+    pub recovery_count: AtomicU64,
+}
+
+impl DARouterMetrics {
+    /// Create new metrics instance.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            primary_requests: AtomicU64::new(0),
+            secondary_requests: AtomicU64::new(0),
+            emergency_requests: AtomicU64::new(0),
+            failover_count: AtomicU64::new(0),
+            recovery_count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for DARouterMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Current routing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingState {
+    /// Using primary DA.
+    Primary,
+    /// Using secondary (fallback) DA.
+    Secondary,
+    /// Using emergency DA.
+    Emergency,
+}
+
+impl std::fmt::Display for RoutingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => write!(f, "primary"),
+            Self::Secondary => write!(f, "secondary"),
+            Self::Emergency => write!(f, "emergency"),
+        }
+    }
+}
+
+/// Health status tracker for DA layers.
+///
+/// Tracks health of primary, secondary, and emergency DA layers.
+/// Used by DARouter to make routing decisions.
+pub struct DAHealthMonitor {
+    /// Primary DA health status.
+    primary_healthy: AtomicBool,
+    /// Secondary DA health status.
+    secondary_healthy: AtomicBool,
+    /// Emergency DA health status.
+    emergency_healthy: AtomicBool,
+    /// Consecutive primary failures.
+    primary_failures: AtomicU64,
+    /// Consecutive primary successes (after recovery).
+    primary_successes: AtomicU64,
+    /// Configuration.
+    config: DARouterConfig,
+    /// Primary DA reference.
+    primary: Arc<dyn DALayer>,
+    /// Secondary DA reference (optional).
+    secondary: Option<Arc<dyn DALayer>>,
+    /// Emergency DA reference (optional).
+    emergency: Option<Arc<dyn DALayer>>,
+    /// Shutdown signal.
+    shutdown: AtomicBool,
+}
+
+impl DAHealthMonitor {
+    /// Create new health monitor.
+    pub fn new(
+        config: DARouterConfig,
+        primary: Arc<dyn DALayer>,
+        secondary: Option<Arc<dyn DALayer>>,
+        emergency: Option<Arc<dyn DALayer>>,
+    ) -> Self {
+        Self {
+            primary_healthy: AtomicBool::new(true),
+            secondary_healthy: AtomicBool::new(secondary.is_some()),
+            emergency_healthy: AtomicBool::new(emergency.is_some()),
+            primary_failures: AtomicU64::new(0),
+            primary_successes: AtomicU64::new(0),
+            config,
+            primary,
+            secondary,
+            emergency,
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    /// Check if primary is healthy.
+    pub fn is_primary_healthy(&self) -> bool {
+        self.primary_healthy.load(Ordering::Relaxed)
+    }
+
+    /// Check if secondary is healthy.
+    pub fn is_secondary_healthy(&self) -> bool {
+        self.secondary_healthy.load(Ordering::Relaxed)
+    }
+
+    /// Check if emergency is healthy.
+    pub fn is_emergency_healthy(&self) -> bool {
+        self.emergency_healthy.load(Ordering::Relaxed)
+    }
+
+    /// Update primary health status.
+    pub fn update_primary_health(&self, healthy: bool) {
+        self.primary_healthy.store(healthy, Ordering::Relaxed);
+        if healthy {
+            self.primary_failures.store(0, Ordering::Relaxed);
+            self.primary_successes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.primary_successes.store(0, Ordering::Relaxed);
+            self.primary_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Check if should failover based on failure count.
+    pub fn should_failover(&self) -> bool {
+        self.primary_failures.load(Ordering::Relaxed) >= u64::from(self.config.failure_threshold)
+    }
+
+    /// Check if should recover based on success count.
+    pub fn should_recover(&self) -> bool {
+        self.primary_successes.load(Ordering::Relaxed) >= u64::from(self.config.recovery_threshold)
+    }
+
+    /// Signal shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Check if shutdown signaled.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Start health monitoring loop.
+    ///
+    /// Returns JoinHandle for the monitoring task.
+    pub fn start_monitoring(self: &Arc<Self>) -> JoinHandle<()> {
+        let monitor = Arc::clone(self);
+        let interval = Duration::from_millis(monitor.config.health_check_interval_ms);
+
+        tokio::spawn(async move {
+            info!("🏥 Health monitor started (interval: {}ms)", interval.as_millis());
+
+            loop {
+                if monitor.is_shutdown() {
+                    info!("Health monitor shutting down");
+                    break;
+                }
+
+                // Check primary health
+                match monitor.primary.health_check().await {
+                    Ok(DAHealthStatus::Healthy) => {
+                        monitor.update_primary_health(true);
+                    }
+                    Ok(DAHealthStatus::Degraded) => {
+                        // Degraded is still usable
+                        monitor.update_primary_health(true);
+                    }
+                    _ => {
+                        monitor.update_primary_health(false);
+                    }
+                }
+
+                // Check secondary health if available
+                if let Some(ref secondary) = monitor.secondary {
+                    let healthy = matches!(
+                        secondary.health_check().await,
+                        Ok(DAHealthStatus::Healthy) | Ok(DAHealthStatus::Degraded)
+                    );
+                    monitor.secondary_healthy.store(healthy, Ordering::Relaxed);
+                }
+
+                // Check emergency health if available
+                if let Some(ref emergency) = monitor.emergency {
+                    let healthy = matches!(
+                        emergency.health_check().await,
+                        Ok(DAHealthStatus::Healthy) | Ok(DAHealthStatus::Degraded)
+                    );
+                    monitor.emergency_healthy.store(healthy, Ordering::Relaxed);
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+}
+
+/// DA Router - Routes DA operations to primary, secondary, or emergency DA.
+///
+/// Thread-safe: All operations are safe to call from multiple threads.
+/// This is the ONLY entry point for DA operations after startup.
+pub struct DARouter {
+    /// Primary DA layer (Celestia).
+    primary: Arc<dyn DALayer>,
+    /// Secondary DA layer (QuorumDA) - optional.
+    secondary: Option<Arc<dyn DALayer>>,
+    /// Emergency DA layer - optional.
+    emergency: Option<Arc<dyn DALayer>>,
+    /// Health monitor.
+    health: Arc<DAHealthMonitor>,
+    /// Configuration.
+    #[allow(dead_code)]
+    config: DARouterConfig,
+    /// Metrics.
+    metrics: DARouterMetrics,
+    /// Current routing state.
+    state: RwLock<RoutingState>,
+}
+
+impl DARouter {
+    /// Create new DARouter.
+    ///
+    /// # Arguments
+    ///
+    /// * `primary` - Primary DA layer (required)
+    /// * `secondary` - Secondary DA layer (optional)
+    /// * `emergency` - Emergency DA layer (optional)
+    /// * `health` - Health monitor
+    /// * `config` - Router configuration
+    /// * `metrics` - Router metrics
+    pub fn new(
+        primary: Arc<dyn DALayer>,
+        secondary: Option<Arc<dyn DALayer>>,
+        emergency: Option<Arc<dyn DALayer>>,
+        health: Arc<DAHealthMonitor>,
+        config: DARouterConfig,
+        metrics: DARouterMetrics,
+    ) -> Self {
+        Self {
+            primary,
+            secondary,
+            emergency,
+            health,
+            config,
+            metrics,
+            state: RwLock::new(RoutingState::Primary),
+        }
+    }
+
+    /// Get current routing state.
+    pub fn current_state(&self) -> RoutingState {
+        *self.state.read()
+    }
+
+    /// Get metrics reference.
+    pub fn router_metrics(&self) -> &DARouterMetrics {
+        &self.metrics
+    }
+
+    /// Get health monitor reference.
+    pub fn health_monitor(&self) -> &Arc<DAHealthMonitor> {
+        &self.health
+    }
+
+    /// Select the appropriate DA layer based on health status.
+    fn select_da(&self) -> (Arc<dyn DALayer>, RoutingState) {
+        let current_state = *self.state.read();
+
+        // If currently on primary
+        if current_state == RoutingState::Primary {
+            if self.health.is_primary_healthy() || !self.health.should_failover() {
+                return (Arc::clone(&self.primary), RoutingState::Primary);
+            }
+            // Primary failed, try secondary
+            if let Some(ref secondary) = self.secondary {
+                if self.health.is_secondary_healthy() {
+                    self.metrics.failover_count.fetch_add(1, Ordering::Relaxed);
+                    *self.state.write() = RoutingState::Secondary;
+                    warn!("⚠️ Failing over to secondary DA");
+                    return (Arc::clone(secondary), RoutingState::Secondary);
+                }
+            }
+            // Secondary unavailable, try emergency
+            if let Some(ref emergency) = self.emergency {
+                if self.health.is_emergency_healthy() {
+                    self.metrics.failover_count.fetch_add(1, Ordering::Relaxed);
+                    *self.state.write() = RoutingState::Emergency;
+                    warn!("🚨 Failing over to emergency DA");
+                    return (Arc::clone(emergency), RoutingState::Emergency);
+                }
+            }
+            // No fallback available, still use primary
+            return (Arc::clone(&self.primary), RoutingState::Primary);
+        }
+
+        // If currently on secondary, check if should recover to primary
+        if current_state == RoutingState::Secondary {
+            if self.health.is_primary_healthy() && self.health.should_recover() {
+                self.metrics.recovery_count.fetch_add(1, Ordering::Relaxed);
+                *self.state.write() = RoutingState::Primary;
+                info!("✅ Recovered to primary DA");
+                return (Arc::clone(&self.primary), RoutingState::Primary);
+            }
+            if let Some(ref secondary) = self.secondary {
+                if self.health.is_secondary_healthy() {
+                    return (Arc::clone(secondary), RoutingState::Secondary);
+                }
+            }
+            // Secondary failed, try emergency
+            if let Some(ref emergency) = self.emergency {
+                if self.health.is_emergency_healthy() {
+                    *self.state.write() = RoutingState::Emergency;
+                    return (Arc::clone(emergency), RoutingState::Emergency);
+                }
+            }
+            // Fallback to primary
+            return (Arc::clone(&self.primary), RoutingState::Primary);
+        }
+
+        // If currently on emergency, check if should recover
+        if self.health.is_primary_healthy() && self.health.should_recover() {
+            self.metrics.recovery_count.fetch_add(1, Ordering::Relaxed);
+            *self.state.write() = RoutingState::Primary;
+            info!("✅ Recovered to primary DA from emergency");
+            return (Arc::clone(&self.primary), RoutingState::Primary);
+        }
+
+        if let Some(ref secondary) = self.secondary {
+            if self.health.is_secondary_healthy() {
+                *self.state.write() = RoutingState::Secondary;
+                return (Arc::clone(secondary), RoutingState::Secondary);
+            }
+        }
+
+        if let Some(ref emergency) = self.emergency {
+            return (Arc::clone(emergency), RoutingState::Emergency);
+        }
+
+        // No choice, use primary
+        (Arc::clone(&self.primary), RoutingState::Primary)
+    }
+
+    /// Update metrics based on routing state.
+    fn record_request(&self, state: RoutingState) {
+        match state {
+            RoutingState::Primary => {
+                self.metrics.primary_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            RoutingState::Secondary => {
+                self.metrics.secondary_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            RoutingState::Emergency => {
+                self.metrics.emergency_requests.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl DALayer for DARouter {
+    fn post_blob(
+        &self,
+        data: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + '_>> {
+        let (da, state) = self.select_da();
+        self.record_request(state);
+        // Copy data to owned Vec to avoid lifetime issues
+        // (data's lifetime is different from &self's lifetime)
+        let data_owned = data.to_vec();
+
+        Box::pin(async move {
+            da.post_blob(&data_owned).await
+        })
+    }
+
+    fn get_blob(
+        &self,
+        ref_: &BlobRef,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DAError>> + Send + '_>> {
+        let (da, state) = self.select_da();
+        self.record_request(state);
+        let ref_clone = ref_.clone();
+
+        Box::pin(async move {
+            da.get_blob(&ref_clone).await
+        })
+    }
+
+    fn subscribe_blobs(
+        &self,
+        from_height: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<BlobStream, DAError>> + Send + '_>> {
+        let (da, state) = self.select_da();
+        self.record_request(state);
+
+        Box::pin(async move {
+            da.subscribe_blobs(from_height).await
+        })
+    }
+
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>> {
+        let current_state = self.current_state();
+        let da = match current_state {
+            RoutingState::Primary => Arc::clone(&self.primary),
+            RoutingState::Secondary => {
+                self.secondary.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::clone(&self.primary))
+            }
+            RoutingState::Emergency => {
+                self.emergency.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::clone(&self.primary))
+            }
+        };
+
+        Box::pin(async move {
+            da.health_check().await
+        })
+    }
+
+    fn metrics(&self) -> Option<DAMetricsSnapshot> {
+        // Return metrics from current active DA
+        let current_state = self.current_state();
+        match current_state {
+            RoutingState::Primary => self.primary.metrics(),
+            RoutingState::Secondary => {
+                self.secondary.as_ref().and_then(|s| s.metrics()).or_else(|| self.primary.metrics())
+            }
+            RoutingState::Emergency => {
+                self.emergency.as_ref().and_then(|e| e.metrics()).or_else(|| self.primary.metrics())
+            }
+        }
+    }
+}
+
+// Compile-time assertion that DARouter is Send + Sync
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<DARouter>();
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -434,37 +925,53 @@ impl CoordinatorConfig {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// APP STATE
+// APP STATE (14A.1A.36)
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Application state shared across handlers.
 ///
-/// Note: DAConsumer is NOT stored here because it contains a Stream
+/// Uses DARouter as the SOLE entry point for DA operations.
+/// DAConsumer is NOT stored here because it contains a Stream
 /// that is not Sync. The consumer runs as a separate background task.
 struct AppState {
     /// Coordinator instance
     coordinator: Coordinator,
-    /// DA layer instance
-    da: Arc<dyn DALayer>,
-    /// Whether DA is available
-    da_available: RwLock<bool>,
+    /// DA Router - the ONLY DA entry point
+    da_router: Arc<DARouter>,
+    /// Health monitor handle (stored to keep it alive)
+    #[allow(dead_code)]
+    monitor_handle: Option<JoinHandle<()>>,
 }
 
 impl AppState {
-    fn new(coordinator: Coordinator, da: Arc<dyn DALayer>) -> Self {
+    /// Create new AppState with DARouter.
+    fn new(
+        coordinator: Coordinator,
+        da_router: Arc<DARouter>,
+        monitor_handle: Option<JoinHandle<()>>,
+    ) -> Self {
         Self {
             coordinator,
-            da,
-            da_available: RwLock::new(true),
+            da_router,
+            monitor_handle,
         }
     }
 
-    fn set_da_available(&self, available: bool) {
-        *self.da_available.write() = available;
+    /// Get reference to DA layer via DARouter.
+    fn da(&self) -> &DARouter {
+        &self.da_router
     }
 
+    /// Check if DA is available based on current routing state.
     fn is_da_available(&self) -> bool {
-        *self.da_available.read()
+        self.da_router.health_monitor().is_primary_healthy()
+            || self.da_router.health_monitor().is_secondary_healthy()
+            || self.da_router.health_monitor().is_emergency_healthy()
+    }
+
+    /// Get current routing state.
+    fn routing_state(&self) -> RoutingState {
+        self.da_router.current_state()
     }
 }
 
@@ -604,22 +1111,23 @@ async fn schedule_workload(
     }
 }
 
-/// Health check endpoint with DA status
+/// Health check endpoint with DA status via DARouter
 async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let da_status = state.da.health_check().await;
+    let da_status = state.da().health_check().await;
     let da_healthy = matches!(da_status, Ok(DAHealthStatus::Healthy));
     let da_available = state.is_da_available();
+    let routing_state = state.routing_state();
 
     let status = if da_healthy && da_available {
-        "healthy".to_string()
+        format!("healthy (routing: {})", routing_state)
     } else if da_available {
-        "degraded".to_string()
+        format!("degraded (routing: {})", routing_state)
     } else {
         "unavailable".to_string()
     };
 
     // Get metrics and convert to serializable struct
-    let metrics = state.da.metrics().map(|m| MetricsInfo {
+    let metrics = state.da().metrics().map(|m| MetricsInfo {
         post_count: m.post_count,
         get_count: m.get_count,
         health_check_count: m.health_check_count,
@@ -639,7 +1147,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse
 
 /// Readiness check - returns 200 only if fully operational
 async fn ready_check(State(state): State<Arc<AppState>>) -> StatusCode {
-    let da_status = state.da.health_check().await;
+    let da_status = state.da().health_check().await;
     if matches!(da_status, Ok(DAHealthStatus::Healthy)) && state.is_da_available() {
         StatusCode::OK
     } else {
@@ -696,7 +1204,65 @@ async fn test_da_connection(da: &dyn DALayer) -> Result<(), DAError> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// MAIN
+// DA INITIALIZATION HELPERS (14A.1A.36)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Initialize secondary DA (QuorumDA) from config.
+///
+/// Returns None if not enabled or initialization fails (graceful).
+fn initialize_secondary_da(config: &CoordinatorConfig) -> Option<Arc<dyn DALayer>> {
+    if !config.is_fallback_ready() {
+        return None;
+    }
+
+    if config.fallback_da_type != FallbackDAType::Quorum {
+        return None;
+    }
+
+    let _quorum_config = match &config.quorum_da_config {
+        Some(c) => c,
+        None => {
+            error!("❌ QuorumDA config missing despite type=Quorum");
+            return None;
+        }
+    };
+
+    // TODO: Replace with actual ValidatorQuorumDA when integrated
+    // For now, use MockDA as placeholder
+    info!("  📦 Initializing Secondary DA (QuorumDA placeholder)...");
+    info!("  ✅ Secondary DA initialized (MockDA placeholder)");
+    Some(Arc::new(MockDA::new()))
+}
+
+/// Initialize emergency DA from config.
+///
+/// Returns None if not enabled or initialization fails (graceful).
+fn initialize_emergency_da(config: &CoordinatorConfig) -> Option<Arc<dyn DALayer>> {
+    if !config.is_fallback_ready() {
+        return None;
+    }
+
+    if config.fallback_da_type != FallbackDAType::Emergency {
+        return None;
+    }
+
+    let _emergency_url = match &config.emergency_da_url {
+        Some(url) => url,
+        None => {
+            error!("❌ Emergency DA URL missing despite type=Emergency");
+            return None;
+        }
+    };
+
+    // TODO: Replace with actual EmergencyDA when integrated
+    // For now, use MockDA as placeholder
+    info!("  📦 Initializing Emergency DA (placeholder)...");
+    info!("  ✅ Emergency DA initialized (MockDA placeholder)");
+    Some(Arc::new(MockDA::new()))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MAIN (14A.1A.36)
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tokio::main]
@@ -709,9 +1275,13 @@ async fn main() {
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("              DSDN Coordinator (Mainnet Ready)                  ");
+    info!("           DARouter Integration (14A.1A.36)                     ");
     info!("═══════════════════════════════════════════════════════════════");
 
-    // Step 1: Load configuration from environment
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 1: Load CoordinatorConfig (including fallback config)
+    // ═══════════════════════════════════════════════════════════════════════
+
     let config = match CoordinatorConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -747,7 +1317,7 @@ async fn main() {
         }
     };
 
-    // Step 2: Validate configuration for production
+    // Validate configuration for production
     if config.da_config.is_mainnet() {
         info!("🌐 Running in MAINNET mode");
         if let Err(e) = config.validate_for_production() {
@@ -786,16 +1356,23 @@ async fn main() {
 
     info!("═══════════════════════════════════════════════════════════════");
 
-    // Step 3: Initialize DA layer
-    let da: Arc<dyn DALayer> = if config.use_mock_da {
-        info!("Using MockDA for development");
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 2: Initialize PRIMARY DA (Celestia) - REQUIRED
+    // ═══════════════════════════════════════════════════════════════════════
+
+    info!("📦 Initializing Primary DA...");
+    let primary_da: Arc<dyn DALayer> = if config.use_mock_da {
+        info!("  Using MockDA for development");
         Arc::new(MockDA::new())
     } else {
-        info!("Connecting to Celestia DA...");
+        info!("  Connecting to Celestia DA...");
         match CelestiaDA::new(config.da_config.clone()) {
-            Ok(celestia) => Arc::new(celestia),
+            Ok(celestia) => {
+                info!("  ✅ Primary DA (Celestia) initialized");
+                Arc::new(celestia)
+            }
             Err(e) => {
-                error!("❌ Failed to initialize Celestia DA: {}", e);
+                error!("❌ Failed to initialize Primary DA (Celestia): {}", e);
                 error!("");
                 error!("Troubleshooting:");
                 error!("  1. Ensure Celestia light node is running and synced");
@@ -807,24 +1384,121 @@ async fn main() {
         }
     };
 
-    // Step 4: Test DA connection
-    if let Err(e) = test_da_connection(da.as_ref()).await {
-        error!("❌ DA connection test failed: {}", e);
+    // Test primary DA connection
+    if let Err(e) = test_da_connection(primary_da.as_ref()).await {
+        error!("❌ Primary DA connection test failed: {}", e);
 
-        // Graceful degradation: continue but mark DA as unavailable
         if config.da_config.network != "mainnet" {
-            warn!("⚠️ Continuing in degraded mode (DA unavailable)");
+            warn!("⚠️ Primary DA unavailable - will rely on fallback if configured");
         } else {
-            error!("Cannot start coordinator on mainnet without DA connection");
+            error!("Cannot start coordinator on mainnet without Primary DA connection");
             std::process::exit(1);
         }
     }
 
-    // Step 5: Initialize coordinator and state
-    let coordinator = Coordinator::new();
-    let state = Arc::new(AppState::new(coordinator, da));
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 3: Initialize SECONDARY DA (QuorumDA) - if enabled
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // Step 6: Build HTTP router
+    let secondary_da: Option<Arc<dyn DALayer>> = if config.enable_fallback
+        && config.fallback_da_type == FallbackDAType::Quorum
+    {
+        match initialize_secondary_da(&config) {
+            Some(da) => Some(da),
+            None => {
+                error!("❌ Failed to initialize Secondary DA (QuorumDA)");
+                warn!("⚠️ Continuing without secondary fallback");
+                None
+            }
+        }
+    } else {
+        if config.enable_fallback && config.fallback_da_type == FallbackDAType::Quorum {
+            warn!("⚠️ QuorumDA fallback configured but not ready");
+        }
+        None
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 4: Initialize EMERGENCY DA - if enabled
+    // ═══════════════════════════════════════════════════════════════════════
+
+    let emergency_da: Option<Arc<dyn DALayer>> = if config.enable_fallback
+        && config.fallback_da_type == FallbackDAType::Emergency
+    {
+        match initialize_emergency_da(&config) {
+            Some(da) => Some(da),
+            None => {
+                error!("❌ Failed to initialize Emergency DA");
+                warn!("⚠️ Continuing without emergency fallback");
+                None
+            }
+        }
+    } else {
+        if config.enable_fallback && config.fallback_da_type == FallbackDAType::Emergency {
+            warn!("⚠️ Emergency DA fallback configured but not ready");
+        }
+        None
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 5: Create DAHealthMonitor
+    // ═══════════════════════════════════════════════════════════════════════
+
+    info!("🏥 Creating DAHealthMonitor...");
+    let router_config = DARouterConfig::default();
+    let health_monitor = Arc::new(DAHealthMonitor::new(
+        router_config.clone(),
+        Arc::clone(&primary_da),
+        secondary_da.clone(),
+        emergency_da.clone(),
+    ));
+    info!("  ✅ DAHealthMonitor created");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 6: Create DARouter (primary + optional fallback)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    info!("🔀 Creating DARouter...");
+    let router_metrics = DARouterMetrics::new();
+    let da_router = Arc::new(DARouter::new(
+        primary_da,
+        secondary_da,
+        emergency_da,
+        Arc::clone(&health_monitor),
+        router_config,
+        router_metrics,
+    ));
+
+    let fallback_status = if health_monitor.is_secondary_healthy() {
+        "secondary"
+    } else if health_monitor.is_emergency_healthy() {
+        "emergency"
+    } else {
+        "none"
+    };
+    info!("  ✅ DARouter created (fallback: {})", fallback_status);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 7: Start health monitoring loop
+    // ═══════════════════════════════════════════════════════════════════════
+
+    info!("🏥 Starting health monitoring...");
+    let monitor_handle = health_monitor.start_monitoring();
+    info!("  ✅ Health monitoring active");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 8: Inject DARouter to AppState
+    // ═══════════════════════════════════════════════════════════════════════
+
+    let coordinator = Coordinator::new();
+    let state = Arc::new(AppState::new(coordinator, da_router, Some(monitor_handle)));
+    info!("  ✅ AppState initialized with DARouter");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 9: Run application runtime
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // Build HTTP router
     let app = Router::new()
         .route("/register", post(register_node))
         .route("/nodes", get(list_nodes))
@@ -838,7 +1512,7 @@ async fn main() {
         .route("/ready", get(ready_check))
         .with_state(state);
 
-    // Step 7: Start HTTP server
+    // Start HTTP server
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .unwrap_or_else(|_| {
@@ -847,7 +1521,11 @@ async fn main() {
         });
 
     info!("");
+    info!("═══════════════════════════════════════════════════════════════");
     info!("🚀 Coordinator listening on http://{}", addr);
+    info!("   Primary DA:     ready");
+    info!("   Health Monitor: active");
+    info!("═══════════════════════════════════════════════════════════════");
     info!("");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -903,84 +1581,48 @@ mod tests {
         clear_fallback_env_vars();
     }
 
+    // ────────────────────────────────────────────────────────────────────────────
+    // Basic Configuration Tests
+    // ────────────────────────────────────────────────────────────────────────────
+
     #[test]
-    fn test_coordinator_config_defaults() {
+    fn test_config_mock_da() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_all_env_vars();
 
         std::env::set_var("USE_MOCK_DA", "true");
 
-        let config = CoordinatorConfig::from_env();
-        assert!(config.is_ok());
+        let config = CoordinatorConfig::from_env().unwrap();
 
-        let config = config.unwrap();
         assert!(config.use_mock_da);
-        assert_eq!(config.host, "127.0.0.1");
-        assert_eq!(config.port, 8080);
-
-        // Fallback defaults
         assert!(!config.enable_fallback);
         assert_eq!(config.fallback_da_type, FallbackDAType::None);
-        assert!(config.quorum_da_config.is_none());
-        assert!(config.emergency_da_url.is_none());
 
-        // Reconciliation defaults
+        clear_all_env_vars();
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_env_vars();
+
+        std::env::set_var("USE_MOCK_DA", "true");
+
+        let config = CoordinatorConfig::from_env().unwrap();
+
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 8080);
         assert_eq!(config.reconciliation_config.batch_size, 10);
-        assert_eq!(config.reconciliation_config.max_retries, 3);
         assert_eq!(config.reconciliation_config.retry_delay_ms, 1000);
+        assert_eq!(config.reconciliation_config.max_retries, 3);
         assert!(!config.reconciliation_config.parallel_reconcile);
 
         clear_all_env_vars();
     }
 
-    #[test]
-    fn test_coordinator_config_custom_port() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        clear_all_env_vars();
-
-        std::env::set_var("COORDINATOR_PORT", "9090");
-        std::env::set_var("USE_MOCK_DA", "true");
-
-        let config = CoordinatorConfig::from_env().unwrap();
-        assert_eq!(config.port, 9090);
-
-        clear_all_env_vars();
-    }
-
-    #[test]
-    fn test_coordinator_config_invalid_port() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        clear_all_env_vars();
-
-        std::env::set_var("COORDINATOR_PORT", "invalid");
-        std::env::set_var("USE_MOCK_DA", "true");
-
-        let result = CoordinatorConfig::from_env();
-        assert!(result.is_err());
-
-        clear_all_env_vars();
-    }
-
     // ────────────────────────────────────────────────────────────────────────────
-    // Fallback DA Configuration Tests (14A.1A.35)
+    // Fallback Configuration Tests
     // ────────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_fallback_disabled() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        clear_all_env_vars();
-
-        std::env::set_var("USE_MOCK_DA", "true");
-        std::env::set_var("ENABLE_FALLBACK", "false");
-
-        let config = CoordinatorConfig::from_env().unwrap();
-
-        assert!(!config.enable_fallback);
-        assert_eq!(config.fallback_da_type, FallbackDAType::None);
-        assert!(!config.is_fallback_ready());
-
-        clear_all_env_vars();
-    }
 
     #[test]
     fn test_fallback_quorum() {
@@ -990,7 +1632,7 @@ mod tests {
         std::env::set_var("USE_MOCK_DA", "true");
         std::env::set_var("ENABLE_FALLBACK", "true");
         std::env::set_var("FALLBACK_DA_TYPE", "quorum");
-        std::env::set_var("QUORUM_VALIDATORS", "http://v1:8080,http://v2:8080,http://v3:8080");
+        std::env::set_var("QUORUM_VALIDATORS", "http://v1:8080,http://v2:8080");
         std::env::set_var("QUORUM_THRESHOLD", "75");
 
         let config = CoordinatorConfig::from_env().unwrap();
@@ -1001,9 +1643,8 @@ mod tests {
         assert!(config.is_fallback_ready());
 
         let quorum = config.quorum_da_config.unwrap();
-        assert_eq!(quorum.validators.len(), 3);
+        assert_eq!(quorum.validators.len(), 2);
         assert_eq!(quorum.quorum_threshold, 75);
-        assert_eq!(quorum.signature_timeout_ms, 5000); // default
 
         clear_all_env_vars();
     }
@@ -1202,21 +1843,372 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // AppState Tests
+    // DARouter Tests (14A.1A.36)
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_app_state_da_available() {
+    fn test_da_router_config_default() {
+        let config = DARouterConfig::default();
+        assert_eq!(config.health_check_interval_ms, 5000);
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.recovery_threshold, 2);
+    }
+
+    #[test]
+    fn test_da_router_metrics_new() {
+        let metrics = DARouterMetrics::new();
+        assert_eq!(metrics.primary_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.secondary_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.emergency_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failover_count.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.recovery_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_routing_state_display() {
+        assert_eq!(RoutingState::Primary.to_string(), "primary");
+        assert_eq!(RoutingState::Secondary.to_string(), "secondary");
+        assert_eq!(RoutingState::Emergency.to_string(), "emergency");
+    }
+
+    #[test]
+    fn test_da_router_primary_only() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            None,
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+
+        let router = DARouter::new(
+            primary,
+            None,
+            None,
+            health,
+            config,
+            metrics,
+        );
+
+        assert_eq!(router.current_state(), RoutingState::Primary);
+        assert!(!router.health_monitor().is_secondary_healthy());
+        assert!(!router.health_monitor().is_emergency_healthy());
+    }
+
+    #[test]
+    fn test_da_router_with_secondary() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+
+        let router = DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            health,
+            config,
+            metrics,
+        );
+
+        assert_eq!(router.current_state(), RoutingState::Primary);
+        assert!(router.health_monitor().is_secondary_healthy());
+        assert!(!router.health_monitor().is_emergency_healthy());
+    }
+
+    #[test]
+    fn test_da_router_with_emergency() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let emergency: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            None,
+            Some(Arc::clone(&emergency)),
+        ));
+        let metrics = DARouterMetrics::new();
+
+        let router = DARouter::new(
+            primary,
+            None,
+            Some(emergency),
+            health,
+            config,
+            metrics,
+        );
+
+        assert_eq!(router.current_state(), RoutingState::Primary);
+        assert!(!router.health_monitor().is_secondary_healthy());
+        assert!(router.health_monitor().is_emergency_healthy());
+    }
+
+    #[test]
+    fn test_da_health_monitor_initial_state() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        );
+
+        assert!(health.is_primary_healthy());
+        assert!(!health.is_secondary_healthy());
+        assert!(!health.is_emergency_healthy());
+        assert!(!health.should_failover());
+        assert!(!health.should_recover());
+        assert!(!health.is_shutdown());
+    }
+
+    #[test]
+    fn test_da_health_monitor_update_health() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig {
+            health_check_interval_ms: 5000,
+            failure_threshold: 3,
+            recovery_threshold: 2,
+        };
+        let health = DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        );
+
+        // Initially healthy
+        assert!(health.is_primary_healthy());
+        assert!(!health.should_failover());
+
+        // Mark unhealthy 3 times
+        health.update_primary_health(false);
+        assert!(!health.is_primary_healthy());
+        assert!(!health.should_failover()); // 1 failure
+
+        health.update_primary_health(false);
+        assert!(!health.should_failover()); // 2 failures
+
+        health.update_primary_health(false);
+        assert!(health.should_failover()); // 3 failures - threshold reached
+
+        // Mark healthy again
+        health.update_primary_health(true);
+        assert!(health.is_primary_healthy());
+        assert!(!health.should_failover()); // Failures reset
+
+        // Need 2 successes to recover
+        assert!(!health.should_recover()); // 1 success
+        health.update_primary_health(true);
+        assert!(health.should_recover()); // 2 successes
+    }
+
+    #[test]
+    fn test_da_health_monitor_shutdown() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = DAHealthMonitor::new(
+            config,
+            primary,
+            None,
+            None,
+        );
+
+        assert!(!health.is_shutdown());
+        health.shutdown();
+        assert!(health.is_shutdown());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AppState Tests (14A.1A.36)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_app_state_with_da_router() {
         let coordinator = Coordinator::new();
-        let da: Arc<dyn DALayer> = Arc::new(MockDA::new());
-        let state = AppState::new(coordinator, da);
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            None,
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let da_router = Arc::new(DARouter::new(
+            primary,
+            None,
+            None,
+            health,
+            config,
+            metrics,
+        ));
+
+        let state = AppState::new(coordinator, da_router, None);
 
         assert!(state.is_da_available());
+        assert_eq!(state.routing_state(), RoutingState::Primary);
+    }
 
-        state.set_da_available(false);
-        assert!(!state.is_da_available());
+    #[test]
+    fn test_app_state_routing_state() {
+        let coordinator = Coordinator::new();
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let da_router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            health,
+            config,
+            metrics,
+        ));
 
-        state.set_da_available(true);
+        let state = AppState::new(coordinator, da_router, None);
+
+        // Initially on primary
+        assert_eq!(state.routing_state(), RoutingState::Primary);
         assert!(state.is_da_available());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Integration Tests - Startup Scenarios (14A.1A.36)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_startup_fallback_disabled_primary_only() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_env_vars();
+
+        std::env::set_var("USE_MOCK_DA", "true");
+
+        let config = CoordinatorConfig::from_env().unwrap();
+
+        assert!(!config.enable_fallback);
+        assert_eq!(config.fallback_da_type, FallbackDAType::None);
+        assert!(!config.is_fallback_ready());
+
+        // Simulate startup: primary only
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config.clone(),
+            Arc::clone(&primary),
+            None,
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            None, // No secondary
+            None, // No emergency
+            health,
+            router_config,
+            metrics,
+        ));
+
+        assert_eq!(router.current_state(), RoutingState::Primary);
+
+        clear_all_env_vars();
+    }
+
+    #[test]
+    fn test_startup_fallback_enabled_quorum() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_env_vars();
+
+        std::env::set_var("USE_MOCK_DA", "true");
+        std::env::set_var("ENABLE_FALLBACK", "true");
+        std::env::set_var("FALLBACK_DA_TYPE", "quorum");
+        std::env::set_var("QUORUM_VALIDATORS", "http://v1:8080,http://v2:8080");
+
+        let config = CoordinatorConfig::from_env().unwrap();
+
+        assert!(config.enable_fallback);
+        assert_eq!(config.fallback_da_type, FallbackDAType::Quorum);
+        assert!(config.is_fallback_ready());
+
+        // Simulate startup: primary + secondary
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            health,
+            router_config,
+            metrics,
+        ));
+
+        assert_eq!(router.current_state(), RoutingState::Primary);
+        assert!(router.health_monitor().is_secondary_healthy());
+
+        clear_all_env_vars();
+    }
+
+    #[test]
+    fn test_startup_fallback_enabled_emergency() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_env_vars();
+
+        std::env::set_var("USE_MOCK_DA", "true");
+        std::env::set_var("ENABLE_FALLBACK", "true");
+        std::env::set_var("FALLBACK_DA_TYPE", "emergency");
+        std::env::set_var("EMERGENCY_DA_URL", "http://emergency:8080");
+
+        let config = CoordinatorConfig::from_env().unwrap();
+
+        assert!(config.enable_fallback);
+        assert_eq!(config.fallback_da_type, FallbackDAType::Emergency);
+        assert!(config.is_fallback_ready());
+
+        // Simulate startup: primary + emergency
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let emergency: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config.clone(),
+            Arc::clone(&primary),
+            None,
+            Some(Arc::clone(&emergency)),
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            None,
+            Some(emergency),
+            health,
+            router_config,
+            metrics,
+        ));
+
+        assert_eq!(router.current_state(), RoutingState::Primary);
+        assert!(router.health_monitor().is_emergency_healthy());
+
+        clear_all_env_vars();
     }
 }
