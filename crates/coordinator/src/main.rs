@@ -177,6 +177,102 @@ impl QuorumDAConfig {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FALLBACK HTTP ENDPOINT TYPES (14A.1A.38)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// DA layer status for HTTP responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DAStatus {
+    /// Primary DA is healthy and active.
+    PrimaryHealthy,
+    /// Primary DA degraded but usable.
+    PrimaryDegraded,
+    /// Fallback DA is active (secondary).
+    FallbackSecondary,
+    /// Fallback DA is active (emergency).
+    FallbackEmergency,
+    /// All DA layers unavailable.
+    Unavailable,
+}
+
+impl std::fmt::Display for DAStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrimaryHealthy => write!(f, "primary_healthy"),
+            Self::PrimaryDegraded => write!(f, "primary_degraded"),
+            Self::FallbackSecondary => write!(f, "fallback_secondary"),
+            Self::FallbackEmergency => write!(f, "fallback_emergency"),
+            Self::Unavailable => write!(f, "unavailable"),
+        }
+    }
+}
+
+/// Response for GET /fallback/status endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct FallbackStatusResponse {
+    /// Current DA status.
+    pub current_status: DAStatus,
+    /// Whether fallback DA is currently active.
+    pub fallback_active: bool,
+    /// Reason for fallback activation (if active).
+    pub fallback_reason: Option<String>,
+    /// Number of pending blobs awaiting reconciliation.
+    pub pending_reconcile_count: u64,
+    /// Timestamp of last fallback activation (Unix ms).
+    pub last_fallback_at: Option<u64>,
+}
+
+/// Information about a pending blob awaiting reconciliation.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingBlobInfo {
+    /// Blob reference ID (commitment hash as hex).
+    pub blob_id: String,
+    /// Source DA layer.
+    pub source_da: String,
+    /// Target DA layer for reconciliation.
+    pub target_da: String,
+    /// Timestamp when blob was stored (Unix ms).
+    pub stored_at: u64,
+    /// Number of reconciliation attempts.
+    pub retry_count: u32,
+    /// Last error message (if any).
+    pub last_error: Option<String>,
+}
+
+/// Report from a reconciliation operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileReport {
+    /// Whether reconciliation completed successfully.
+    pub success: bool,
+    /// Number of blobs processed.
+    pub blobs_processed: u64,
+    /// Number of blobs successfully reconciled.
+    pub blobs_reconciled: u64,
+    /// Number of blobs that failed reconciliation.
+    pub blobs_failed: u64,
+    /// Duration of reconciliation in milliseconds.
+    pub duration_ms: u64,
+    /// Error messages for failed blobs (if any).
+    pub errors: Vec<String>,
+}
+
+/// Report from state consistency verification.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsistencyReport {
+    /// Whether state is consistent.
+    pub is_consistent: bool,
+    /// Number of items verified.
+    pub items_verified: u64,
+    /// Number of inconsistencies found.
+    pub inconsistencies_found: u64,
+    /// Description of inconsistencies (if any).
+    pub details: Vec<String>,
+    /// Verification timestamp (Unix ms).
+    pub verified_at: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // DAROUTER TYPES (14A.1A.36)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -282,6 +378,10 @@ pub struct DAHealthMonitor {
     emergency: Option<Arc<dyn DALayer>>,
     /// Shutdown signal.
     shutdown: AtomicBool,
+    /// Reason for current fallback state (14A.1A.38).
+    fallback_reason: RwLock<Option<String>>,
+    /// Timestamp of last fallback activation in Unix ms (14A.1A.38).
+    last_fallback_at: AtomicU64,
 }
 
 impl DAHealthMonitor {
@@ -303,6 +403,8 @@ impl DAHealthMonitor {
             secondary,
             emergency,
             shutdown: AtomicBool::new(false),
+            fallback_reason: RwLock::new(None),
+            last_fallback_at: AtomicU64::new(0),
         }
     }
 
@@ -351,6 +453,55 @@ impl DAHealthMonitor {
     /// Check if shutdown signaled.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Get current DA status for HTTP API.
+    pub fn current_da_status(&self) -> DAStatus {
+        if self.is_primary_healthy() {
+            DAStatus::PrimaryHealthy
+        } else if self.is_secondary_healthy() {
+            DAStatus::FallbackSecondary
+        } else if self.is_emergency_healthy() {
+            DAStatus::FallbackEmergency
+        } else {
+            DAStatus::Unavailable
+        }
+    }
+
+    /// Check if any fallback is currently active.
+    pub fn is_fallback_active(&self) -> bool {
+        !self.is_primary_healthy() && (self.is_secondary_healthy() || self.is_emergency_healthy())
+    }
+
+    /// Get current fallback reason.
+    pub fn get_fallback_reason(&self) -> Option<String> {
+        self.fallback_reason.read().clone()
+    }
+
+    /// Set fallback reason and update timestamp.
+    pub fn set_fallback_reason(&self, reason: String) {
+        *self.fallback_reason.write() = Some(reason);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_fallback_at.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Clear fallback reason (when recovered to primary).
+    pub fn clear_fallback_reason(&self) {
+        *self.fallback_reason.write() = None;
+    }
+
+    /// Get last fallback activation timestamp.
+    pub fn get_last_fallback_at(&self) -> Option<u64> {
+        let ts = self.last_fallback_at.load(Ordering::Relaxed);
+        if ts == 0 { None } else { Some(ts) }
+    }
+
+    /// Get consecutive failure count.
+    pub fn failure_count(&self) -> u64 {
+        self.primary_failures.load(Ordering::Relaxed)
     }
 
     /// Start health monitoring loop.
@@ -650,6 +801,255 @@ const _: fn() = || {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// RECONCILIATION ENGINE (14A.1A.38)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Internal representation of a pending blob for reconciliation.
+struct PendingBlobEntry {
+    /// Blob reference ID (commitment hash as hex).
+    blob_id: String,
+    /// Source DA layer.
+    source_da: String,
+    /// Target DA layer for reconciliation.
+    target_da: String,
+    /// Timestamp when blob was stored (Unix ms).
+    stored_at: u64,
+    /// Number of reconciliation attempts.
+    retry_count: u32,
+    /// Last error message (if any).
+    last_error: Option<String>,
+    /// Blob data.
+    #[allow(dead_code)]
+    data: Vec<u8>,
+}
+
+/// Engine for reconciling blobs between primary and fallback DA layers.
+///
+/// Thread-safe: All operations are safe to call from multiple threads.
+pub struct ReconciliationEngine {
+    /// Pending blobs awaiting reconciliation.
+    pending_blobs: RwLock<Vec<PendingBlobEntry>>,
+    /// DA Router for posting blobs.
+    da_router: Arc<DARouter>,
+    /// Health monitor for checking DA status.
+    health_monitor: Arc<DAHealthMonitor>,
+    /// Configuration.
+    config: ReconciliationConfig,
+}
+
+impl ReconciliationEngine {
+    /// Create new reconciliation engine.
+    pub fn new(
+        da_router: Arc<DARouter>,
+        health_monitor: Arc<DAHealthMonitor>,
+        config: ReconciliationConfig,
+    ) -> Self {
+        Self {
+            pending_blobs: RwLock::new(Vec::new()),
+            da_router,
+            health_monitor,
+            config,
+        }
+    }
+
+    /// Get count of pending blobs.
+    pub fn pending_count(&self) -> u64 {
+        self.pending_blobs.read().len() as u64
+    }
+
+    /// Get list of pending blob info (for HTTP API).
+    pub fn get_pending_blobs(&self) -> Vec<PendingBlobInfo> {
+        self.pending_blobs
+            .read()
+            .iter()
+            .map(|entry| PendingBlobInfo {
+                blob_id: entry.blob_id.clone(),
+                source_da: entry.source_da.clone(),
+                target_da: entry.target_da.clone(),
+                stored_at: entry.stored_at,
+                retry_count: entry.retry_count,
+                last_error: entry.last_error.clone(),
+            })
+            .collect()
+    }
+
+    /// Add a blob to pending reconciliation queue.
+    #[allow(dead_code)]
+    pub fn add_pending_blob(
+        &self,
+        blob_id: String,
+        source_da: String,
+        target_da: String,
+        data: Vec<u8>,
+    ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let entry = PendingBlobEntry {
+            blob_id,
+            source_da,
+            target_da,
+            stored_at: now_ms,
+            retry_count: 0,
+            last_error: None,
+            data,
+        };
+
+        self.pending_blobs.write().push(entry);
+    }
+
+    /// Perform reconciliation of pending blobs.
+    ///
+    /// This is a synchronous operation that blocks until reconciliation completes.
+    /// DOES NOT spawn background tasks.
+    pub async fn reconcile(&self) -> ReconcileReport {
+        let start = std::time::Instant::now();
+        let mut blobs_processed: u64 = 0;
+        let mut blobs_reconciled: u64 = 0;
+        let mut blobs_failed: u64 = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        // Check if primary DA is healthy before attempting reconciliation
+        if !self.health_monitor.is_primary_healthy() {
+            return ReconcileReport {
+                success: false,
+                blobs_processed: 0,
+                blobs_reconciled: 0,
+                blobs_failed: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+                errors: vec!["Primary DA is not healthy, cannot reconcile".to_string()],
+            };
+        }
+
+        // Take pending blobs for processing
+        let pending: Vec<PendingBlobEntry> = {
+            let mut guard = self.pending_blobs.write();
+            let batch_size = self.config.batch_size.min(guard.len());
+            if batch_size == 0 {
+                return ReconcileReport {
+                    success: true,
+                    blobs_processed: 0,
+                    blobs_reconciled: 0,
+                    blobs_failed: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    errors: Vec::new(),
+                };
+            }
+            guard.drain(0..batch_size).collect()
+        };
+
+        // Process each pending blob
+        for mut entry in pending {
+            blobs_processed += 1;
+
+            // Attempt to post blob to primary DA
+            match self.da_router.post_blob(&entry.data).await {
+                Ok(_blob_ref) => {
+                    blobs_reconciled += 1;
+                }
+                Err(e) => {
+                    blobs_failed += 1;
+                    entry.retry_count += 1;
+                    entry.last_error = Some(e.to_string());
+                    errors.push(format!("Blob {}: {}", entry.blob_id, e));
+
+                    // Re-queue if under max retries
+                    if entry.retry_count < self.config.max_retries {
+                        self.pending_blobs.write().push(entry);
+                    } else {
+                        errors.push(format!(
+                            "Blob {} exceeded max retries ({})",
+                            entry.blob_id, self.config.max_retries
+                        ));
+                    }
+                }
+            }
+        }
+
+        ReconcileReport {
+            success: blobs_failed == 0,
+            blobs_processed,
+            blobs_reconciled,
+            blobs_failed,
+            duration_ms: start.elapsed().as_millis() as u64,
+            errors,
+        }
+    }
+
+    /// Verify state consistency between primary and fallback DA.
+    ///
+    /// This is a READ-ONLY operation that does not modify state.
+    pub fn verify_state_consistency(&self) -> ConsistencyReport {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let pending = self.pending_blobs.read();
+        let pending_count = pending.len() as u64;
+        let mut details = Vec::new();
+
+        // Check for blobs with high retry counts
+        let high_retry_blobs: Vec<&PendingBlobEntry> = pending
+            .iter()
+            .filter(|e| e.retry_count >= 2)
+            .collect();
+
+        if !high_retry_blobs.is_empty() {
+            details.push(format!(
+                "{} blob(s) have high retry counts (>=2)",
+                high_retry_blobs.len()
+            ));
+        }
+
+        // Check for stale blobs (older than 5 minutes)
+        let stale_threshold_ms = 5 * 60 * 1000; // 5 minutes
+        let stale_blobs: Vec<&PendingBlobEntry> = pending
+            .iter()
+            .filter(|e| now_ms.saturating_sub(e.stored_at) > stale_threshold_ms)
+            .collect();
+
+        if !stale_blobs.is_empty() {
+            details.push(format!(
+                "{} blob(s) are stale (older than 5 minutes)",
+                stale_blobs.len()
+            ));
+        }
+
+        // Check primary/fallback health consistency
+        let primary_healthy = self.health_monitor.is_primary_healthy();
+        let fallback_active = self.health_monitor.is_fallback_active();
+
+        if fallback_active && pending_count == 0 {
+            // Fallback is active but no pending blobs - might have missed some
+            details.push("Fallback DA active but no pending blobs - verify blob tracking".to_string());
+        }
+
+        if !primary_healthy && !fallback_active {
+            details.push("Primary DA unhealthy and no fallback active - system degraded".to_string());
+        }
+
+        let inconsistencies_found = details.len() as u64;
+
+        ConsistencyReport {
+            is_consistent: inconsistencies_found == 0,
+            items_verified: pending_count + 2, // pending blobs + health checks
+            inconsistencies_found,
+            details,
+            verified_at: now_ms,
+        }
+    }
+}
+
+// Compile-time assertion that ReconciliationEngine is Send + Sync
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ReconciliationEngine>();
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -941,6 +1341,8 @@ struct AppState {
     /// Health monitor handle (stored to keep it alive)
     #[allow(dead_code)]
     monitor_handle: Option<JoinHandle<()>>,
+    /// Reconciliation engine for fallback blob sync (14A.1A.38)
+    reconciliation_engine: Arc<ReconciliationEngine>,
 }
 
 impl AppState {
@@ -949,11 +1351,13 @@ impl AppState {
         coordinator: Coordinator,
         da_router: Arc<DARouter>,
         monitor_handle: Option<JoinHandle<()>>,
+        reconciliation_engine: Arc<ReconciliationEngine>,
     ) -> Self {
         Self {
             coordinator,
             da_router,
             monitor_handle,
+            reconciliation_engine,
         }
     }
 
@@ -972,6 +1376,16 @@ impl AppState {
     /// Get current routing state.
     fn routing_state(&self) -> RoutingState {
         self.da_router.current_state()
+    }
+
+    /// Get reference to health monitor.
+    fn health_monitor(&self) -> &Arc<DAHealthMonitor> {
+        self.da_router.health_monitor()
+    }
+
+    /// Get reference to reconciliation engine.
+    fn reconciliation_engine(&self) -> &Arc<ReconciliationEngine> {
+        &self.reconciliation_engine
     }
 }
 
@@ -1153,6 +1567,88 @@ async fn ready_check(State(state): State<Arc<AppState>>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FALLBACK HTTP HANDLERS (14A.1A.38)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// GET /fallback/status - Returns current fallback status.
+///
+/// Response includes:
+/// - current_status: DAStatus
+/// - fallback_active: bool
+/// - fallback_reason: Option<String>
+/// - pending_reconcile_count: u64
+/// - last_fallback_at: Option<u64>
+async fn get_fallback_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<FallbackStatusResponse> {
+    let health = state.health_monitor();
+    let reconcile = state.reconciliation_engine();
+
+    let response = FallbackStatusResponse {
+        current_status: health.current_da_status(),
+        fallback_active: health.is_fallback_active(),
+        fallback_reason: health.get_fallback_reason(),
+        pending_reconcile_count: reconcile.pending_count(),
+        last_fallback_at: health.get_last_fallback_at(),
+    };
+
+    Json(response)
+}
+
+/// GET /fallback/pending - Returns list of pending blobs awaiting reconciliation.
+///
+/// Does NOT return raw blob data, only metadata.
+async fn get_pending_blobs(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<PendingBlobInfo>> {
+    let reconcile = state.reconciliation_engine();
+    Json(reconcile.get_pending_blobs())
+}
+
+/// POST /fallback/reconcile - Triggers manual reconciliation.
+///
+/// This endpoint:
+/// - Calls ReconciliationEngine::reconcile()
+/// - Does NOT spawn background tasks
+/// - Returns ReconcileReport directly
+///
+/// Returns HTTP 500 if reconciliation fails critically.
+async fn trigger_reconcile(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ReconcileReport>, (StatusCode, Json<Value>)> {
+    let reconcile = state.reconciliation_engine();
+
+    let report = reconcile.reconcile().await;
+
+    // If reconciliation failed critically (not just individual blobs)
+    if !report.success && report.blobs_processed == 0 && !report.errors.is_empty() {
+        let error_msg = report.errors.first()
+            .cloned()
+            .unwrap_or_else(|| "Unknown reconciliation error".to_string());
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "reconciliation_failed",
+                "message": error_msg,
+                "report": report
+            })),
+        ));
+    }
+
+    Ok(Json(report))
+}
+
+/// GET /fallback/consistency - Verifies state consistency.
+///
+/// This is a READ-ONLY operation that does NOT modify state.
+async fn get_consistency_report(
+    State(state): State<Arc<AppState>>,
+) -> Json<ConsistencyReport> {
+    let reconcile = state.reconciliation_engine();
+    Json(reconcile.verify_state_consistency())
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1487,12 +1983,29 @@ async fn main() {
     info!("  ✅ Health monitoring active");
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Step 7.5: Create ReconciliationEngine (14A.1A.38)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    info!("🔄 Creating ReconciliationEngine...");
+    let reconciliation_engine = Arc::new(ReconciliationEngine::new(
+        Arc::clone(&da_router),
+        Arc::clone(&health_monitor),
+        config.reconciliation_config.clone(),
+    ));
+    info!("  ✅ ReconciliationEngine created");
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Step 8: Inject DARouter to AppState
     // ═══════════════════════════════════════════════════════════════════════
 
     let coordinator = Coordinator::new();
-    let state = Arc::new(AppState::new(coordinator, da_router, Some(monitor_handle)));
-    info!("  ✅ AppState initialized with DARouter");
+    let state = Arc::new(AppState::new(
+        coordinator,
+        da_router,
+        Some(monitor_handle),
+        reconciliation_engine,
+    ));
+    info!("  ✅ AppState initialized with DARouter and ReconciliationEngine");
 
     // ═══════════════════════════════════════════════════════════════════════
     // Step 9: Run application runtime
@@ -1510,6 +2023,11 @@ async fn main() {
         .route("/schedule", post(schedule_workload))
         .route("/health", get(health_check))
         .route("/ready", get(ready_check))
+        // Fallback HTTP endpoints (14A.1A.38)
+        .route("/fallback/status", get(get_fallback_status))
+        .route("/fallback/pending", get(get_pending_blobs))
+        .route("/fallback/reconcile", post(trigger_reconcile))
+        .route("/fallback/consistency", get(get_consistency_report))
         .with_state(state);
 
     // Start HTTP server
@@ -2047,12 +2565,24 @@ mod tests {
             primary,
             None,
             None,
-            health,
+            Arc::clone(&health),
             config,
             metrics,
         ));
 
-        let state = AppState::new(coordinator, da_router, None);
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconciliation_engine = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&da_router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        let state = AppState::new(coordinator, da_router, None, reconciliation_engine);
 
         assert!(state.is_da_available());
         assert_eq!(state.routing_state(), RoutingState::Primary);
@@ -2075,12 +2605,24 @@ mod tests {
             primary,
             Some(secondary),
             None,
-            health,
+            Arc::clone(&health),
             config,
             metrics,
         ));
 
-        let state = AppState::new(coordinator, da_router, None);
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconciliation_engine = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&da_router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        let state = AppState::new(coordinator, da_router, None, reconciliation_engine);
 
         // Initially on primary
         assert_eq!(state.routing_state(), RoutingState::Primary);
@@ -2210,5 +2752,415 @@ mod tests {
         assert!(router.health_monitor().is_emergency_healthy());
 
         clear_all_env_vars();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Fallback HTTP Endpoint Tests (14A.1A.38)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Helper to create test infrastructure for fallback endpoint tests.
+    fn create_test_infrastructure() -> (
+        Arc<DARouter>,
+        Arc<DAHealthMonitor>,
+        Arc<ReconciliationEngine>,
+    ) {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            Arc::clone(&health),
+            router_config,
+            metrics,
+        ));
+
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconcile = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        (router, health, reconcile)
+    }
+
+    #[test]
+    fn test_da_status_primary_healthy() {
+        let (_router, health, _reconcile) = create_test_infrastructure();
+        assert_eq!(health.current_da_status(), DAStatus::PrimaryHealthy);
+    }
+
+    #[test]
+    fn test_da_status_fallback_secondary() {
+        let (_router, health, _reconcile) = create_test_infrastructure();
+        
+        // Simulate primary unhealthy
+        health.update_primary_health(false);
+        
+        // Secondary should be healthy (from create_test_infrastructure)
+        assert!(health.is_secondary_healthy());
+        assert_eq!(health.current_da_status(), DAStatus::FallbackSecondary);
+    }
+
+    #[test]
+    fn test_da_status_unavailable() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config.clone(),
+            Arc::clone(&primary),
+            None, // No secondary
+            None, // No emergency
+        ));
+        
+        // Simulate primary unhealthy
+        health.update_primary_health(false);
+        
+        assert_eq!(health.current_da_status(), DAStatus::Unavailable);
+    }
+
+    #[test]
+    fn test_fallback_active_detection() {
+        let (_router, health, _reconcile) = create_test_infrastructure();
+        
+        // Initially primary is healthy
+        assert!(!health.is_fallback_active());
+        
+        // Simulate primary unhealthy
+        health.update_primary_health(false);
+        
+        // Now fallback should be active (secondary is healthy)
+        assert!(health.is_fallback_active());
+    }
+
+    #[test]
+    fn test_fallback_reason_tracking() {
+        let (_router, health, _reconcile) = create_test_infrastructure();
+        
+        // Initially no reason
+        assert!(health.get_fallback_reason().is_none());
+        assert!(health.get_last_fallback_at().is_none());
+        
+        // Set fallback reason
+        health.set_fallback_reason("Primary DA connection timeout".to_string());
+        
+        // Should have reason and timestamp
+        assert_eq!(
+            health.get_fallback_reason(),
+            Some("Primary DA connection timeout".to_string())
+        );
+        assert!(health.get_last_fallback_at().is_some());
+        
+        // Clear reason
+        health.clear_fallback_reason();
+        assert!(health.get_fallback_reason().is_none());
+        // Timestamp should still be present (historical)
+        assert!(health.get_last_fallback_at().is_some());
+    }
+
+    #[test]
+    fn test_reconciliation_engine_pending_count() {
+        let (_router, _health, reconcile) = create_test_infrastructure();
+        
+        assert_eq!(reconcile.pending_count(), 0);
+        
+        // Add pending blob
+        reconcile.add_pending_blob(
+            "abc123".to_string(),
+            "secondary".to_string(),
+            "primary".to_string(),
+            vec![1, 2, 3],
+        );
+        
+        assert_eq!(reconcile.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_reconciliation_engine_get_pending_blobs() {
+        let (_router, _health, reconcile) = create_test_infrastructure();
+        
+        assert!(reconcile.get_pending_blobs().is_empty());
+        
+        // Add pending blob
+        reconcile.add_pending_blob(
+            "abc123".to_string(),
+            "secondary".to_string(),
+            "primary".to_string(),
+            vec![1, 2, 3],
+        );
+        
+        let pending = reconcile.get_pending_blobs();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].blob_id, "abc123");
+        assert_eq!(pending[0].source_da, "secondary");
+        assert_eq!(pending[0].target_da, "primary");
+        assert_eq!(pending[0].retry_count, 0);
+        assert!(pending[0].last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_engine_reconcile_empty() {
+        let (_router, _health, reconcile) = create_test_infrastructure();
+        
+        let report = reconcile.reconcile().await;
+        
+        assert!(report.success);
+        assert_eq!(report.blobs_processed, 0);
+        assert_eq!(report.blobs_reconciled, 0);
+        assert_eq!(report.blobs_failed, 0);
+        assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_engine_reconcile_with_blobs() {
+        let (_router, _health, reconcile) = create_test_infrastructure();
+        
+        // Add pending blob
+        reconcile.add_pending_blob(
+            "blob1".to_string(),
+            "secondary".to_string(),
+            "primary".to_string(),
+            vec![1, 2, 3, 4],
+        );
+        
+        let report = reconcile.reconcile().await;
+        
+        // MockDA should succeed
+        assert!(report.success);
+        assert_eq!(report.blobs_processed, 1);
+        assert_eq!(report.blobs_reconciled, 1);
+        assert_eq!(report.blobs_failed, 0);
+        
+        // Pending count should be 0 now
+        assert_eq!(reconcile.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_engine_reconcile_primary_unhealthy() {
+        let (_router, health, reconcile) = create_test_infrastructure();
+        
+        // Add pending blob
+        reconcile.add_pending_blob(
+            "blob1".to_string(),
+            "secondary".to_string(),
+            "primary".to_string(),
+            vec![1, 2, 3, 4],
+        );
+        
+        // Simulate primary unhealthy
+        health.update_primary_health(false);
+        
+        let report = reconcile.reconcile().await;
+        
+        // Should fail because primary is not healthy
+        assert!(!report.success);
+        assert_eq!(report.blobs_processed, 0);
+        assert!(!report.errors.is_empty());
+        assert!(report.errors[0].contains("Primary DA is not healthy"));
+        
+        // Blob should still be pending
+        assert_eq!(reconcile.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_consistency_report_empty() {
+        let (_router, _health, reconcile) = create_test_infrastructure();
+        
+        let report = reconcile.verify_state_consistency();
+        
+        assert!(report.is_consistent);
+        assert_eq!(report.items_verified, 2); // health checks only
+        assert_eq!(report.inconsistencies_found, 0);
+        assert!(report.details.is_empty());
+        assert!(report.verified_at > 0);
+    }
+
+    #[test]
+    fn test_consistency_report_with_fallback_active() {
+        let (_router, health, reconcile) = create_test_infrastructure();
+        
+        // Simulate primary unhealthy (fallback active)
+        health.update_primary_health(false);
+        
+        let report = reconcile.verify_state_consistency();
+        
+        // Should detect fallback active with no pending blobs
+        assert!(!report.is_consistent);
+        assert!(report.inconsistencies_found > 0);
+        assert!(report.details.iter().any(|d| d.contains("Fallback DA active")));
+    }
+
+    #[test]
+    fn test_fallback_status_response_fields() {
+        let (_router, health, reconcile) = create_test_infrastructure();
+        
+        let response = FallbackStatusResponse {
+            current_status: health.current_da_status(),
+            fallback_active: health.is_fallback_active(),
+            fallback_reason: health.get_fallback_reason(),
+            pending_reconcile_count: reconcile.pending_count(),
+            last_fallback_at: health.get_last_fallback_at(),
+        };
+        
+        assert_eq!(response.current_status, DAStatus::PrimaryHealthy);
+        assert!(!response.fallback_active);
+        assert!(response.fallback_reason.is_none());
+        assert_eq!(response.pending_reconcile_count, 0);
+        assert!(response.last_fallback_at.is_none());
+    }
+
+    #[test]
+    fn test_pending_blob_info_struct() {
+        let info = PendingBlobInfo {
+            blob_id: "test123".to_string(),
+            source_da: "secondary".to_string(),
+            target_da: "primary".to_string(),
+            stored_at: 1234567890,
+            retry_count: 2,
+            last_error: Some("Connection timeout".to_string()),
+        };
+        
+        assert_eq!(info.blob_id, "test123");
+        assert_eq!(info.source_da, "secondary");
+        assert_eq!(info.target_da, "primary");
+        assert_eq!(info.stored_at, 1234567890);
+        assert_eq!(info.retry_count, 2);
+        assert_eq!(info.last_error, Some("Connection timeout".to_string()));
+    }
+
+    #[test]
+    fn test_reconcile_report_struct() {
+        let report = ReconcileReport {
+            success: true,
+            blobs_processed: 10,
+            blobs_reconciled: 8,
+            blobs_failed: 2,
+            duration_ms: 1500,
+            errors: vec!["Error 1".to_string(), "Error 2".to_string()],
+        };
+        
+        assert!(report.success);
+        assert_eq!(report.blobs_processed, 10);
+        assert_eq!(report.blobs_reconciled, 8);
+        assert_eq!(report.blobs_failed, 2);
+        assert_eq!(report.duration_ms, 1500);
+        assert_eq!(report.errors.len(), 2);
+    }
+
+    #[test]
+    fn test_consistency_report_struct() {
+        let report = ConsistencyReport {
+            is_consistent: false,
+            items_verified: 15,
+            inconsistencies_found: 3,
+            details: vec![
+                "Detail 1".to_string(),
+                "Detail 2".to_string(),
+                "Detail 3".to_string(),
+            ],
+            verified_at: 1234567890,
+        };
+        
+        assert!(!report.is_consistent);
+        assert_eq!(report.items_verified, 15);
+        assert_eq!(report.inconsistencies_found, 3);
+        assert_eq!(report.details.len(), 3);
+        assert_eq!(report.verified_at, 1234567890);
+    }
+
+    #[test]
+    fn test_da_status_display() {
+        assert_eq!(format!("{}", DAStatus::PrimaryHealthy), "primary_healthy");
+        assert_eq!(format!("{}", DAStatus::PrimaryDegraded), "primary_degraded");
+        assert_eq!(format!("{}", DAStatus::FallbackSecondary), "fallback_secondary");
+        assert_eq!(format!("{}", DAStatus::FallbackEmergency), "fallback_emergency");
+        assert_eq!(format!("{}", DAStatus::Unavailable), "unavailable");
+    }
+
+    #[test]
+    fn test_reconciliation_engine_batch_size() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config.clone(),
+            Arc::clone(&primary),
+            Some(Arc::clone(&secondary)),
+            None,
+        ));
+        let metrics = DARouterMetrics::new();
+        let router = Arc::new(DARouter::new(
+            primary,
+            Some(secondary),
+            None,
+            Arc::clone(&health),
+            router_config,
+            metrics,
+        ));
+
+        // Small batch size
+        let reconciliation_config = ReconciliationConfig {
+            batch_size: 2,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let reconcile = Arc::new(ReconciliationEngine::new(
+            Arc::clone(&router),
+            Arc::clone(&health),
+            reconciliation_config,
+        ));
+
+        // Add 5 blobs
+        for i in 0..5 {
+            reconcile.add_pending_blob(
+                format!("blob{}", i),
+                "secondary".to_string(),
+                "primary".to_string(),
+                vec![i as u8],
+            );
+        }
+
+        assert_eq!(reconcile.pending_count(), 5);
+    }
+
+    #[test]
+    fn test_health_monitor_failure_count() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDA::new());
+        let router_config = DARouterConfig::default();
+        let health = Arc::new(DAHealthMonitor::new(
+            router_config,
+            primary,
+            None,
+            None,
+        ));
+
+        // Initially 0 failures
+        assert_eq!(health.failure_count(), 0);
+
+        // Simulate failures
+        health.update_primary_health(false);
+        assert_eq!(health.failure_count(), 1);
+        
+        health.update_primary_health(false);
+        assert_eq!(health.failure_count(), 2);
+
+        // Recovery resets failures
+        health.update_primary_health(true);
+        assert_eq!(health.failure_count(), 0);
     }
 }
