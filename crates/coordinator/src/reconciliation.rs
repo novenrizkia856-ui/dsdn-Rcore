@@ -1,4 +1,4 @@
-//! ReconciliationEngine - Reconcile fallback blobs ke Celestia (14A.1A.31-33)
+//! ReconciliationEngine - Reconcile fallback blobs ke Celestia (14A.1A.31-34)
 //!
 //! Module ini menyediakan ReconciliationEngine untuk melakukan reconciliation
 //! blob dari QuorumDA (fallback) ke Celestia (primary DA).
@@ -11,6 +11,10 @@
 //! - `PendingBlobInfo`: Summary info tanpa data mentah
 //! - `ReconcileReport`: Laporan hasil reconciliation
 //! - `ReconcileError`: Error types
+//! - `ConsistencyReport`: Laporan verifikasi konsistensi (14A.1A.34)
+//! - `ConsistencyError`: Error untuk verifikasi konsistensi (14A.1A.34)
+//! - `ConsistencyMismatch`: Detail mismatch (14A.1A.34)
+//! - `MismatchType`: Tipe mismatch (14A.1A.34)
 //!
 //! ## Thread Safety
 //!
@@ -194,6 +198,116 @@ pub struct ReconcileReport {
 
     /// Timestamp selesai (Unix seconds).
     pub completed_at: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CONSISTENCY TYPES (14A.1A.34)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error yang dapat terjadi saat verifikasi konsistensi.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsistencyError {
+    /// DA layer tidak tersedia.
+    DAUnavailable(String),
+
+    /// Blob tidak ditemukan.
+    BlobNotFound(u64),
+
+    /// Mismatch tidak dapat diperbaiki (HashMismatch).
+    NonRepairable(String),
+
+    /// Error saat re-posting blob.
+    RepostFailed(String),
+
+    /// Error saat fetching blob dari Celestia.
+    FetchFailed(String),
+
+    /// Internal error.
+    Internal(String),
+}
+
+impl std::fmt::Display for ConsistencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DAUnavailable(msg) => write!(f, "DA layer unavailable: {}", msg),
+            Self::BlobNotFound(seq) => write!(f, "Blob not found at sequence {}", seq),
+            Self::NonRepairable(msg) => write!(f, "Non-repairable mismatch: {}", msg),
+            Self::RepostFailed(msg) => write!(f, "Repost failed: {}", msg),
+            Self::FetchFailed(msg) => write!(f, "Fetch failed: {}", msg),
+            Self::Internal(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ConsistencyError {}
+
+/// Tipe mismatch antara fallback dan primary DA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MismatchType {
+    /// Blob ada di fallback tapi tidak ada di primary (Celestia).
+    MissingInPrimary,
+
+    /// Blob ada di primary (Celestia) tapi tidak ada di fallback.
+    MissingInFallback,
+
+    /// Blob ada di kedua DA tapi hash/commitment tidak cocok.
+    HashMismatch,
+}
+
+impl std::fmt::Display for MismatchType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingInPrimary => write!(f, "MissingInPrimary"),
+            Self::MissingInFallback => write!(f, "MissingInFallback"),
+            Self::HashMismatch => write!(f, "HashMismatch"),
+        }
+    }
+}
+
+/// Detail mismatch untuk satu blob.
+///
+/// Menyimpan informasi tentang ketidakkonsistenan TANPA data blob mentah.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsistencyMismatch {
+    /// Sequence number dari blob.
+    pub sequence: u64,
+
+    /// Tipe mismatch.
+    pub mismatch_type: MismatchType,
+
+    /// Commitment dari fallback (jika ada).
+    pub fallback_commitment: Option<[u8; 32]>,
+
+    /// Commitment dari Celestia (jika ada).
+    pub celestia_commitment: Option<[u8; 32]>,
+
+    /// Deskripsi tambahan.
+    pub description: String,
+}
+
+/// Laporan hasil verifikasi konsistensi.
+#[derive(Debug, Clone)]
+pub struct ConsistencyReport {
+    /// Jumlah total sequences yang dicek.
+    pub total_sequences_checked: usize,
+
+    /// Jumlah mismatch yang ditemukan.
+    pub mismatches_count: usize,
+
+    /// Detail setiap mismatch.
+    pub mismatches: Vec<ConsistencyMismatch>,
+
+    /// Apakah state konsisten (tidak ada mismatch).
+    pub is_consistent: bool,
+
+    /// Timestamp verifikasi (Unix seconds).
+    pub checked_at: u64,
+
+    /// Sequence range minimum yang dicek.
+    pub min_sequence: Option<u64>,
+
+    /// Sequence range maximum yang dicek.
+    pub max_sequence: Option<u64>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -674,6 +788,257 @@ impl ReconciliationEngine {
             }
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // State Consistency Verification (14A.1A.34)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Verifikasi konsistensi state antara fallback DA dan Celestia (primary).
+    ///
+    /// ## Proses
+    ///
+    /// 1. Ambil sequence range dari pending blobs (fallback)
+    /// 2. Untuk setiap sequence, bandingkan dengan Celestia
+    /// 3. Klasifikasikan mismatch yang ditemukan
+    /// 4. Bangun ConsistencyReport lengkap
+    ///
+    /// ## Thread Safety
+    ///
+    /// - Lock hanya dipegang saat membaca state
+    /// - Lock TIDAK dipegang saat network call ke Celestia
+    ///
+    /// ## Returns
+    ///
+    /// - `Ok(ConsistencyReport)` dengan detail hasil verifikasi
+    /// - `Err(ConsistencyError)` jika terjadi error fatal
+    pub async fn verify_state_consistency(&self) -> Result<ConsistencyReport, ConsistencyError> {
+        let checked_at = current_unix_timestamp();
+
+        // Step 1: Extract pending blobs info (with lock, short duration)
+        let pending_info: Vec<(u64, [u8; 32], dsdn_common::BlobRef)> = {
+            let pending = self.pending_blobs.read();
+            pending
+                .iter()
+                .map(|blob| (blob.original_sequence(), blob.blob_ref.commitment, blob.blob_ref.clone()))
+                .collect()
+        };
+
+        // If no pending blobs, state is consistent (empty range)
+        if pending_info.is_empty() {
+            return Ok(ConsistencyReport {
+                total_sequences_checked: 0,
+                mismatches_count: 0,
+                mismatches: Vec::new(),
+                is_consistent: true,
+                checked_at,
+                min_sequence: None,
+                max_sequence: None,
+            });
+        }
+
+        // Calculate sequence range
+        let min_sequence = pending_info.iter().map(|(seq, _, _)| *seq).min();
+        let max_sequence = pending_info.iter().map(|(seq, _, _)| *seq).max();
+
+        // Step 2: Check each pending blob against Celestia (without lock)
+        let mut mismatches = Vec::new();
+
+        for (sequence, fallback_commitment, blob_ref) in &pending_info {
+            // Try to get blob from Celestia
+            let celestia_result = self.celestia.get_blob(blob_ref).await;
+
+            match celestia_result {
+                Ok(celestia_data) => {
+                    // Blob exists in Celestia, verify commitment
+                    // Compute commitment from data (using SHA-256 as per BlobRef spec)
+                    let computed_commitment = compute_commitment(&celestia_data);
+
+                    if computed_commitment != *fallback_commitment {
+                        // Hash mismatch
+                        mismatches.push(ConsistencyMismatch {
+                            sequence: *sequence,
+                            mismatch_type: MismatchType::HashMismatch,
+                            fallback_commitment: Some(*fallback_commitment),
+                            celestia_commitment: Some(computed_commitment),
+                            description: "Commitment hash does not match between fallback and Celestia".to_string(),
+                        });
+                    }
+                    // If commitments match, blob is consistent (no action needed)
+                }
+                Err(dsdn_common::DAError::BlobNotFound(_)) => {
+                    // Blob exists in fallback but not in Celestia
+                    mismatches.push(ConsistencyMismatch {
+                        sequence: *sequence,
+                        mismatch_type: MismatchType::MissingInPrimary,
+                        fallback_commitment: Some(*fallback_commitment),
+                        celestia_commitment: None,
+                        description: "Blob exists in fallback but not found in Celestia".to_string(),
+                    });
+                }
+                Err(e) => {
+                    // Network or other error - treat as unavailable
+                    return Err(ConsistencyError::DAUnavailable(format!(
+                        "Failed to get blob {} from Celestia: {}",
+                        sequence, e
+                    )));
+                }
+            }
+        }
+
+        let total_checked = pending_info.len();
+        let mismatches_count = mismatches.len();
+        let is_consistent = mismatches.is_empty();
+
+        Ok(ConsistencyReport {
+            total_sequences_checked: total_checked,
+            mismatches_count,
+            mismatches,
+            is_consistent,
+            checked_at,
+            min_sequence,
+            max_sequence,
+        })
+    }
+
+    /// Memperbaiki satu inconsistency berdasarkan tipe mismatch.
+    ///
+    /// ## Behavior berdasarkan MismatchType
+    ///
+    /// - `MissingInPrimary`: Re-post blob dari fallback ke Celestia
+    /// - `MissingInFallback`: Fetch dari Celestia dan simpan ke fallback
+    /// - `HashMismatch`: Return error (non-repairable)
+    ///
+    /// ## Thread Safety
+    ///
+    /// - Lock dipegang secara minimal
+    /// - Lock TIDAK dipegang saat network call
+    ///
+    /// ## Returns
+    ///
+    /// - `Ok(())` jika repair berhasil
+    /// - `Err(ConsistencyError)` jika gagal atau non-repairable
+    pub async fn repair_inconsistency(
+        &self,
+        mismatch: &ConsistencyMismatch,
+    ) -> Result<(), ConsistencyError> {
+        match mismatch.mismatch_type {
+            MismatchType::MissingInPrimary => {
+                // Re-post blob from fallback to Celestia
+                self.repair_missing_in_primary(mismatch.sequence).await
+            }
+            MismatchType::MissingInFallback => {
+                // Fetch blob from Celestia and add to fallback
+                self.repair_missing_in_fallback(mismatch).await
+            }
+            MismatchType::HashMismatch => {
+                // Hash mismatch cannot be auto-resolved
+                Err(ConsistencyError::NonRepairable(format!(
+                    "Hash mismatch at sequence {} cannot be automatically repaired. \
+                     Fallback commitment: {:?}, Celestia commitment: {:?}. \
+                     Manual intervention required.",
+                    mismatch.sequence,
+                    mismatch.fallback_commitment,
+                    mismatch.celestia_commitment
+                )))
+            }
+        }
+    }
+
+    /// Repair MissingInPrimary: re-post blob dari fallback ke Celestia.
+    async fn repair_missing_in_primary(&self, sequence: u64) -> Result<(), ConsistencyError> {
+        // Step 1: Get blob data from pending (with lock)
+        let blob_data: Option<(Vec<u8>, [u8; 32])> = {
+            let pending = self.pending_blobs.read();
+            pending
+                .iter()
+                .find(|b| b.original_sequence() == sequence)
+                .map(|b| (b.data.clone(), b.blob_ref.commitment))
+        };
+
+        let (data, expected_commitment) = blob_data.ok_or_else(|| {
+            ConsistencyError::BlobNotFound(sequence)
+        })?;
+
+        // Step 2: Post to Celestia (without lock)
+        let post_result = self.celestia.post_blob(&data).await;
+
+        match post_result {
+            Ok(celestia_ref) => {
+                // Verify commitment matches
+                if celestia_ref.commitment == expected_commitment {
+                    // Success - blob is now in Celestia
+                    // Note: We don't remove from pending here, that's reconcile's job
+                    Ok(())
+                } else {
+                    Err(ConsistencyError::RepostFailed(format!(
+                        "Commitment mismatch after repost. Expected {:?}, got {:?}",
+                        expected_commitment, celestia_ref.commitment
+                    )))
+                }
+            }
+            Err(e) => {
+                Err(ConsistencyError::RepostFailed(format!(
+                    "Failed to post blob to Celestia: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    /// Repair MissingInFallback: fetch dari Celestia dan simpan ke fallback.
+    async fn repair_missing_in_fallback(
+        &self,
+        mismatch: &ConsistencyMismatch,
+    ) -> Result<(), ConsistencyError> {
+        // For MissingInFallback, we need to know the BlobRef from Celestia
+        // Since we only have the sequence, we need to construct a BlobRef
+        // This requires celestia_commitment to be present
+        let celestia_commitment = mismatch.celestia_commitment.ok_or_else(|| {
+            ConsistencyError::Internal(
+                "MissingInFallback requires celestia_commitment".to_string()
+            )
+        })?;
+
+        // Construct BlobRef for fetching
+        let blob_ref = dsdn_common::BlobRef {
+            height: mismatch.sequence,
+            commitment: celestia_commitment,
+            namespace: [0u8; 29], // Default namespace
+        };
+
+        // Step 1: Fetch from Celestia (without lock)
+        let fetch_result = self.celestia.get_blob(&blob_ref).await;
+
+        let data = match fetch_result {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(ConsistencyError::FetchFailed(format!(
+                    "Failed to fetch blob from Celestia: {}",
+                    e
+                )));
+            }
+        };
+
+        // Step 2: Add to pending (with lock)
+        // Only add if not already present
+        {
+            let mut pending = self.pending_blobs.write();
+            let already_exists = pending
+                .iter()
+                .any(|b| b.original_sequence() == mismatch.sequence);
+
+            if !already_exists {
+                pending.push(PendingBlob {
+                    blob_ref,
+                    data,
+                    added_at: current_unix_timestamp(),
+                    retry_count: 0,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -688,6 +1053,20 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Compute commitment hash dari blob data.
+///
+/// Menggunakan SHA-256 sesuai dengan BlobRef spec.
+/// Menghasilkan 32-byte hash yang deterministik.
+fn compute_commitment(data: &[u8]) -> [u8; 32] {
+    use sha3::{Sha3_256, Digest};
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut commitment = [0u8; 32];
+    commitment.copy_from_slice(&result);
+    commitment
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1460,5 +1839,337 @@ mod tests {
         assert!(matches!(s2, BlobReconcileStatus::Failed(_)));
         assert!(matches!(s3, BlobReconcileStatus::PermanentlyFailed(_)));
         assert!(matches!(s4, BlobReconcileStatus::Skipped(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Tests for 14A.1A.34 - State Consistency Verification
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Mock DA layer yang mengembalikan data konsisten
+    struct ConsistentDALayer;
+
+    impl DALayer for ConsistentDALayer {
+        fn post_blob(
+            &self,
+            data: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobRef, dsdn_common::DAError>> + Send + '_>> {
+            let commitment = compute_commitment(data);
+            Box::pin(async move {
+                Ok(dsdn_common::BlobRef {
+                    height: 1,
+                    commitment,
+                    namespace: [0u8; 29],
+                })
+            })
+        }
+
+        fn get_blob(
+            &self,
+            ref_: &dsdn_common::BlobRef,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, dsdn_common::DAError>> + Send + '_>> {
+            // Return data that matches the commitment
+            let height = ref_.height;
+            Box::pin(async move {
+                // Return data based on height
+                Ok(vec![height as u8])
+            })
+        }
+
+        fn subscribe_blobs(
+            &self,
+            _from_height: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobStream, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::Other("not implemented".to_string()))
+            })
+        }
+
+        fn health_check(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::DAHealthStatus, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move { Ok(dsdn_common::DAHealthStatus::Healthy) })
+        }
+    }
+
+    /// Mock DA layer yang selalu return BlobNotFound
+    struct MissingBlobDALayer;
+
+    impl DALayer for MissingBlobDALayer {
+        fn post_blob(
+            &self,
+            data: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobRef, dsdn_common::DAError>> + Send + '_>> {
+            let commitment = compute_commitment(data);
+            Box::pin(async move {
+                Ok(dsdn_common::BlobRef {
+                    height: 1,
+                    commitment,
+                    namespace: [0u8; 29],
+                })
+            })
+        }
+
+        fn get_blob(
+            &self,
+            ref_: &dsdn_common::BlobRef,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, dsdn_common::DAError>> + Send + '_>> {
+            let ref_clone = ref_.clone();
+            Box::pin(async move {
+                Err(dsdn_common::DAError::BlobNotFound(ref_clone))
+            })
+        }
+
+        fn subscribe_blobs(
+            &self,
+            _from_height: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobStream, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::Other("not implemented".to_string()))
+            })
+        }
+
+        fn health_check(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::DAHealthStatus, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move { Ok(dsdn_common::DAHealthStatus::Healthy) })
+        }
+    }
+
+    /// Mock DA layer yang return data berbeda (hash mismatch)
+    struct MismatchDALayer;
+
+    impl DALayer for MismatchDALayer {
+        fn post_blob(
+            &self,
+            _data: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobRef, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(dsdn_common::BlobRef {
+                    height: 1,
+                    commitment: [0u8; 32],
+                    namespace: [0u8; 29],
+                })
+            })
+        }
+
+        fn get_blob(
+            &self,
+            _ref_: &dsdn_common::BlobRef,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, dsdn_common::DAError>> + Send + '_>> {
+            // Return different data than what was stored
+            Box::pin(async move {
+                Ok(vec![99, 99, 99]) // Different data
+            })
+        }
+
+        fn subscribe_blobs(
+            &self,
+            _from_height: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobStream, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::Other("not implemented".to_string()))
+            })
+        }
+
+        fn health_check(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::DAHealthStatus, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move { Ok(dsdn_common::DAHealthStatus::Healthy) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_consistency_empty() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(ConsistentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // No pending blobs - should be consistent
+        let report = engine.verify_state_consistency().await
+            .expect("verify should succeed");
+
+        assert!(report.is_consistent);
+        assert_eq!(report.total_sequences_checked, 0);
+        assert_eq!(report.mismatches_count, 0);
+        assert!(report.min_sequence.is_none());
+        assert!(report.max_sequence.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_consistency_consistent() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(ConsistentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add blob with commitment that matches what ConsistentDALayer returns
+        let data = vec![1u8];
+        let commitment = compute_commitment(&data);
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 1,
+                commitment,
+                namespace: [0u8; 29],
+            },
+            data,
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+
+        let report = engine.verify_state_consistency().await
+            .expect("verify should succeed");
+
+        assert!(report.is_consistent);
+        assert_eq!(report.total_sequences_checked, 1);
+        assert_eq!(report.mismatches_count, 0);
+        assert_eq!(report.min_sequence, Some(1));
+        assert_eq!(report.max_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_consistency_missing_in_primary() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(MissingBlobDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        engine.add_pending(make_test_blob(1, vec![1], 0));
+
+        let report = engine.verify_state_consistency().await
+            .expect("verify should succeed");
+
+        assert!(!report.is_consistent);
+        assert_eq!(report.total_sequences_checked, 1);
+        assert_eq!(report.mismatches_count, 1);
+        assert_eq!(report.mismatches[0].mismatch_type, MismatchType::MissingInPrimary);
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_consistency_hash_mismatch() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(MismatchDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add blob - MismatchDALayer will return different data
+        engine.add_pending(make_test_blob(1, vec![1], 0));
+
+        let report = engine.verify_state_consistency().await
+            .expect("verify should succeed");
+
+        assert!(!report.is_consistent);
+        assert_eq!(report.mismatches_count, 1);
+        assert_eq!(report.mismatches[0].mismatch_type, MismatchType::HashMismatch);
+    }
+
+    #[tokio::test]
+    async fn test_repair_inconsistency_missing_in_primary() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(ConsistentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add a pending blob
+        let data = vec![1u8];
+        let commitment = compute_commitment(&data);
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 1,
+                commitment,
+                namespace: [0u8; 29],
+            },
+            data,
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+
+        let mismatch = ConsistencyMismatch {
+            sequence: 1,
+            mismatch_type: MismatchType::MissingInPrimary,
+            fallback_commitment: Some(commitment),
+            celestia_commitment: None,
+            description: "Test mismatch".to_string(),
+        };
+
+        // Repair should succeed (ConsistentDALayer returns matching commitment)
+        let result = engine.repair_inconsistency(&mismatch).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_repair_inconsistency_hash_mismatch_fails() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(ConsistentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        let mismatch = ConsistencyMismatch {
+            sequence: 1,
+            mismatch_type: MismatchType::HashMismatch,
+            fallback_commitment: Some([1u8; 32]),
+            celestia_commitment: Some([2u8; 32]),
+            description: "Hash mismatch".to_string(),
+        };
+
+        // Repair should fail for HashMismatch (non-repairable)
+        let result = engine.repair_inconsistency(&mismatch).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ConsistencyError::NonRepairable(_))));
+    }
+
+    #[tokio::test]
+    async fn test_repair_inconsistency_missing_in_fallback() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(ConsistentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        let mismatch = ConsistencyMismatch {
+            sequence: 5,
+            mismatch_type: MismatchType::MissingInFallback,
+            fallback_commitment: None,
+            celestia_commitment: Some([5u8; 32]),
+            description: "Missing in fallback".to_string(),
+        };
+
+        // Repair should succeed - fetches from Celestia and adds to pending
+        let result = engine.repair_inconsistency(&mismatch).await;
+        assert!(result.is_ok());
+
+        // Should have added the blob to pending
+        assert_eq!(engine.get_pending_count(), 1);
+    }
+
+    #[test]
+    fn test_consistency_error_display() {
+        let e1 = ConsistencyError::DAUnavailable("test".to_string());
+        assert!(e1.to_string().contains("DA layer unavailable"));
+
+        let e2 = ConsistencyError::BlobNotFound(123);
+        assert!(e2.to_string().contains("123"));
+
+        let e3 = ConsistencyError::NonRepairable("hash mismatch".to_string());
+        assert!(e3.to_string().contains("Non-repairable"));
+
+        let e4 = ConsistencyError::RepostFailed("network".to_string());
+        assert!(e4.to_string().contains("Repost failed"));
+
+        let e5 = ConsistencyError::FetchFailed("timeout".to_string());
+        assert!(e5.to_string().contains("Fetch failed"));
+    }
+
+    #[test]
+    fn test_mismatch_type_display() {
+        assert_eq!(MismatchType::MissingInPrimary.to_string(), "MissingInPrimary");
+        assert_eq!(MismatchType::MissingInFallback.to_string(), "MissingInFallback");
+        assert_eq!(MismatchType::HashMismatch.to_string(), "HashMismatch");
+    }
+
+    #[test]
+    fn test_compute_commitment() {
+        let data = vec![1, 2, 3, 4];
+        let c1 = compute_commitment(&data);
+        let c2 = compute_commitment(&data);
+
+        // Same data should produce same commitment
+        assert_eq!(c1, c2);
+
+        // Different data should produce different commitment
+        let c3 = compute_commitment(&[5, 6, 7]);
+        assert_ne!(c1, c3);
     }
 }
