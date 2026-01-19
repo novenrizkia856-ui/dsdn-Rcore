@@ -1,16 +1,23 @@
-//! ReconciliationEngine - Fondasi untuk reconcile fallback blobs ke Celestia (14A.1A.31)
+//! ReconciliationEngine - Reconcile fallback blobs ke Celestia (14A.1A.31-33)
 //!
-//! Module ini mendefinisikan struktur dasar untuk ReconciliationEngine.
+//! Module ini menyediakan ReconciliationEngine untuk melakukan reconciliation
+//! blob dari QuorumDA (fallback) ke Celestia (primary DA).
 //!
-//! ## Tahap Ini (14A.1A.31)
+//! ## Components
 //!
-//! Tahap ini HANYA mendefinisikan:
-//! - Struktur dasar `ReconciliationEngine`
-//! - Struktur `ReconciliationConfig` dengan Default
-//! - Struktur `PendingBlob` untuk tracking
-//! - Module exports
+//! - `ReconciliationEngine`: Engine utama untuk reconciliation
+//! - `ReconciliationConfig`: Konfigurasi engine (batch_size, retry, parallel)
+//! - `PendingBlob`: Blob yang pending untuk di-reconcile
+//! - `PendingBlobInfo`: Summary info tanpa data mentah
+//! - `ReconcileReport`: Laporan hasil reconciliation
+//! - `ReconcileError`: Error types
 //!
-//! **TIDAK ADA** logic reconcile, async task, loop, atau side-effect.
+//! ## Thread Safety
+//!
+//! Semua komponen thread-safe:
+//! - `RwLock` untuk mutable state
+//! - `AtomicU64` untuk counters
+//! - Lock TIDAK dipegang saat network call
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -98,6 +105,95 @@ pub struct PendingBlobInfo {
 
     /// Apakah commitment hash ada (selalu true karena BlobRef memiliki commitment).
     pub commitment_present: bool,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// RECONCILE TYPES (14A.1A.33)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error yang dapat terjadi saat reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileError {
+    /// Tidak ada pending blobs untuk diproses.
+    NoPendingBlobs,
+
+    /// DA layer tidak tersedia.
+    DAUnavailable(String),
+
+    /// Internal error.
+    Internal(String),
+}
+
+impl std::fmt::Display for ReconcileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPendingBlobs => write!(f, "No pending blobs to reconcile"),
+            Self::DAUnavailable(msg) => write!(f, "DA layer unavailable: {}", msg),
+            Self::Internal(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ReconcileError {}
+
+/// Status hasil reconciliation untuk satu blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobReconcileStatus {
+    /// Berhasil di-reconcile ke Celestia.
+    Success,
+
+    /// Gagal dengan error yang dapat di-retry.
+    Failed(String),
+
+    /// Gagal permanen (sudah melebihi max_retries).
+    PermanentlyFailed(String),
+
+    /// Di-skip karena sudah expired sebelum diproses.
+    Skipped(String),
+}
+
+/// Detail hasil reconciliation untuk satu blob.
+#[derive(Debug, Clone)]
+pub struct BlobReconcileDetail {
+    /// Sequence number dari blob.
+    pub original_sequence: u64,
+
+    /// Status hasil reconciliation.
+    pub status: BlobReconcileStatus,
+
+    /// Commitment dari Celestia jika sukses.
+    pub celestia_commitment: Option<[u8; 32]>,
+
+    /// Height di Celestia jika sukses.
+    pub celestia_height: Option<u64>,
+
+    /// Retry count saat ini.
+    pub retry_count: u32,
+}
+
+/// Laporan hasil reconciliation batch.
+#[derive(Debug, Clone)]
+pub struct ReconcileReport {
+    /// Jumlah total pending blobs sebelum reconciliation.
+    pub total_pending: usize,
+
+    /// Jumlah blob yang berhasil di-reconcile.
+    pub reconciled: usize,
+
+    /// Jumlah blob yang gagal.
+    pub failed: usize,
+
+    /// Jumlah blob yang di-skip.
+    pub skipped: usize,
+
+    /// Detail per-blob.
+    pub details: Vec<BlobReconcileDetail>,
+
+    /// Timestamp mulai (Unix seconds).
+    pub started_at: u64,
+
+    /// Timestamp selesai (Unix seconds).
+    pub completed_at: u64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -304,6 +400,294 @@ impl ReconciliationEngine {
         pending.retain(|blob| blob.retry_count < max_retries);
         initial_len - pending.len()
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Reconcile Method (14A.1A.33)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Melakukan reconciliation batch dari pending blobs ke Celestia.
+    ///
+    /// ## Proses
+    ///
+    /// 1. Mengambil batch PendingBlob (max batch_size, urutan deterministik)
+    /// 2. Untuk setiap blob:
+    ///    - Validasi (tidak expired, retry_count <= max_retries)
+    ///    - Post ke Celestia via post_blob()
+    ///    - Verifikasi commitment
+    ///    - Update state berdasarkan hasil
+    /// 3. Mengembalikan ReconcileReport lengkap
+    ///
+    /// ## Thread Safety
+    ///
+    /// - Lock hanya dipegang saat membaca/menulis state
+    /// - Lock TIDAK dipegang saat network call
+    /// - Atomic updates untuk counters
+    ///
+    /// ## Errors
+    ///
+    /// Returns `Err(ReconcileError::NoPendingBlobs)` jika tidak ada blob untuk diproses.
+    pub async fn reconcile(&self) -> Result<ReconcileReport, ReconcileError> {
+        let started_at = current_unix_timestamp();
+        let max_retries = self.config.max_retries;
+        let batch_size = self.config.batch_size;
+
+        // Step 1: Extract batch of blobs to process (with lock)
+        // Filter out expired blobs and take at most batch_size
+        let batch: Vec<(usize, PendingBlob)> = {
+            let pending = self.pending_blobs.read();
+            pending
+                .iter()
+                .enumerate()
+                .filter(|(_, blob)| blob.retry_count < max_retries)
+                .take(batch_size)
+                .map(|(idx, blob)| (idx, blob.clone()))
+                .collect()
+        };
+
+        let total_pending = self.get_pending_count();
+
+        if batch.is_empty() {
+            return Err(ReconcileError::NoPendingBlobs);
+        }
+
+        // Step 2: Process blobs (without lock)
+        let results: Vec<(u64, BlobReconcileDetail, bool)> = if self.config.parallel_reconcile {
+            // Parallel processing
+            self.process_batch_parallel(&batch, max_retries).await
+        } else {
+            // Serial processing
+            self.process_batch_serial(&batch, max_retries).await
+        };
+
+        // Step 3: Apply results to state (with lock)
+        let mut reconciled = 0usize;
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        let mut details = Vec::with_capacity(results.len());
+
+        // Collect sequences to remove and retry counts to update
+        let mut sequences_to_remove: Vec<u64> = Vec::new();
+        let mut sequences_to_increment_retry: Vec<u64> = Vec::new();
+        let mut sequences_permanently_failed: Vec<u64> = Vec::new();
+
+        for (sequence, detail, success) in results {
+            match &detail.status {
+                BlobReconcileStatus::Success => {
+                    reconciled += 1;
+                    sequences_to_remove.push(sequence);
+                }
+                BlobReconcileStatus::Failed(_) => {
+                    failed += 1;
+                    sequences_to_increment_retry.push(sequence);
+                }
+                BlobReconcileStatus::PermanentlyFailed(_) => {
+                    failed += 1;
+                    sequences_permanently_failed.push(sequence);
+                }
+                BlobReconcileStatus::Skipped(_) => {
+                    skipped += 1;
+                }
+            }
+            details.push(detail);
+        }
+
+        // Apply state changes (with lock)
+        {
+            let mut pending = self.pending_blobs.write();
+
+            // Remove successfully reconciled blobs
+            pending.retain(|blob| !sequences_to_remove.contains(&blob.original_sequence()));
+
+            // Remove permanently failed blobs
+            pending.retain(|blob| !sequences_permanently_failed.contains(&blob.original_sequence()));
+
+            // Increment retry count for failed blobs
+            for blob in pending.iter_mut() {
+                if sequences_to_increment_retry.contains(&blob.original_sequence()) {
+                    blob.retry_count = blob.retry_count.saturating_add(1);
+                }
+            }
+        }
+
+        // Step 4: Update metrics (atomic)
+        if reconciled > 0 {
+            self.reconciled_count.fetch_add(
+                reconciled as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        if failed > 0 {
+            self.failed_count.fetch_add(
+                failed as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        let completed_at = current_unix_timestamp();
+        self.last_reconcile.store(completed_at, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(ReconcileReport {
+            total_pending,
+            reconciled,
+            failed,
+            skipped,
+            details,
+            started_at,
+            completed_at,
+        })
+    }
+
+    /// Process batch serially (one by one).
+    async fn process_batch_serial(
+        &self,
+        batch: &[(usize, PendingBlob)],
+        max_retries: u32,
+    ) -> Vec<(u64, BlobReconcileDetail, bool)> {
+        let mut results = Vec::with_capacity(batch.len());
+
+        for (_, blob) in batch {
+            let result = self.process_single_blob(blob, max_retries).await;
+            results.push(result);
+        }
+
+        results
+    }
+
+    /// Process batch in parallel.
+    ///
+    /// Uses futures::future::join_all for concurrent execution.
+    async fn process_batch_parallel(
+        &self,
+        batch: &[(usize, PendingBlob)],
+        max_retries: u32,
+    ) -> Vec<(u64, BlobReconcileDetail, bool)> {
+        use futures::future::join_all;
+
+        let futs: Vec<_> = batch
+            .iter()
+            .map(|(_, blob)| self.process_single_blob(blob, max_retries))
+            .collect();
+
+        join_all(futs).await
+    }
+
+    /// Process a single blob.
+    ///
+    /// Returns (sequence, detail, success).
+    async fn process_single_blob(
+        &self,
+        blob: &PendingBlob,
+        max_retries: u32,
+    ) -> (u64, BlobReconcileDetail, bool) {
+        let sequence = blob.original_sequence();
+        let current_retry = blob.retry_count;
+
+        // Check if already expired (shouldn't happen but be defensive)
+        if current_retry >= max_retries {
+            return (
+                sequence,
+                BlobReconcileDetail {
+                    original_sequence: sequence,
+                    status: BlobReconcileStatus::Skipped("Already expired".to_string()),
+                    celestia_commitment: None,
+                    celestia_height: None,
+                    retry_count: current_retry,
+                },
+                false,
+            );
+        }
+
+        // Post blob to Celestia
+        let post_result = self.celestia.post_blob(&blob.data).await;
+
+        match post_result {
+            Ok(celestia_ref) => {
+                // Verify commitment matches (if original has commitment)
+                // Note: blob.blob_ref.commitment is the original commitment from QuorumDA
+                // celestia_ref.commitment is the new commitment from Celestia
+                // In practice, same data should produce same commitment
+                // But we compare anyway for integrity check
+                
+                let commitment_matches = blob.blob_ref.commitment == celestia_ref.commitment;
+
+                if commitment_matches {
+                    (
+                        sequence,
+                        BlobReconcileDetail {
+                            original_sequence: sequence,
+                            status: BlobReconcileStatus::Success,
+                            celestia_commitment: Some(celestia_ref.commitment),
+                            celestia_height: Some(celestia_ref.height),
+                            retry_count: current_retry,
+                        },
+                        true,
+                    )
+                } else {
+                    // Commitment mismatch - this is a serious error
+                    // Mark as failed, will retry
+                    let new_retry = current_retry.saturating_add(1);
+                    let status = if new_retry >= max_retries {
+                        BlobReconcileStatus::PermanentlyFailed(
+                            "Commitment mismatch after max retries".to_string(),
+                        )
+                    } else {
+                        BlobReconcileStatus::Failed("Commitment mismatch".to_string())
+                    };
+
+                    (
+                        sequence,
+                        BlobReconcileDetail {
+                            original_sequence: sequence,
+                            status,
+                            celestia_commitment: Some(celestia_ref.commitment),
+                            celestia_height: Some(celestia_ref.height),
+                            retry_count: new_retry,
+                        },
+                        false,
+                    )
+                }
+            }
+            Err(e) => {
+                // Post failed
+                let new_retry = current_retry.saturating_add(1);
+                let error_msg = e.to_string();
+                let status = if new_retry >= max_retries {
+                    BlobReconcileStatus::PermanentlyFailed(format!(
+                        "Post failed after max retries: {}",
+                        error_msg
+                    ))
+                } else {
+                    BlobReconcileStatus::Failed(format!("Post failed: {}", error_msg))
+                };
+
+                (
+                    sequence,
+                    BlobReconcileDetail {
+                        original_sequence: sequence,
+                        status,
+                        celestia_commitment: None,
+                        celestia_height: None,
+                        retry_count: new_retry,
+                    },
+                    false,
+                )
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Get current Unix timestamp in seconds.
+///
+/// Returns 0 if system time is before Unix epoch (should never happen).
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -676,5 +1060,405 @@ mod tests {
         };
         let info2 = info1.clone();
         assert_eq!(info1, info2);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Tests for 14A.1A.33 - Reconcile Method
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Mock DA layer that always fails
+    struct FailingDALayer;
+
+    impl DALayer for FailingDALayer {
+        fn post_blob(
+            &self,
+            _data: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobRef, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::NetworkError("Connection refused".to_string()))
+            })
+        }
+
+        fn get_blob(
+            &self,
+            _ref_: &dsdn_common::BlobRef,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::Other("not implemented".to_string()))
+            })
+        }
+
+        fn subscribe_blobs(
+            &self,
+            _from_height: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobStream, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::Other("not implemented".to_string()))
+            })
+        }
+
+        fn health_check(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::DAHealthStatus, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move { Ok(dsdn_common::DAHealthStatus::Unavailable) })
+        }
+    }
+
+    /// Mock DA layer that returns matching commitment
+    struct MatchingCommitmentDALayer;
+
+    impl DALayer for MatchingCommitmentDALayer {
+        fn post_blob(
+            &self,
+            data: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobRef, dsdn_common::DAError>> + Send + '_>> {
+            // Return commitment that matches the blob's height (used as commitment in make_test_blob)
+            let height = if data.is_empty() { 0 } else { data[0] as u64 };
+            let commitment = [height as u8; 32];
+            Box::pin(async move {
+                Ok(dsdn_common::BlobRef {
+                    height: 1000 + height,
+                    commitment,
+                    namespace: [0u8; 29],
+                })
+            })
+        }
+
+        fn get_blob(
+            &self,
+            _ref_: &dsdn_common::BlobRef,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn subscribe_blobs(
+            &self,
+            _from_height: Option<u64>,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::BlobStream, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move {
+                Err(dsdn_common::DAError::Other("not implemented".to_string()))
+            })
+        }
+
+        fn health_check(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<dsdn_common::DAHealthStatus, dsdn_common::DAError>> + Send + '_>> {
+            Box::pin(async move { Ok(dsdn_common::DAHealthStatus::Healthy) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_no_pending() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(MockDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        let result = engine.reconcile().await;
+        assert!(result.is_err());
+        match result {
+            Err(ReconcileError::NoPendingBlobs) => {}
+            _ => panic!("Expected NoPendingBlobs error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_all_success() {
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(MatchingCommitmentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add blobs with matching commitments
+        // make_test_blob uses [height as u8; 32] as commitment
+        // MatchingCommitmentDALayer returns commitment based on first byte of data
+        // So we need data[0] == height for commitment match
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 1,
+                commitment: [1u8; 32],
+                namespace: [0u8; 29],
+            },
+            data: vec![1],
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 2,
+                commitment: [2u8; 32],
+                namespace: [0u8; 29],
+            },
+            data: vec![2],
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+
+        assert_eq!(engine.get_pending_count(), 2);
+
+        let report = engine.reconcile().await.expect("reconcile should succeed");
+
+        assert_eq!(report.total_pending, 2);
+        assert_eq!(report.reconciled, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.details.len(), 2);
+
+        // Verify blobs removed
+        assert_eq!(engine.get_pending_count(), 0);
+
+        // Verify counters
+        assert_eq!(engine.reconciled_count(), 2);
+        assert_eq!(engine.failed_count(), 0);
+        assert!(engine.last_reconcile() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_all_fail() {
+        let config = ReconciliationConfig::default(); // max_retries = 3
+        let celestia: Arc<dyn DALayer> = Arc::new(FailingDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        engine.add_pending(make_test_blob(1, vec![1], 0));
+        engine.add_pending(make_test_blob(2, vec![2], 0));
+
+        let report = engine.reconcile().await.expect("reconcile should return report");
+
+        assert_eq!(report.total_pending, 2);
+        assert_eq!(report.reconciled, 0);
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.skipped, 0);
+
+        // Blobs should still be pending (retry_count incremented)
+        assert_eq!(engine.get_pending_count(), 2);
+
+        // Verify retry counts incremented
+        let list = engine.list_pending();
+        assert_eq!(list[0].retry_count, 1);
+        assert_eq!(list[1].retry_count, 1);
+
+        // Verify counters
+        assert_eq!(engine.reconciled_count(), 0);
+        assert_eq!(engine.failed_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_retry_exhaustion() {
+        let config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 2,
+            parallel_reconcile: false,
+        };
+        let celestia: Arc<dyn DALayer> = Arc::new(FailingDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add blob that's already at retry_count = 1 (one more failure will reach max_retries)
+        engine.add_pending(make_test_blob(1, vec![1], 1));
+
+        let report = engine.reconcile().await.expect("reconcile should return report");
+
+        // Should be permanently failed (retry_count would become 2 == max_retries)
+        assert_eq!(report.reconciled, 0);
+        assert_eq!(report.failed, 1);
+
+        // Verify status
+        assert!(matches!(
+            report.details[0].status,
+            BlobReconcileStatus::PermanentlyFailed(_)
+        ));
+
+        // Permanently failed blob should be removed
+        assert_eq!(engine.get_pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_partial_success() {
+        // Use MockDALayer which returns [0u8; 32] commitment
+        let config = ReconciliationConfig::default();
+        let celestia: Arc<dyn DALayer> = Arc::new(MockDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Blob 1: commitment [0u8; 32] will match MockDALayer's return
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 1,
+                commitment: [0u8; 32], // matches MockDALayer
+                namespace: [0u8; 29],
+            },
+            data: vec![1, 2, 3],
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+
+        // Blob 2: commitment [1u8; 32] will NOT match MockDALayer's return
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 2,
+                commitment: [1u8; 32], // does not match MockDALayer
+                namespace: [0u8; 29],
+            },
+            data: vec![4, 5, 6],
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+
+        assert_eq!(engine.get_pending_count(), 2);
+
+        let report = engine.reconcile().await.expect("reconcile should return report");
+
+        // One success, one fail (commitment mismatch)
+        assert_eq!(report.reconciled, 1);
+        assert_eq!(report.failed, 1);
+
+        // First blob (success) should be removed
+        // Second blob (failed) should still be pending with retry_count = 1
+        assert_eq!(engine.get_pending_count(), 1);
+        let list = engine.list_pending();
+        assert_eq!(list[0].original_sequence, 2);
+        assert_eq!(list[0].retry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_skips_expired() {
+        let config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let celestia: Arc<dyn DALayer> = Arc::new(MatchingCommitmentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add one valid blob
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 1,
+                commitment: [1u8; 32],
+                namespace: [0u8; 29],
+            },
+            data: vec![1],
+            added_at: 1700000000,
+            retry_count: 0,
+        });
+
+        // Add one expired blob (retry_count >= max_retries)
+        engine.add_pending(PendingBlob {
+            blob_ref: dsdn_common::BlobRef {
+                height: 2,
+                commitment: [2u8; 32],
+                namespace: [0u8; 29],
+            },
+            data: vec![2],
+            added_at: 1700000000,
+            retry_count: 5, // expired
+        });
+
+        assert_eq!(engine.get_pending_count(), 2);
+
+        let report = engine.reconcile().await.expect("reconcile should return report");
+
+        // Only non-expired blob should be processed
+        assert_eq!(report.reconciled, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.skipped, 0); // expired ones are filtered, not skipped
+        assert_eq!(report.details.len(), 1);
+
+        // Only expired blob should remain (valid one removed)
+        assert_eq!(engine.get_pending_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_batch_size() {
+        let config = ReconciliationConfig {
+            batch_size: 2, // Only process 2 at a time
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: false,
+        };
+        let celestia: Arc<dyn DALayer> = Arc::new(MatchingCommitmentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add 5 blobs
+        for i in 1..=5 {
+            engine.add_pending(PendingBlob {
+                blob_ref: dsdn_common::BlobRef {
+                    height: i,
+                    commitment: [i as u8; 32],
+                    namespace: [0u8; 29],
+                },
+                data: vec![i as u8],
+                added_at: 1700000000,
+                retry_count: 0,
+            });
+        }
+
+        assert_eq!(engine.get_pending_count(), 5);
+
+        let report = engine.reconcile().await.expect("reconcile should return report");
+
+        // Only 2 should be processed (batch_size = 2)
+        assert_eq!(report.total_pending, 5);
+        assert_eq!(report.reconciled, 2);
+        assert_eq!(report.details.len(), 2);
+
+        // 3 blobs should remain
+        assert_eq!(engine.get_pending_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_parallel() {
+        let config = ReconciliationConfig {
+            batch_size: 10,
+            retry_delay_ms: 1000,
+            max_retries: 3,
+            parallel_reconcile: true, // Enable parallel
+        };
+        let celestia: Arc<dyn DALayer> = Arc::new(MatchingCommitmentDALayer);
+        let engine = ReconciliationEngine::new(config, celestia);
+
+        // Add multiple blobs
+        for i in 1..=3 {
+            engine.add_pending(PendingBlob {
+                blob_ref: dsdn_common::BlobRef {
+                    height: i,
+                    commitment: [i as u8; 32],
+                    namespace: [0u8; 29],
+                },
+                data: vec![i as u8],
+                added_at: 1700000000,
+                retry_count: 0,
+            });
+        }
+
+        let report = engine.reconcile().await.expect("reconcile should return report");
+
+        // All should succeed
+        assert_eq!(report.reconciled, 3);
+        assert_eq!(engine.get_pending_count(), 0);
+    }
+
+    #[test]
+    fn test_reconcile_error_display() {
+        let e1 = ReconcileError::NoPendingBlobs;
+        assert_eq!(e1.to_string(), "No pending blobs to reconcile");
+
+        let e2 = ReconcileError::DAUnavailable("test".to_string());
+        assert!(e2.to_string().contains("DA layer unavailable"));
+
+        let e3 = ReconcileError::Internal("err".to_string());
+        assert!(e3.to_string().contains("Internal error"));
+    }
+
+    #[test]
+    fn test_blob_reconcile_status_variants() {
+        let s1 = BlobReconcileStatus::Success;
+        let s2 = BlobReconcileStatus::Failed("err".to_string());
+        let s3 = BlobReconcileStatus::PermanentlyFailed("max retries".to_string());
+        let s4 = BlobReconcileStatus::Skipped("expired".to_string());
+
+        // Just verify they exist and can be matched
+        assert!(matches!(s1, BlobReconcileStatus::Success));
+        assert!(matches!(s2, BlobReconcileStatus::Failed(_)));
+        assert!(matches!(s3, BlobReconcileStatus::PermanentlyFailed(_)));
+        assert!(matches!(s4, BlobReconcileStatus::Skipped(_)));
     }
 }
