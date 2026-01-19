@@ -507,8 +507,15 @@ async fn main() {
 mod tests {
     use super::*;
 
+    /// Mutex to serialize environment variable tests.
+    /// Environment variables are process-global state, so concurrent tests
+    /// that modify them will race and produce flaky results.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_coordinator_config_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         // Clear env vars
         std::env::remove_var("DA_RPC_URL");
         std::env::remove_var("DA_NAMESPACE");
@@ -530,6 +537,8 @@ mod tests {
 
     #[test]
     fn test_coordinator_config_custom_port() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("COORDINATOR_PORT", "9090");
         std::env::set_var("USE_MOCK_DA", "true");
 
@@ -543,6 +552,8 @@ mod tests {
 
     #[test]
     fn test_coordinator_config_invalid_port() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("COORDINATOR_PORT", "invalid");
         std::env::set_var("USE_MOCK_DA", "true");
 
