@@ -2,7 +2,7 @@
 //!
 //! The Coordinator is the central orchestration component of DSDN (Decentralized
 //! Storage and Data Network). It manages node registry, placement decisions,
-//! workload scheduling, and DA layer integration.
+//! workload scheduling, and DA layer integration with fallback support.
 //!
 //! ## Architecture Overview
 //!
@@ -31,6 +31,194 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! ## DA Fallback Architecture (14A.1A.35-39)
+//!
+//! The coordinator implements a multi-layer DA fallback system to ensure high
+//! availability when primary Celestia DA is unavailable.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────────────┐
+//! │                         DA ROUTING SUBSYSTEM                             │
+//! │                                                                          │
+//! │  ┌────────────────────────────────────────────────────────────────────┐ │
+//! │  │                          DARouter                                  │ │
+//! │  │  (Single entry point for ALL DA operations)                       │ │
+//! │  │                                                                    │ │
+//! │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │ │
+//! │  │  │   Primary   │  │  Secondary  │  │  Emergency  │               │ │
+//! │  │  │  (Celestia) │  │  (QuorumDA) │  │    (Mock)   │               │ │
+//! │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │ │
+//! │  │         │                │                │                       │ │
+//! │  │         └────────────────┴────────────────┘                       │ │
+//! │  │                          │                                        │ │
+//! │  │                    route by health                                │ │
+//! │  └──────────────────────────┼────────────────────────────────────────┘ │
+//! │                             │                                          │
+//! │                             ▼                                          │
+//! │  ┌────────────────────────────────────────────────────────────────────┐ │
+//! │  │                     DAHealthMonitor                                │ │
+//! │  │  - Periodic health checks (configurable interval)                 │ │
+//! │  │  - Tracks: primary_healthy, secondary_healthy, emergency_healthy  │ │
+//! │  │  - Detects failover (consecutive failures >= threshold)           │ │
+//! │  │  - Detects recovery (consecutive successes >= threshold)          │ │
+//! │  │  - Triggers auto-reconciliation on recovery (14A.1A.39)           │ │
+//! │  └──────────────────────────┼────────────────────────────────────────┘ │
+//! │                             │                                          │
+//! │                             │ on recovery transition                   │
+//! │                             ▼                                          │
+//! │  ┌────────────────────────────────────────────────────────────────────┐ │
+//! │  │                   ReconciliationEngine                             │ │
+//! │  │  - Tracks pending blobs stored in fallback DA                     │ │
+//! │  │  - Batch reconcile to Celestia when primary recovers              │ │
+//! │  │  - Configurable: batch_size, max_retries, parallel_reconcile      │ │
+//! │  │  - Verifies state consistency between DA layers                   │ │
+//! │  └────────────────────────────────────────────────────────────────────┘ │
+//! │                                                                          │
+//! └──────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Component Relationships
+//!
+//! **DARouter** (defined in `main.rs`):
+//! - Single entry point for ALL DA operations (`post_blob`, `get_blob`)
+//! - Routes requests to primary, secondary, or emergency DA based on health
+//! - Tracks routing metrics (request counts, failover counts, recovery counts)
+//! - Holds references to all DA layers and health monitor
+//!
+//! **DAHealthMonitor** (defined in `main.rs`):
+//! - Runs periodic health checks on all DA layers
+//! - Tracks consecutive failures/successes for each DA
+//! - Determines failover: `primary_failures >= failure_threshold`
+//! - Determines recovery: `primary_successes >= recovery_threshold` while primary healthy
+//! - Triggers automatic reconciliation on recovery transition (14A.1A.39)
+//! - Holds reference to [`ReconciliationEngine`] for auto-recovery
+//!
+//! **ReconciliationEngine** (defined in `reconciliation` module):
+//! - Tracks blobs written to fallback DA that need reconciliation to Celestia
+//! - Provides batch reconciliation with configurable `batch_size`
+//! - Supports retry logic with `max_retries` and `retry_delay_ms`
+//! - Optional parallel reconciliation via `parallel_reconcile` config
+//! - Verifies state consistency between primary and fallback DA
+//!
+//! ## DA Status Flow
+//!
+//! ```text
+//! ┌───────────────────────────────────────────────────────────────────────────┐
+//! │                         DA STATUS TRANSITIONS                             │
+//! │                                                                           │
+//! │   ┌─────────┐                                                             │
+//! │   │ Healthy │◀──────────────────────────────────────────────────┐        │
+//! │   │(Primary)│                                                    │        │
+//! │   └────┬────┘                                                    │        │
+//! │        │ health check fails                                      │        │
+//! │        ▼                                                         │        │
+//! │   ┌─────────┐                                                    │        │
+//! │   │ Warning │ (primary_failures < failure_threshold)             │        │
+//! │   └────┬────┘                                                    │        │
+//! │        │ consecutive failures >= threshold                       │        │
+//! │        ▼                                                         │        │
+//! │   ┌─────────┐                                                    │        │
+//! │   │Degraded │ (using secondary/QuorumDA)                         │        │
+//! │   │(Fallback)│                                                   │        │
+//! │   └────┬────┘                                                    │        │
+//! │        │ secondary also fails                                    │        │
+//! │        ▼                                                    Reconcile     │
+//! │   ┌─────────┐                                               completes     │
+//! │   │Emergency│ (using emergency DA)                               │        │
+//! │   └────┬────┘                                                    │        │
+//! │        │ primary health checks start succeeding                  │        │
+//! │        ▼                                                         │        │
+//! │   ┌──────────┐                                                   │        │
+//! │   │Recovering│ (primary healthy, reconciling pending blobs)──────┘        │
+//! │   └──────────┘                                                            │
+//! │                                                                           │
+//! │   IMPORTANT: Transition to Healthy ONLY after reconciliation succeeds.   │
+//! │   If reconciliation fails, status remains NOT Healthy.                    │
+//! └───────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Reconciliation Process
+//!
+//! Reconciliation ensures data written to fallback DA during outages is
+//! eventually persisted to Celestia (primary DA).
+//!
+//! ### When Reconciliation Runs
+//!
+//! **Automatic (14A.1A.39)**:
+//! - Triggered when DAHealthMonitor detects recovery transition
+//! - Trigger conditions (ALL must be true):
+//!   - `was_on_fallback = true` (previously using fallback)
+//!   - `primary_healthy = true` (primary DA now responds)
+//!   - `should_recover() = true` (recovery threshold met)
+//!   - `is_recovery_in_progress() = false` (not already reconciling)
+//! - Spawned as background task (non-blocking to health monitor loop)
+//! - Controlled by `auto_reconcile_on_recovery` config (default: `true`)
+//!
+//! **Manual**:
+//! - `POST /fallback/reconcile` HTTP endpoint
+//! - Can be triggered independently of recovery state
+//! - Requires primary DA to be healthy
+//!
+//! ### Reconciliation Steps
+//!
+//! 1. **Pending Blob Tracking**: When blob is written to fallback DA,
+//!    it is added to pending queue with `blob_id`, `source_da`, `target_da`, `data`
+//!
+//! 2. **Batch Processing**: Engine processes up to `batch_size` blobs per run
+//!
+//! 3. **Per-Blob Processing**:
+//!    - Post blob data to primary DA via DARouter
+//!    - On success: remove from pending queue
+//!    - On failure: increment `retry_count`, re-queue if under `max_retries`
+//!
+//! 4. **Report Generation**: Returns [`ReconcileReport`] with:
+//!    - `blobs_processed`, `blobs_reconciled`, `blobs_failed`
+//!    - `duration_ms`, `errors` list
+//!    - `success = true` only if `blobs_failed == 0`
+//!
+//! ### Consistency Verification
+//!
+//! [`ReconciliationEngine::verify_state_consistency`] checks:
+//! - Blobs with high retry counts (potential persistent issues)
+//! - Stale blobs (in pending queue too long)
+//! - Returns [`ConsistencyReport`] with `is_consistent`, `details`
+//!
+//! ## Configuration Options
+//!
+//! ### DARouter Configuration (`DARouterConfig` in `main.rs`)
+//!
+//! | Option | Type | Default | Description |
+//! |--------|------|---------|-------------|
+//! | `health_check_interval_ms` | `u64` | `5000` | Interval between health checks |
+//! | `failure_threshold` | `u32` | `3` | Consecutive failures before failover |
+//! | `recovery_threshold` | `u32` | `2` | Consecutive successes before recovery |
+//! | `auto_reconcile_on_recovery` | `bool` | `true` | Auto-trigger reconcile on recovery |
+//!
+//! ### Reconciliation Configuration ([`ReconciliationConfig`])
+//!
+//! | Option | Type | Default | Description |
+//! |--------|------|---------|-------------|
+//! | `batch_size` | `usize` | `10` | Blobs per reconciliation batch |
+//! | `retry_delay_ms` | `u64` | `1000` | Delay between retries |
+//! | `max_retries` | `u32` | `3` | Max retry attempts per blob |
+//! | `parallel_reconcile` | `bool` | `false` | Enable parallel processing |
+//!
+//! ### Coordinator Configuration (`CoordinatorConfig` in `main.rs`)
+//!
+//! | Option | Type | Default | Description |
+//! |--------|------|---------|-------------|
+//! | `enable_fallback` | `bool` | `false` | Enable DA fallback system |
+//! | `fallback_da_type` | enum | `None` | `none`, `quorum`, or `emergency` |
+//!
+//! ## HTTP API Endpoints (14A.1A.38)
+//!
+//! | Endpoint | Method | Description |
+//! |----------|--------|-------------|
+//! | `/fallback/status` | GET | Current DA status, fallback state, pending count |
+//! | `/fallback/pending` | GET | List of pending blobs awaiting reconciliation |
+//! | `/fallback/reconcile` | POST | Trigger manual reconciliation |
+//! | `/fallback/consistency` | GET | Verify state consistency |
+//!
 //! ## Modules
 //!
 //! - **scheduler**: Node scoring and workload-aware scheduling
@@ -38,6 +226,7 @@
 //! - **state_machine**: Deterministic event processing
 //! - **state_rebuild**: State reconstruction from DA history
 //! - **event_publisher**: Event batching and publishing to DA
+//! - **reconciliation**: Fallback blob reconciliation to Celestia (14A.1A.31-34)
 //!
 //! ## Key Invariant
 //!
@@ -60,6 +249,7 @@
 //! 3. **Query**: Scheduler and Placement read from `DADerivedState`
 //! 4. **Publish**: `EventPublisher` writes new events to DA
 //! 5. **Recovery**: `StateRebuilder` reconstructs state from DA history
+//! 6. **Reconcile**: `ReconciliationEngine` syncs fallback blobs to Celestia
 
 use std::collections::HashMap;
 use parking_lot::RwLock;
@@ -84,7 +274,15 @@ pub use state_machine::{
 };
 pub use state_rebuild::{StateRebuilder, RebuildProgress, RebuildError};
 pub use event_publisher::{EventPublisher, BlobRef};
-pub use reconciliation::{ReconciliationEngine, ReconciliationConfig};
+
+// Reconciliation exports (14A.1A.40)
+pub use reconciliation::{
+    ReconciliationEngine,
+    ReconciliationConfig,
+    ReconcileReport,
+    ConsistencyReport,
+    PendingBlobInfo,
+};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,6 +433,12 @@ impl Coordinator {
     }
 }
 
+impl Default for Coordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +511,11 @@ mod tests {
         let wl = Workload { cpu_req: None, ram_req_mb: Some(512.0), gpu_req: None, max_latency_ms: None, io_tolerance: None };
         let chosen = c.schedule(&wl).expect("should pick n1");
         assert_eq!(chosen, "n1");
+    }
+
+    #[test]
+    fn test_coordinator_default() {
+        let c = Coordinator::default();
+        assert!(c.list_nodes().is_empty());
     }
 }
