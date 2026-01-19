@@ -41,6 +41,125 @@ pub struct BlobRef {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FALLBACK EVENT TYPES (14A.1A.37)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Event published when fallback DA is activated.
+///
+/// This event records the transition from primary DA to fallback DA.
+/// It is published to the currently active DA layer via DARouter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackActivated {
+    /// Timestamp when fallback was activated (Unix milliseconds)
+    pub activated_at: u64,
+    /// Reason for activation
+    pub reason: String,
+    /// Previous routing state (e.g., "primary")
+    pub previous_state: String,
+    /// New routing state (e.g., "secondary" or "emergency")
+    pub new_state: String,
+    /// Number of consecutive primary failures that triggered fallback
+    pub failure_count: u32,
+}
+
+/// Event published when fallback DA is deactivated (recovery to primary).
+///
+/// This event records the transition back to primary DA from fallback.
+/// It is published to the currently active DA layer via DARouter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackDeactivated {
+    /// Timestamp when fallback was deactivated (Unix milliseconds)
+    pub deactivated_at: u64,
+    /// Reason for deactivation (recovery)
+    pub reason: String,
+    /// Previous routing state (e.g., "secondary" or "emergency")
+    pub previous_state: String,
+    /// New routing state (should be "primary")
+    pub new_state: String,
+    /// Duration in milliseconds that fallback was active
+    pub fallback_duration_ms: u64,
+}
+
+/// Reconciliation event types.
+///
+/// These events track the reconciliation process that ensures
+/// data consistency between primary and fallback DA layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciliationEvent {
+    /// Reconciliation process has started
+    Started(ReconciliationStarted),
+    /// Reconciliation process has completed
+    Completed(ReconciliationCompleted),
+}
+
+/// Event published when reconciliation starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationStarted {
+    /// Timestamp when reconciliation started (Unix milliseconds)
+    pub started_at: u64,
+    /// Source DA layer being reconciled from
+    pub source_da: String,
+    /// Target DA layer being reconciled to
+    pub target_da: String,
+    /// Starting sequence number for reconciliation
+    pub from_sequence: u64,
+    /// Ending sequence number for reconciliation (if known)
+    pub to_sequence: Option<u64>,
+}
+
+/// Event published when reconciliation completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationCompleted {
+    /// Timestamp when reconciliation completed (Unix milliseconds)
+    pub completed_at: u64,
+    /// Source DA layer that was reconciled from
+    pub source_da: String,
+    /// Target DA layer that was reconciled to
+    pub target_da: String,
+    /// Number of events reconciled
+    pub events_reconciled: u64,
+    /// Duration of reconciliation in milliseconds
+    pub duration_ms: u64,
+    /// Whether reconciliation was successful
+    pub success: bool,
+    /// Error message if reconciliation failed
+    pub error_message: Option<String>,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PUBLISH ERROR
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Error type for event publishing operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    /// DA layer returned an error
+    DAError(String),
+    /// Serialization failed
+    SerializationError(String),
+    /// Event validation failed
+    ValidationError(String),
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PublishError::DAError(msg) => write!(f, "DA error: {}", msg),
+            PublishError::SerializationError(msg) => write!(f, "serialization error: {}", msg),
+            PublishError::ValidationError(msg) => write!(f, "validation error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+impl From<DAError> for PublishError {
+    fn from(err: DAError) -> Self {
+        PublishError::DAError(err.to_string())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // EVENT PUBLISHER
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -431,6 +550,305 @@ impl EventPublisher {
     /// Get the flush interval setting.
     pub fn flush_interval_ms(&self) -> u64 {
         self.flush_interval_ms
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FALLBACK EVENT PUBLISHING (14A.1A.37)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Publish a fallback activated event.
+    ///
+    /// This method publishes the event IMMEDIATELY (not batched) because
+    /// fallback activation is a critical system state change that must be
+    /// recorded as soon as possible.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The FallbackActivated event to publish
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BlobRef)` - Event published successfully
+    /// * `Err(PublishError)` - Publication failed
+    ///
+    /// # Routing
+    ///
+    /// The event is routed through DARouter which selects the appropriate
+    /// DA layer based on current health status.
+    pub fn publish_fallback_activated(&self, event: FallbackActivated) -> Result<BlobRef, PublishError> {
+        // Validate event
+        if event.reason.is_empty() {
+            return Err(PublishError::ValidationError(
+                "FallbackActivated.reason cannot be empty".to_string()
+            ));
+        }
+        if event.previous_state.is_empty() || event.new_state.is_empty() {
+            return Err(PublishError::ValidationError(
+                "FallbackActivated state fields cannot be empty".to_string()
+            ));
+        }
+
+        // Encode event deterministically
+        let encoded = Self::encode_fallback_activated(&event)?;
+
+        // Post to DA via DARouter
+        let blob_ref = self.post_blob_to_da(&encoded)?;
+
+        Ok(blob_ref)
+    }
+
+    /// Publish a fallback deactivated event.
+    ///
+    /// This method publishes the event IMMEDIATELY (not batched) because
+    /// fallback deactivation (recovery) is a critical system state change
+    /// that must be recorded as soon as possible.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The FallbackDeactivated event to publish
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BlobRef)` - Event published successfully
+    /// * `Err(PublishError)` - Publication failed
+    ///
+    /// # Routing
+    ///
+    /// The event is routed through DARouter which selects the appropriate
+    /// DA layer based on current health status.
+    pub fn publish_fallback_deactivated(&self, event: FallbackDeactivated) -> Result<BlobRef, PublishError> {
+        // Validate event
+        if event.reason.is_empty() {
+            return Err(PublishError::ValidationError(
+                "FallbackDeactivated.reason cannot be empty".to_string()
+            ));
+        }
+        if event.previous_state.is_empty() || event.new_state.is_empty() {
+            return Err(PublishError::ValidationError(
+                "FallbackDeactivated state fields cannot be empty".to_string()
+            ));
+        }
+
+        // Encode event deterministically
+        let encoded = Self::encode_fallback_deactivated(&event)?;
+
+        // Post to DA via DARouter
+        let blob_ref = self.post_blob_to_da(&encoded)?;
+
+        Ok(blob_ref)
+    }
+
+    /// Publish a reconciliation event.
+    ///
+    /// This method publishes the event IMMEDIATELY (not batched) because
+    /// reconciliation events are critical for tracking data consistency
+    /// between DA layers.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The ReconciliationEvent to publish (Started or Completed)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BlobRef)` - Event published successfully
+    /// * `Err(PublishError)` - Publication failed
+    ///
+    /// # Routing
+    ///
+    /// The event is routed through DARouter which selects the appropriate
+    /// DA layer based on current health status.
+    pub fn publish_reconciliation_event(&self, event: ReconciliationEvent) -> Result<BlobRef, PublishError> {
+        // Validate event based on variant
+        match &event {
+            ReconciliationEvent::Started(started) => {
+                if started.source_da.is_empty() || started.target_da.is_empty() {
+                    return Err(PublishError::ValidationError(
+                        "ReconciliationStarted DA fields cannot be empty".to_string()
+                    ));
+                }
+            }
+            ReconciliationEvent::Completed(completed) => {
+                if completed.source_da.is_empty() || completed.target_da.is_empty() {
+                    return Err(PublishError::ValidationError(
+                        "ReconciliationCompleted DA fields cannot be empty".to_string()
+                    ));
+                }
+                // If not successful, error_message should be present
+                if !completed.success && completed.error_message.is_none() {
+                    return Err(PublishError::ValidationError(
+                        "ReconciliationCompleted requires error_message when success=false".to_string()
+                    ));
+                }
+            }
+        }
+
+        // Encode event deterministically
+        let encoded = Self::encode_reconciliation_event(&event)?;
+
+        // Post to DA via DARouter
+        let blob_ref = self.post_blob_to_da(&encoded)?;
+
+        Ok(blob_ref)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FALLBACK EVENT ENCODING (14A.1A.37)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Encode FallbackActivated event deterministically.
+    ///
+    /// Format:
+    /// - 1 byte: event type discriminant (0xF1)
+    /// - 8 bytes: activated_at (u64 big-endian)
+    /// - 4 bytes: reason length + reason bytes
+    /// - 4 bytes: previous_state length + previous_state bytes
+    /// - 4 bytes: new_state length + new_state bytes
+    /// - 4 bytes: failure_count (u32 big-endian)
+    fn encode_fallback_activated(event: &FallbackActivated) -> Result<Vec<u8>, PublishError> {
+        let mut buffer = Vec::new();
+
+        // Event type discriminant
+        buffer.push(0xF1);
+
+        // Timestamp
+        buffer.extend_from_slice(&event.activated_at.to_be_bytes());
+
+        // Reason
+        Self::encode_string(&mut buffer, &event.reason);
+
+        // Previous state
+        Self::encode_string(&mut buffer, &event.previous_state);
+
+        // New state
+        Self::encode_string(&mut buffer, &event.new_state);
+
+        // Failure count
+        buffer.extend_from_slice(&event.failure_count.to_be_bytes());
+
+        Ok(buffer)
+    }
+
+    /// Encode FallbackDeactivated event deterministically.
+    ///
+    /// Format:
+    /// - 1 byte: event type discriminant (0xF2)
+    /// - 8 bytes: deactivated_at (u64 big-endian)
+    /// - 4 bytes: reason length + reason bytes
+    /// - 4 bytes: previous_state length + previous_state bytes
+    /// - 4 bytes: new_state length + new_state bytes
+    /// - 8 bytes: fallback_duration_ms (u64 big-endian)
+    fn encode_fallback_deactivated(event: &FallbackDeactivated) -> Result<Vec<u8>, PublishError> {
+        let mut buffer = Vec::new();
+
+        // Event type discriminant
+        buffer.push(0xF2);
+
+        // Timestamp
+        buffer.extend_from_slice(&event.deactivated_at.to_be_bytes());
+
+        // Reason
+        Self::encode_string(&mut buffer, &event.reason);
+
+        // Previous state
+        Self::encode_string(&mut buffer, &event.previous_state);
+
+        // New state
+        Self::encode_string(&mut buffer, &event.new_state);
+
+        // Fallback duration
+        buffer.extend_from_slice(&event.fallback_duration_ms.to_be_bytes());
+
+        Ok(buffer)
+    }
+
+    /// Encode ReconciliationEvent deterministically.
+    ///
+    /// Format for Started (discriminant 0xR1):
+    /// - 1 byte: event type discriminant (0xR1)
+    /// - 8 bytes: started_at (u64 big-endian)
+    /// - 4 bytes: source_da length + source_da bytes
+    /// - 4 bytes: target_da length + target_da bytes
+    /// - 8 bytes: from_sequence (u64 big-endian)
+    /// - 1 byte: to_sequence presence flag (0 or 1)
+    /// - 8 bytes: to_sequence (if present)
+    ///
+    /// Format for Completed (discriminant 0xR2):
+    /// - 1 byte: event type discriminant (0xR2)
+    /// - 8 bytes: completed_at (u64 big-endian)
+    /// - 4 bytes: source_da length + source_da bytes
+    /// - 4 bytes: target_da length + target_da bytes
+    /// - 8 bytes: events_reconciled (u64 big-endian)
+    /// - 8 bytes: duration_ms (u64 big-endian)
+    /// - 1 byte: success flag (0 or 1)
+    /// - 1 byte: error_message presence flag
+    /// - 4 bytes + bytes: error_message (if present)
+    fn encode_reconciliation_event(event: &ReconciliationEvent) -> Result<Vec<u8>, PublishError> {
+        let mut buffer = Vec::new();
+
+        match event {
+            ReconciliationEvent::Started(started) => {
+                // Event type discriminant for Started
+                buffer.push(0xE1);
+
+                // Timestamp
+                buffer.extend_from_slice(&started.started_at.to_be_bytes());
+
+                // Source DA
+                Self::encode_string(&mut buffer, &started.source_da);
+
+                // Target DA
+                Self::encode_string(&mut buffer, &started.target_da);
+
+                // From sequence
+                buffer.extend_from_slice(&started.from_sequence.to_be_bytes());
+
+                // To sequence (optional)
+                match started.to_sequence {
+                    Some(seq) => {
+                        buffer.push(0x01); // Present
+                        buffer.extend_from_slice(&seq.to_be_bytes());
+                    }
+                    None => {
+                        buffer.push(0x00); // Not present
+                    }
+                }
+            }
+            ReconciliationEvent::Completed(completed) => {
+                // Event type discriminant for Completed
+                buffer.push(0xE2);
+
+                // Timestamp
+                buffer.extend_from_slice(&completed.completed_at.to_be_bytes());
+
+                // Source DA
+                Self::encode_string(&mut buffer, &completed.source_da);
+
+                // Target DA
+                Self::encode_string(&mut buffer, &completed.target_da);
+
+                // Events reconciled
+                buffer.extend_from_slice(&completed.events_reconciled.to_be_bytes());
+
+                // Duration
+                buffer.extend_from_slice(&completed.duration_ms.to_be_bytes());
+
+                // Success flag
+                buffer.push(if completed.success { 0x01 } else { 0x00 });
+
+                // Error message (optional)
+                match &completed.error_message {
+                    Some(msg) => {
+                        buffer.push(0x01); // Present
+                        Self::encode_string(&mut buffer, msg);
+                    }
+                    None => {
+                        buffer.push(0x00); // Not present
+                    }
+                }
+            }
+        }
+
+        Ok(buffer)
     }
 }
 
@@ -881,5 +1299,474 @@ mod tests {
         for (i, event) in pending.iter().enumerate() {
             assert_eq!(event.sequence, (i + 1) as u64);
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // I. FALLBACK EVENT PUBLISHING TESTS (14A.1A.37)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_publish_fallback_activated_success() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = FallbackActivated {
+            activated_at: 1700000000000,
+            reason: "Primary DA health check failed".to_string(),
+            previous_state: "primary".to_string(),
+            new_state: "secondary".to_string(),
+            failure_count: 3,
+        };
+
+        let result = publisher.publish_fallback_activated(event);
+        assert!(result.is_ok());
+
+        let blob_ref = result.unwrap();
+        assert!(blob_ref.size > 0);
+    }
+
+    #[test]
+    fn test_publish_fallback_activated_validation_empty_reason() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = FallbackActivated {
+            activated_at: 1700000000000,
+            reason: "".to_string(), // Invalid: empty
+            previous_state: "primary".to_string(),
+            new_state: "secondary".to_string(),
+            failure_count: 3,
+        };
+
+        let result = publisher.publish_fallback_activated(event);
+        assert!(result.is_err());
+        
+        if let Err(PublishError::ValidationError(msg)) = result {
+            assert!(msg.contains("reason"));
+        } else {
+            panic!("Expected ValidationError");
+        }
+    }
+
+    #[test]
+    fn test_publish_fallback_activated_validation_empty_state() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = FallbackActivated {
+            activated_at: 1700000000000,
+            reason: "Primary failed".to_string(),
+            previous_state: "".to_string(), // Invalid: empty
+            new_state: "secondary".to_string(),
+            failure_count: 3,
+        };
+
+        let result = publisher.publish_fallback_activated(event);
+        assert!(result.is_err());
+        
+        if let Err(PublishError::ValidationError(msg)) = result {
+            assert!(msg.contains("state"));
+        } else {
+            panic!("Expected ValidationError");
+        }
+    }
+
+    #[test]
+    fn test_publish_fallback_deactivated_success() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = FallbackDeactivated {
+            deactivated_at: 1700000060000,
+            reason: "Primary DA recovered".to_string(),
+            previous_state: "secondary".to_string(),
+            new_state: "primary".to_string(),
+            fallback_duration_ms: 60000,
+        };
+
+        let result = publisher.publish_fallback_deactivated(event);
+        assert!(result.is_ok());
+
+        let blob_ref = result.unwrap();
+        assert!(blob_ref.size > 0);
+    }
+
+    #[test]
+    fn test_publish_fallback_deactivated_validation_empty_reason() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = FallbackDeactivated {
+            deactivated_at: 1700000060000,
+            reason: "".to_string(), // Invalid: empty
+            previous_state: "secondary".to_string(),
+            new_state: "primary".to_string(),
+            fallback_duration_ms: 60000,
+        };
+
+        let result = publisher.publish_fallback_deactivated(event);
+        assert!(result.is_err());
+        
+        if let Err(PublishError::ValidationError(msg)) = result {
+            assert!(msg.contains("reason"));
+        } else {
+            panic!("Expected ValidationError");
+        }
+    }
+
+    #[test]
+    fn test_publish_reconciliation_started_success() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = ReconciliationEvent::Started(ReconciliationStarted {
+            started_at: 1700000000000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            from_sequence: 100,
+            to_sequence: Some(200),
+        });
+
+        let result = publisher.publish_reconciliation_event(event);
+        assert!(result.is_ok());
+
+        let blob_ref = result.unwrap();
+        assert!(blob_ref.size > 0);
+    }
+
+    #[test]
+    fn test_publish_reconciliation_started_no_to_sequence() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = ReconciliationEvent::Started(ReconciliationStarted {
+            started_at: 1700000000000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            from_sequence: 100,
+            to_sequence: None, // Open-ended reconciliation
+        });
+
+        let result = publisher.publish_reconciliation_event(event);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_publish_reconciliation_started_validation_empty_da() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = ReconciliationEvent::Started(ReconciliationStarted {
+            started_at: 1700000000000,
+            source_da: "".to_string(), // Invalid: empty
+            target_da: "celestia".to_string(),
+            from_sequence: 100,
+            to_sequence: None,
+        });
+
+        let result = publisher.publish_reconciliation_event(event);
+        assert!(result.is_err());
+        
+        if let Err(PublishError::ValidationError(msg)) = result {
+            assert!(msg.contains("DA"));
+        } else {
+            panic!("Expected ValidationError");
+        }
+    }
+
+    #[test]
+    fn test_publish_reconciliation_completed_success() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = ReconciliationEvent::Completed(ReconciliationCompleted {
+            completed_at: 1700000060000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            events_reconciled: 100,
+            duration_ms: 60000,
+            success: true,
+            error_message: None,
+        });
+
+        let result = publisher.publish_reconciliation_event(event);
+        assert!(result.is_ok());
+
+        let blob_ref = result.unwrap();
+        assert!(blob_ref.size > 0);
+    }
+
+    #[test]
+    fn test_publish_reconciliation_completed_with_error() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        let event = ReconciliationEvent::Completed(ReconciliationCompleted {
+            completed_at: 1700000060000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            events_reconciled: 50,
+            duration_ms: 30000,
+            success: false,
+            error_message: Some("Connection timeout".to_string()),
+        });
+
+        let result = publisher.publish_reconciliation_event(event);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_publish_reconciliation_completed_validation_missing_error() {
+        let da = Arc::new(MockDA::new()) as Arc<dyn DALayer>;
+        let publisher = EventPublisher::new(da);
+
+        // success=false but no error_message
+        let event = ReconciliationEvent::Completed(ReconciliationCompleted {
+            completed_at: 1700000060000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            events_reconciled: 50,
+            duration_ms: 30000,
+            success: false,
+            error_message: None, // Invalid: required when success=false
+        });
+
+        let result = publisher.publish_reconciliation_event(event);
+        assert!(result.is_err());
+        
+        if let Err(PublishError::ValidationError(msg)) = result {
+            assert!(msg.contains("error_message"));
+        } else {
+            panic!("Expected ValidationError");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // J. FALLBACK EVENT ENCODING TESTS (14A.1A.37)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_encode_fallback_activated_deterministic() {
+        let event = FallbackActivated {
+            activated_at: 1700000000000,
+            reason: "Primary failed".to_string(),
+            previous_state: "primary".to_string(),
+            new_state: "secondary".to_string(),
+            failure_count: 3,
+        };
+
+        let encoded1 = EventPublisher::encode_fallback_activated(&event).unwrap();
+        let encoded2 = EventPublisher::encode_fallback_activated(&event).unwrap();
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_encode_fallback_activated_format() {
+        let event = FallbackActivated {
+            activated_at: 1700000000000,
+            reason: "fail".to_string(),
+            previous_state: "a".to_string(),
+            new_state: "b".to_string(),
+            failure_count: 5,
+        };
+
+        let encoded = EventPublisher::encode_fallback_activated(&event).unwrap();
+
+        // Verify discriminant
+        assert_eq!(encoded[0], 0xF1);
+
+        // Verify timestamp (bytes 1-8)
+        let ts = u64::from_be_bytes([
+            encoded[1], encoded[2], encoded[3], encoded[4],
+            encoded[5], encoded[6], encoded[7], encoded[8],
+        ]);
+        assert_eq!(ts, 1700000000000);
+    }
+
+    #[test]
+    fn test_encode_fallback_deactivated_deterministic() {
+        let event = FallbackDeactivated {
+            deactivated_at: 1700000060000,
+            reason: "Recovered".to_string(),
+            previous_state: "secondary".to_string(),
+            new_state: "primary".to_string(),
+            fallback_duration_ms: 60000,
+        };
+
+        let encoded1 = EventPublisher::encode_fallback_deactivated(&event).unwrap();
+        let encoded2 = EventPublisher::encode_fallback_deactivated(&event).unwrap();
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_encode_fallback_deactivated_format() {
+        let event = FallbackDeactivated {
+            deactivated_at: 1700000060000,
+            reason: "ok".to_string(),
+            previous_state: "x".to_string(),
+            new_state: "y".to_string(),
+            fallback_duration_ms: 12345,
+        };
+
+        let encoded = EventPublisher::encode_fallback_deactivated(&event).unwrap();
+
+        // Verify discriminant
+        assert_eq!(encoded[0], 0xF2);
+    }
+
+    #[test]
+    fn test_encode_reconciliation_started_deterministic() {
+        let event = ReconciliationEvent::Started(ReconciliationStarted {
+            started_at: 1700000000000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            from_sequence: 100,
+            to_sequence: Some(200),
+        });
+
+        let encoded1 = EventPublisher::encode_reconciliation_event(&event).unwrap();
+        let encoded2 = EventPublisher::encode_reconciliation_event(&event).unwrap();
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_encode_reconciliation_completed_deterministic() {
+        let event = ReconciliationEvent::Completed(ReconciliationCompleted {
+            completed_at: 1700000060000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            events_reconciled: 100,
+            duration_ms: 60000,
+            success: true,
+            error_message: None,
+        });
+
+        let encoded1 = EventPublisher::encode_reconciliation_event(&event).unwrap();
+        let encoded2 = EventPublisher::encode_reconciliation_event(&event).unwrap();
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_encode_reconciliation_started_format() {
+        let event = ReconciliationEvent::Started(ReconciliationStarted {
+            started_at: 1700000000000,
+            source_da: "q".to_string(),
+            target_da: "c".to_string(),
+            from_sequence: 100,
+            to_sequence: None,
+        });
+
+        let encoded = EventPublisher::encode_reconciliation_event(&event).unwrap();
+
+        // Verify discriminant for Started
+        assert_eq!(encoded[0], 0xE1);
+    }
+
+    #[test]
+    fn test_encode_reconciliation_completed_format() {
+        let event = ReconciliationEvent::Completed(ReconciliationCompleted {
+            completed_at: 1700000060000,
+            source_da: "q".to_string(),
+            target_da: "c".to_string(),
+            events_reconciled: 100,
+            duration_ms: 60000,
+            success: true,
+            error_message: None,
+        });
+
+        let encoded = EventPublisher::encode_reconciliation_event(&event).unwrap();
+
+        // Verify discriminant for Completed
+        assert_eq!(encoded[0], 0xE2);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // K. PUBLISH ERROR TESTS (14A.1A.37)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_publish_error_display() {
+        let da_err = PublishError::DAError("connection failed".to_string());
+        assert!(da_err.to_string().contains("DA error"));
+        assert!(da_err.to_string().contains("connection failed"));
+
+        let ser_err = PublishError::SerializationError("invalid utf8".to_string());
+        assert!(ser_err.to_string().contains("serialization"));
+
+        let val_err = PublishError::ValidationError("missing field".to_string());
+        assert!(val_err.to_string().contains("validation"));
+    }
+
+    #[test]
+    fn test_publish_error_from_da_error() {
+        let da_error = DAError::Unavailable;
+        let publish_error: PublishError = da_error.into();
+
+        if let PublishError::DAError(msg) = publish_error {
+            assert!(msg.contains("unavailable"));
+        } else {
+            panic!("Expected DAError variant");
+        }
+    }
+
+    #[test]
+    fn test_fallback_activated_struct() {
+        let event = FallbackActivated {
+            activated_at: 1700000000000,
+            reason: "test".to_string(),
+            previous_state: "primary".to_string(),
+            new_state: "secondary".to_string(),
+            failure_count: 3,
+        };
+
+        // Test Clone
+        let cloned = event.clone();
+        assert_eq!(event, cloned);
+
+        // Test Debug
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("FallbackActivated"));
+    }
+
+    #[test]
+    fn test_fallback_deactivated_struct() {
+        let event = FallbackDeactivated {
+            deactivated_at: 1700000060000,
+            reason: "recovered".to_string(),
+            previous_state: "secondary".to_string(),
+            new_state: "primary".to_string(),
+            fallback_duration_ms: 60000,
+        };
+
+        // Test Clone
+        let cloned = event.clone();
+        assert_eq!(event, cloned);
+
+        // Test Debug
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("FallbackDeactivated"));
+    }
+
+    #[test]
+    fn test_reconciliation_event_struct() {
+        let started = ReconciliationEvent::Started(ReconciliationStarted {
+            started_at: 1700000000000,
+            source_da: "quorum".to_string(),
+            target_da: "celestia".to_string(),
+            from_sequence: 0,
+            to_sequence: None,
+        });
+
+        // Test Clone
+        let cloned = started.clone();
+        assert_eq!(started, cloned);
+
+        // Test Debug
+        let debug_str = format!("{:?}", started);
+        assert!(debug_str.contains("Started"));
     }
 }
