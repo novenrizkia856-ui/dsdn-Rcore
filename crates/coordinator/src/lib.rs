@@ -73,6 +73,7 @@ pub mod da_consumer;
 pub mod state_machine;
 pub mod state_rebuild;
 pub mod event_publisher;
+pub mod reconciliation;
 
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
@@ -83,6 +84,7 @@ pub use state_machine::{
 };
 pub use state_rebuild::{StateRebuilder, RebuildProgress, RebuildError};
 pub use event_publisher::{EventPublisher, BlobRef};
+pub use reconciliation::{ReconciliationEngine, ReconciliationConfig};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
