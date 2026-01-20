@@ -1,6 +1,5 @@
 //! Internal state layout helpers (13.8.H)
-//! For LMDB bucket layout integration
-//! Dipindahkan dari state.rs untuk modularisasi
+//! For LMDB bucket layout integration sta
 
 use crate::types::{Address, Hash};
 use std::collections::{HashMap, HashSet};
