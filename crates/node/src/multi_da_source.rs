@@ -62,7 +62,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use dsdn_common::{BlobRef, BlobStream, DAError, DALayer};
+use dsdn_common::{BlobRef, BlobStream, DAError, DAHealthStatus, DALayer};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // DA SOURCE TYPE
@@ -591,6 +591,185 @@ impl MultiDASource {
             Err(last_error)
         })
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SOURCE PRIORITIZATION (14A.1A.43)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Returns all configured DA sources in fixed priority order.
+    ///
+    /// ## Behavior (DETERMINISTIC)
+    ///
+    /// 1. Returns sources in fixed priority order: Primary → Secondary → Emergency
+    /// 2. Only includes CONFIGURED sources (skips unconfigured)
+    /// 3. Primary is always included (always configured)
+    /// 4. Does NOT modify any internal state
+    /// 5. Does NOT check health (sync method, no async)
+    ///
+    /// ## Thread Safety
+    ///
+    /// This method is safe to call concurrently - it only reads immutable fields.
+    ///
+    /// # Returns
+    ///
+    /// Vector of (DASourceType, Arc<dyn DALayer>) tuples in priority order.
+    /// Always contains at least Primary.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let sources = multi_da.prioritize_sources();
+    /// for (source_type, da_layer) in sources {
+    ///     println!("Source: {}", source_type);
+    /// }
+    /// ```
+    #[must_use]
+    pub fn prioritize_sources(&self) -> Vec<(DASourceType, Arc<dyn DALayer>)> {
+        let mut sources = Vec::with_capacity(3);
+
+        // Fixed priority order: Primary → Secondary → Emergency
+        // Primary is always configured (required in constructor)
+        sources.push((DASourceType::Primary, Arc::clone(&self.primary)));
+
+        // Secondary if configured
+        if let Some(ref secondary) = self.secondary {
+            sources.push((DASourceType::Secondary, Arc::clone(secondary)));
+        }
+
+        // Emergency if configured
+        if let Some(ref emergency) = self.emergency {
+            sources.push((DASourceType::Emergency, Arc::clone(emergency)));
+        }
+
+        sources
+    }
+
+    /// Set the preferred DA source explicitly.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Checks if source is configured (available)
+    /// 2. If not configured: returns `false`, no state change
+    /// 3. If configured: sets `current_source` and returns `true`
+    ///
+    /// ## Thread Safety
+    ///
+    /// - Uses RwLock for atomic read-check-write
+    /// - Lock is held briefly, no async operations while locked
+    ///
+    /// ## Error Handling
+    ///
+    /// - NO panic
+    /// - NO silent failure
+    /// - Returns `false` explicitly if source not available
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The preferred source type to set
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Source was set successfully (source is configured)
+    /// * `false` - Source is not configured, no change made
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Try to set Secondary as preferred
+    /// if multi_da.set_preferred_source(DASourceType::Secondary) {
+    ///     println!("Set to Secondary");
+    /// } else {
+    ///     println!("Secondary not configured");
+    /// }
+    /// ```
+    pub fn set_preferred_source(&self, source: DASourceType) -> bool {
+        // Check if source is configured (sync check, no async)
+        if self.get_da_for_source(source).is_none() {
+            return false;
+        }
+
+        // Set current_source (thread-safe via RwLock)
+        let mut current = self.current_source.write();
+        *current = source;
+        true
+    }
+
+    /// Attempt to promote to Primary if it's healthy.
+    ///
+    /// ## Auto-Promotion Logic (14A.1A.43)
+    ///
+    /// This implements the auto-promotion requirement:
+    /// "When Primary becomes available again, system MUST auto-promote back to Primary"
+    ///
+    /// ## Behavior
+    ///
+    /// 1. If already on Primary: returns `false` (no action needed)
+    /// 2. If `prefer_primary` config is false: returns `false` (auto-promotion disabled)
+    /// 3. Performs health check on Primary DA layer
+    /// 4. If Primary is `Healthy`: promotes to Primary, returns `true`
+    /// 5. If Primary is not healthy or health check fails: returns `false`
+    ///
+    /// ## Thread Safety
+    ///
+    /// - `current_source` read/write uses RwLock
+    /// - Lock NOT held during async health check
+    /// - Final write is atomic
+    ///
+    /// ## Determinism
+    ///
+    /// - No implicit loops or polling
+    /// - No background tasks
+    /// - Caller controls when to call (e.g., periodically, after operations)
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Successfully promoted to Primary
+    /// * `false` - Already on Primary, prefer_primary disabled, or Primary not healthy
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Call periodically or after successful fallback operations
+    /// if multi_da.try_promote_to_primary().await {
+    ///     println!("Promoted back to Primary");
+    /// }
+    /// ```
+    pub fn try_promote_to_primary<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            // Check 1: Already on Primary - no action needed
+            if self.get_current_source() == DASourceType::Primary {
+                return false;
+            }
+
+            // Check 2: prefer_primary must be enabled for auto-promotion
+            if !self.config.prefer_primary {
+                return false;
+            }
+
+            // Check 3: Health check on Primary
+            // Lock NOT held during this async operation
+            let health_result = self.primary.health_check().await;
+
+            match health_result {
+                Ok(DAHealthStatus::Healthy) => {
+                    // Primary is healthy - promote!
+                    // This acquires write lock briefly
+                    self.set_current_source(DASourceType::Primary);
+                    true
+                }
+                Ok(DAHealthStatus::Degraded) | Ok(DAHealthStatus::Unavailable) => {
+                    // Primary not fully healthy - don't promote
+                    false
+                }
+                Err(_) => {
+                    // Health check failed - don't promote
+                    false
+                }
+            }
+        })
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -613,12 +792,16 @@ mod tests {
         name: String,
         /// Whether operations should succeed
         should_succeed: AtomicBool,
+        /// Whether health check returns Healthy
+        is_healthy: AtomicBool,
         /// Data to return on get_blob success
         blob_data: Vec<u8>,
         /// Counter for get_blob calls
         get_blob_calls: AtomicU32,
         /// Counter for subscribe_blobs calls
         subscribe_calls: AtomicU32,
+        /// Counter for health_check calls
+        health_check_calls: AtomicU32,
     }
 
     impl MockDALayer {
@@ -626,9 +809,11 @@ mod tests {
             Self {
                 name: name.to_string(),
                 should_succeed: AtomicBool::new(true),
+                is_healthy: AtomicBool::new(true),
                 blob_data: vec![1, 2, 3, 4],
                 get_blob_calls: AtomicU32::new(0),
                 subscribe_calls: AtomicU32::new(0),
+                health_check_calls: AtomicU32::new(0),
             }
         }
 
@@ -636,9 +821,11 @@ mod tests {
             Self {
                 name: name.to_string(),
                 should_succeed: AtomicBool::new(false),
+                is_healthy: AtomicBool::new(false),
                 blob_data: vec![],
                 get_blob_calls: AtomicU32::new(0),
                 subscribe_calls: AtomicU32::new(0),
+                health_check_calls: AtomicU32::new(0),
             }
         }
 
@@ -646,10 +833,16 @@ mod tests {
             Self {
                 name: name.to_string(),
                 should_succeed: AtomicBool::new(true),
+                is_healthy: AtomicBool::new(true),
                 blob_data: data,
                 get_blob_calls: AtomicU32::new(0),
                 subscribe_calls: AtomicU32::new(0),
+                health_check_calls: AtomicU32::new(0),
             }
+        }
+
+        fn set_healthy(&self, healthy: bool) {
+            self.is_healthy.store(healthy, Ordering::SeqCst);
         }
 
         fn get_blob_call_count(&self) -> u32 {
@@ -713,8 +906,15 @@ mod tests {
         fn health_check(
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<DAHealthStatus, DAError>> + Send + '_>> {
+            self.health_check_calls.fetch_add(1, Ordering::SeqCst);
+            let is_healthy = self.is_healthy.load(Ordering::SeqCst);
+
             Box::pin(async move {
-                Ok(DAHealthStatus::Healthy)
+                if is_healthy {
+                    Ok(DAHealthStatus::Healthy)
+                } else {
+                    Ok(DAHealthStatus::Unavailable)
+                }
             })
         }
     }
@@ -1318,5 +1518,287 @@ mod tests {
 
         // Primary should have been called 5 times
         assert_eq!(primary.get_blob_call_count(), 5);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // prioritize_sources Tests (14A.1A.43)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_prioritize_sources_all_configured() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("secondary"));
+        let emergency: Arc<dyn DALayer> = Arc::new(MockDALayer::new("emergency"));
+
+        let source = MultiDASource::with_fallbacks(
+            primary,
+            Some(secondary),
+            Some(emergency),
+            MultiDAConfig::default(),
+        );
+
+        let prioritized = source.prioritize_sources();
+
+        // Should have all 3 sources
+        assert_eq!(prioritized.len(), 3);
+
+        // Check order: Primary → Secondary → Emergency
+        assert_eq!(prioritized[0].0, DASourceType::Primary);
+        assert_eq!(prioritized[1].0, DASourceType::Secondary);
+        assert_eq!(prioritized[2].0, DASourceType::Emergency);
+    }
+
+    #[test]
+    fn test_prioritize_sources_primary_only() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let source = MultiDASource::new(primary);
+
+        let prioritized = source.prioritize_sources();
+
+        // Should only have Primary
+        assert_eq!(prioritized.len(), 1);
+        assert_eq!(prioritized[0].0, DASourceType::Primary);
+    }
+
+    #[test]
+    fn test_prioritize_sources_no_emergency() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("secondary"));
+
+        let source = MultiDASource::with_fallbacks(
+            primary,
+            Some(secondary),
+            None,
+            MultiDAConfig::default(),
+        );
+
+        let prioritized = source.prioritize_sources();
+
+        // Should have Primary and Secondary
+        assert_eq!(prioritized.len(), 2);
+        assert_eq!(prioritized[0].0, DASourceType::Primary);
+        assert_eq!(prioritized[1].0, DASourceType::Secondary);
+    }
+
+    #[test]
+    fn test_prioritize_sources_no_secondary() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let emergency: Arc<dyn DALayer> = Arc::new(MockDALayer::new("emergency"));
+
+        let source = MultiDASource::with_fallbacks(
+            primary,
+            None,
+            Some(emergency),
+            MultiDAConfig::default(),
+        );
+
+        let prioritized = source.prioritize_sources();
+
+        // Should have Primary and Emergency (no Secondary)
+        assert_eq!(prioritized.len(), 2);
+        assert_eq!(prioritized[0].0, DASourceType::Primary);
+        assert_eq!(prioritized[1].0, DASourceType::Emergency);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // set_preferred_source Tests (14A.1A.43)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_preferred_source_to_primary() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let source = MultiDASource::new(primary);
+
+        // Set to Primary (should succeed, it's always configured)
+        let result = source.set_preferred_source(DASourceType::Primary);
+        assert!(result);
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
+    }
+
+    #[test]
+    fn test_set_preferred_source_to_configured_secondary() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("secondary"));
+
+        let source = MultiDASource::with_fallbacks(
+            primary,
+            Some(secondary),
+            None,
+            MultiDAConfig::default(),
+        );
+
+        // Set to Secondary (should succeed)
+        let result = source.set_preferred_source(DASourceType::Secondary);
+        assert!(result);
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+    }
+
+    #[test]
+    fn test_set_preferred_source_to_unconfigured_secondary() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let source = MultiDASource::new(primary);
+
+        // Try to set to Secondary (should fail - not configured)
+        let result = source.set_preferred_source(DASourceType::Secondary);
+        assert!(!result);
+        // Should remain Primary
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
+    }
+
+    #[test]
+    fn test_set_preferred_source_to_unconfigured_emergency() {
+        let primary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("primary"));
+        let secondary: Arc<dyn DALayer> = Arc::new(MockDALayer::new("secondary"));
+
+        let source = MultiDASource::with_fallbacks(
+            primary,
+            Some(secondary),
+            None, // No emergency
+            MultiDAConfig::default(),
+        );
+
+        // Try to set to Emergency (should fail - not configured)
+        let result = source.set_preferred_source(DASourceType::Emergency);
+        assert!(!result);
+        // Should remain Primary
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // try_promote_to_primary Tests (14A.1A.43)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_try_promote_to_primary_success() {
+        let primary = Arc::new(MockDALayer::new("primary"));
+        let secondary = Arc::new(MockDALayer::new("secondary"));
+
+        primary.set_healthy(true);
+
+        let primary_da: Arc<dyn DALayer> = primary.clone();
+        let secondary_da: Arc<dyn DALayer> = secondary.clone();
+
+        let source = MultiDASource::with_fallbacks(
+            primary_da,
+            Some(secondary_da),
+            None,
+            MultiDAConfig::default(),
+        );
+
+        // Set to Secondary first
+        source.set_current_source(DASourceType::Secondary);
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+
+        // Try to promote to Primary (Primary is healthy)
+        let promoted = source.try_promote_to_primary().await;
+        assert!(promoted);
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
+    }
+
+    #[tokio::test]
+    async fn test_try_promote_to_primary_already_primary() {
+        let primary = Arc::new(MockDALayer::new("primary"));
+        let primary_da: Arc<dyn DALayer> = primary.clone();
+
+        let source = MultiDASource::new(primary_da);
+
+        // Already on Primary
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
+
+        // Try to promote - should return false (already on Primary)
+        let promoted = source.try_promote_to_primary().await;
+        assert!(!promoted);
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
+    }
+
+    #[tokio::test]
+    async fn test_try_promote_to_primary_unhealthy() {
+        let primary = Arc::new(MockDALayer::new("primary"));
+        let secondary = Arc::new(MockDALayer::new("secondary"));
+
+        // Set Primary as unhealthy
+        primary.set_healthy(false);
+
+        let primary_da: Arc<dyn DALayer> = primary.clone();
+        let secondary_da: Arc<dyn DALayer> = secondary.clone();
+
+        let source = MultiDASource::with_fallbacks(
+            primary_da,
+            Some(secondary_da),
+            None,
+            MultiDAConfig::default(),
+        );
+
+        // Set to Secondary first
+        source.set_current_source(DASourceType::Secondary);
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+
+        // Try to promote to Primary (Primary is unhealthy)
+        let promoted = source.try_promote_to_primary().await;
+        assert!(!promoted);
+        // Should remain on Secondary
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+    }
+
+    #[tokio::test]
+    async fn test_try_promote_to_primary_prefer_primary_disabled() {
+        let primary = Arc::new(MockDALayer::new("primary"));
+        let secondary = Arc::new(MockDALayer::new("secondary"));
+
+        primary.set_healthy(true);
+
+        let primary_da: Arc<dyn DALayer> = primary.clone();
+        let secondary_da: Arc<dyn DALayer> = secondary.clone();
+
+        // Create config with prefer_primary = false
+        let config = MultiDAConfig {
+            auto_fallback_enabled: true,
+            prefer_primary: false, // Disabled
+        };
+
+        let source = MultiDASource::with_fallbacks(
+            primary_da,
+            Some(secondary_da),
+            None,
+            config,
+        );
+
+        // Set to Secondary first
+        source.set_current_source(DASourceType::Secondary);
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+
+        // Try to promote - should fail because prefer_primary is disabled
+        let promoted = source.try_promote_to_primary().await;
+        assert!(!promoted);
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+    }
+
+    #[tokio::test]
+    async fn test_auto_promotion_after_fallback() {
+        // Simulate: Primary fails → fallback to Secondary → Primary recovers → auto-promote
+        let primary = Arc::new(MockDALayer::new("primary"));
+        let secondary = Arc::new(MockDALayer::new("secondary"));
+
+        let primary_da: Arc<dyn DALayer> = primary.clone();
+        let secondary_da: Arc<dyn DALayer> = secondary.clone();
+
+        let source = MultiDASource::with_fallbacks(
+            primary_da,
+            Some(secondary_da),
+            None,
+            MultiDAConfig::default(),
+        );
+
+        // Simulate fallback to Secondary
+        source.set_current_source(DASourceType::Secondary);
+        assert_eq!(source.get_current_source(), DASourceType::Secondary);
+
+        // Primary is healthy (recovered)
+        primary.set_healthy(true);
+
+        // Auto-promote back to Primary
+        let promoted = source.try_promote_to_primary().await;
+        assert!(promoted);
+        assert_eq!(source.get_current_source(), DASourceType::Primary);
     }
 }
