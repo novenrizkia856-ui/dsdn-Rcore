@@ -33,10 +33,12 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use thiserror::Error;
+use tracing::{info, warn};
 
 use dsdn_coordinator::{DAEvent, DAEventPayload, ReplicaAddedPayload, ReplicaRemovedPayload};
 
 use crate::da_follower::NodeDerivedState;
+use crate::multi_da_source::DASourceType;
 
 // ════════════════════════════════════════════════════════════════════════════
 // PROCESS ERROR
@@ -73,6 +75,9 @@ pub enum ProcessError {
 /// - `DeleteChunk`: Node should delete a chunk
 /// - `UpdateReplicaStatus`: Node should update verification status
 /// - `SyncFromPeer`: Node should sync chunk data from another node
+/// - `SwitchToFallback`: Node should switch to fallback DA source (14A.1A.45)
+/// - `SwitchToPrimary`: Node should switch back to primary DA source (14A.1A.45)
+/// - `VerifyReconciliation`: Node should verify local state consistency (14A.1A.45)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeAction {
     /// No action required. Event is not relevant to this node.
@@ -106,6 +111,52 @@ pub enum NodeAction {
         hash: String,
         /// Peer node to sync from
         peer_node: String,
+    },
+
+    /// Switch to fallback DA source (14A.1A.45).
+    ///
+    /// Triggered when primary DA becomes unavailable and fallback is activated.
+    /// The executor should:
+    /// 1. Update local fallback status flag
+    /// 2. Log the switch explicitly
+    /// 3. Continue event processing with new source
+    SwitchToFallback {
+        /// Previous DA source before switch
+        from_source: DASourceType,
+        /// Target fallback DA source
+        to_source: DASourceType,
+        /// Reason for the switch
+        reason: String,
+    },
+
+    /// Switch back to primary DA source (14A.1A.45).
+    ///
+    /// Triggered when primary DA becomes available again.
+    /// The executor should:
+    /// 1. Clear local fallback status flag
+    /// 2. Log the switch explicitly
+    /// 3. Continue event processing with primary
+    SwitchToPrimary {
+        /// Previous fallback source
+        from_source: DASourceType,
+    },
+
+    /// Verify local state consistency after reconciliation (14A.1A.45).
+    ///
+    /// Triggered after source switch to verify no events were missed.
+    /// The executor should:
+    /// 1. Compare local sequence/height against expected
+    /// 2. Report any gaps found
+    /// 3. Trigger resync if needed
+    VerifyReconciliation {
+        /// Expected last sequence number
+        expected_sequence: u64,
+        /// Expected last height
+        expected_height: u64,
+        /// Local sequence at time of check
+        local_sequence: u64,
+        /// Local height at time of check
+        local_height: u64,
     },
 }
 
@@ -314,6 +365,220 @@ impl NodeEventProcessor {
             DAEventPayload::NodeUnregistered(p) => p.node_id == self.node_id,
             _ => false,
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // FALLBACK DETECTION METHODS (14A.1A.45)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Handle fallback activation (14A.1A.45).
+    ///
+    /// Called when DAFollower detects that MultiDASource has switched
+    /// from Primary to a fallback source (Secondary or Emergency).
+    ///
+    /// ## Arguments
+    ///
+    /// * `from_source` - The previous DA source (should be Primary)
+    /// * `to_source` - The fallback DA source being activated
+    /// * `reason` - Human-readable reason for the switch
+    ///
+    /// ## Returns
+    ///
+    /// `NodeAction::SwitchToFallback` with all relevant information.
+    ///
+    /// ## Guarantees
+    ///
+    /// - Always logs the event explicitly
+    /// - Deterministic output
+    /// - No state mutation
+    /// - No panic
+    /// - Thread-safe (only reads state)
+    pub fn handle_fallback_activated(
+        &self,
+        from_source: DASourceType,
+        to_source: DASourceType,
+        reason: &str,
+    ) -> NodeAction {
+        info!(
+            "Fallback ACTIVATED for node {}: {:?} -> {:?}, reason: {}",
+            self.node_id, from_source, to_source, reason
+        );
+
+        NodeAction::SwitchToFallback {
+            from_source,
+            to_source,
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Handle fallback deactivation (14A.1A.45).
+    ///
+    /// Called when DAFollower detects that MultiDASource has switched
+    /// back to Primary from a fallback source.
+    ///
+    /// ## Arguments
+    ///
+    /// * `from_source` - The fallback source being deactivated
+    ///
+    /// ## Returns
+    ///
+    /// `NodeAction::SwitchToPrimary` with the previous source.
+    ///
+    /// ## Guarantees
+    ///
+    /// - Always logs the event explicitly
+    /// - Deterministic output
+    /// - No state mutation
+    /// - No panic
+    /// - Thread-safe (only reads state)
+    pub fn handle_fallback_deactivated(&self, from_source: DASourceType) -> NodeAction {
+        info!(
+            "Fallback DEACTIVATED for node {}: {:?} -> Primary",
+            self.node_id, from_source
+        );
+
+        NodeAction::SwitchToPrimary { from_source }
+    }
+
+    /// Handle reconciliation completed (14A.1A.45).
+    ///
+    /// Called after a source switch to verify local state consistency.
+    /// This method checks if there are any gaps between local state
+    /// and expected state.
+    ///
+    /// ## Arguments
+    ///
+    /// * `expected_sequence` - Expected last sequence after reconciliation
+    /// * `expected_height` - Expected last height after reconciliation
+    ///
+    /// ## Returns
+    ///
+    /// * `Ok(NodeAction::VerifyReconciliation)` - Action with comparison data
+    /// * `Err(ProcessError::InconsistentState)` - If gap is detected and explicit error needed
+    ///
+    /// ## Guarantees
+    ///
+    /// - Always logs the verification attempt
+    /// - Explicit error if inconsistency detected (no silent ignore)
+    /// - Deterministic output
+    /// - No state mutation
+    /// - No panic
+    /// - Thread-safe (only reads state)
+    ///
+    /// ## Gap Handling
+    ///
+    /// - If local_sequence < expected_sequence: potential missing events (returns error)
+    /// - If local_sequence > expected_sequence: local ahead (logged as warning, returns action)
+    /// - If local_sequence == expected_sequence: consistent (returns action)
+    pub fn handle_reconciliation_completed(
+        &self,
+        expected_sequence: u64,
+        expected_height: u64,
+    ) -> Result<NodeAction, ProcessError> {
+        // Read local state (thread-safe via RwLock)
+        let state = self.state.read();
+        let local_sequence = state.last_sequence;
+        let local_height = state.last_height;
+        // Release lock immediately after reading
+        drop(state);
+
+        info!(
+            "Reconciliation check for node {}: local(seq={}, h={}) vs expected(seq={}, h={})",
+            self.node_id, local_sequence, local_height, expected_sequence, expected_height
+        );
+
+        // Check for sequence gap (local behind expected)
+        if local_sequence < expected_sequence {
+            let gap = expected_sequence - local_sequence;
+            warn!(
+                "Sequence GAP detected for node {}: local {} < expected {}, gap = {}",
+                self.node_id, local_sequence, expected_sequence, gap
+            );
+            // Return explicit error - caller must handle this gap
+            return Err(ProcessError::InconsistentState(format!(
+                "Sequence gap: local={}, expected={}, gap={}",
+                local_sequence, expected_sequence, gap
+            )));
+        }
+
+        // Check if local is ahead (suspicious but not necessarily error)
+        if local_sequence > expected_sequence {
+            warn!(
+                "Local sequence {} AHEAD of expected {} for node {} (may be normal if events processed before reconciliation)",
+                local_sequence, expected_sequence, self.node_id
+            );
+        }
+
+        // Check height consistency
+        if local_height < expected_height {
+            warn!(
+                "Height mismatch for node {}: local {} < expected {}",
+                self.node_id, local_height, expected_height
+            );
+        }
+
+        // Return verification action with all data for executor to decide
+        Ok(NodeAction::VerifyReconciliation {
+            expected_sequence,
+            expected_height,
+            local_sequence,
+            local_height,
+        })
+    }
+
+    /// Check if a source switch represents fallback activation.
+    ///
+    /// Utility method to determine if switching from one source to another
+    /// represents activating a fallback (moving away from Primary).
+    ///
+    /// ## Arguments
+    ///
+    /// * `from` - Previous DA source
+    /// * `to` - New DA source
+    ///
+    /// ## Returns
+    ///
+    /// * `true` - If this is fallback activation (from Primary to Secondary/Emergency)
+    /// * `false` - Otherwise
+    #[must_use]
+    pub fn is_fallback_activation(from: DASourceType, to: DASourceType) -> bool {
+        matches!(from, DASourceType::Primary)
+            && matches!(to, DASourceType::Secondary | DASourceType::Emergency)
+    }
+
+    /// Check if a source switch represents fallback deactivation.
+    ///
+    /// Utility method to determine if switching from one source to another
+    /// represents deactivating a fallback (returning to Primary).
+    ///
+    /// ## Arguments
+    ///
+    /// * `from` - Previous DA source
+    /// * `to` - New DA source
+    ///
+    /// ## Returns
+    ///
+    /// * `true` - If this is fallback deactivation (from Secondary/Emergency to Primary)
+    /// * `false` - Otherwise
+    #[must_use]
+    pub fn is_fallback_deactivation(from: DASourceType, to: DASourceType) -> bool {
+        matches!(from, DASourceType::Secondary | DASourceType::Emergency)
+            && matches!(to, DASourceType::Primary)
+    }
+
+    /// Check if currently in fallback mode based on source type.
+    ///
+    /// ## Arguments
+    ///
+    /// * `current_source` - Current DA source type
+    ///
+    /// ## Returns
+    ///
+    /// * `true` - If using fallback source (Secondary or Emergency)
+    /// * `false` - If using Primary
+    #[must_use]
+    pub fn is_in_fallback_mode(current_source: DASourceType) -> bool {
+        !matches!(current_source, DASourceType::Primary)
     }
 }
 
@@ -782,5 +1047,340 @@ mod tests {
         let err = ProcessError::MalformedEvent("test".to_string());
         let display = format!("{}", err);
         assert!(display.contains("Malformed"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // I. FALLBACK DETECTION TESTS (14A.1A.45)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_handle_fallback_activated_primary_to_secondary() {
+        let processor = make_processor();
+
+        let action = processor.handle_fallback_activated(
+            DASourceType::Primary,
+            DASourceType::Secondary,
+            "Primary unavailable",
+        );
+
+        match action {
+            NodeAction::SwitchToFallback { from_source, to_source, reason } => {
+                assert_eq!(from_source, DASourceType::Primary);
+                assert_eq!(to_source, DASourceType::Secondary);
+                assert_eq!(reason, "Primary unavailable");
+            }
+            _ => panic!("Expected SwitchToFallback action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_fallback_activated_primary_to_emergency() {
+        let processor = make_processor();
+
+        let action = processor.handle_fallback_activated(
+            DASourceType::Primary,
+            DASourceType::Emergency,
+            "All sources failing",
+        );
+
+        match action {
+            NodeAction::SwitchToFallback { from_source, to_source, reason } => {
+                assert_eq!(from_source, DASourceType::Primary);
+                assert_eq!(to_source, DASourceType::Emergency);
+                assert_eq!(reason, "All sources failing");
+            }
+            _ => panic!("Expected SwitchToFallback action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_fallback_activated_secondary_to_emergency() {
+        let processor = make_processor();
+
+        let action = processor.handle_fallback_activated(
+            DASourceType::Secondary,
+            DASourceType::Emergency,
+            "Secondary also unavailable",
+        );
+
+        match action {
+            NodeAction::SwitchToFallback { from_source, to_source, reason } => {
+                assert_eq!(from_source, DASourceType::Secondary);
+                assert_eq!(to_source, DASourceType::Emergency);
+                assert_eq!(reason, "Secondary also unavailable");
+            }
+            _ => panic!("Expected SwitchToFallback action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_fallback_deactivated_secondary_to_primary() {
+        let processor = make_processor();
+
+        let action = processor.handle_fallback_deactivated(DASourceType::Secondary);
+
+        match action {
+            NodeAction::SwitchToPrimary { from_source } => {
+                assert_eq!(from_source, DASourceType::Secondary);
+            }
+            _ => panic!("Expected SwitchToPrimary action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_fallback_deactivated_emergency_to_primary() {
+        let processor = make_processor();
+
+        let action = processor.handle_fallback_deactivated(DASourceType::Emergency);
+
+        match action {
+            NodeAction::SwitchToPrimary { from_source } => {
+                assert_eq!(from_source, DASourceType::Emergency);
+            }
+            _ => panic!("Expected SwitchToPrimary action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_reconciliation_completed_consistent() {
+        // Create processor with state at sequence 100, height 50
+        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
+        {
+            let mut s = state.write();
+            s.last_sequence = 100;
+            s.last_height = 50;
+        }
+        let processor = NodeEventProcessor::new(TEST_NODE.to_string(), state);
+
+        // Expected matches local
+        let result = processor.handle_reconciliation_completed(100, 50);
+        assert!(result.is_ok());
+
+        match result {
+            Ok(NodeAction::VerifyReconciliation {
+                expected_sequence,
+                expected_height,
+                local_sequence,
+                local_height,
+            }) => {
+                assert_eq!(expected_sequence, 100);
+                assert_eq!(expected_height, 50);
+                assert_eq!(local_sequence, 100);
+                assert_eq!(local_height, 50);
+            }
+            _ => panic!("Expected VerifyReconciliation action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_reconciliation_completed_local_ahead() {
+        // Create processor with state ahead of expected
+        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
+        {
+            let mut s = state.write();
+            s.last_sequence = 150; // Local ahead
+            s.last_height = 60;
+        }
+        let processor = NodeEventProcessor::new(TEST_NODE.to_string(), state);
+
+        // Expected behind local (not an error, just logged)
+        let result = processor.handle_reconciliation_completed(100, 50);
+        assert!(result.is_ok());
+
+        match result {
+            Ok(NodeAction::VerifyReconciliation {
+                expected_sequence,
+                expected_height,
+                local_sequence,
+                local_height,
+            }) => {
+                assert_eq!(expected_sequence, 100);
+                assert_eq!(expected_height, 50);
+                assert_eq!(local_sequence, 150);
+                assert_eq!(local_height, 60);
+            }
+            _ => panic!("Expected VerifyReconciliation action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_reconciliation_completed_gap_detected() {
+        // Create processor with state behind expected (gap)
+        let state = Arc::new(RwLock::new(NodeDerivedState::new()));
+        {
+            let mut s = state.write();
+            s.last_sequence = 50; // Local behind!
+            s.last_height = 30;
+        }
+        let processor = NodeEventProcessor::new(TEST_NODE.to_string(), state);
+
+        // Expected ahead of local (gap detected)
+        let result = processor.handle_reconciliation_completed(100, 50);
+        assert!(result.is_err());
+
+        match result {
+            Err(ProcessError::InconsistentState(msg)) => {
+                assert!(msg.contains("gap"));
+                assert!(msg.contains("50")); // local
+                assert!(msg.contains("100")); // expected
+            }
+            _ => panic!("Expected InconsistentState error"),
+        }
+    }
+
+    #[test]
+    fn test_is_fallback_activation_primary_to_secondary() {
+        assert!(NodeEventProcessor::is_fallback_activation(
+            DASourceType::Primary,
+            DASourceType::Secondary
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_activation_primary_to_emergency() {
+        assert!(NodeEventProcessor::is_fallback_activation(
+            DASourceType::Primary,
+            DASourceType::Emergency
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_activation_secondary_to_emergency_false() {
+        // Secondary to Emergency is NOT activation (already in fallback)
+        assert!(!NodeEventProcessor::is_fallback_activation(
+            DASourceType::Secondary,
+            DASourceType::Emergency
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_activation_secondary_to_primary_false() {
+        // Going to Primary is never activation
+        assert!(!NodeEventProcessor::is_fallback_activation(
+            DASourceType::Secondary,
+            DASourceType::Primary
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_deactivation_secondary_to_primary() {
+        assert!(NodeEventProcessor::is_fallback_deactivation(
+            DASourceType::Secondary,
+            DASourceType::Primary
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_deactivation_emergency_to_primary() {
+        assert!(NodeEventProcessor::is_fallback_deactivation(
+            DASourceType::Emergency,
+            DASourceType::Primary
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_deactivation_primary_to_secondary_false() {
+        // Going from Primary is never deactivation
+        assert!(!NodeEventProcessor::is_fallback_deactivation(
+            DASourceType::Primary,
+            DASourceType::Secondary
+        ));
+    }
+
+    #[test]
+    fn test_is_fallback_deactivation_secondary_to_emergency_false() {
+        // Going to Emergency is not deactivation
+        assert!(!NodeEventProcessor::is_fallback_deactivation(
+            DASourceType::Secondary,
+            DASourceType::Emergency
+        ));
+    }
+
+    #[test]
+    fn test_is_in_fallback_mode_primary() {
+        assert!(!NodeEventProcessor::is_in_fallback_mode(DASourceType::Primary));
+    }
+
+    #[test]
+    fn test_is_in_fallback_mode_secondary() {
+        assert!(NodeEventProcessor::is_in_fallback_mode(DASourceType::Secondary));
+    }
+
+    #[test]
+    fn test_is_in_fallback_mode_emergency() {
+        assert!(NodeEventProcessor::is_in_fallback_mode(DASourceType::Emergency));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // J. NEW NODE ACTION VARIANTS TESTS (14A.1A.45)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_node_action_switch_to_fallback_clone() {
+        let action = NodeAction::SwitchToFallback {
+            from_source: DASourceType::Primary,
+            to_source: DASourceType::Secondary,
+            reason: "test".to_string(),
+        };
+        let cloned = action.clone();
+        assert_eq!(action, cloned);
+    }
+
+    #[test]
+    fn test_node_action_switch_to_primary_clone() {
+        let action = NodeAction::SwitchToPrimary {
+            from_source: DASourceType::Secondary,
+        };
+        let cloned = action.clone();
+        assert_eq!(action, cloned);
+    }
+
+    #[test]
+    fn test_node_action_verify_reconciliation_clone() {
+        let action = NodeAction::VerifyReconciliation {
+            expected_sequence: 100,
+            expected_height: 50,
+            local_sequence: 100,
+            local_height: 50,
+        };
+        let cloned = action.clone();
+        assert_eq!(action, cloned);
+    }
+
+    #[test]
+    fn test_node_action_switch_to_fallback_debug() {
+        let action = NodeAction::SwitchToFallback {
+            from_source: DASourceType::Primary,
+            to_source: DASourceType::Secondary,
+            reason: "test".to_string(),
+        };
+        let debug_str = format!("{:?}", action);
+        assert!(debug_str.contains("SwitchToFallback"));
+        assert!(debug_str.contains("Primary"));
+        assert!(debug_str.contains("Secondary"));
+    }
+
+    #[test]
+    fn test_node_action_switch_to_primary_debug() {
+        let action = NodeAction::SwitchToPrimary {
+            from_source: DASourceType::Emergency,
+        };
+        let debug_str = format!("{:?}", action);
+        assert!(debug_str.contains("SwitchToPrimary"));
+        assert!(debug_str.contains("Emergency"));
+    }
+
+    #[test]
+    fn test_node_action_verify_reconciliation_debug() {
+        let action = NodeAction::VerifyReconciliation {
+            expected_sequence: 100,
+            expected_height: 50,
+            local_sequence: 100,
+            local_height: 50,
+        };
+        let debug_str = format!("{:?}", action);
+        assert!(debug_str.contains("VerifyReconciliation"));
+        assert!(debug_str.contains("100"));
+        assert!(debug_str.contains("50"));
     }
 }
