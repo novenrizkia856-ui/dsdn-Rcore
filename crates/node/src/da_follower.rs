@@ -45,6 +45,8 @@ use dsdn_coordinator::{
     ZoneAssignedPayload, ZoneUnassignedPayload,
 };
 
+use crate::multi_da_source::DASourceType;
+
 // ════════════════════════════════════════════════════════════════════════════
 // STATE ERROR
 // ════════════════════════════════════════════════════════════════════════════
@@ -149,6 +151,7 @@ pub struct ChunkAssignment {
 /// - Chunks assigned to this node
 /// - A subset of coordinator state for local decisions
 /// - Sequence tracking for consistency
+/// - Fallback tracking for multi-source DA (14A.1A.46)
 ///
 /// ## Non-Authoritative
 ///
@@ -161,6 +164,14 @@ pub struct ChunkAssignment {
 /// - Same events → Same state
 /// - No random values
 /// - No local timestamps
+///
+/// ## Fallback State Invariants (14A.1A.46)
+///
+/// The following invariants MUST hold:
+/// - If `fallback_active == false`, then `fallback_since == None`
+/// - If `fallback_active == true`, then `fallback_since.is_some()`
+/// - If `fallback_active == true`, then `current_da_source != Primary`
+/// - `events_from_fallback` only increments, never decreases
 #[derive(Debug)]
 pub struct NodeDerivedState {
     /// Chunks assigned to this node: hash -> assignment info
@@ -175,10 +186,60 @@ pub struct NodeDerivedState {
     chunk_sizes: HashMap<String, u64>,
     /// Replica status for each chunk: hash -> status
     pub replica_status: HashMap<String, ReplicaStatus>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FALLBACK TRACKING FIELDS (14A.1A.46)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Whether fallback mode is currently active.
+    ///
+    /// - `true`: Node is reading from a fallback DA source (Secondary/Emergency)
+    /// - `false`: Node is reading from Primary DA source
+    ///
+    /// Invariant: If false, `fallback_since` MUST be None.
+    pub fallback_active: bool,
+
+    /// Timestamp when fallback was activated.
+    ///
+    /// - `Some(timestamp)`: Fallback is active, activated at this timestamp
+    /// - `None`: Fallback is not active
+    ///
+    /// Invariant: Must be Some iff `fallback_active == true`.
+    pub fallback_since: Option<u64>,
+
+    /// Current DA source type being used.
+    ///
+    /// Tracks which DA source is currently being read from.
+    /// Updated atomically with fallback_active.
+    pub current_da_source: DASourceType,
+
+    /// Count of events processed from fallback sources.
+    ///
+    /// Only increments when events are processed from non-Primary sources.
+    /// Uses saturating arithmetic to prevent overflow.
+    pub events_from_fallback: u64,
+
+    /// Last sequence number after reconciliation completed.
+    ///
+    /// - `Some(seq)`: Reconciliation completed at this sequence
+    /// - `None`: No reconciliation has occurred
+    ///
+    /// Used to verify state consistency after source switches.
+    pub last_reconciliation_sequence: Option<u64>,
 }
 
 impl NodeDerivedState {
     /// Create a new empty node derived state.
+    ///
+    /// ## Initial State (14A.1A.46)
+    ///
+    /// - `fallback_active`: false (not in fallback mode)
+    /// - `fallback_since`: None (no fallback timestamp)
+    /// - `current_da_source`: Primary (default source)
+    /// - `events_from_fallback`: 0 (no fallback events yet)
+    /// - `last_reconciliation_sequence`: None (no reconciliation yet)
+    ///
+    /// All invariants are satisfied in the initial state.
     pub fn new() -> Self {
         Self {
             my_chunks: HashMap::new(),
@@ -187,6 +248,12 @@ impl NodeDerivedState {
             last_height: 0,
             chunk_sizes: HashMap::new(),
             replica_status: HashMap::new(),
+            // Fallback fields (14A.1A.46) - initial state
+            fallback_active: false,
+            fallback_since: None,
+            current_da_source: DASourceType::Primary,
+            events_from_fallback: 0,
+            last_reconciliation_sequence: None,
         }
     }
 
@@ -469,6 +536,196 @@ impl NodeDerivedState {
     /// * `None` - If the chunk has no status (not assigned)
     pub fn get_replica_status(&self, hash: &str) -> Option<ReplicaStatus> {
         self.replica_status.get(hash).copied()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // FALLBACK STATE TRANSITION METHODS (14A.1A.46)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Activate fallback mode.
+    ///
+    /// Transitions the state to fallback mode atomically.
+    /// All related fields are updated together to maintain invariants.
+    ///
+    /// ## Arguments
+    ///
+    /// * `timestamp` - Timestamp of fallback activation (from event or system)
+    /// * `source` - The fallback DA source being activated (must NOT be Primary)
+    ///
+    /// ## State Changes
+    ///
+    /// - `fallback_active` → `true`
+    /// - `fallback_since` → `Some(timestamp)`
+    /// - `current_da_source` → `source`
+    ///
+    /// ## Invariants Maintained
+    ///
+    /// - If already in fallback mode, updates source but preserves `fallback_since`
+    /// - `fallback_active` and `fallback_since` are always consistent
+    ///
+    /// ## Guarantees
+    ///
+    /// - Atomic update (all fields updated together)
+    /// - No partial state
+    /// - Never panics
+    /// - Thread-safe (caller must hold write lock)
+    pub fn activate_fallback(&mut self, timestamp: u64, source: DASourceType) {
+        // Update source regardless
+        self.current_da_source = source;
+
+        // Only set fallback_since if not already in fallback mode
+        // This preserves the original activation timestamp
+        if !self.fallback_active {
+            self.fallback_active = true;
+            self.fallback_since = Some(timestamp);
+        }
+        // If already active, just update source (e.g., Secondary → Emergency)
+    }
+
+    /// Deactivate fallback mode.
+    ///
+    /// Transitions the state back to primary mode atomically.
+    /// Clears all fallback-related state.
+    ///
+    /// ## State Changes
+    ///
+    /// - `fallback_active` → `false`
+    /// - `fallback_since` → `None`
+    /// - `current_da_source` → `Primary`
+    ///
+    /// ## Invariants Maintained
+    ///
+    /// - `fallback_active == false` implies `fallback_since == None`
+    /// - `current_da_source` is always Primary when not in fallback
+    ///
+    /// ## Guarantees
+    ///
+    /// - Atomic update (all fields updated together)
+    /// - Idempotent (safe to call when already deactivated)
+    /// - No partial state
+    /// - Never panics
+    /// - Thread-safe (caller must hold write lock)
+    pub fn deactivate_fallback(&mut self) {
+        self.fallback_active = false;
+        self.fallback_since = None;
+        self.current_da_source = DASourceType::Primary;
+    }
+
+    /// Record that an event was processed from a fallback source.
+    ///
+    /// Increments the `events_from_fallback` counter.
+    /// Uses saturating arithmetic to prevent overflow.
+    ///
+    /// ## State Changes
+    ///
+    /// - `events_from_fallback` → `events_from_fallback + 1` (saturating)
+    ///
+    /// ## Guarantees
+    ///
+    /// - Never overflows (uses saturating_add)
+    /// - Never panics
+    /// - Thread-safe (caller must hold write lock)
+    ///
+    /// ## Usage
+    ///
+    /// Should be called for each event processed when `current_da_source != Primary`.
+    pub fn record_fallback_event(&mut self) {
+        self.events_from_fallback = self.events_from_fallback.saturating_add(1);
+    }
+
+    /// Record reconciliation completion.
+    ///
+    /// Updates `last_reconciliation_sequence` to record when reconciliation
+    /// was successfully completed.
+    ///
+    /// ## Arguments
+    ///
+    /// * `sequence` - The sequence number at reconciliation completion
+    ///
+    /// ## State Changes
+    ///
+    /// - `last_reconciliation_sequence` → `Some(sequence)`
+    ///
+    /// ## Guarantees
+    ///
+    /// - Atomic update
+    /// - Never panics
+    /// - Thread-safe (caller must hold write lock)
+    ///
+    /// ## Usage
+    ///
+    /// Called after successful reconciliation to record the state checkpoint.
+    pub fn record_reconciliation(&mut self, sequence: u64) {
+        self.last_reconciliation_sequence = Some(sequence);
+    }
+
+    /// Check if fallback mode is currently active.
+    ///
+    /// ## Returns
+    ///
+    /// * `true` - Currently in fallback mode
+    /// * `false` - Using primary DA source
+    #[must_use]
+    pub fn is_fallback_active(&self) -> bool {
+        self.fallback_active
+    }
+
+    /// Get the duration of current fallback (if active).
+    ///
+    /// ## Arguments
+    ///
+    /// * `current_timestamp` - Current timestamp for duration calculation
+    ///
+    /// ## Returns
+    ///
+    /// * `Some(duration)` - Fallback is active, returns duration in same units as timestamp
+    /// * `None` - Fallback is not active
+    ///
+    /// ## Guarantees
+    ///
+    /// - Returns None if not in fallback mode
+    /// - Uses saturating subtraction to prevent underflow
+    /// - Never panics
+    #[must_use]
+    pub fn get_fallback_duration(&self, current_timestamp: u64) -> Option<u64> {
+        self.fallback_since.map(|since| current_timestamp.saturating_sub(since))
+    }
+
+    /// Validate fallback state invariants.
+    ///
+    /// Checks that all fallback-related fields are in a consistent state.
+    ///
+    /// ## Returns
+    ///
+    /// * `true` - All invariants hold
+    /// * `false` - State is inconsistent (should never happen in correct code)
+    ///
+    /// ## Invariants Checked
+    ///
+    /// 1. If `fallback_active == false`, then `fallback_since == None`
+    /// 2. If `fallback_active == true`, then `fallback_since.is_some()`
+    /// 3. If `fallback_active == false`, then `current_da_source == Primary`
+    ///
+    /// ## Usage
+    ///
+    /// Can be used in debug builds or tests to verify state consistency.
+    #[must_use]
+    pub fn validate_fallback_invariants(&self) -> bool {
+        // Invariant 1 & 2: fallback_active and fallback_since must be consistent
+        let since_consistent = if self.fallback_active {
+            self.fallback_since.is_some()
+        } else {
+            self.fallback_since.is_none()
+        };
+
+        // Invariant 3: If not in fallback, source must be Primary
+        let source_consistent = if !self.fallback_active {
+            matches!(self.current_da_source, DASourceType::Primary)
+        } else {
+            true // Any source is valid when in fallback
+        };
+
+        since_consistent && source_consistent
     }
 }
 
@@ -2005,5 +2262,307 @@ mod tests {
         // States should be identical
         assert_eq!(state1.get_replica_status("chunk-1"), state2.get_replica_status("chunk-1"));
         assert_eq!(state1.get_replica_status("chunk-2"), state2.get_replica_status("chunk-2"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // T. FALLBACK STATE FIELDS TESTS (14A.1A.46)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_fields_initial_state() {
+        let state = NodeDerivedState::new();
+
+        // Verify all fallback fields are initialized correctly
+        assert!(!state.fallback_active);
+        assert!(state.fallback_since.is_none());
+        assert_eq!(state.current_da_source, DASourceType::Primary);
+        assert_eq!(state.events_from_fallback, 0);
+        assert!(state.last_reconciliation_sequence.is_none());
+
+        // Invariants should hold
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_activate_fallback_from_primary() {
+        let mut state = NodeDerivedState::new();
+
+        // Activate fallback to Secondary
+        state.activate_fallback(1000, DASourceType::Secondary);
+
+        assert!(state.fallback_active);
+        assert_eq!(state.fallback_since, Some(1000));
+        assert_eq!(state.current_da_source, DASourceType::Secondary);
+
+        // Invariants should hold
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_activate_fallback_to_emergency() {
+        let mut state = NodeDerivedState::new();
+
+        // Activate fallback directly to Emergency
+        state.activate_fallback(2000, DASourceType::Emergency);
+
+        assert!(state.fallback_active);
+        assert_eq!(state.fallback_since, Some(2000));
+        assert_eq!(state.current_da_source, DASourceType::Emergency);
+
+        // Invariants should hold
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_activate_fallback_secondary_to_emergency() {
+        let mut state = NodeDerivedState::new();
+
+        // First activate to Secondary
+        state.activate_fallback(1000, DASourceType::Secondary);
+        assert_eq!(state.fallback_since, Some(1000));
+
+        // Then switch to Emergency (should preserve original timestamp)
+        state.activate_fallback(2000, DASourceType::Emergency);
+
+        assert!(state.fallback_active);
+        assert_eq!(state.fallback_since, Some(1000)); // Original timestamp preserved
+        assert_eq!(state.current_da_source, DASourceType::Emergency); // Source updated
+
+        // Invariants should hold
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_deactivate_fallback() {
+        let mut state = NodeDerivedState::new();
+
+        // Activate fallback
+        state.activate_fallback(1000, DASourceType::Secondary);
+        assert!(state.fallback_active);
+
+        // Deactivate
+        state.deactivate_fallback();
+
+        assert!(!state.fallback_active);
+        assert!(state.fallback_since.is_none());
+        assert_eq!(state.current_da_source, DASourceType::Primary);
+
+        // Invariants should hold
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_deactivate_fallback_idempotent() {
+        let mut state = NodeDerivedState::new();
+
+        // Deactivate when already inactive (idempotent)
+        state.deactivate_fallback();
+
+        assert!(!state.fallback_active);
+        assert!(state.fallback_since.is_none());
+        assert_eq!(state.current_da_source, DASourceType::Primary);
+
+        // Invariants should hold
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_record_fallback_event() {
+        let mut state = NodeDerivedState::new();
+
+        assert_eq!(state.events_from_fallback, 0);
+
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, 1);
+
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, 2);
+
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, 3);
+    }
+
+    #[test]
+    fn test_record_fallback_event_saturating() {
+        let mut state = NodeDerivedState::new();
+
+        // Set to max - 1
+        state.events_from_fallback = u64::MAX - 1;
+
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, u64::MAX);
+
+        // Should saturate, not overflow
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, u64::MAX);
+    }
+
+    #[test]
+    fn test_record_reconciliation() {
+        let mut state = NodeDerivedState::new();
+
+        assert!(state.last_reconciliation_sequence.is_none());
+
+        state.record_reconciliation(100);
+        assert_eq!(state.last_reconciliation_sequence, Some(100));
+
+        // Can update to new value
+        state.record_reconciliation(200);
+        assert_eq!(state.last_reconciliation_sequence, Some(200));
+    }
+
+    #[test]
+    fn test_is_fallback_active() {
+        let mut state = NodeDerivedState::new();
+
+        assert!(!state.is_fallback_active());
+
+        state.activate_fallback(1000, DASourceType::Secondary);
+        assert!(state.is_fallback_active());
+
+        state.deactivate_fallback();
+        assert!(!state.is_fallback_active());
+    }
+
+    #[test]
+    fn test_get_fallback_duration() {
+        let mut state = NodeDerivedState::new();
+
+        // No duration when not in fallback
+        assert!(state.get_fallback_duration(2000).is_none());
+
+        // Activate fallback at timestamp 1000
+        state.activate_fallback(1000, DASourceType::Secondary);
+
+        // Duration at timestamp 1500 should be 500
+        assert_eq!(state.get_fallback_duration(1500), Some(500));
+
+        // Duration at timestamp 2000 should be 1000
+        assert_eq!(state.get_fallback_duration(2000), Some(1000));
+
+        // Duration at same timestamp should be 0
+        assert_eq!(state.get_fallback_duration(1000), Some(0));
+    }
+
+    #[test]
+    fn test_get_fallback_duration_saturating() {
+        let mut state = NodeDerivedState::new();
+
+        // Activate at high timestamp
+        state.activate_fallback(1000, DASourceType::Secondary);
+
+        // Query with lower timestamp (should saturate to 0, not underflow)
+        assert_eq!(state.get_fallback_duration(500), Some(0));
+    }
+
+    #[test]
+    fn test_validate_fallback_invariants_valid() {
+        let mut state = NodeDerivedState::new();
+
+        // Initial state should be valid
+        assert!(state.validate_fallback_invariants());
+
+        // After activation should be valid
+        state.activate_fallback(1000, DASourceType::Secondary);
+        assert!(state.validate_fallback_invariants());
+
+        // After deactivation should be valid
+        state.deactivate_fallback();
+        assert!(state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_validate_fallback_invariants_invalid_since_without_active() {
+        let mut state = NodeDerivedState::new();
+
+        // Manually create invalid state (should not happen in normal code)
+        state.fallback_active = false;
+        state.fallback_since = Some(1000); // Invalid: since without active
+
+        assert!(!state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_validate_fallback_invariants_invalid_active_without_since() {
+        let mut state = NodeDerivedState::new();
+
+        // Manually create invalid state (should not happen in normal code)
+        state.fallback_active = true;
+        state.fallback_since = None; // Invalid: active without since
+
+        assert!(!state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_validate_fallback_invariants_invalid_source_when_inactive() {
+        let mut state = NodeDerivedState::new();
+
+        // Manually create invalid state (should not happen in normal code)
+        state.fallback_active = false;
+        state.fallback_since = None;
+        state.current_da_source = DASourceType::Secondary; // Invalid: non-primary when inactive
+
+        assert!(!state.validate_fallback_invariants());
+    }
+
+    #[test]
+    fn test_fallback_full_cycle() {
+        let mut state = NodeDerivedState::new();
+
+        // Initial state
+        assert!(state.validate_fallback_invariants());
+        assert!(!state.is_fallback_active());
+        assert_eq!(state.events_from_fallback, 0);
+
+        // Activate fallback
+        state.activate_fallback(1000, DASourceType::Secondary);
+        assert!(state.validate_fallback_invariants());
+        assert!(state.is_fallback_active());
+
+        // Record some events
+        state.record_fallback_event();
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, 2);
+
+        // Switch to Emergency
+        state.activate_fallback(2000, DASourceType::Emergency);
+        assert!(state.validate_fallback_invariants());
+        assert_eq!(state.current_da_source, DASourceType::Emergency);
+        assert_eq!(state.fallback_since, Some(1000)); // Original timestamp
+
+        // Record more events
+        state.record_fallback_event();
+        assert_eq!(state.events_from_fallback, 3);
+
+        // Record reconciliation
+        state.record_reconciliation(500);
+        assert_eq!(state.last_reconciliation_sequence, Some(500));
+
+        // Deactivate fallback
+        state.deactivate_fallback();
+        assert!(state.validate_fallback_invariants());
+        assert!(!state.is_fallback_active());
+        assert_eq!(state.current_da_source, DASourceType::Primary);
+
+        // Events count preserved
+        assert_eq!(state.events_from_fallback, 3);
+        // Reconciliation sequence preserved
+        assert_eq!(state.last_reconciliation_sequence, Some(500));
+    }
+
+    #[test]
+    fn test_fallback_fields_with_debug_format() {
+        let mut state = NodeDerivedState::new();
+        state.activate_fallback(1000, DASourceType::Secondary);
+        state.record_fallback_event();
+        state.record_reconciliation(100);
+
+        // Debug format should include all fields
+        let debug_str = format!("{:?}", state);
+        assert!(debug_str.contains("fallback_active"));
+        assert!(debug_str.contains("fallback_since"));
+        assert!(debug_str.contains("current_da_source"));
+        assert!(debug_str.contains("events_from_fallback"));
+        assert!(debug_str.contains("last_reconciliation_sequence"));
     }
 }
