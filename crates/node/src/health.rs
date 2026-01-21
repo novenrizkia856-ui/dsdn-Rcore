@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::da_follower::{NodeDerivedState, ReplicaStatus};
+use crate::multi_da_source::DASourceType;
 
 // ════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -40,6 +41,14 @@ use crate::da_follower::{NodeDerivedState, ReplicaStatus};
 /// Maximum acceptable DA lag (in sequence numbers) before node is considered unhealthy.
 /// This threshold allows for brief network delays while catching significant sync issues.
 pub const DA_LAG_THRESHOLD: u64 = 100;
+
+/// Maximum duration (in milliseconds) in fallback mode before health is degraded.
+/// 5 minutes = 300,000 milliseconds.
+///
+/// If a node has been in fallback mode longer than this, it is considered degraded.
+/// This threshold is chosen to allow for brief primary outages while detecting
+/// extended fallback situations that may indicate infrastructure issues.
+pub const FALLBACK_DEGRADATION_THRESHOLD_MS: u64 = 300_000;
 
 // ════════════════════════════════════════════════════════════════════════════
 // HEALTH STORAGE TRAIT
@@ -94,6 +103,10 @@ pub trait DAInfo: Send + Sync {
 /// | storage_used_gb | Current storage usage in GB |
 /// | storage_capacity_gb | Total storage capacity in GB |
 /// | last_check | Timestamp of this health check |
+/// | fallback_active | Whether node is in fallback mode (14A.1A.47) |
+/// | da_source | Current DA source type as string (14A.1A.47) |
+/// | events_from_fallback | Count of events from fallback sources (14A.1A.47) |
+/// | last_primary_contact | Timestamp of last primary contact (14A.1A.47) |
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeHealth {
     /// Unique identifier of the node.
@@ -116,6 +129,38 @@ pub struct NodeHealth {
     pub storage_capacity_gb: f64,
     /// Unix timestamp (milliseconds) of this health check.
     pub last_check: u64,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FALLBACK AWARENESS FIELDS (14A.1A.47)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Whether the node is currently in fallback mode.
+    ///
+    /// `true` indicates the node is reading from a fallback DA source
+    /// (Secondary or Emergency) instead of Primary.
+    pub fallback_active: bool,
+
+    /// Current DA source type as a string.
+    ///
+    /// Possible values: "Primary", "Secondary", "Emergency".
+    /// Always reflects the actual source being used.
+    pub da_source: String,
+
+    /// Total count of events processed from fallback sources.
+    ///
+    /// Monotonically increasing counter. Helps track how much data
+    /// was read from fallback sources over time.
+    pub events_from_fallback: u64,
+
+    /// Unix timestamp (milliseconds) of last contact with primary DA.
+    ///
+    /// `Some(timestamp)` - Last time primary was successfully used
+    /// `None` - Primary has never been successfully contacted or data unavailable
+    ///
+    /// This is computed from fallback_since: if fallback is active,
+    /// last_primary_contact = fallback_since (when we left primary).
+    /// If fallback is not active, last_primary_contact = last_check (now).
+    pub last_primary_contact: Option<u64>,
 }
 
 impl NodeHealth {
@@ -140,6 +185,7 @@ impl NodeHealth {
     /// - Never panics
     /// - All fields are computed from actual state
     /// - If DA is unreachable, da_connected = false but other fields are still filled
+    /// - Fallback fields are populated from NodeDerivedState (14A.1A.47)
     pub fn check(
         node_id: &str,
         da: &dyn DAInfo,
@@ -176,6 +222,30 @@ impl NodeHealth {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        // ════════════════════════════════════════════════════════════════════════
+        // FALLBACK AWARENESS (14A.1A.47)
+        // ════════════════════════════════════════════════════════════════════════
+
+        // Get fallback status from state
+        let fallback_active = state.fallback_active;
+
+        // Convert DA source type to string
+        let da_source = Self::da_source_to_string(state.current_da_source);
+
+        // Get events from fallback counter
+        let events_from_fallback = state.events_from_fallback;
+
+        // Compute last_primary_contact:
+        // - If not in fallback: primary is currently active, so last contact is now
+        // - If in fallback: last primary contact was when fallback started (fallback_since)
+        let last_primary_contact = if fallback_active {
+            // In fallback mode: use fallback_since as last primary contact
+            state.fallback_since
+        } else {
+            // Not in fallback: primary is active now
+            Some(last_check)
+        };
+
         Self {
             node_id: node_id.to_string(),
             da_connected,
@@ -187,6 +257,22 @@ impl NodeHealth {
             storage_used_gb,
             storage_capacity_gb,
             last_check,
+            // Fallback fields (14A.1A.47)
+            fallback_active,
+            da_source,
+            events_from_fallback,
+            last_primary_contact,
+        }
+    }
+
+    /// Convert DASourceType to string representation.
+    ///
+    /// This is a deterministic mapping, never panics.
+    fn da_source_to_string(source: DASourceType) -> String {
+        match source {
+            DASourceType::Primary => "Primary".to_string(),
+            DASourceType::Secondary => "Secondary".to_string(),
+            DASourceType::Emergency => "Emergency".to_string(),
         }
     }
 
@@ -222,6 +308,7 @@ impl NodeHealth {
     /// - No chunks are missing
     /// - DA lag is within acceptable threshold (< 100 sequences)
     /// - Storage is not overflowing
+    /// - Not in extended fallback (> 5 minutes) (14A.1A.47)
     ///
     /// # Returns
     ///
@@ -247,7 +334,48 @@ impl NodeHealth {
             return false;
         }
 
+        // Criterion 5 (14A.1A.47): Not in extended fallback
+        if self.is_fallback_degraded() {
+            return false;
+        }
+
         true
+    }
+
+    /// Check if node is degraded due to extended fallback.
+    ///
+    /// A node is considered degraded if it has been in fallback mode
+    /// for longer than FALLBACK_DEGRADATION_THRESHOLD_MS.
+    ///
+    /// # Returns
+    ///
+    /// `true` if in extended fallback, `false` otherwise.
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministic: same inputs always give same output
+    /// - No flip-flop: consistent with fallback_active and last_primary_contact
+    /// - Never panics
+    pub fn is_fallback_degraded(&self) -> bool {
+        // Not degraded if not in fallback
+        if !self.fallback_active {
+            return false;
+        }
+
+        // Check if we have last_primary_contact to compute duration
+        let Some(last_primary) = self.last_primary_contact else {
+            // If no last_primary_contact but fallback is active,
+            // we cannot determine duration - treat as not degraded
+            // to avoid false positives
+            return false;
+        };
+
+        // Compute duration in fallback (current time - last primary contact)
+        // Use saturating subtraction to prevent underflow
+        let fallback_duration = self.last_check.saturating_sub(last_primary);
+
+        // Degraded if in fallback longer than threshold
+        fallback_duration >= FALLBACK_DEGRADATION_THRESHOLD_MS
     }
 
     /// Convert health report to JSON string.
@@ -275,8 +403,14 @@ impl NodeHealth {
 
     /// Manual JSON serialization fallback.
     fn to_json_manual(&self) -> String {
+        // Handle Option<u64> for last_primary_contact
+        let last_primary_str = match self.last_primary_contact {
+            Some(ts) => ts.to_string(),
+            None => "null".to_string(),
+        };
+
         format!(
-            r#"{{"node_id":"{}","da_connected":{},"da_last_sequence":{},"da_behind_by":{},"chunks_stored":{},"chunks_pending":{},"chunks_missing":{},"storage_used_gb":{},"storage_capacity_gb":{},"last_check":{}}}"#,
+            r#"{{"node_id":"{}","da_connected":{},"da_last_sequence":{},"da_behind_by":{},"chunks_stored":{},"chunks_pending":{},"chunks_missing":{},"storage_used_gb":{},"storage_capacity_gb":{},"last_check":{},"fallback_active":{},"da_source":"{}","events_from_fallback":{},"last_primary_contact":{}}}"#,
             self.node_id,
             self.da_connected,
             self.da_last_sequence,
@@ -286,7 +420,11 @@ impl NodeHealth {
             self.chunks_missing,
             self.storage_used_gb,
             self.storage_capacity_gb,
-            self.last_check
+            self.last_check,
+            self.fallback_active,
+            self.da_source,
+            self.events_from_fallback,
+            last_primary_str
         )
     }
 
@@ -321,6 +459,23 @@ impl NodeHealth {
             ));
         }
 
+        // Fallback-related issues (14A.1A.47)
+        if self.is_fallback_degraded() {
+            let duration_ms = self.last_primary_contact
+                .map(|lp| self.last_check.saturating_sub(lp))
+                .unwrap_or(0);
+            let duration_min = duration_ms / 60_000;
+            issues.push(format!(
+                "Extended fallback: in {} mode for {} minutes (threshold: {} minutes)",
+                self.da_source,
+                duration_min,
+                FALLBACK_DEGRADATION_THRESHOLD_MS / 60_000
+            ));
+        } else if self.fallback_active {
+            // Fallback is active but not yet degraded - informational
+            // Not adding to issues since it's not unhealthy yet
+        }
+
         issues
     }
 }
@@ -338,6 +493,11 @@ impl Default for NodeHealth {
             storage_used_gb: 0.0,
             storage_capacity_gb: 0.0,
             last_check: 0,
+            // Fallback fields (14A.1A.47)
+            fallback_active: false,
+            da_source: "Primary".to_string(),
+            events_from_fallback: 0,
+            last_primary_contact: None,
         }
     }
 }
@@ -959,6 +1119,12 @@ mod tests {
         assert_eq!(health.storage_capacity_gb, 0.0);
         assert_eq!(health.last_check, 0);
 
+        // Fallback fields (14A.1A.47)
+        assert!(!health.fallback_active);
+        assert_eq!(health.da_source, "Primary");
+        assert_eq!(health.events_from_fallback, 0);
+        assert!(health.last_primary_contact.is_none());
+
         // Default is unhealthy (DA not connected)
         assert!(!health.is_healthy());
     }
@@ -1024,11 +1190,357 @@ mod tests {
             storage_used_gb: 50.0,
             storage_capacity_gb: 100.0,
             last_check: 12345,
+            // Fallback fields (14A.1A.47)
+            fallback_active: false,
+            da_source: "Primary".to_string(),
+            events_from_fallback: 0,
+            last_primary_contact: Some(12345),
         };
 
         let response = HealthResponse::from_health(&health);
 
         assert_eq!(response.status_code, 200);
         assert!(response.body.contains("test-node-1"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P. FALLBACK AWARENESS TESTS (14A.1A.47)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_health_includes_fallback_info_primary() {
+        let da = MockDAInfo::new(true, 100);
+        let state = make_empty_state();
+        let storage = MockHealthStorage::new(0, GB_100);
+
+        let health = NodeHealth::check(TEST_NODE, &da, &state, &storage);
+
+        // Default state: not in fallback
+        assert!(!health.fallback_active);
+        assert_eq!(health.da_source, "Primary");
+        assert_eq!(health.events_from_fallback, 0);
+        // last_primary_contact should be approximately last_check
+        assert!(health.last_primary_contact.is_some());
+    }
+
+    #[test]
+    fn test_health_includes_fallback_info_secondary() {
+        let da = MockDAInfo::new(true, 100);
+        let mut state = make_empty_state();
+
+        // Activate fallback to Secondary
+        state.activate_fallback(1000, crate::multi_da_source::DASourceType::Secondary);
+        state.record_fallback_event();
+        state.record_fallback_event();
+
+        let storage = MockHealthStorage::new(0, GB_100);
+
+        let health = NodeHealth::check(TEST_NODE, &da, &state, &storage);
+
+        assert!(health.fallback_active);
+        assert_eq!(health.da_source, "Secondary");
+        assert_eq!(health.events_from_fallback, 2);
+        assert_eq!(health.last_primary_contact, Some(1000));
+    }
+
+    #[test]
+    fn test_health_includes_fallback_info_emergency() {
+        let da = MockDAInfo::new(true, 100);
+        let mut state = make_empty_state();
+
+        // Activate fallback to Emergency
+        state.activate_fallback(2000, crate::multi_da_source::DASourceType::Emergency);
+        state.record_fallback_event();
+
+        let storage = MockHealthStorage::new(0, GB_100);
+
+        let health = NodeHealth::check(TEST_NODE, &da, &state, &storage);
+
+        assert!(health.fallback_active);
+        assert_eq!(health.da_source, "Emergency");
+        assert_eq!(health.events_from_fallback, 1);
+        assert_eq!(health.last_primary_contact, Some(2000));
+    }
+
+    #[test]
+    fn test_health_serialization_includes_fallback_fields() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 5,
+            chunks_pending: 2,
+            chunks_missing: 0,
+            storage_used_gb: 10.0,
+            storage_capacity_gb: 100.0,
+            last_check: 50000,
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 42,
+            last_primary_contact: Some(10000),
+        };
+
+        let json = health.to_json();
+
+        assert!(json.contains("\"fallback_active\":true"));
+        assert!(json.contains("\"da_source\":\"Secondary\""));
+        assert!(json.contains("\"events_from_fallback\":42"));
+        assert!(json.contains("\"last_primary_contact\":10000"));
+    }
+
+    #[test]
+    fn test_health_serialization_null_last_primary_contact() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 0,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 0.0,
+            storage_capacity_gb: 100.0,
+            last_check: 50000,
+            fallback_active: false,
+            da_source: "Primary".to_string(),
+            events_from_fallback: 0,
+            last_primary_contact: None,
+        };
+
+        let json = health.to_json();
+
+        assert!(json.contains("\"last_primary_contact\":null"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Q. FALLBACK DEGRADATION TESTS (14A.1A.47)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_not_degraded_when_not_in_fallback() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            last_check: 1_000_000,
+            fallback_active: false,
+            da_source: "Primary".to_string(),
+            events_from_fallback: 0,
+            last_primary_contact: Some(1_000_000),
+        };
+
+        assert!(!health.is_fallback_degraded());
+        assert!(health.is_healthy());
+    }
+
+    #[test]
+    fn test_not_degraded_when_fallback_short_duration() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            // last_check = 60 seconds after fallback started
+            last_check: 60_000,
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 10,
+            // Fallback started at timestamp 0
+            last_primary_contact: Some(0),
+        };
+
+        // 60 seconds < 5 minutes threshold
+        assert!(!health.is_fallback_degraded());
+        assert!(health.is_healthy());
+    }
+
+    #[test]
+    fn test_degraded_when_fallback_exceeds_threshold() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            // last_check = 6 minutes after fallback started (360,000 ms)
+            last_check: 360_000,
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 100,
+            // Fallback started at timestamp 0
+            last_primary_contact: Some(0),
+        };
+
+        // 6 minutes > 5 minutes threshold
+        assert!(health.is_fallback_degraded());
+        assert!(!health.is_healthy());
+    }
+
+    #[test]
+    fn test_degraded_exactly_at_threshold() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            // last_check = exactly 5 minutes after fallback started (300,000 ms)
+            last_check: FALLBACK_DEGRADATION_THRESHOLD_MS,
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 50,
+            // Fallback started at timestamp 0
+            last_primary_contact: Some(0),
+        };
+
+        // Exactly at threshold = degraded (>=)
+        assert!(health.is_fallback_degraded());
+        assert!(!health.is_healthy());
+    }
+
+    #[test]
+    fn test_degraded_with_emergency_source() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            last_check: 600_000, // 10 minutes
+            fallback_active: true,
+            da_source: "Emergency".to_string(),
+            events_from_fallback: 200,
+            last_primary_contact: Some(0),
+        };
+
+        assert!(health.is_fallback_degraded());
+        assert!(!health.is_healthy());
+    }
+
+    #[test]
+    fn test_health_issues_includes_extended_fallback() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            last_check: 600_000, // 10 minutes
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 100,
+            last_primary_contact: Some(0),
+        };
+
+        let issues = health.health_issues();
+
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|i| i.contains("Extended fallback")));
+        assert!(issues.iter().any(|i| i.contains("Secondary")));
+    }
+
+    #[test]
+    fn test_health_issues_no_fallback_issue_when_short() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            last_check: 60_000, // 1 minute
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 10,
+            last_primary_contact: Some(0),
+        };
+
+        let issues = health.health_issues();
+
+        // Short fallback should not produce issues
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_fallback_degraded_no_last_primary_contact() {
+        let health = NodeHealth {
+            node_id: TEST_NODE.to_string(),
+            da_connected: true,
+            da_last_sequence: 100,
+            da_behind_by: 0,
+            chunks_stored: 10,
+            chunks_pending: 0,
+            chunks_missing: 0,
+            storage_used_gb: 50.0,
+            storage_capacity_gb: 100.0,
+            last_check: 1_000_000,
+            fallback_active: true,
+            da_source: "Secondary".to_string(),
+            events_from_fallback: 50,
+            // No last_primary_contact available
+            last_primary_contact: None,
+        };
+
+        // Cannot determine duration, so not degraded
+        assert!(!health.is_fallback_degraded());
+    }
+
+    #[test]
+    fn test_healthy_after_fallback_deactivated() {
+        let da = MockDAInfo::new(true, 100);
+        let mut state = make_empty_state();
+
+        // Set last_sequence to match DA to avoid lag-based unhealthy status
+        state.last_sequence = 100;
+
+        // Activate then deactivate fallback
+        state.activate_fallback(1000, crate::multi_da_source::DASourceType::Secondary);
+        state.record_fallback_event();
+        state.deactivate_fallback();
+
+        let storage = MockHealthStorage::new(0, GB_100);
+
+        let health = NodeHealth::check(TEST_NODE, &da, &state, &storage);
+
+        assert!(!health.fallback_active);
+        assert_eq!(health.da_source, "Primary");
+        // events_from_fallback preserves count
+        assert_eq!(health.events_from_fallback, 1);
+        // last_primary_contact is now (primary is active)
+        assert!(health.last_primary_contact.is_some());
+        // da_behind_by = 0, so should be healthy
+        assert_eq!(health.da_behind_by, 0);
+        assert!(health.is_healthy());
     }
 }
