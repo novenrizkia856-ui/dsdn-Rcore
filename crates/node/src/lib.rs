@@ -31,6 +31,7 @@
 //! - `state_sync`: State synchronization
 //! - `health`: Health reporting
 //! - `multi_da_source`: Multi-DA source abstraction for fallback (14A.1A.41)
+//! - `metrics`: Node fallback metrics tracking (14A.1A.49)
 //!
 //! ## Key Invariant
 //! Node TIDAK menerima instruksi dari Coordinator via RPC.
@@ -40,6 +41,7 @@ pub mod da_follower;
 pub mod delete_handler;
 pub mod event_processor;
 pub mod health;
+pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
 pub mod state_sync;
@@ -48,6 +50,7 @@ pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError,
 pub use delete_handler::{DeleteHandler, DeleteError, DeleteRequestedEvent, PendingDelete, Storage};
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};
 pub use health::{NodeHealth, HealthStorage, DAInfo, HealthResponse, health_endpoint, DA_LAG_THRESHOLD};
+pub use metrics::NodeFallbackMetrics;
 pub use multi_da_source::{MultiDASource, MultiDAConfig, DASourceType};
 pub use placement_verifier::{PlacementVerifier, PlacementReport, PlacementDetail, PlacementStatus};
 pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
