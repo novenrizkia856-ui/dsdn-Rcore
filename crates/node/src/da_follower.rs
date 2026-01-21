@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::sync::Notify;
-use tracing::{debug, warn, error};
+use tracing::{debug, info, warn, error};
 
 use dsdn_common::da::{DALayer, DAError, Blob};
 use dsdn_coordinator::{
@@ -62,6 +62,81 @@ pub enum StateError {
     #[error("Inconsistent state: {0}")]
     InconsistentState(String),
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TRANSITION ERROR (14A.1A.48)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Errors that can occur during source transition.
+///
+/// These errors represent failures in the graceful source transition process.
+/// All errors are recoverable - rollback will restore the previous state.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum TransitionError {
+    /// Transition timed out waiting for pause to complete.
+    #[error("Transition timeout after {0}ms")]
+    Timeout(u64),
+
+    /// Sequence gap detected after transition.
+    #[error("Sequence gap detected: expected {expected}, got {actual}")]
+    SequenceGap {
+        /// Expected next sequence number
+        expected: u64,
+        /// Actual sequence number received
+        actual: u64,
+    },
+
+    /// Another transition is already in progress.
+    #[error("Transition already in progress")]
+    AlreadyInProgress,
+
+    /// Invalid transition (e.g., Primary to Primary).
+    #[error("Invalid transition from {from:?} to {to:?}")]
+    InvalidTransition {
+        /// Source type we're transitioning from
+        from: DASourceType,
+        /// Source type we're transitioning to
+        to: DASourceType,
+    },
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TRANSITION RESULT (14A.1A.48)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Result of a source transition operation.
+///
+/// Represents the outcome of a graceful source transition attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitionResult {
+    /// Transition completed successfully.
+    Success {
+        /// Source type we transitioned from
+        from: DASourceType,
+        /// Source type we transitioned to
+        to: DASourceType,
+        /// Sequence number before transition
+        sequence_before: u64,
+        /// Sequence number after transition (should equal sequence_before)
+        sequence_after: u64,
+    },
+
+    /// Transition failed and was rolled back to original source.
+    RolledBack {
+        /// Source type we attempted to transition from
+        from: DASourceType,
+        /// Source type we attempted to transition to
+        to: DASourceType,
+        /// Reason for rollback
+        reason: String,
+    },
+}
+
+/// Timeout for source transition operations in milliseconds.
+///
+/// If the transition (pause, drain, update, resume) takes longer than this,
+/// it is considered failed and will be rolled back.
+pub const TRANSITION_TIMEOUT_MS: u64 = 5000;
 
 // ════════════════════════════════════════════════════════════════════════════
 // REPLICA STATUS
@@ -774,6 +849,26 @@ pub struct DAFollower {
     shutdown_notify: Arc<Notify>,
     /// Last processed height (for reconnection)
     last_height: Arc<AtomicU64>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SOURCE TRANSITION FIELDS (14A.1A.48)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Flag indicating if event processing is paused.
+    ///
+    /// When true, the background task will not process new events.
+    /// This is used during source transitions to ensure atomicity.
+    paused: Arc<AtomicBool>,
+
+    /// Flag indicating if a transition is currently in progress.
+    ///
+    /// Prevents concurrent transitions which could cause inconsistent state.
+    transition_in_progress: Arc<AtomicBool>,
+
+    /// Notify for pause coordination.
+    ///
+    /// Used to signal when pause has been acknowledged by background task.
+    pause_notify: Arc<Notify>,
 }
 
 impl DAFollower {
@@ -805,6 +900,10 @@ impl DAFollower {
             running: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             last_height: Arc::new(AtomicU64::new(0)),
+            // Source transition fields (14A.1A.48)
+            paused: Arc::new(AtomicBool::new(false)),
+            transition_in_progress: Arc::new(AtomicBool::new(false)),
+            pause_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -843,6 +942,7 @@ impl DAFollower {
     /// - Will not spawn duplicate tasks if called multiple times
     /// - Events are filtered to only process node-relevant events
     /// - Background task handles reconnection on stream errors
+    /// - Background task respects pause flag for source transitions (14A.1A.48)
     /// - Does NOT panic
     pub fn start(&mut self) -> Result<(), DAError> {
         // Check if already running
@@ -859,9 +959,15 @@ impl DAFollower {
         let running = Arc::clone(&self.running);
         let shutdown = Arc::clone(&self.shutdown_notify);
         let last_height = Arc::clone(&self.last_height);
+        // 14A.1A.48: Pass pause coordination
+        let paused = Arc::clone(&self.paused);
+        let pause_notify = Arc::clone(&self.pause_notify);
 
         tokio::spawn(async move {
-            Self::background_task(da, node_id, state, running, shutdown, last_height).await;
+            Self::background_task(
+                da, node_id, state, running, shutdown, last_height,
+                paused, pause_notify,
+            ).await;
         });
 
         Ok(())
@@ -869,7 +975,7 @@ impl DAFollower {
 
     /// Background task for processing DA events.
     ///
-    /// Handles subscription, event processing, and reconnection.
+    /// Handles subscription, event processing, reconnection, and pause/resume.
     async fn background_task(
         da: Arc<dyn DALayer>,
         node_id: String,
@@ -877,10 +983,27 @@ impl DAFollower {
         running: Arc<AtomicBool>,
         shutdown: Arc<Notify>,
         last_height: Arc<AtomicU64>,
+        paused: Arc<AtomicBool>,
+        pause_notify: Arc<Notify>,
     ) {
         debug!("Background task started for node {}", node_id);
 
         while running.load(Ordering::SeqCst) {
+            // 14A.1A.48: Check if paused, if so wait
+            if paused.load(Ordering::SeqCst) {
+                debug!("Background task paused for node {}", node_id);
+                // Signal that we've acknowledged the pause
+                pause_notify.notify_one();
+                // Wait until unpaused
+                while paused.load(Ordering::SeqCst) && running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                debug!("Background task resumed for node {}", node_id);
+            }
+
             // Get from_height for subscription
             let from_height = {
                 let h = last_height.load(Ordering::SeqCst);
@@ -896,6 +1019,12 @@ impl DAFollower {
 
                     // Process blobs from stream
                     loop {
+                        // 14A.1A.48: Check if paused - break to outer loop for pause handling
+                        if paused.load(Ordering::SeqCst) {
+                            debug!("Pause requested, breaking inner loop for node {}", node_id);
+                            break;
+                        }
+
                         tokio::select! {
                             _ = shutdown.notified() => {
                                 debug!("Shutdown signal received for node {}", node_id);
@@ -1297,6 +1426,277 @@ impl DAFollower {
     /// Get all chunk hashes assigned to this node.
     pub fn chunk_hashes(&self) -> Vec<String> {
         self.state.read().my_chunks.keys().cloned().collect()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SOURCE TRANSITION METHODS (14A.1A.48)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Handle graceful source transition.
+    ///
+    /// Performs a safe transition from one DA source to another with guarantees:
+    /// - No events are lost
+    /// - No events are duplicated
+    /// - Sequence continuity is verified
+    /// - Rollback occurs on failure
+    ///
+    /// ## Arguments
+    ///
+    /// * `from` - Source type we're transitioning from
+    /// * `to` - Source type we're transitioning to
+    ///
+    /// ## Order of Operations (14A.1A.48 Contract)
+    ///
+    /// 1. Validate transition (from != to)
+    /// 2. Acquire transition lock
+    /// 3. Pause event processing
+    /// 4. Wait for pause acknowledgment (with timeout)
+    /// 5. Update NodeDerivedState fallback fields
+    /// 6. Verify sequence continuity
+    /// 7. Resume event processing
+    /// 8. Release transition lock
+    ///
+    /// ## Rollback
+    ///
+    /// If any step fails:
+    /// - State is rolled back to previous values
+    /// - Event processing is resumed
+    /// - Transition lock is released
+    /// - Error is returned
+    ///
+    /// ## Guarantees
+    ///
+    /// - Thread-safe via atomic flags and RwLock
+    /// - No deadlock (timeout enforced)
+    /// - No partial state updates
+    /// - Deterministic behavior
+    /// - Never panics
+    ///
+    /// ## Returns
+    ///
+    /// * `Ok(TransitionResult::Success)` - Transition completed
+    /// * `Ok(TransitionResult::RolledBack)` - Transition failed, rolled back
+    /// * `Err(TransitionError)` - Unrecoverable error
+    pub async fn handle_source_transition(
+        &self,
+        from: DASourceType,
+        to: DASourceType,
+    ) -> Result<TransitionResult, TransitionError> {
+        use std::time::Instant;
+
+        // Step 1: Validate transition
+        if from == to {
+            return Err(TransitionError::InvalidTransition { from, to });
+        }
+
+        // Step 2: Acquire transition lock (prevent concurrent transitions)
+        if self.transition_in_progress.swap(true, Ordering::SeqCst) {
+            return Err(TransitionError::AlreadyInProgress);
+        }
+
+        info!(
+            "Starting source transition for node {}: {:?} -> {:?}",
+            self.node_id, from, to
+        );
+
+        let start_time = Instant::now();
+
+        // Record state before transition for potential rollback
+        let sequence_before = self.state.read().last_sequence;
+        let _height_before = self.state.read().last_height;
+        let was_fallback_active = self.state.read().fallback_active;
+        let old_fallback_since = self.state.read().fallback_since;
+        let old_source = self.state.read().current_da_source;
+
+        // Step 3: Pause event processing
+        self.paused.store(true, Ordering::SeqCst);
+
+        // Step 4: Wait for pause acknowledgment (with timeout)
+        let pause_result = self.wait_for_pause(start_time).await;
+        if let Err(e) = pause_result {
+            // Rollback: resume processing
+            self.paused.store(false, Ordering::SeqCst);
+            self.transition_in_progress.store(false, Ordering::SeqCst);
+            warn!("Transition failed at pause step: {:?}", e);
+            return Err(e);
+        }
+
+        // Step 5: Update NodeDerivedState fallback fields
+        let update_result = self.update_state_for_transition(from, to, start_time);
+        if let Err(reason) = update_result {
+            // Rollback: restore state and resume
+            self.rollback_state(
+                was_fallback_active,
+                old_fallback_since,
+                old_source,
+            );
+            self.paused.store(false, Ordering::SeqCst);
+            self.transition_in_progress.store(false, Ordering::SeqCst);
+            
+            return Ok(TransitionResult::RolledBack {
+                from,
+                to,
+                reason,
+            });
+        }
+
+        // Step 6: Verify sequence continuity
+        let sequence_after = self.state.read().last_sequence;
+        let _height_after = self.state.read().last_height;
+
+        // Sequence should not have changed during pause
+        if sequence_after != sequence_before {
+            // This indicates a race condition - should not happen with proper pause
+            warn!(
+                "Sequence changed during transition: {} -> {}",
+                sequence_before, sequence_after
+            );
+            // Rollback
+            self.rollback_state(
+                was_fallback_active,
+                old_fallback_since,
+                old_source,
+            );
+            self.paused.store(false, Ordering::SeqCst);
+            self.transition_in_progress.store(false, Ordering::SeqCst);
+            
+            return Err(TransitionError::SequenceGap {
+                expected: sequence_before,
+                actual: sequence_after,
+            });
+        }
+
+        // Step 7: Resume event processing
+        self.paused.store(false, Ordering::SeqCst);
+
+        // Step 8: Release transition lock
+        self.transition_in_progress.store(false, Ordering::SeqCst);
+
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        info!(
+            "Source transition completed for node {}: {:?} -> {:?} in {}ms",
+            self.node_id, from, to, elapsed_ms
+        );
+
+        Ok(TransitionResult::Success {
+            from,
+            to,
+            sequence_before,
+            sequence_after,
+        })
+    }
+
+    /// Wait for pause to be acknowledged by background task.
+    ///
+    /// Returns error if timeout is exceeded.
+    async fn wait_for_pause(
+        &self,
+        start_time: std::time::Instant,
+    ) -> Result<(), TransitionError> {
+        use tokio::time::{timeout, Duration};
+
+        // If not running, pause is immediate
+        if !self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Wait for pause_notify with remaining timeout
+        let elapsed = start_time.elapsed().as_millis() as u64;
+        if elapsed >= TRANSITION_TIMEOUT_MS {
+            return Err(TransitionError::Timeout(TRANSITION_TIMEOUT_MS));
+        }
+
+        let remaining = TRANSITION_TIMEOUT_MS - elapsed;
+
+        // Wait for the background task to acknowledge the pause
+        match timeout(Duration::from_millis(remaining), self.pause_notify.notified()).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(TransitionError::Timeout(TRANSITION_TIMEOUT_MS)),
+        }
+    }
+
+    /// Update NodeDerivedState for the transition.
+    ///
+    /// Returns Ok(()) on success, Err(reason) on failure.
+    fn update_state_for_transition(
+        &self,
+        from: DASourceType,
+        to: DASourceType,
+        start_time: std::time::Instant,
+    ) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut state = self.state.write();
+
+        // Determine transition type and update state
+        match (from, to) {
+            // Activation: Primary -> Secondary/Emergency
+            (DASourceType::Primary, DASourceType::Secondary) |
+            (DASourceType::Primary, DASourceType::Emergency) => {
+                state.activate_fallback(timestamp, to);
+            }
+            // Escalation: Secondary -> Emergency
+            (DASourceType::Secondary, DASourceType::Emergency) => {
+                state.activate_fallback(timestamp, to);
+            }
+            // Deactivation: Secondary/Emergency -> Primary
+            (DASourceType::Secondary, DASourceType::Primary) |
+            (DASourceType::Emergency, DASourceType::Primary) => {
+                state.deactivate_fallback();
+            }
+            // De-escalation: Emergency -> Secondary
+            (DASourceType::Emergency, DASourceType::Secondary) => {
+                // Still in fallback, just change source
+                state.current_da_source = to;
+            }
+            // Same source (should have been caught earlier)
+            _ => {
+                return Err(format!("Invalid transition: {:?} -> {:?}", from, to));
+            }
+        }
+
+        // Check timeout hasn't been exceeded
+        let elapsed = start_time.elapsed().as_millis() as u64;
+        if elapsed >= TRANSITION_TIMEOUT_MS {
+            return Err(format!("Timeout during state update: {}ms", elapsed));
+        }
+
+        Ok(())
+    }
+
+    /// Rollback state to previous values.
+    ///
+    /// Called when transition fails to restore consistent state.
+    fn rollback_state(
+        &self,
+        was_active: bool,
+        old_since: Option<u64>,
+        old_source: DASourceType,
+    ) {
+        let mut state = self.state.write();
+        state.fallback_active = was_active;
+        state.fallback_since = old_since;
+        state.current_da_source = old_source;
+
+        warn!(
+            "Rolled back state for node {}: fallback_active={}, source={:?}",
+            self.node_id, was_active, old_source
+        );
+    }
+
+    /// Check if a transition is currently in progress.
+    #[must_use]
+    pub fn is_transition_in_progress(&self) -> bool {
+        self.transition_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Check if event processing is currently paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 }
 
@@ -2564,5 +2964,378 @@ mod tests {
         assert!(debug_str.contains("current_da_source"));
         assert!(debug_str.contains("events_from_fallback"));
         assert!(debug_str.contains("last_reconciliation_sequence"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // U. SOURCE TRANSITION TESTS (14A.1A.48)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_transition_error_display() {
+        let err = TransitionError::Timeout(5000);
+        assert!(err.to_string().contains("5000"));
+
+        let err = TransitionError::SequenceGap { expected: 100, actual: 105 };
+        assert!(err.to_string().contains("100"));
+        assert!(err.to_string().contains("105"));
+
+        let err = TransitionError::AlreadyInProgress;
+        assert!(err.to_string().contains("already in progress"));
+
+        let err = TransitionError::InvalidTransition {
+            from: DASourceType::Primary,
+            to: DASourceType::Primary,
+        };
+        assert!(err.to_string().contains("Primary"));
+    }
+
+    #[test]
+    fn test_transition_result_success() {
+        let result = TransitionResult::Success {
+            from: DASourceType::Primary,
+            to: DASourceType::Secondary,
+            sequence_before: 100,
+            sequence_after: 100,
+        };
+
+        match result {
+            TransitionResult::Success { from, to, sequence_before, sequence_after } => {
+                assert_eq!(from, DASourceType::Primary);
+                assert_eq!(to, DASourceType::Secondary);
+                assert_eq!(sequence_before, 100);
+                assert_eq!(sequence_after, 100);
+            }
+            _ => panic!("Expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_transition_result_rolled_back() {
+        let result = TransitionResult::RolledBack {
+            from: DASourceType::Primary,
+            to: DASourceType::Secondary,
+            reason: "test failure".to_string(),
+        };
+
+        match result {
+            TransitionResult::RolledBack { from, to, reason } => {
+                assert_eq!(from, DASourceType::Primary);
+                assert_eq!(to, DASourceType::Secondary);
+                assert_eq!(reason, "test failure");
+            }
+            _ => panic!("Expected RolledBack"),
+        }
+    }
+
+    #[test]
+    fn test_da_follower_initial_transition_flags() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Initially not paused and no transition in progress
+        assert!(!follower.is_paused());
+        assert!(!follower.is_transition_in_progress());
+    }
+
+    #[tokio::test]
+    async fn test_transition_invalid_same_source() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Transitioning to same source should fail
+        let result = follower.handle_source_transition(
+            DASourceType::Primary,
+            DASourceType::Primary,
+        ).await;
+
+        assert!(result.is_err());
+        match result {
+            Err(TransitionError::InvalidTransition { from, to }) => {
+                assert_eq!(from, DASourceType::Primary);
+                assert_eq!(to, DASourceType::Primary);
+            }
+            _ => panic!("Expected InvalidTransition error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transition_primary_to_secondary_not_running() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Transition when not running should succeed immediately
+        let result = follower.handle_source_transition(
+            DASourceType::Primary,
+            DASourceType::Secondary,
+        ).await;
+
+        assert!(result.is_ok());
+        match result {
+            Ok(TransitionResult::Success { from, to, .. }) => {
+                assert_eq!(from, DASourceType::Primary);
+                assert_eq!(to, DASourceType::Secondary);
+            }
+            _ => panic!("Expected Success"),
+        }
+
+        // State should be updated
+        let state = follower.state.read();
+        assert!(state.fallback_active);
+        assert_eq!(state.current_da_source, DASourceType::Secondary);
+        assert!(state.fallback_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_transition_secondary_to_primary_not_running() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // First activate fallback
+        {
+            let mut state = follower.state.write();
+            state.activate_fallback(1000, DASourceType::Secondary);
+        }
+
+        // Transition back to primary
+        let result = follower.handle_source_transition(
+            DASourceType::Secondary,
+            DASourceType::Primary,
+        ).await;
+
+        assert!(result.is_ok());
+        match result {
+            Ok(TransitionResult::Success { from, to, .. }) => {
+                assert_eq!(from, DASourceType::Secondary);
+                assert_eq!(to, DASourceType::Primary);
+            }
+            _ => panic!("Expected Success"),
+        }
+
+        // State should be deactivated
+        let state = follower.state.read();
+        assert!(!state.fallback_active);
+        assert_eq!(state.current_da_source, DASourceType::Primary);
+        assert!(state.fallback_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_transition_secondary_to_emergency() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // First activate fallback to secondary
+        {
+            let mut state = follower.state.write();
+            state.activate_fallback(1000, DASourceType::Secondary);
+        }
+
+        // Escalate to emergency
+        let result = follower.handle_source_transition(
+            DASourceType::Secondary,
+            DASourceType::Emergency,
+        ).await;
+
+        assert!(result.is_ok());
+        match result {
+            Ok(TransitionResult::Success { from, to, .. }) => {
+                assert_eq!(from, DASourceType::Secondary);
+                assert_eq!(to, DASourceType::Emergency);
+            }
+            _ => panic!("Expected Success"),
+        }
+
+        // State should still be in fallback but with Emergency source
+        let state = follower.state.read();
+        assert!(state.fallback_active);
+        assert_eq!(state.current_da_source, DASourceType::Emergency);
+        // Original fallback_since should be preserved
+        assert_eq!(state.fallback_since, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn test_transition_emergency_to_secondary() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // First activate fallback to emergency
+        {
+            let mut state = follower.state.write();
+            state.activate_fallback(1000, DASourceType::Emergency);
+        }
+
+        // De-escalate to secondary
+        let result = follower.handle_source_transition(
+            DASourceType::Emergency,
+            DASourceType::Secondary,
+        ).await;
+
+        assert!(result.is_ok());
+
+        // State should still be in fallback but with Secondary source
+        let state = follower.state.read();
+        assert!(state.fallback_active);
+        assert_eq!(state.current_da_source, DASourceType::Secondary);
+    }
+
+    #[tokio::test]
+    async fn test_transition_concurrent_blocked() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Manually set transition in progress
+        follower.transition_in_progress.store(true, Ordering::SeqCst);
+
+        // Second transition should fail
+        let result = follower.handle_source_transition(
+            DASourceType::Primary,
+            DASourceType::Secondary,
+        ).await;
+
+        assert!(result.is_err());
+        match result {
+            Err(TransitionError::AlreadyInProgress) => {}
+            _ => panic!("Expected AlreadyInProgress error"),
+        }
+
+        // Cleanup
+        follower.transition_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_transition_sequence_preserved() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Set some sequence
+        {
+            let mut state = follower.state.write();
+            state.last_sequence = 500;
+            state.last_height = 100;
+        }
+
+        let result = follower.handle_source_transition(
+            DASourceType::Primary,
+            DASourceType::Secondary,
+        ).await;
+
+        assert!(result.is_ok());
+        match result {
+            Ok(TransitionResult::Success { sequence_before, sequence_after, .. }) => {
+                assert_eq!(sequence_before, 500);
+                assert_eq!(sequence_after, 500);
+            }
+            _ => panic!("Expected Success"),
+        }
+
+        // Sequence should be unchanged
+        let state = follower.state.read();
+        assert_eq!(state.last_sequence, 500);
+        assert_eq!(state.last_height, 100);
+    }
+
+    #[tokio::test]
+    async fn test_transition_pause_resume_flags() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Before transition
+        assert!(!follower.is_paused());
+        assert!(!follower.is_transition_in_progress());
+
+        // After successful transition
+        let _ = follower.handle_source_transition(
+            DASourceType::Primary,
+            DASourceType::Secondary,
+        ).await;
+
+        // Flags should be cleared
+        assert!(!follower.is_paused());
+        assert!(!follower.is_transition_in_progress());
+    }
+
+    #[tokio::test]
+    async fn test_transition_full_cycle() {
+        let da = Arc::new(MockDA::new());
+        let follower = DAFollower::new(da, "test-node".to_string());
+
+        // Set initial sequence
+        {
+            let mut state = follower.state.write();
+            state.last_sequence = 100;
+        }
+
+        // Primary -> Secondary
+        let result = follower.handle_source_transition(
+            DASourceType::Primary,
+            DASourceType::Secondary,
+        ).await;
+        assert!(result.is_ok());
+        assert!(follower.state.read().fallback_active);
+
+        // Secondary -> Emergency
+        let result = follower.handle_source_transition(
+            DASourceType::Secondary,
+            DASourceType::Emergency,
+        ).await;
+        assert!(result.is_ok());
+        assert_eq!(follower.state.read().current_da_source, DASourceType::Emergency);
+
+        // Emergency -> Primary
+        let result = follower.handle_source_transition(
+            DASourceType::Emergency,
+            DASourceType::Primary,
+        ).await;
+        assert!(result.is_ok());
+        assert!(!follower.state.read().fallback_active);
+        assert_eq!(follower.state.read().current_da_source, DASourceType::Primary);
+
+        // Sequence should be unchanged throughout
+        assert_eq!(follower.state.read().last_sequence, 100);
+    }
+
+    #[test]
+    fn test_transition_timeout_constant() {
+        // Verify timeout constant is reasonable
+        assert!(TRANSITION_TIMEOUT_MS >= 1000); // At least 1 second
+        assert!(TRANSITION_TIMEOUT_MS <= 60000); // At most 1 minute
+    }
+
+    #[test]
+    fn test_transition_error_equality() {
+        let err1 = TransitionError::AlreadyInProgress;
+        let err2 = TransitionError::AlreadyInProgress;
+        assert_eq!(err1, err2);
+
+        let err3 = TransitionError::Timeout(5000);
+        let err4 = TransitionError::Timeout(5000);
+        assert_eq!(err3, err4);
+
+        let err5 = TransitionError::Timeout(5000);
+        let err6 = TransitionError::Timeout(6000);
+        assert_ne!(err5, err6);
+    }
+
+    #[test]
+    fn test_transition_result_equality() {
+        let res1 = TransitionResult::Success {
+            from: DASourceType::Primary,
+            to: DASourceType::Secondary,
+            sequence_before: 100,
+            sequence_after: 100,
+        };
+        let res2 = TransitionResult::Success {
+            from: DASourceType::Primary,
+            to: DASourceType::Secondary,
+            sequence_before: 100,
+            sequence_after: 100,
+        };
+        assert_eq!(res1, res2);
+
+        let res3 = TransitionResult::RolledBack {
+            from: DASourceType::Primary,
+            to: DASourceType::Secondary,
+            reason: "test".to_string(),
+        };
+        assert_ne!(res1, res3);
     }
 }
