@@ -1,41 +1,221 @@
 //! # DSDN Node Crate (14A)
 //!
-//! Storage node untuk DSDN network.
+//! Storage node for DSDN network with Multi-DA source fallback capability.
 //!
-//! ## Architecture
+//! # Architecture
+//!
 //! ```text
-//! ┌─────────────────────────────────────────────┐
-//! │                   Node                       │
-//! ├─────────────────────────────────────────────┤
-//! │  ┌─────────────┐    ┌──────────────────┐   │
-//! │  │ DAFollower  │───▶│ NodeDerivedState │   │
-//! │  └─────────────┘    └──────────────────┘   │
-//! │         │                    │              │
-//! │         ▼                    ▼              │
-//! │  ┌─────────────┐    ┌──────────────────┐   │
-//! │  │EventProcessor│   │  Local Storage   │   │
-//! │  └─────────────┘    └──────────────────┘   │
-//! └─────────────────────────────────────────────┘
-//!                      │
-//!                      ▼
-//!              ┌───────────────┐
-//!              │  Celestia DA  │
-//!              └───────────────┘
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │                              Node                                        │
+//! ├─────────────────────────────────────────────────────────────────────────┤
+//! │                                                                          │
+//! │  ┌─────────────────────────────────────────────────────────────────┐   │
+//! │  │                      MultiDASource                               │   │
+//! │  │  ┌───────────┐   ┌─────────────┐   ┌─────────────────────────┐  │   │
+//! │  │  │  Primary  │   │  Secondary  │   │       Emergency         │  │   │
+//! │  │  │ (Celestia)│   │  (Backup)   │   │    (Last Resort)        │  │   │
+//! │  │  └─────┬─────┘   └──────┬──────┘   └────────────┬────────────┘  │   │
+//! │  │        │                │                       │               │   │
+//! │  │        └────────────────┼───────────────────────┘               │   │
+//! │  │                         │ Fallback with Priority                │   │
+//! │  └─────────────────────────┼───────────────────────────────────────┘   │
+//! │                            │                                            │
+//! │                            ▼                                            │
+//! │  ┌─────────────────────────────────────────────────────────────────┐   │
+//! │  │                       DAFollower                                 │   │
+//! │  │  ┌─────────────────┐         ┌──────────────────────────────┐   │   │
+//! │  │  │ Source Transition│────────▶│     NodeDerivedState        │   │   │
+//! │  │  │   (14A.1A.48)   │         │  - fallback_active           │   │   │
+//! │  │  └─────────────────┘         │  - fallback_since            │   │   │
+//! │  │                              │  - current_da_source         │   │   │
+//! │  │                              │  - events_from_fallback      │   │   │
+//! │  │                              │  - last_reconciliation_seq   │   │   │
+//! │  │                              └──────────────────────────────┘   │   │
+//! │  └─────────────────────────────────────────────────────────────────┘   │
+//! │                            │                                            │
+//! │              ┌─────────────┼─────────────┐                              │
+//! │              ▼             ▼             ▼                              │
+//! │  ┌───────────────┐ ┌─────────────┐ ┌──────────────────────────────┐    │
+//! │  │EventProcessor │ │   Health    │ │  NodeFallbackMetrics         │    │
+//! │  │               │ │  Reporting  │ │  - source_switches           │    │
+//! │  │ - is_fallback │ │  - degraded │ │  - events_from_primary       │    │
+//! │  │   _source()   │ │    status   │ │  - events_from_fallback      │    │
+//! │  │ - detect_     │ │  - fallback │ │  - fallback_duration_secs    │    │
+//! │  │   fallback()  │ │    fields   │ │  - transition_failures       │    │
+//! │  └───────────────┘ └─────────────┘ └──────────────────────────────┘    │
+//! │                                                                          │
+//! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## Modules
-//! - `da_follower`: DA subscription dan event processing
-//! - `event_processor`: Event handling logic
-//! - `placement_verifier`: Placement verification
-//! - `delete_handler`: Delete request handling
-//! - `state_sync`: State synchronization
-//! - `health`: Health reporting
-//! - `multi_da_source`: Multi-DA source abstraction for fallback (14A.1A.41)
-//! - `metrics`: Node fallback metrics tracking (14A.1A.49)
+//! # Multi-DA Source Architecture
 //!
-//! ## Key Invariant
-//! Node TIDAK menerima instruksi dari Coordinator via RPC.
-//! Semua perintah datang via DA events.
+//! The node implements a fault-tolerant Multi-DA source system with three tiers:
+//!
+//! | Source    | Priority | Role                                           |
+//! |-----------|----------|------------------------------------------------|
+//! | Primary   | 1        | Main DA source (Celestia), always preferred    |
+//! | Secondary | 2        | Backup DA source, used when Primary fails      |
+//! | Emergency | 3        | Last resort DA source, used when both fail     |
+//!
+//! ## Design Principles
+//!
+//! - **Determinism**: All nodes must converge to the same state regardless of
+//!   which DA source provided the events. Events are identified by sequence
+//!   number, not by source.
+//!
+//! - **No Event Loss**: During source transitions, the system guarantees that
+//!   no events are lost. Events are drained from the old source before
+//!   switching to the new source.
+//!
+//! - **No Duplication**: Events are deduplicated by sequence number. If the
+//!   same event is seen from multiple sources, only the first is processed.
+//!
+//! - **Eventual Consistency**: The node will eventually return to Primary
+//!   source when it becomes available (auto-promotion).
+//!
+//! # Source Prioritization
+//!
+//! ## Priority Order
+//!
+//! Sources are tried in strict priority order:
+//!
+//! 1. **Primary** - Always attempted first
+//! 2. **Secondary** - Used only when Primary is unavailable
+//! 3. **Emergency** - Used only when both Primary and Secondary fail
+//!
+//! ## Switching Conditions
+//!
+//! A source switch occurs when:
+//!
+//! - **Downgrade** (Primary → Secondary → Emergency):
+//!   - Current source fails to respond within timeout
+//!   - Current source returns errors repeatedly
+//!   - Current source returns invalid/corrupted data
+//!
+//! - **Upgrade** (Emergency → Secondary → Primary):
+//!   - Higher priority source becomes available (auto-promotion)
+//!   - Periodic health checks succeed on higher priority source
+//!
+//! ## Auto-Promotion
+//!
+//! When operating in fallback mode, the system periodically attempts to
+//! reconnect to higher priority sources. Successful reconnection triggers
+//! an automatic promotion back to the preferred source.
+//!
+//! # Transition Handling
+//!
+//! Source transitions follow a strict protocol to ensure data integrity:
+//!
+//! ## Transition Protocol
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                  Source Transition Flow                  │
+//! ├─────────────────────────────────────────────────────────┤
+//! │                                                          │
+//! │  1. PAUSE     ──▶  Stop processing new events            │
+//! │                    (paused flag = true)                  │
+//! │                                                          │
+//! │  2. DRAIN     ──▶  Process all pending events from       │
+//! │                    current source                        │
+//! │                                                          │
+//! │  3. UPDATE    ──▶  Update NodeDerivedState:              │
+//! │                    - Set current_da_source               │
+//! │                    - Set fallback_active/fallback_since  │
+//! │                                                          │
+//! │  4. VERIFY    ──▶  Verify sequence continuity            │
+//! │                    (no gaps, no duplicates)              │
+//! │                                                          │
+//! │  5. RESUME    ──▶  Resume event processing               │
+//! │                    (paused flag = false)                 │
+//! │                                                          │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Rollback Semantics
+//!
+//! If any step in the transition fails:
+//!
+//! 1. State is restored to pre-transition values
+//! 2. Event processing resumes from original source
+//! 3. Transition failure is recorded in metrics
+//! 4. System continues operating on previous source
+//!
+//! Rollback is atomic - there is no partial state after a failed transition.
+//!
+//! ## Timeout Handling
+//!
+//! Transitions have a configurable timeout (`TRANSITION_TIMEOUT_MS`).
+//! If the transition exceeds this timeout, it is considered failed and
+//! rollback is triggered automatically.
+//!
+//! # Metrics Interpretation
+//!
+//! ## Fallback Metrics
+//!
+//! The [`NodeFallbackMetrics`] struct tracks fallback operations:
+//!
+//! | Metric                        | Meaning                                    |
+//! |-------------------------------|--------------------------------------------|
+//! | `source_switches`             | Total number of DA source transitions      |
+//! | `events_from_primary`         | Events successfully processed from Primary |
+//! | `events_from_fallback`        | Events processed from Secondary/Emergency  |
+//! | `fallback_duration_total_secs`| Cumulative time spent in fallback mode     |
+//! | `transition_failures`         | Number of failed transition attempts       |
+//!
+//! ## Health Degradation
+//!
+//! A node's health is considered **degraded** when:
+//!
+//! - `fallback_active == true` AND
+//! - Time since `fallback_since` exceeds `FALLBACK_DEGRADATION_THRESHOLD_MS` (5 minutes)
+//!
+//! Degraded health indicates the node has been operating on a fallback source
+//! for an extended period, which may indicate Primary source issues.
+//!
+//! ## Metrics-Health-State Relationship
+//!
+//! ```text
+//! ┌──────────────────────┐      ┌─────────────────┐      ┌──────────────┐
+//! │ NodeFallbackMetrics  │      │ NodeDerivedState│      │  NodeHealth  │
+//! │                      │      │                 │      │              │
+//! │ source_switches ─────┼──────┼▶ fallback_active│──────┼▶ is_healthy  │
+//! │ events_from_fallback │      │  fallback_since │      │  health_     │
+//! │ transition_failures  │      │  current_source │      │  issues()    │
+//! └──────────────────────┘      └─────────────────┘      └──────────────┘
+//!         │                             │                       │
+//!         │                             │                       │
+//!         ▼                             ▼                       ▼
+//!    Prometheus              State Transitions           Health API
+//!    /metrics                 & Fallback Logic          /health endpoint
+//! ```
+//!
+//! # Modules
+//!
+//! | Module              | Description                                          |
+//! |---------------------|------------------------------------------------------|
+//! | `da_follower`       | DA subscription, event processing, source transitions|
+//! | `event_processor`   | Event handling logic with fallback detection         |
+//! | `placement_verifier`| Placement verification                               |
+//! | `delete_handler`    | Delete request handling                              |
+//! | `state_sync`        | State synchronization                                |
+//! | `health`            | Health reporting with fallback awareness             |
+//! | `multi_da_source`   | Multi-DA source abstraction (Primary/Secondary/Emergency) |
+//! | `metrics`           | Node fallback metrics for Prometheus export          |
+//!
+//! # Key Invariants
+//!
+//! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
+//!    via RPC. All commands arrive via DA events.
+//!
+//! 2. **Source Independence**: Node state is independent of which DA source
+//!    provided the events. Same sequence number = same state.
+//!
+//! 3. **Atomic Transitions**: Source transitions are atomic - they either
+//!    complete fully or roll back completely.
+//!
+//! 4. **No Silent Failures**: All errors are explicitly handled and propagated.
+//!    No panic, unwrap, or expect in production code paths.
 
 pub mod da_follower;
 pub mod delete_handler;
@@ -46,10 +226,16 @@ pub mod multi_da_source;
 pub mod placement_verifier;
 pub mod state_sync;
 
-pub use da_follower::{DAFollower, NodeDerivedState, ChunkAssignment, StateError, ReplicaStatus};
+pub use da_follower::{
+    DAFollower, NodeDerivedState, ChunkAssignment, StateError, ReplicaStatus,
+    TransitionError, TransitionResult, TRANSITION_TIMEOUT_MS,
+};
 pub use delete_handler::{DeleteHandler, DeleteError, DeleteRequestedEvent, PendingDelete, Storage};
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};
-pub use health::{NodeHealth, HealthStorage, DAInfo, HealthResponse, health_endpoint, DA_LAG_THRESHOLD};
+pub use health::{
+    NodeHealth, HealthStorage, DAInfo, HealthResponse, health_endpoint,
+    DA_LAG_THRESHOLD, FALLBACK_DEGRADATION_THRESHOLD_MS,
+};
 pub use metrics::NodeFallbackMetrics;
 pub use multi_da_source::{MultiDASource, MultiDAConfig, DASourceType};
 pub use placement_verifier::{PlacementVerifier, PlacementReport, PlacementDetail, PlacementStatus};
