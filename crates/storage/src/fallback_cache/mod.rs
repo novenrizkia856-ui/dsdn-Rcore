@@ -1,4 +1,4 @@
-//! FallbackCache Module (14A.1A.53)
+//! FallbackCache Module (14A.1A.54)
 //!
 //! Provides caching for DA blobs during fallback operations.
 
@@ -27,7 +27,7 @@ pub use eviction::{
     create_evictor, EvictionPolicy, Evictor, FallbackCacheConfig, FIFOEvictor, LFUEvictor,
     LRUEvictor,
 };
-pub use metrics::CacheMetrics;
+pub use metrics::{CacheMetrics, MetricsSnapshot};
 pub use validation::ValidationReport;
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -149,10 +149,11 @@ impl FallbackCache {
             }
 
             // Try to remove using BlobStorage trait method
-            if self.remove(seq).is_some() {
+            if let Some(removed_blob) = self.remove(seq) {
                 evicted += 1;
-                // Record eviction in metrics
-                self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+                // Record eviction in metrics (count=1, bytes removed)
+                self.metrics.record_eviction(1);
+                self.metrics.record_bytes_removed(removed_blob.data.len() as u64);
             }
         }
 
@@ -198,10 +199,11 @@ impl FallbackCache {
         let mut evicted = 0;
 
         for seq in expired {
-            if self.remove(seq).is_some() {
+            if let Some(removed_blob) = self.remove(seq) {
                 evicted += 1;
                 // Record eviction in metrics
-                self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+                self.metrics.record_eviction(1);
+                self.metrics.record_bytes_removed(removed_blob.data.len() as u64);
             }
         }
 
@@ -234,8 +236,8 @@ impl BlobStorage for FallbackCache {
         // Update total_bytes after successful insert
         self.total_bytes.fetch_add(blob_size, Ordering::SeqCst);
 
-        // Record insertion in metrics
-        self.metrics.insertions.fetch_add(1, Ordering::Relaxed);
+        // Record store in metrics (increments stores, current_entries, current_bytes)
+        self.metrics.record_store(blob_size);
 
         Ok(())
     }
@@ -247,14 +249,21 @@ impl BlobStorage for FallbackCache {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        guard.get(&sequence).map(|blob| {
-            // Increment access_count atomically on the stored blob
-            blob.access_count.fetch_add(1, Ordering::Relaxed);
-            // Record hit in metrics
-            self.metrics.hits.fetch_add(1, Ordering::Relaxed);
-            // Return a clone
-            blob.clone()
-        })
+        match guard.get(&sequence) {
+            Some(blob) => {
+                // Increment access_count atomically on the stored blob
+                blob.access_count.fetch_add(1, Ordering::Relaxed);
+                // Record hit in metrics
+                self.metrics.record_hit();
+                // Return a clone
+                Some(blob.clone())
+            }
+            None => {
+                // Record miss in metrics
+                self.metrics.record_miss();
+                None
+            }
+        }
     }
 
     /// Remove and return a blob by sequence number.
@@ -692,17 +701,19 @@ mod tests {
 
         cache.evict_if_needed();
 
-        assert!(cache.metrics().evictions.load(Ordering::SeqCst) > 0);
+        assert!(cache.metrics().get_evictions() > 0);
     }
 
     #[test]
-    fn test_insertion_updates_metrics() {
+    fn test_store_updates_metrics() {
         let cache = FallbackCache::new();
 
         cache.store(1, make_blob(10, 1000)).unwrap();
         cache.store(2, make_blob(10, 2000)).unwrap();
 
-        assert_eq!(cache.metrics().insertions.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.metrics().get_stores(), 2);
+        assert_eq!(cache.metrics().get_current_entries(), 2);
+        assert_eq!(cache.metrics().get_current_bytes(), 20);
     }
 
     #[test]
@@ -713,6 +724,53 @@ mod tests {
         cache.get(1);
         cache.get(1);
 
-        assert_eq!(cache.metrics().hits.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.metrics().get_hits(), 2);
+    }
+
+    #[test]
+    fn test_metrics_snapshot() {
+        let cache = FallbackCache::new();
+
+        cache.store(1, make_blob(100, 1000)).unwrap();
+        cache.get(1);
+        cache.get(1);
+        cache.get(1);
+
+        let snapshot = cache.metrics().snapshot();
+
+        assert_eq!(snapshot.stores, 1);
+        assert_eq!(snapshot.hits, 3);
+        assert_eq!(snapshot.current_entries, 1);
+        assert_eq!(snapshot.current_bytes, 100);
+    }
+
+    #[test]
+    fn test_metrics_hit_rate() {
+        let cache = FallbackCache::new();
+        cache.store(1, make_blob(10, 1000)).unwrap();
+
+        // 3 hits
+        cache.get(1);
+        cache.get(1);
+        cache.get(1);
+
+        // 1 miss (get() records miss automatically when blob not found)
+        cache.get(999);
+
+        let rate = cache.metrics().hit_rate();
+        assert!((rate - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_get_updates_miss_metrics() {
+        let cache = FallbackCache::new();
+
+        // Try to get non-existent blobs
+        cache.get(1);
+        cache.get(2);
+        cache.get(3);
+
+        assert_eq!(cache.metrics().get_misses(), 3);
+        assert_eq!(cache.metrics().get_hits(), 0);
     }
 }
