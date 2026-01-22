@@ -1,8 +1,9 @@
 ﻿//! # DSDN Storage Crate (14A)
 //!
-//! Storage layer untuk DSDN dengan DA awareness.
+//! Storage layer untuk DSDN dengan DA awareness dan Multi-DA fallback support.
 //!
 //! ## Modules
+//!
 //! - `store`: Storage trait dan basic implementations
 //! - `localfs`: Local filesystem storage
 //! - `chunker`: File chunking utilities
@@ -15,7 +16,123 @@
 //! - `events`: Storage event emission
 //! - `fallback_cache`: Fallback blob caching for Multi-DA support (14A.1A.51)
 //!
-//! ## DA Integration
+//! # Architecture Overview
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                        DAStorage                             │
+//! ├─────────────────────────────────────────────────────────────┤
+//! │  ┌───────────────┐  ┌─────────────────────────────────────┐ │
+//! │  │ LocalStorage  │  │          FallbackCache              │ │
+//! │  └───────────────┘  │  ┌─────────┐ ┌──────────────────┐  │ │
+//! │                      │  │  blob   │ │    eviction      │  │ │
+//! │                      │  ├─────────┤ ├──────────────────┤  │ │
+//! │                      │  │ metrics │ │  reconciliation  │  │ │
+//! │                      │  ├─────────┤ ├──────────────────┤  │ │
+//! │                      │  │validation│ │   persistence   │  │ │
+//! │                      │  └─────────┘ └──────────────────┘  │ │
+//! │                      └─────────────────────────────────────┘ │
+//! └─────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## LocalStorage vs FallbackCache
+//!
+//! ### LocalStorage
+//!
+//! `LocalStorage` adalah primary storage untuk chunk data.
+//! - Menyimpan chunk data yang sudah diverifikasi dan committed ke DA layer
+//! - Bersifat persistent dan durable
+//! - Source of truth untuk chunk yang sudah di-commit
+//! - Digunakan untuk operasi normal (non-fallback)
+//!
+//! ### FallbackCache
+//!
+//! `FallbackCache` adalah secondary storage yang digunakan HANYA saat
+//! primary DA layer tidak tersedia. FallbackCache adalah **fallback**,
+//! **bukan pengganti** primary storage.
+//!
+//! Karakteristik FallbackCache:
+//! - **Temporary**: Data di cache bersifat sementara hingga reconciliation
+//! - **Non-authoritative**: Cache TIDAK menjadi source of truth
+//! - **Fallback-only**: Cache HANYA aktif saat DA layer down
+//! - **Best-effort**: Tidak ada jaminan durability seperti primary storage
+//!
+//! ## FallbackCache Components
+//!
+//! ### Blob Storage
+//!
+//! Menyimpan blob data sementara dengan metadata:
+//! - Sequence number untuk ordering
+//! - Source DA type untuk reconciliation target
+//! - Timestamp untuk eviction policy
+//!
+//! ### Eviction
+//!
+//! Kebijakan penghapusan entry dari cache:
+//! - `CacheFull`: LRU eviction saat capacity tercapai
+//! - `Expired`: TTL-based eviction
+//! - `Reconciled`: Entry dihapus setelah sukses reconcile ke DA
+//! - `MemoryPressure`: Eviction saat memory usage tinggi
+//!
+//! Eviction policy dikonfigurasi via [`EvictionPolicy`].
+//!
+//! ### Metrics
+//!
+//! [`CacheMetrics`] menyediakan observability:
+//! - Hit/miss ratio
+//! - Cache size (entries dan bytes)
+//! - Eviction counts per reason
+//! - Reconciliation pending count
+//!
+//! Metrik bersifat read-only dan tidak mempengaruhi behavior.
+//!
+//! ### Validation
+//!
+//! [`ValidationReport`] memvalidasi integritas cache:
+//! - Blob integrity check
+//! - Metadata consistency check
+//! - Orphaned entry detection
+//!
+//! Validation bersifat diagnostic, tidak auto-fix.
+//!
+//! ### Reconciliation
+//!
+//! Proses memindahkan data dari FallbackCache ke primary DA layer:
+//! - Batch-based untuk efisiensi
+//! - Per-sequence tracking untuk reliability
+//! - Retry dengan exponential backoff
+//! - Event emission untuk observability
+//!
+//! Reconciliation terjadi HANYA saat DA layer kembali available.
+//!
+//! ### Persistence
+//!
+//! [`PersistentFallbackCache`] menyediakan durability untuk cache:
+//! - Disk-backed storage
+//! - Crash recovery
+//! - Configurable sync policy
+//!
+//! Persistence adalah **optional** dan dapat dimatikan.
+//!
+//! ## Configuration
+//!
+//! Semua komponen FallbackCache dikonfigurasi via [`FallbackCacheConfig`]:
+//! - `enabled`: Master switch untuk seluruh fallback system
+//! - `max_size_bytes`: Maximum cache size
+//! - `eviction_policy`: Kebijakan eviction
+//! - `persistence_enabled`: Toggle untuk persistent cache
+//! - `reconcile_batch_size`: Batch size untuk reconciliation
+//!
+//! ## Key Invariants
+//!
+//! 1. FallbackCache TIDAK aktif saat DA layer healthy
+//! 2. FallbackCache TIDAK mengubah behavior normal storage
+//! 3. Semua data di FallbackCache HARUS di-reconcile ke DA layer
+//! 4. Semua komponen fallback dapat di-disable tanpa breaking changes
+//! 5. Chunk metadata dapat direkonstruksi dari DA layer
+//!
+//! ## DA Integration (Legacy Diagram)
+//!
 //! ```text
 //! ┌─────────────────────────────────────┐
 //! │           DAStorage                  │
@@ -31,9 +148,6 @@
 //! │  └───────────────────────────────┘ │
 //! └─────────────────────────────────────┘
 //! ```
-//!
-//! ## Key Invariant
-//! Semua chunk metadata dapat direkonstruksi dari DA.
 //!
 //! ## Storage Proof
 //!
@@ -84,6 +198,17 @@
 //! - Events HANYA untuk logging, monitoring, debugging
 //! - Events TIDAK authoritative, TIDAK mempengaruhi correctness
 //! - Events TIDAK mengubah perilaku sistem
+//!
+//! ### Fallback Events (14A.1A.59)
+//!
+//! Event tambahan untuk fallback awareness:
+//! - `FallbackCacheHit`: Cache hit saat fallback aktif
+//! - `FallbackCacheMiss`: Cache miss saat fallback aktif
+//! - `FallbackCacheStore`: Blob disimpan ke cache
+//! - `FallbackCacheEviction`: Entry di-evict dari cache
+//! - `FallbackReconcileStart`: Batch reconcile dimulai
+//! - `FallbackReconcileComplete`: Sequence berhasil di-reconcile
+//! - `FallbackReconcileFailed`: Sequence gagal di-reconcile
 
 pub mod chunker;
 pub mod store;
@@ -147,4 +272,12 @@ pub use crate::events::{
     CompositeListener,
     EventEmitter,
 };
-pub use crate::fallback_cache::FallbackCache;
+pub use crate::fallback_cache::{
+    FallbackCache,
+    FallbackCacheConfig,
+    CachedBlob,
+    CacheMetrics,
+    EvictionPolicy,
+    ValidationReport,
+};
+pub use crate::fallback_cache::persistence::PersistentFallbackCache;
