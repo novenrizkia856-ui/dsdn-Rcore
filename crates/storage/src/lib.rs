@@ -13,6 +13,7 @@
 //! - `recovery`: Chunk recovery dari peers
 //! - `metrics`: Storage health metrics
 //! - `events`: Storage event emission
+//! - `fallback_cache`: Fallback blob caching for Multi-DA support (14A.1A.51)
 //!
 //! ## DA Integration
 //! ```text
@@ -94,6 +95,7 @@ pub mod metrics;
 pub mod recovery;
 pub mod events;
 pub mod rpc;
+pub mod fallback_cache;
 
 // hasil generate dari tonic_build (OUT_DIR/api.rs)
 pub mod proto {
@@ -145,3 +147,4 @@ pub use crate::events::{
     CompositeListener,
     EventEmitter,
 };
+pub use crate::fallback_cache::FallbackCache;
