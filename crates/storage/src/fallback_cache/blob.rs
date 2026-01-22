@@ -1,4 +1,4 @@
-//! Blob types for FallbackCache (14A.1A.52)
+//! Blob types for FallbackCache (14A.1A.55)
 //!
 //! Provides core types for cached blob data and storage operations.
 
@@ -28,6 +28,8 @@ pub enum DASourceType {
 pub enum CacheError {
     /// Blob with this sequence already exists.
     AlreadyExists(u64),
+    /// Blob with this sequence was not found.
+    NotFound(u64),
     /// RwLock was poisoned.
     LockPoisoned,
 }
@@ -36,6 +38,7 @@ impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyExists(seq) => write!(f, "blob with sequence {} already exists", seq),
+            Self::NotFound(seq) => write!(f, "blob with sequence {} not found", seq),
             Self::LockPoisoned => write!(f, "lock poisoned"),
         }
     }
@@ -232,8 +235,11 @@ mod tests {
         let err1 = CacheError::AlreadyExists(42);
         assert_eq!(format!("{}", err1), "blob with sequence 42 already exists");
 
-        let err2 = CacheError::LockPoisoned;
-        assert_eq!(format!("{}", err2), "lock poisoned");
+        let err2 = CacheError::NotFound(123);
+        assert_eq!(format!("{}", err2), "blob with sequence 123 not found");
+
+        let err3 = CacheError::LockPoisoned;
+        assert_eq!(format!("{}", err3), "lock poisoned");
     }
 
     #[test]
@@ -270,5 +276,12 @@ mod tests {
     fn test_cached_blob_is_sync() {
         fn assert_sync<T: Sync>() {}
         assert_sync::<CachedBlob>();
+    }
+
+    #[test]
+    fn test_cache_error_not_found() {
+        let err = CacheError::NotFound(999);
+        assert_eq!(err, CacheError::NotFound(999));
+        assert_ne!(err, CacheError::AlreadyExists(999));
     }
 }

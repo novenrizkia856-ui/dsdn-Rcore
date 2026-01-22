@@ -1,4 +1,4 @@
-//! FallbackCache Module (14A.1A.54)
+//! FallbackCache Module (14A.1A.55)
 //!
 //! Provides caching for DA blobs during fallback operations.
 
@@ -13,22 +13,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod blob;
 pub mod eviction;
+pub mod metrics;
 pub mod persistence;
 pub mod reconciliation;
-pub mod metrics;
 pub mod validation;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
 
-pub use blob::{BlobStorage, CachedBlob, CacheError, DASourceType};
+pub use blob::{BlobStorage, CacheError, CachedBlob, DASourceType};
 pub use eviction::{
-    create_evictor, EvictionPolicy, Evictor, FallbackCacheConfig, FIFOEvictor, LFUEvictor,
+    create_evictor, EvictionPolicy, Evictor, FIFOEvictor, FallbackCacheConfig, LFUEvictor,
     LRUEvictor,
 };
 pub use metrics::{CacheMetrics, MetricsSnapshot};
-pub use validation::ValidationReport;
+pub use validation::{
+    compute_blob_hash, CacheValidator, HashValidator, ValidationError, ValidationReport,
+};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // FALLBACK CACHE
@@ -209,6 +211,103 @@ impl FallbackCache {
 
         evicted
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // VALIDATION METHODS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Validate a single cache entry by sequence number.
+    ///
+    /// ## Returns
+    ///
+    /// - `Ok(true)` - Entry is valid
+    /// - `Ok(false)` - Entry is invalid
+    /// - `Err(CacheError::NotFound)` - Entry does not exist
+    ///
+    /// ## Guarantees
+    ///
+    /// - Does not remove the entry
+    /// - Does not panic
+    pub fn validate(&self, sequence: u64) -> Result<bool, CacheError> {
+        let guard = match self.blobs.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let blob = guard.get(&sequence).ok_or(CacheError::NotFound(sequence))?;
+
+        let validator = HashValidator::new(self.config.ttl_seconds);
+        let validation_result = validator.validate_blob(blob);
+
+        Ok(validation_result.is_none()) // None = valid
+    }
+
+    /// Validate all cache entries and return a detailed report.
+    ///
+    /// ## Returns
+    ///
+    /// ValidationReport containing:
+    /// - total_checked: number of entries validated
+    /// - valid_count: number of valid entries
+    /// - invalid_entries: list of (sequence, error) for invalid entries
+    ///
+    /// ## Guarantees
+    ///
+    /// - Does not remove any entries
+    /// - Does not panic
+    pub fn validate_all(&self) -> ValidationReport {
+        let guard = match self.blobs.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let mut report = ValidationReport::new();
+        let validator = HashValidator::new(self.config.ttl_seconds);
+
+        for (&sequence, blob) in guard.iter() {
+            match validator.validate_blob(blob) {
+                None => report.add_valid(),
+                Some(error) => report.add_invalid(sequence, error),
+            }
+        }
+
+        report
+    }
+
+    /// Validate all entries and remove invalid ones.
+    ///
+    /// ## Returns
+    ///
+    /// Number of invalid entries removed.
+    ///
+    /// ## Guarantees
+    ///
+    /// - Only removes invalid entries
+    /// - Valid entries are never removed
+    /// - Removal is atomic per entry
+    /// - Updates metrics consistently
+    pub fn remove_invalid(&self) -> usize {
+        // First, validate all entries to get invalid sequences
+        let report = self.validate_all();
+
+        if report.invalid_entries.is_empty() {
+            return 0;
+        }
+
+        let mut removed = 0;
+
+        // Remove each invalid entry
+        for (sequence, _error) in report.invalid_entries {
+            if let Some(removed_blob) = self.remove(sequence) {
+                removed += 1;
+                // Record eviction in metrics
+                self.metrics.record_eviction(1);
+                self.metrics.record_bytes_removed(removed_blob.data.len() as u64);
+            }
+        }
+
+        removed
+    }
 }
 
 impl Default for FallbackCache {
@@ -309,15 +408,55 @@ impl BlobStorage for FallbackCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
 
     fn make_blob(size: usize, received_at: u64) -> CachedBlob {
-        CachedBlob::new(vec![0; size], DASourceType::Primary, received_at, [0; 32])
+        let data = vec![0; size];
+        let hash = compute_blob_hash(&data);
+        CachedBlob {
+            data,
+            source: DASourceType::Primary,
+            received_at,
+            hash,
+            access_count: AtomicU32::new(0),
+        }
     }
 
     fn make_blob_with_access(size: usize, received_at: u64, access_count: u32) -> CachedBlob {
         let blob = make_blob(size, received_at);
         blob.access_count.store(access_count, Ordering::SeqCst);
         blob
+    }
+
+    fn make_valid_blob(data: Vec<u8>, received_at: u64) -> CachedBlob {
+        let hash = compute_blob_hash(&data);
+        CachedBlob {
+            data,
+            source: DASourceType::Primary,
+            received_at,
+            hash,
+            access_count: AtomicU32::new(0),
+        }
+    }
+
+    fn make_invalid_hash_blob(data: Vec<u8>, received_at: u64) -> CachedBlob {
+        CachedBlob {
+            data,
+            source: DASourceType::Primary,
+            received_at,
+            hash: [0xFF; 32], // Wrong hash
+            access_count: AtomicU32::new(0),
+        }
+    }
+
+    fn make_corrupted_blob(received_at: u64) -> CachedBlob {
+        CachedBlob {
+            data: vec![], // Empty = corrupted
+            source: DASourceType::Primary,
+            received_at,
+            hash: [0; 32],
+            access_count: AtomicU32::new(0),
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -532,8 +671,7 @@ mod tests {
 
     #[test]
     fn test_lru_eviction_evicts_least_accessed_oldest() {
-        let config =
-            FallbackCacheConfig::new(100, 2).with_eviction_policy(EvictionPolicy::LRU);
+        let config = FallbackCacheConfig::new(100, 2).with_eviction_policy(EvictionPolicy::LRU);
         let cache = FallbackCache::with_config(config);
 
         // Blob 1: access=5, received=1000 ← should be evicted (lowest access)
@@ -557,8 +695,7 @@ mod tests {
 
     #[test]
     fn test_fifo_eviction_evicts_oldest() {
-        let config =
-            FallbackCacheConfig::new(100, 2).with_eviction_policy(EvictionPolicy::FIFO);
+        let config = FallbackCacheConfig::new(100, 2).with_eviction_policy(EvictionPolicy::FIFO);
         let cache = FallbackCache::with_config(config);
 
         // Blob 1: received=1000 ← oldest, should be evicted
@@ -582,8 +719,7 @@ mod tests {
 
     #[test]
     fn test_lfu_eviction_evicts_least_frequent() {
-        let config =
-            FallbackCacheConfig::new(100, 2).with_eviction_policy(EvictionPolicy::LFU);
+        let config = FallbackCacheConfig::new(100, 2).with_eviction_policy(EvictionPolicy::LFU);
         let cache = FallbackCache::with_config(config);
 
         // Blob 1: access=10
@@ -772,5 +908,278 @@ mod tests {
 
         assert_eq!(cache.metrics().get_misses(), 3);
         assert_eq!(cache.metrics().get_hits(), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // J. VALIDATION TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_validate_valid_entry() {
+        let cache = FallbackCache::new();
+        let blob = make_valid_blob(vec![1, 2, 3, 4, 5], 1000);
+
+        cache.store(1, blob).unwrap();
+
+        let result = cache.validate(1);
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // Valid
+    }
+
+    #[test]
+    fn test_validate_invalid_hash_entry() {
+        let cache = FallbackCache::new();
+        let blob = make_invalid_hash_blob(vec![1, 2, 3, 4, 5], 1000);
+
+        cache.store(1, blob).unwrap();
+
+        let result = cache.validate(1);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Invalid (hash mismatch)
+    }
+
+    #[test]
+    fn test_validate_corrupted_entry() {
+        let cache = FallbackCache::new();
+        let blob = make_corrupted_blob(1000);
+
+        cache.store(1, blob).unwrap();
+
+        let result = cache.validate(1);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Invalid (corrupted)
+    }
+
+    #[test]
+    fn test_validate_nonexistent_entry() {
+        let cache = FallbackCache::new();
+
+        let result = cache.validate(999);
+        assert!(result.is_err()); // Not found
+    }
+
+    #[test]
+    fn test_validate_does_not_remove_entry() {
+        let cache = FallbackCache::new();
+        let blob = make_invalid_hash_blob(vec![1, 2, 3], 1000);
+
+        cache.store(1, blob).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        cache.validate(1).unwrap();
+
+        // Entry still exists
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains(1));
+    }
+
+    #[test]
+    fn test_validate_all_all_valid() {
+        let cache = FallbackCache::new();
+
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 1000))
+            .unwrap();
+        cache
+            .store(2, make_valid_blob(vec![4, 5, 6], 2000))
+            .unwrap();
+        cache
+            .store(3, make_valid_blob(vec![7, 8, 9], 3000))
+            .unwrap();
+
+        let report = cache.validate_all();
+
+        assert_eq!(report.total_checked, 3);
+        assert_eq!(report.valid_count, 3);
+        assert_eq!(report.invalid_count(), 0);
+        assert!(report.is_healthy());
+    }
+
+    #[test]
+    fn test_validate_all_mixed() {
+        let cache = FallbackCache::new();
+
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 1000))
+            .unwrap();
+        cache
+            .store(2, make_invalid_hash_blob(vec![4, 5, 6], 2000))
+            .unwrap();
+        cache.store(3, make_corrupted_blob(3000)).unwrap();
+        cache
+            .store(4, make_valid_blob(vec![10, 11, 12], 4000))
+            .unwrap();
+
+        let report = cache.validate_all();
+
+        assert_eq!(report.total_checked, 4);
+        assert_eq!(report.valid_count, 2);
+        assert_eq!(report.invalid_count(), 2);
+        assert!(!report.is_healthy());
+    }
+
+    #[test]
+    fn test_validate_all_does_not_remove_entries() {
+        let cache = FallbackCache::new();
+
+        cache
+            .store(1, make_invalid_hash_blob(vec![1, 2, 3], 1000))
+            .unwrap();
+        cache.store(2, make_corrupted_blob(2000)).unwrap();
+
+        assert_eq!(cache.len(), 2);
+
+        cache.validate_all();
+
+        // Entries still exist
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_invalid_removes_only_invalid() {
+        let cache = FallbackCache::new();
+
+        // Valid entries
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 1000))
+            .unwrap();
+        cache
+            .store(4, make_valid_blob(vec![10, 11, 12], 4000))
+            .unwrap();
+
+        // Invalid entries
+        cache
+            .store(2, make_invalid_hash_blob(vec![4, 5, 6], 2000))
+            .unwrap();
+        cache.store(3, make_corrupted_blob(3000)).unwrap();
+
+        assert_eq!(cache.len(), 4);
+
+        let removed = cache.remove_invalid();
+
+        assert_eq!(removed, 2);
+        assert_eq!(cache.len(), 2);
+
+        // Valid entries still exist
+        assert!(cache.contains(1));
+        assert!(cache.contains(4));
+
+        // Invalid entries removed
+        assert!(!cache.contains(2));
+        assert!(!cache.contains(3));
+    }
+
+    #[test]
+    fn test_remove_invalid_returns_zero_when_all_valid() {
+        let cache = FallbackCache::new();
+
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 1000))
+            .unwrap();
+        cache
+            .store(2, make_valid_blob(vec![4, 5, 6], 2000))
+            .unwrap();
+
+        let removed = cache.remove_invalid();
+
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_invalid_updates_metrics() {
+        let cache = FallbackCache::new();
+
+        cache
+            .store(1, make_invalid_hash_blob(vec![1, 2, 3], 1000))
+            .unwrap();
+        cache.store(2, make_corrupted_blob(2000)).unwrap();
+
+        let initial_evictions = cache.metrics().get_evictions();
+
+        cache.remove_invalid();
+
+        assert_eq!(cache.metrics().get_evictions(), initial_evictions + 2);
+    }
+
+    #[test]
+    fn test_remove_invalid_empty_cache() {
+        let cache = FallbackCache::new();
+
+        let removed = cache.remove_invalid();
+
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_validate_with_ttl_expired() {
+        let config = FallbackCacheConfig::new(1000, 100).with_ttl_seconds(1); // 1 second TTL
+        let cache = FallbackCache::with_config(config);
+
+        // Valid hash but very old blob
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 0))
+            .unwrap(); // received_at = 0
+
+        let result = cache.validate(1);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Invalid (expired)
+    }
+
+    #[test]
+    fn test_validate_all_with_ttl_expired() {
+        let config = FallbackCacheConfig::new(1000, 100).with_ttl_seconds(1);
+        let cache = FallbackCache::with_config(config);
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Old blob (expired)
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 0))
+            .unwrap();
+        // Fresh blob
+        cache
+            .store(2, make_valid_blob(vec![4, 5, 6], now_ms))
+            .unwrap();
+
+        let report = cache.validate_all();
+
+        assert_eq!(report.total_checked, 2);
+        assert_eq!(report.valid_count, 1);
+        assert_eq!(report.invalid_count(), 1);
+
+        // Check that expired blob is in invalid entries
+        let expired_entry = report.invalid_entries.iter().find(|(seq, _)| *seq == 1);
+        assert!(expired_entry.is_some());
+        assert_eq!(expired_entry.unwrap().1, ValidationError::Expired);
+    }
+
+    #[test]
+    fn test_remove_invalid_with_expired() {
+        let config = FallbackCacheConfig::new(1000, 100).with_ttl_seconds(1);
+        let cache = FallbackCache::with_config(config);
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Old blob (expired)
+        cache
+            .store(1, make_valid_blob(vec![1, 2, 3], 0))
+            .unwrap();
+        // Fresh blob
+        cache
+            .store(2, make_valid_blob(vec![4, 5, 6], now_ms))
+            .unwrap();
+
+        let removed = cache.remove_invalid();
+
+        assert_eq!(removed, 1);
+        assert!(!cache.contains(1)); // Expired removed
+        assert!(cache.contains(2)); // Fresh kept
     }
 }
