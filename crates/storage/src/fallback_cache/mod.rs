@@ -1,4 +1,4 @@
-//! FallbackCache Module (14A.1A.55)
+//! FallbackCache Module (14A.1A.56)
 //!
 //! Provides caching for DA blobs during fallback operations.
 
@@ -28,6 +28,7 @@ pub use eviction::{
     LRUEvictor,
 };
 pub use metrics::{CacheMetrics, MetricsSnapshot};
+pub use reconciliation::{ReconciliationCallback, ReconciliationState};
 pub use validation::{
     compute_blob_hash, CacheValidator, HashValidator, ValidationError, ValidationReport,
 };
@@ -39,7 +40,7 @@ pub use validation::{
 /// Fallback cache for DA blobs.
 ///
 /// Stores blobs temporarily during fallback operations.
-/// Thread-safe via RwLock for blob storage.
+/// Thread-safe via RwLock for blob storage and reconciliation state.
 pub struct FallbackCache {
     /// Cached blobs indexed by sequence number.
     blobs: RwLock<HashMap<u64, CachedBlob>>,
@@ -49,6 +50,8 @@ pub struct FallbackCache {
     metrics: Arc<CacheMetrics>,
     /// Total bytes currently cached.
     total_bytes: AtomicU64,
+    /// Reconciliation state tracking.
+    reconciliation: RwLock<ReconciliationState>,
 }
 
 impl FallbackCache {
@@ -66,6 +69,7 @@ impl FallbackCache {
             config,
             metrics: Arc::new(CacheMetrics::new()),
             total_bytes: AtomicU64::new(0),
+            reconciliation: RwLock::new(ReconciliationState::new()),
         }
     }
 
@@ -308,6 +312,186 @@ impl FallbackCache {
 
         removed
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // RECONCILIATION METHODS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Add a sequence to pending reconciliation.
+    ///
+    /// ## Returns
+    ///
+    /// true if sequence was added, false if already pending
+    pub fn add_to_pending(&self, sequence: u64) -> bool {
+        let mut guard = match self.reconciliation.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.mark_pending(sequence)
+    }
+
+    /// Get pending sequences with their blobs for reconciliation.
+    ///
+    /// ## Returns
+    ///
+    /// Vector of (sequence, blob) pairs for pending sequences.
+    /// Sequences without corresponding blobs in cache are skipped.
+    ///
+    /// ## Guarantees
+    ///
+    /// - Does not modify reconciliation state
+    /// - Does not modify cache
+    pub fn get_pending_for_reconcile(&self) -> Vec<(u64, CachedBlob)> {
+        // Get pending sequences (read lock on reconciliation)
+        let pending_sequences = {
+            let guard = match self.reconciliation.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.get_pending_sequences()
+        };
+
+        // Get corresponding blobs (read lock on blobs)
+        let blobs_guard = match self.blobs.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        pending_sequences
+            .into_iter()
+            .filter_map(|seq| blobs_guard.get(&seq).map(|blob| (seq, blob.clone())))
+            .collect()
+    }
+
+    /// Mark a sequence as reconciled.
+    ///
+    /// ## Behavior
+    ///
+    /// - Moves sequence from pending to reconciled
+    /// - Invokes on_reconcile_complete callbacks (outside lock)
+    /// - If sequence not in pending → NO-OP
+    ///
+    /// ## Guarantees
+    ///
+    /// - Callbacks invoked exactly once per successful reconciliation
+    /// - Lock not held during callback invocation
+    pub fn mark_reconciled(&self, sequence: u64) {
+        // Step 1: Mark reconciled under write lock
+        let was_reconciled = {
+            let mut guard = match self.reconciliation.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.mark_reconciled(sequence)
+        };
+        // Write lock released here
+
+        // Step 2: Invoke callbacks outside lock (if was reconciled)
+        if was_reconciled {
+            let guard = match self.reconciliation.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.invoke_complete_callbacks(sequence);
+        }
+    }
+
+    /// Mark a sequence as failed reconciliation.
+    ///
+    /// ## Behavior
+    ///
+    /// - Removes sequence from pending (can be retried later)
+    /// - Invokes on_reconcile_failed callbacks (outside lock)
+    /// - If sequence not in pending → NO-OP
+    pub fn mark_reconcile_failed(&self, sequence: u64, error: &str) {
+        // Step 1: Mark failed under write lock
+        let was_pending = {
+            let mut guard = match self.reconciliation.write() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.mark_failed(sequence)
+        };
+        // Write lock released here
+
+        // Step 2: Invoke callbacks outside lock (if was pending)
+        if was_pending {
+            let guard = match self.reconciliation.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.invoke_failed_callbacks(sequence, error);
+        }
+    }
+
+    /// Clear all reconciled sequences.
+    ///
+    /// ## Returns
+    ///
+    /// Number of sequences cleared.
+    pub fn clear_reconciled(&self) -> usize {
+        let mut guard = match self.reconciliation.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.clear_reconciled()
+    }
+
+    /// Register a callback for reconciliation events.
+    pub fn register_reconciliation_callback(&self, cb: Box<dyn ReconciliationCallback>) {
+        let mut guard = match self.reconciliation.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.register_callback(cb);
+    }
+
+    /// Get the number of pending reconciliation sequences.
+    #[must_use]
+    pub fn pending_reconciliation_count(&self) -> usize {
+        let guard = match self.reconciliation.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.pending_count()
+    }
+
+    /// Get the number of reconciled sequences.
+    #[must_use]
+    pub fn reconciled_count(&self) -> usize {
+        let guard = match self.reconciliation.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.reconciled_count()
+    }
+
+    /// Check if a sequence is pending reconciliation.
+    #[must_use]
+    pub fn is_pending_reconciliation(&self, sequence: u64) -> bool {
+        let guard = match self.reconciliation.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.is_pending(sequence)
+    }
+
+    /// Check if a sequence has been reconciled.
+    #[must_use]
+    pub fn is_reconciled(&self, sequence: u64) -> bool {
+        let guard = match self.reconciliation.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        guard.is_reconciled(sequence)
+    }
 }
 
 impl Default for FallbackCache {
@@ -476,6 +660,10 @@ mod tests {
         assert_eq!(cache.config().max_entries, 1000);
         assert_eq!(cache.config().eviction_policy, EvictionPolicy::LRU);
         assert_eq!(cache.config().ttl_seconds, 0);
+
+        // Verify reconciliation state initialized
+        assert_eq!(cache.pending_reconciliation_count(), 0);
+        assert_eq!(cache.reconciled_count(), 0);
     }
 
     #[test]
@@ -1181,5 +1369,249 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!cache.contains(1)); // Expired removed
         assert!(cache.contains(2)); // Fresh kept
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // K. RECONCILIATION TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_add_to_pending() {
+        let cache = FallbackCache::new();
+
+        let added = cache.add_to_pending(1);
+
+        assert!(added);
+        assert_eq!(cache.pending_reconciliation_count(), 1);
+        assert!(cache.is_pending_reconciliation(1));
+    }
+
+    #[test]
+    fn test_add_to_pending_duplicate() {
+        let cache = FallbackCache::new();
+
+        cache.add_to_pending(1);
+        let added = cache.add_to_pending(1);
+
+        assert!(!added);
+        assert_eq!(cache.pending_reconciliation_count(), 1);
+    }
+
+    #[test]
+    fn test_get_pending_for_reconcile_returns_blobs() {
+        let cache = FallbackCache::new();
+
+        // Store blobs
+        cache.store(1, make_blob(10, 1000)).unwrap();
+        cache.store(2, make_blob(20, 2000)).unwrap();
+        cache.store(3, make_blob(30, 3000)).unwrap();
+
+        // Mark some as pending
+        cache.add_to_pending(1);
+        cache.add_to_pending(3);
+
+        let pending = cache.get_pending_for_reconcile();
+
+        assert_eq!(pending.len(), 2);
+
+        let sequences: Vec<u64> = pending.iter().map(|(s, _)| *s).collect();
+        assert!(sequences.contains(&1));
+        assert!(sequences.contains(&3));
+        assert!(!sequences.contains(&2));
+    }
+
+    #[test]
+    fn test_get_pending_for_reconcile_skips_missing_blobs() {
+        let cache = FallbackCache::new();
+
+        // Store only one blob
+        cache.store(1, make_blob(10, 1000)).unwrap();
+
+        // Mark multiple as pending (some don't have blobs)
+        cache.add_to_pending(1);
+        cache.add_to_pending(999); // No blob for this
+
+        let pending = cache.get_pending_for_reconcile();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 1);
+    }
+
+    #[test]
+    fn test_get_pending_for_reconcile_does_not_modify_state() {
+        let cache = FallbackCache::new();
+
+        cache.store(1, make_blob(10, 1000)).unwrap();
+        cache.add_to_pending(1);
+
+        let count_before = cache.pending_reconciliation_count();
+
+        let _ = cache.get_pending_for_reconcile();
+        let _ = cache.get_pending_for_reconcile();
+
+        assert_eq!(cache.pending_reconciliation_count(), count_before);
+    }
+
+    #[test]
+    fn test_mark_reconciled_moves_to_reconciled() {
+        let cache = FallbackCache::new();
+
+        cache.add_to_pending(1);
+        assert!(cache.is_pending_reconciliation(1));
+        assert!(!cache.is_reconciled(1));
+
+        cache.mark_reconciled(1);
+
+        assert!(!cache.is_pending_reconciliation(1));
+        assert!(cache.is_reconciled(1));
+    }
+
+    #[test]
+    fn test_mark_reconciled_not_pending_noop() {
+        let cache = FallbackCache::new();
+
+        cache.mark_reconciled(999);
+
+        assert!(!cache.is_reconciled(999));
+        assert_eq!(cache.reconciled_count(), 0);
+    }
+
+    #[test]
+    fn test_mark_reconcile_failed() {
+        let cache = FallbackCache::new();
+
+        cache.add_to_pending(1);
+        assert!(cache.is_pending_reconciliation(1));
+
+        cache.mark_reconcile_failed(1, "test error");
+
+        assert!(!cache.is_pending_reconciliation(1));
+        assert!(!cache.is_reconciled(1)); // Not moved to reconciled
+    }
+
+    #[test]
+    fn test_clear_reconciled() {
+        let cache = FallbackCache::new();
+
+        cache.add_to_pending(1);
+        cache.add_to_pending(2);
+        cache.add_to_pending(3);
+
+        cache.mark_reconciled(1);
+        cache.mark_reconciled(2);
+        cache.mark_reconciled(3);
+
+        assert_eq!(cache.reconciled_count(), 3);
+
+        let cleared = cache.clear_reconciled();
+
+        assert_eq!(cleared, 3);
+        assert_eq!(cache.reconciled_count(), 0);
+    }
+
+    #[test]
+    fn test_reconciliation_callback_invoked() {
+        use std::sync::atomic::AtomicU64;
+
+        let cache = FallbackCache::new();
+
+        // Create a test callback
+        struct TestCb {
+            complete_count: AtomicU64,
+            last_seq: AtomicU64,
+        }
+
+        impl ReconciliationCallback for TestCb {
+            fn on_reconcile_complete(&self, sequence: u64) {
+                self.complete_count.fetch_add(1, Ordering::SeqCst);
+                self.last_seq.store(sequence, Ordering::SeqCst);
+            }
+
+            fn on_reconcile_failed(&self, _sequence: u64, _error: &str) {}
+        }
+
+        let cb = Arc::new(TestCb {
+            complete_count: AtomicU64::new(0),
+            last_seq: AtomicU64::new(0),
+        });
+
+        // Wrap in Box for registration
+        struct ArcCb(Arc<TestCb>);
+        impl ReconciliationCallback for ArcCb {
+            fn on_reconcile_complete(&self, sequence: u64) {
+                self.0.on_reconcile_complete(sequence);
+            }
+            fn on_reconcile_failed(&self, sequence: u64, error: &str) {
+                self.0.on_reconcile_failed(sequence, error);
+            }
+        }
+
+        cache.register_reconciliation_callback(Box::new(ArcCb(Arc::clone(&cb))));
+
+        cache.add_to_pending(42);
+        cache.mark_reconciled(42);
+
+        assert_eq!(cb.complete_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cb.last_seq.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn test_reconciliation_callback_not_invoked_if_not_pending() {
+        use std::sync::atomic::AtomicU64;
+
+        let cache = FallbackCache::new();
+
+        struct TestCb {
+            call_count: AtomicU64,
+        }
+
+        impl ReconciliationCallback for TestCb {
+            fn on_reconcile_complete(&self, _sequence: u64) {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+            }
+            fn on_reconcile_failed(&self, _sequence: u64, _error: &str) {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let cb = Arc::new(TestCb {
+            call_count: AtomicU64::new(0),
+        });
+
+        struct ArcCb(Arc<TestCb>);
+        impl ReconciliationCallback for ArcCb {
+            fn on_reconcile_complete(&self, sequence: u64) {
+                self.0.on_reconcile_complete(sequence);
+            }
+            fn on_reconcile_failed(&self, sequence: u64, error: &str) {
+                self.0.on_reconcile_failed(sequence, error);
+            }
+        }
+
+        cache.register_reconciliation_callback(Box::new(ArcCb(Arc::clone(&cb))));
+
+        // Try to reconcile without pending
+        cache.mark_reconciled(999);
+
+        assert_eq!(cb.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_reconciliation_state_invariant() {
+        let cache = FallbackCache::new();
+
+        // Sequence should never be in both pending and reconciled
+        cache.add_to_pending(1);
+        assert!(cache.is_pending_reconciliation(1));
+        assert!(!cache.is_reconciled(1));
+
+        cache.mark_reconciled(1);
+        assert!(!cache.is_pending_reconciliation(1));
+        assert!(cache.is_reconciled(1));
+
+        // Re-add to pending (should remove from reconciled)
+        cache.add_to_pending(1);
+        assert!(cache.is_pending_reconciliation(1));
+        assert!(!cache.is_reconciled(1));
     }
 }
