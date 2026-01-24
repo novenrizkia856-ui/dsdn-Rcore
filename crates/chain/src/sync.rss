@@ -21,15 +21,16 @@
 //! HeaderSyncer melakukan validasi chain structure tanpa download block body.
 //! Validasi header bersifat CONSENSUS-CRITICAL.
 
-use serde::{Serialize, Deserialize};
-use std::collections::{VecDeque, HashSet, HashMap};
-use anyhow::Result;
+use serde::{Serialize, Deserialize}
+use std::collections::{VecDeque, HashSet, HashMap}
+use std::sync::{Arc, Mutex}
+use anyhow::Result
 
-use crate::types::Hash;
-use crate::block::{Block, BlockHeader}; //block.rss adalah program rusts+
-use crate::db::ChainDb;
-use crate::state::ChainState;
-use crate::Chain;
+use crate::types::Hash
+use crate::block::{Block, BlockHeader}
+use crate::db::ChainDb
+use crate::state::ChainState
+use crate::Chain
 
 // ════════════════════════════════════════════════════════════════════════════
 // SYNC STATUS
@@ -47,32 +48,32 @@ use crate::Chain;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncStatus {
     /// Tidak sedang sync, node idle
-    Idle,
+    Idle
     /// Sedang sync headers dari peer
     SyncingHeaders {
         /// Height awal sync
-        start_height: u64,
+        start_height u64
         /// Height target (dari peer tip)
-        target_height: u64,
+        target_height u64
         /// Height saat ini yang sudah di-sync
-        current_height: u64,
-    },
+        current_height u64
+    }
     /// Sedang sync blocks setelah headers terverifikasi
     SyncingBlocks {
         /// Height awal sync
-        start_height: u64,
+        start_height u64
         /// Height target
-        target_height: u64,
+        target_height u64
         /// Height saat ini yang sudah di-download
-        current_height: u64,
-    },
+        current_height u64
+    }
     /// Sedang replay state dari checkpoint
     SyncingState {
         /// Height checkpoint yang sedang di-replay
-        checkpoint_height: u64,
-    },
+        checkpoint_height u64
+    }
     /// Sync selesai, node sudah synchronized
-    Synced,
+    Synced
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -90,22 +91,22 @@ pub enum SyncRequest {
     /// Request range of headers
     GetHeaders {
         /// Height pertama yang diminta
-        start_height: u64,
+        start_height u64
         /// Jumlah headers yang diminta
-        count: u64,
-    },
+        count u64
+    }
     /// Request single block by height
     GetBlock {
         /// Height block yang diminta
-        height: u64,
-    },
+        height u64
+    }
     /// Request multiple blocks by heights
     GetBlocks {
         /// List heights yang diminta
-        heights: Vec<u64>,
-    },
+        heights Vec[u64]
+    }
     /// Request current chain tip dari peer
-    GetChainTip,
+    GetChainTip
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -120,35 +121,35 @@ pub enum SyncResponse {
     /// Response berisi headers
     Headers {
         /// List headers yang diminta
-        headers: Vec<BlockHeader>,
-    },
+        headers Vec[BlockHeader]
+    }
     /// Response berisi single block
     Block {
         /// Block yang diminta
-        block: Block,
-    },
+        block Block
+    }
     /// Response berisi multiple blocks
     Blocks {
         /// List blocks yang diminta
-        blocks: Vec<Block>,
-    },
+        blocks Vec[Block]
+    }
     /// Response berisi chain tip info
     ChainTip {
         /// Height tip saat ini
-        height: u64,
+        height u64
         /// Hash tip saat ini
-        hash: Hash,
-    },
+        hash Hash
+    }
     /// Block tidak ditemukan
     NotFound {
         /// Height yang tidak ditemukan
-        height: u64,
-    },
+        height u64
+    }
     /// Error response
     Error {
         /// Pesan error
-        message: String,
-    },
+        message String
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -165,22 +166,22 @@ pub enum SyncResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncConfig {
     /// Maximum headers per single request
-    pub max_headers_per_request: u64,
+    pub max_headers_per_request u64
     /// Maximum blocks per single request
-    pub max_blocks_per_request: u64,
+    pub max_blocks_per_request u64
     /// Timeout untuk sync request dalam milliseconds
-    pub sync_timeout_ms: u64,
+    pub sync_timeout_ms u64
     /// Batch size untuk parallel downloads
-    pub batch_size: u64,
+    pub batch_size u64
 }
 
 impl Default for SyncConfig {
-    fn default() -> Self {
+    fn default() Self {
         Self {
-            max_headers_per_request: 500,
-            max_blocks_per_request: 100,
-            sync_timeout_ms: 30000,
-            batch_size: 50,
+            max_headers_per_request = 500
+            max_blocks_per_request = 100
+            sync_timeout_ms = 30000
+            batch_size = 50
         }
     }
 }
@@ -198,15 +199,15 @@ impl Default for SyncConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerSyncState {
     /// Identifier unik peer
-    pub peer_id: String,
+    pub peer_id String
     /// Height tip yang dilaporkan peer
-    pub tip_height: u64,
+    pub tip_height u64
     /// Hash tip yang dilaporkan peer
-    pub tip_hash: Hash,
+    pub tip_hash Hash
     /// Unix timestamp terakhir peer terlihat aktif
-    pub last_seen: u64,
+    pub last_seen u64
     /// Apakah sedang sync dengan peer ini
-    pub is_syncing: bool,
+    pub is_syncing bool
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -228,13 +229,13 @@ pub struct PeerSyncState {
 #[derive(Debug, Clone)]
 pub struct HeaderSyncer {
     /// Local chain tip (height, hash)
-    pub local_tip: (u64, Hash),
+    pub local_tip (u64, Hash)
     /// Target chain tip dari peer (height, hash)
-    pub target_tip: (u64, Hash),
+    pub target_tip (u64, Hash)
     /// Headers yang sudah diterima tapi belum diproses
-    pub pending_headers: VecDeque<BlockHeader>,
+    pub pending_headers VecDeque[BlockHeader]
     /// Heights yang sudah terverifikasi dan disimpan
-    pub verified_heights: HashSet<u64>,
+    pub verified_heights HashSet[u64]
 }
 
 impl HeaderSyncer {
@@ -244,14 +245,14 @@ impl HeaderSyncer {
     /// * `local_tip` - (height, hash) dari chain tip lokal
     /// * `target_tip` - (height, hash) target dari peer
     pub fn new(
-        local_tip: (u64, Hash),
-        target_tip: (u64, Hash),
-    ) -> Self {
+        local_tip (u64, Hash),
+        target_tip (u64, Hash)
+    ) Self {
         Self {
-            local_tip,
-            target_tip,
-            pending_headers: VecDeque::new(),
-            verified_heights: HashSet::new(),
+            local_tip = local_tip
+            target_tip = target_tip
+            pending_headers = VecDeque::new()
+            verified_heights = HashSet::new()
         }
     }
 
@@ -259,14 +260,14 @@ impl HeaderSyncer {
     ///
     /// Request dimulai dari local_tip.height + 1 + verified_heights.len()
     /// Menggunakan batch size dari SyncConfig default (500).
-    pub fn request_next_headers(&self) -> SyncRequest {
-        let start_height = self.local_tip.0 + 1 + self.verified_heights.len() as u64;
-        let remaining = self.target_tip.0.saturating_sub(start_height) + 1;
-        let count = remaining.min(SyncConfig::default().max_headers_per_request);
+    pub fn request_next_headers(&self) SyncRequest {
+        start_height = self.local_tip.0 + 1 + self.verified_heights.len() as u64
+        remaining = self.target_tip.0.saturating_sub(start_height) + 1
+        count = remaining.min(SyncConfig::default().max_headers_per_request)
         
         SyncRequest::GetHeaders {
-            start_height,
-            count,
+            start_height = start_height
+            count = count
         }
     }
 
@@ -285,26 +286,26 @@ impl HeaderSyncer {
     /// * LMDB write error
     pub fn process_headers(
         &mut self,
-        headers: Vec<BlockHeader>,
-        db: &ChainDb,
-    ) -> Result<()> {
+        headers Vec[BlockHeader],
+        db &ChainDb
+    ) effects(io, panic, write self) Result[()] {
         // Verifikasi chain linkage
-        self.verify_header_chain(&headers)?;
+        self.verify_header_chain(&headers)?
         
         // Simpan setiap header ke LMDB dan update verified_heights
         for header in headers {
-            let height = header.height;
+            height = header.height
             
             // Skip header yang sudah ada
             if self.verified_heights.contains(&height) {
-                continue;
+                continue
             }
             
             // Simpan ke LMDB
-            db.put_header(height, &header)?;
+            db.put_header(height, &header)?
             
             // Update tracking
-            self.verified_heights.insert(height);
+            self.verified_heights.insert(height)
         }
         
         Ok(())
@@ -329,76 +330,76 @@ impl HeaderSyncer {
     /// * Timestamp tidak increasing
     pub fn verify_header_chain(
         &self,
-        headers: &[BlockHeader],
-    ) -> Result<()> {
+        headers &[BlockHeader]
+    ) effects(panic) Result[()] {
         if headers.is_empty() {
-            return Ok(());
+            return Ok(())
         }
         
         // Verifikasi header pertama terhadap local_tip
-        let first = &headers[0];
-        let expected_height = self.local_tip.0 + 1 + self.verified_heights.len() as u64;
+        first = &headers[0]
+        expected_height = self.local_tip.0 + 1 + self.verified_heights.len() as u64
         
         if first.height != expected_height {
-            anyhow::bail!(
+            anyhow::bail(
                 "header height mismatch: expected {}, got {}",
                 expected_height,
                 first.height
-            );
+            )
         }
         
         if first.parent_hash != self.local_tip.1 && self.verified_heights.is_empty() {
-            anyhow::bail!(
+            anyhow::bail(
                 "first header parent_hash mismatch: expected {}, got {}",
                 self.local_tip.1,
                 first.parent_hash
-            );
+            )
         }
         
         // Verifikasi proposer valid (bukan zero address)
-        let zero_addr = crate::types::Address::from_bytes([0u8; 20]);
+        zero_addr = crate::types::Address::from_bytes([0u8; 20])
         if first.proposer == zero_addr {
-            anyhow::bail!("header {} has zero proposer address", first.height);
+            anyhow::bail("header {} has zero proposer address", first.height)
         }
         
         // Verifikasi sequential headers
         for i in 1..headers.len() {
-            let prev = &headers[i - 1];
-            let curr = &headers[i];
+            prev = &headers[i - 1]
+            curr = &headers[i]
             
             // Rule 1: height == previous.height + 1
             if curr.height != prev.height + 1 {
-                anyhow::bail!(
+                anyhow::bail(
                     "header height not sequential: {} -> {}",
                     prev.height,
                     curr.height
-                );
+                )
             }
             
             // Rule 2: parent_hash == hash(previous)
-            let prev_hash = Block::compute_hash(prev);
+            prev_hash = Block::compute_hash(prev)
             if curr.parent_hash != prev_hash {
-                anyhow::bail!(
+                anyhow::bail(
                     "header {} parent_hash mismatch: expected {}, got {}",
                     curr.height,
                     prev_hash,
                     curr.parent_hash
-                );
+                )
             }
             
             // Rule 3: proposer valid
             if curr.proposer == zero_addr {
-                anyhow::bail!("header {} has zero proposer address", curr.height);
+                anyhow::bail("header {} has zero proposer address", curr.height)
             }
             
             // Rule 4: timestamp > previous.timestamp
             if curr.timestamp <= prev.timestamp {
-                anyhow::bail!(
+                anyhow::bail(
                     "header {} timestamp not increasing: {} <= {}",
                     curr.height,
                     curr.timestamp,
                     prev.timestamp
-                );
+                )
             }
         }
         
@@ -408,16 +409,16 @@ impl HeaderSyncer {
     /// Check apakah header sync sudah selesai.
     ///
     /// Returns true bila semua headers dari local_tip sampai target_tip sudah terverifikasi.
-    pub fn is_complete(&self) -> bool {
-        let total_needed = self.target_tip.0.saturating_sub(self.local_tip.0);
+    pub fn is_complete(&self) bool {
+        total_needed = self.target_tip.0.saturating_sub(self.local_tip.0)
         self.verified_heights.len() as u64 >= total_needed
     }
 
     /// Get sync progress.
     ///
     /// Returns (current_height, target_height)
-    pub fn get_progress(&self) -> (u64, u64) {
-        let current = self.local_tip.0 + self.verified_heights.len() as u64;
+    pub fn get_progress(&self) (u64, u64) {
+        current = self.local_tip.0 + self.verified_heights.len() as u64
         (current, self.target_tip.0)
     }
 }
@@ -427,7 +428,7 @@ impl HeaderSyncer {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Maximum retry count per block height
-const MAX_RETRY_COUNT: u32 = 3;
+const MAX_RETRY_COUNT u32 = 3
 
 /// Block sync engine.
 ///
@@ -449,13 +450,13 @@ const MAX_RETRY_COUNT: u32 = 3;
 #[derive(Debug, Clone)]
 pub struct BlockSyncer {
     /// Headers yang masih perlu di-fetch (height, expected_hash)
-    pub headers_to_fetch: VecDeque<(u64, Hash)>,
+    pub headers_to_fetch VecDeque[(u64, Hash)]
     /// Blocks yang sudah berhasil di-fetch dan tervalidasi
-    pub fetched_blocks: HashMap<u64, Block>,
+    pub fetched_blocks HashMap[u64, Block]
     /// Heights yang gagal setelah max retry
-    pub failed_heights: HashSet<u64>,
+    pub failed_heights HashSet[u64]
     /// Retry count per height
-    pub retry_count: HashMap<u64, u32>,
+    pub retry_count HashMap[u64, u32]
 }
 
 impl BlockSyncer {
@@ -463,12 +464,12 @@ impl BlockSyncer {
     ///
     /// # Arguments
     /// * `headers` - Vec<(height, hash)> dari headers yang sudah diverifikasi
-    pub fn new(headers: Vec<(u64, Hash)>) -> Self {
+    pub fn new(headers Vec[(u64, Hash)]) Self {
         Self {
-            headers_to_fetch: VecDeque::from(headers),
-            fetched_blocks: HashMap::new(),
-            failed_heights: HashSet::new(),
-            retry_count: HashMap::new(),
+            headers_to_fetch = VecDeque::from(headers)
+            fetched_blocks = HashMap::new()
+            failed_heights = HashSet::new()
+            retry_count = HashMap::new()
         }
     }
 
@@ -480,16 +481,16 @@ impl BlockSyncer {
     /// Returns SyncRequest::GetBlocks dengan heights yang diminta
     pub fn request_next_blocks(
         &self,
-        batch_size: u64,
-    ) -> SyncRequest {
-        let count = (batch_size as usize).min(self.headers_to_fetch.len());
-        let heights: Vec<u64> = self.headers_to_fetch
+        batch_size u64
+    ) SyncRequest {
+        count = (batch_size as usize).min(self.headers_to_fetch.len())
+        heights Vec[u64] = self.headers_to_fetch
             .iter()
             .take(count)
             .map(|(h, _)| *h)
-            .collect();
+            .collect()
         
-        SyncRequest::GetBlocks { heights }
+        SyncRequest::GetBlocks { heights = heights }
     }
 
     /// Proses block yang diterima dari peer.
@@ -508,40 +509,40 @@ impl BlockSyncer {
     /// * Transaction signature invalid
     pub fn process_block(
         &mut self,
-        block: Block,
-        expected_header: &BlockHeader,
-    ) -> Result<()> {
-        let height = block.header.height;
+        block Block,
+        expected_header &BlockHeader
+    ) effects(panic, write self) Result[()] {
+        height = block.header.height
         
         // Validasi block terhadap expected header
         match self.validate_block_header(&block, expected_header) {
-            Ok(()) => {
+            Ok(()) {
                 // Validasi sukses: simpan block
-                self.fetched_blocks.insert(height, block);
+                self.fetched_blocks.insert(height, block)
                 
                 // Hapus dari headers_to_fetch
-                self.headers_to_fetch.retain(|(h, _)| *h != height);
+                self.headers_to_fetch.retain(|(h, _)| *h != height)
                 
                 // Reset retry count
-                self.retry_count.remove(&height);
+                self.retry_count.remove(&height)
                 
                 Ok(())
             }
-            Err(e) => {
+            Err(e) {
                 // Increment retry count
-                let count = self.retry_count.entry(height).or_insert(0);
-                *count += 1;
+                count = self.retry_count.entry(height).or_insert(0)
+                *count += 1
                 
                 // Check max retry
                 if *count >= MAX_RETRY_COUNT {
                     // Move ke failed_heights
-                    self.failed_heights.insert(height);
+                    self.failed_heights.insert(height)
                     
                     // Hapus dari headers_to_fetch
-                    self.headers_to_fetch.retain(|(h, _)| *h != height);
+                    self.headers_to_fetch.retain(|(h, _)| *h != height)
                     
                     // Hapus retry count
-                    self.retry_count.remove(&height);
+                    self.retry_count.remove(&height)
                 }
                 
                 Err(e)
@@ -567,69 +568,69 @@ impl BlockSyncer {
     /// * Transaction signature invalid
     pub fn validate_block_header(
         &self,
-        block: &Block,
-        expected_header: &BlockHeader,
-    ) -> Result<()> {
+        block &Block,
+        expected_header &BlockHeader
+    ) effects(panic) Result[()] {
         // Rule 1: block.header == expected_header (exact match)
         if block.header.height != expected_header.height {
-            anyhow::bail!(
+            anyhow::bail(
                 "block height mismatch: expected {}, got {}",
                 expected_header.height,
                 block.header.height
-            );
+            )
         }
         
         if block.header.parent_hash != expected_header.parent_hash {
-            anyhow::bail!(
+            anyhow::bail(
                 "block {} parent_hash mismatch",
                 block.header.height
-            );
+            )
         }
         
         if block.header.state_root != expected_header.state_root {
-            anyhow::bail!(
+            anyhow::bail(
                 "block {} state_root mismatch",
                 block.header.height
-            );
+            )
         }
         
         if block.header.tx_root != expected_header.tx_root {
-            anyhow::bail!(
+            anyhow::bail(
                 "block {} tx_root mismatch",
                 block.header.height
-            );
+            )
         }
         
         if block.header.timestamp != expected_header.timestamp {
-            anyhow::bail!(
+            anyhow::bail(
                 "block {} timestamp mismatch",
                 block.header.height
-            );
+            )
         }
         
         if block.header.proposer != expected_header.proposer {
-            anyhow::bail!(
+            anyhow::bail(
                 "block {} proposer mismatch",
                 block.header.height
-            );
+            )
         }
         
         // Rule 2: block.verify_signature() sukses
         if !block.verify_signature()? {
-            anyhow::bail!(
+            anyhow::bail(
                 "block {} signature verification failed",
                 block.header.height
-            );
+            )
         }
         
         // Rule 3: semua tx.verify_signature() sukses
         for (i, tx) in block.body.transactions.iter().enumerate() {
             if !tx.verify_signature()? {
-                anyhow::bail!(
+                anyhow::bail(
                     "block {} tx {} signature verification failed",
                     block.header.height,
                     i
-                );
+                )
             }
         }
         
@@ -639,7 +640,7 @@ impl BlockSyncer {
     /// Get heights yang masih pending (belum di-fetch).
     ///
     /// Returns Vec<u64> sorted ascending
-    pub fn get_pending_heights(&self) -> Vec<u64> {
+    pub fn get_pending_heights(&self) Vec[u64] {
         self.headers_to_fetch
             .iter()
             .map(|(h, _)| *h)
@@ -651,22 +652,22 @@ impl BlockSyncer {
     /// Returns true bila:
     /// - headers_to_fetch kosong, DAN
     /// - tidak ada pending retry
-    pub fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) bool {
         self.headers_to_fetch.is_empty()
     }
 
     /// Get jumlah blocks yang sudah berhasil di-fetch.
-    pub fn fetched_count(&self) -> usize {
+    pub fn fetched_count(&self) usize {
         self.fetched_blocks.len()
     }
 
     /// Get jumlah heights yang gagal.
-    pub fn failed_count(&self) -> usize {
+    pub fn failed_count(&self) usize {
         self.failed_heights.len()
     }
 
     /// Get block by height dari fetched_blocks.
-    pub fn get_block(&self, height: u64) -> Option<&Block> {
+    pub fn get_block(&self, height u64) Option[&Block] {
         self.fetched_blocks.get(&height)
     }
 }
@@ -694,15 +695,15 @@ impl BlockSyncer {
 /// - Replay bekerja pada cloned ChainState
 pub struct StateReplayEngine {
     /// Chain untuk akses DB (load blocks)
-    pub chain: Chain,
+    pub chain Chain
     /// Height awal replay
-    pub start_height: u64,
+    pub start_height u64
     /// Height akhir replay (inclusive)
-    pub end_height: u64,
+    pub end_height u64
     /// Height saat ini yang sedang diproses
-    pub current_height: u64,
+    pub current_height u64
     /// Checkpoint state (None = replay dari genesis)
-    pub state_checkpoint: Option<ChainState>,
+    pub state_checkpoint Option[ChainState]
 }
 
 impl StateReplayEngine {
@@ -712,13 +713,13 @@ impl StateReplayEngine {
     /// * `chain` - Chain untuk akses DB
     /// * `start` - Height awal replay (inclusive)
     /// * `end` - Height akhir replay (inclusive)
-    pub fn new(chain: Chain, start: u64, end: u64) -> Self {
+    pub fn new(chain Chain, start u64, end u64) Self {
         Self {
-            chain,
-            start_height: start,
-            end_height: end,
-            current_height: start,
-            state_checkpoint: None,
+            chain = chain
+            start_height = start
+            end_height = end
+            current_height = start
+            state_checkpoint = None
         }
     }
 
@@ -730,33 +731,33 @@ impl StateReplayEngine {
     /// # Errors
     /// * BlockNotFound — block tidak ada di DB
     /// * StateRootMismatch — computed state_root != block.header.state_root
-    pub fn replay_from_genesis(&mut self) -> Result<()> {
+    pub fn replay_from_genesis(&mut self) effects(io, panic, write self) Result[()] {
         // Reset state ke genesis state (empty)
-        let mut state = ChainState::new();
+        mut state = ChainState::new()
         
         // Replay dari height 0
-        self.current_height = 0;
+        self.current_height = 0
         
         while self.current_height <= self.end_height {
             // Load block dari DB
-            let block = self.chain.db.get_block(self.current_height)?
-                .ok_or_else(|| anyhow::anyhow!(
+            block = self.chain.db.get_block(self.current_height)?
+                .ok_or_else(|| anyhow::anyhow(
                     "BlockNotFound: height {}",
                     self.current_height
-                ))?;
+                ))?
             
             // Replay block
-            self.replay_block_internal(&block, &mut state)?;
+            self.replay_block_internal(&block, &mut state)?
             
             // Verify state root
-            self.verify_state_root(&block, &state)?;
+            self.verify_state_root(&block, &state)?
             
             // Next height
-            self.current_height += 1;
+            self.current_height += 1
         }
         
         // Store final state
-        self.state_checkpoint = Some(state);
+        self.state_checkpoint = Some(state)
         
         Ok(())
     }
@@ -775,36 +776,36 @@ impl StateReplayEngine {
     /// * StateRootMismatch — computed state_root != block.header.state_root
     pub fn replay_from_checkpoint(
         &mut self,
-        height: u64,
-        state: ChainState,
-    ) -> Result<()> {
+        height u64,
+        state ChainState
+    ) effects(io, panic, write self) Result[()] {
         // Set starting point
-        self.current_height = height + 1;
-        self.start_height = height + 1;
+        self.current_height = height + 1
+        self.start_height = height + 1
         
         // Clone state untuk replay
-        let mut replay_state = state;
+        mut replay_state = state
         
         while self.current_height <= self.end_height {
             // Load block dari DB
-            let block = self.chain.db.get_block(self.current_height)?
-                .ok_or_else(|| anyhow::anyhow!(
+            block = self.chain.db.get_block(self.current_height)?
+                .ok_or_else(|| anyhow::anyhow(
                     "BlockNotFound: height {}",
                     self.current_height
-                ))?;
+                ))?
             
             // Replay block
-            self.replay_block_internal(&block, &mut replay_state)?;
+            self.replay_block_internal(&block, &mut replay_state)?
             
             // Verify state root
-            self.verify_state_root(&block, &replay_state)?;
+            self.verify_state_root(&block, &replay_state)?
             
             // Next height
-            self.current_height += 1;
+            self.current_height += 1
         }
         
         // Store final state
-        self.state_checkpoint = Some(replay_state);
+        self.state_checkpoint = Some(replay_state)
         
         Ok(())
     }
@@ -819,21 +820,21 @@ impl StateReplayEngine {
     ///
     /// # Errors
     /// * StateRootMismatch — computed state_root != block.header.state_root
-    pub fn replay_block(&mut self, block: &Block) -> Result<()> {
+    pub fn replay_block(&mut self, block &Block) effects(io, panic, write self) Result[()] {
         // Get or create state
-        let mut state = self.state_checkpoint.take().unwrap_or_else(ChainState::new);
+        mut state = self.state_checkpoint.take().unwrap_or_else(ChainState::new)
         
         // Replay block
-        self.replay_block_internal(block, &mut state)?;
+        self.replay_block_internal(block, &mut state)?
         
         // Verify state root
-        self.verify_state_root(block, &state)?;
+        self.verify_state_root(block, &state)?
         
         // Update current height
-        self.current_height = block.header.height + 1;
+        self.current_height = block.header.height + 1
         
         // Store state back
-        self.state_checkpoint = Some(state);
+        self.state_checkpoint = Some(state)
         
         Ok(())
     }
@@ -841,25 +842,25 @@ impl StateReplayEngine {
     /// Internal: replay block pada state yang diberikan.
     fn replay_block_internal(
         &self,
-        block: &Block,
-        state: &mut ChainState,
-    ) -> Result<()> {
-        let proposer = block.header.proposer;
+        block &Block,
+        state &mut ChainState
+    ) effects(io, panic, write state) Result[()] {
+        proposer = block.header.proposer
         
         // Execute each transaction
         for (i, tx) in block.body.transactions.iter().enumerate() {
             match state.apply_payload(tx, &proposer) {
-                Ok(_) => {
+                Ok(_) {
                     // TX sukses
                 }
-                Err(e) => {
+                Err(e) {
                     // TxExecutionError: non-fatal, log and continue
-                    println!(
+                    println(
                         "   ⚠️  Block {} TX {} execution error (continuing): {}",
                         block.header.height,
                         i,
                         e
-                    );
+                    )
                 }
             }
         }
@@ -877,19 +878,19 @@ impl StateReplayEngine {
     /// * StateRootMismatch — computed != expected
     pub fn verify_state_root(
         &self,
-        block: &Block,
-        state: &ChainState,
-    ) -> Result<()> {
-        let computed = state.compute_state_root()?;
-        let expected = &block.header.state_root;
+        block &Block,
+        state &ChainState
+    ) effects(panic) Result[()] {
+        computed = state.compute_state_root()?
+        expected = &block.header.state_root
         
         if &computed != expected {
-            anyhow::bail!(
+            anyhow::bail(
                 "StateRootMismatch at height {}: expected {}, computed {}",
                 block.header.height,
                 expected,
                 computed
-            );
+            )
         }
         
         Ok(())
@@ -898,14 +899,14 @@ impl StateReplayEngine {
     /// Get replay progress.
     ///
     /// Returns (current_height, end_height)
-    pub fn get_progress(&self) -> (u64, u64) {
+    pub fn get_progress(&self) (u64, u64) {
         (self.current_height, self.end_height)
     }
 
     /// Check apakah replay sudah selesai.
     ///
     /// Returns true bila current_height > end_height
-    pub fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) bool {
         self.current_height > self.end_height
     }
 
@@ -913,7 +914,7 @@ impl StateReplayEngine {
     ///
     /// Returns cloned ChainState dari state_checkpoint.
     /// Panggil setelah replay selesai.
-    pub fn get_final_state(&self) -> ChainState {
+    pub fn get_final_state(&self) ChainState {
         self.state_checkpoint.clone().unwrap_or_else(ChainState::new)
     }
 
@@ -957,21 +958,21 @@ impl StateReplayEngine {
     /// State langsung di-update ke chain.state.
     pub fn replay_using_chain(
         &mut self,
-        progress: Option<&dyn Fn(u64, u64)>,
-    ) -> Result<()> {
+        progress Option[&dyn Fn(u64, u64)]
+    ) effects(io, panic, write self) Result[()] {
         // Use Chain's replay_blocks_from
         self.chain.replay_blocks_from(
             self.start_height,
             self.end_height,
-            progress,
-        ).map_err(|e| anyhow::anyhow!("Chain replay failed: {}", e))?;
+            progress
+        ).map_err(|e| anyhow::anyhow("Chain replay failed: {}", e))?
 
         // Update current_height to mark completion
-        self.current_height = self.end_height + 1;
+        self.current_height = self.end_height + 1
 
         // Get final state from chain
-        let final_state = self.chain.state.read().clone();
-        self.state_checkpoint = Some(final_state);
+        final_state = self.chain.state.read().clone()
+        self.state_checkpoint = Some(final_state)
 
         Ok(())
     }
@@ -992,44 +993,26 @@ impl StateReplayEngine {
     /// ## Returns
     /// * `Ok(ChainState)` - Final state setelah replay
     /// * `Err` - Replay gagal
-    ///
-    /// ## Example
-    /// ```text
-    /// // 1. Load snapshot
-    /// let snapshot_db = ChainDb::load_snapshot(path)?;
-    /// let snapshot_state = snapshot_db.load_state()?;
-    ///
-    /// // 2. Create replay engine
-    /// let mut engine = StateReplayEngine::new(chain, snapshot_height, tip_height);
-    ///
-    /// // 3. Fast sync
-    /// let final_state = engine.fast_sync_from_snapshot(
-    ///     snapshot_height,
-    ///     tip_height,
-    ///     snapshot_state,
-    ///     Some(&|cur, total| println!("{}/{}", cur, total)),
-    /// )?;
-    /// ```
     pub fn fast_sync_from_snapshot(
         &mut self,
-        snapshot_height: u64,
-        target_height: u64,
-        snapshot_state: ChainState,
-        progress: Option<&dyn Fn(u64, u64)>,
-    ) -> Result<ChainState> {
+        snapshot_height u64,
+        target_height u64,
+        snapshot_state ChainState,
+        progress Option[&dyn Fn(u64, u64)]
+    ) effects(io, panic, write self) Result[ChainState] {
         // Set chain state ke snapshot state
         {
-            let mut state_guard = self.chain.state.write();
-            *state_guard = snapshot_state;
+            mut state_guard = self.chain.state.write()
+            *state_guard = snapshot_state
         }
 
         // Update engine parameters
-        self.start_height = snapshot_height;
-        self.end_height = target_height;
-        self.current_height = snapshot_height + 1;
+        self.start_height = snapshot_height
+        self.end_height = target_height
+        self.current_height = snapshot_height + 1
 
         // Replay using chain
-        self.replay_using_chain(progress)?;
+        self.replay_using_chain(progress)?
 
         // Return final state
         Ok(self.get_final_state())
@@ -1069,23 +1052,23 @@ impl StateReplayEngine {
 /// Error sebelum commit = tidak ada data tersimpan.
 pub struct SyncManager {
     /// Chain untuk akses DB dan state
-    pub chain: Chain,
+    pub chain Chain
     /// Status sync saat ini
-    pub status: SyncStatus,
+    pub status SyncStatus
     /// Header syncer (aktif saat SyncingHeaders)
-    pub header_syncer: Option<HeaderSyncer>,
+    pub header_syncer Option[HeaderSyncer]
     /// Block syncer (aktif saat SyncingBlocks)
-    pub block_syncer: Option<BlockSyncer>,
+    pub block_syncer Option[BlockSyncer]
     /// State replay engine (aktif saat SyncingState)
-    pub replay_engine: Option<StateReplayEngine>,
-    /// Celestia control-plane syncer
-    pub celestia_syncer: Option<crate::celestia::ControlPlaneSyncer>,
+    pub replay_engine Option[StateReplayEngine]
+    /// Celestia control-plane syncer (wrapped in Arc<Mutex> for Clone + mutable access)
+    pub celestia_syncer Option[Arc[Mutex[crate::celestia::ControlPlaneSyncer]]]
     /// Konfigurasi sync
-    pub config: SyncConfig,
+    pub config SyncConfig
     /// Target tip untuk sync
-    target_tip: Option<(u64, Hash)>,
+    target_tip Option[(u64, Hash)]
     /// Start height untuk tracking
-    start_height: u64,
+    start_height u64
 }
 
 impl SyncManager {
@@ -1094,17 +1077,17 @@ impl SyncManager {
     /// # Arguments
     /// * `chain` - Chain instance untuk akses DB dan state
     /// * `config` - SyncConfig untuk tuning parameters
-    pub fn new(chain: Chain, config: SyncConfig) -> Self {
+    pub fn new(chain Chain, config SyncConfig) Self {
         Self {
-            chain,
-            status: SyncStatus::Idle,
-            header_syncer: None,
-            block_syncer: None,
-            replay_engine: None,
-            celestia_syncer: None,
-            config,
-            target_tip: None,
-            start_height: 0,
+            chain = chain
+            status = SyncStatus::Idle
+            header_syncer = None
+            block_syncer = None
+            replay_engine = None
+            celestia_syncer = None
+            config = config
+            target_tip = None
+            start_height = 0
         }
     }
 
@@ -1117,45 +1100,45 @@ impl SyncManager {
     ///
     /// # Errors
     /// * Sync sudah berjalan (status != Idle)
-    pub fn start_sync(&mut self, target_tip: (u64, Hash)) -> Result<()> {
+    pub fn start_sync(&mut self, target_tip (u64, Hash)) effects(io, panic, write self) Result[()] {
         // Validasi: hanya bisa start dari Idle
         if self.status != SyncStatus::Idle {
-            anyhow::bail!("sync already in progress, current status: {:?}", self.status);
+            anyhow::bail("sync already in progress, current status: {:?}", self.status)
         }
 
         // Get local tip
-        let local_tip = self.chain.db.get_tip()?
-            .unwrap_or((0, Hash::from_bytes([0u8; 64])));
+        local_tip = self.chain.db.get_tip()?
+            .unwrap_or((0, Hash::from_bytes([0u8; 64])))
         
         // Store local height sebelum move
-        let local_height = local_tip.0;
+        local_height = local_tip.0
         
         // Validasi: target harus lebih tinggi dari local
         if target_tip.0 <= local_height {
-            println!("✅ Already synced to height {}", local_height);
-            self.status = SyncStatus::Synced;
-            return Ok(());
+            println("✅ Already synced to height {}", local_height)
+            self.status = SyncStatus::Synced
+            return Ok(())
         }
 
-        println!("═══════════════════════════════════════════════════════════");
-        println!("🔄 SYNC MANAGER: Starting sync");
-        println!("   Local tip:  height={}", local_height);
-        println!("   Target tip: height={}", target_tip.0);
-        println!("═══════════════════════════════════════════════════════════");
+        println("═══════════════════════════════════════════════════════════")
+        println("🔄 SYNC MANAGER: Starting sync")
+        println("   Local tip:  height={}", local_height)
+        println("   Target tip: height={}", target_tip.0)
+        println("═══════════════════════════════════════════════════════════")
 
         // Store target dan start height
-        self.target_tip = Some(target_tip.clone());
-        self.start_height = local_height + 1;
+        self.target_tip = Some(target_tip.clone())
+        self.start_height = local_height + 1
 
         // Initialize HeaderSyncer (moves local_tip)
-        self.header_syncer = Some(HeaderSyncer::new(local_tip, target_tip.clone()));
+        self.header_syncer = Some(HeaderSyncer::new(local_tip, target_tip.clone()))
 
         // Transition to SyncingHeaders
         self.status = SyncStatus::SyncingHeaders {
-            start_height: self.start_height,
-            target_height: target_tip.0,
-            current_height: local_height,
-        };
+            start_height = self.start_height
+            target_height = target_tip.0
+            current_height = local_height
+        }
 
         Ok(())
     }
@@ -1172,22 +1155,22 @@ impl SyncManager {
     /// - SyncingBlocks: delegasi ke BlockSyncer
     /// - SyncingState: delegasi ke StateReplayEngine + ControlPlaneSyncer
     /// - Synced: return immediately
-    pub fn sync_step(&mut self) -> Result<()> {
+    pub fn sync_step(&mut self) effects(io, panic, write self) Result[()] {
         match &self.status {
-            SyncStatus::Idle => {
+            SyncStatus::Idle {
                 // Nothing to do
                 Ok(())
             }
-            SyncStatus::SyncingHeaders { start_height, target_height, current_height } => {
+            SyncStatus::SyncingHeaders { start_height, target_height, current_height } {
                 self.step_syncing_headers(*start_height, *target_height, *current_height)
             }
-            SyncStatus::SyncingBlocks { start_height, target_height, current_height } => {
+            SyncStatus::SyncingBlocks { start_height, target_height, current_height } {
                 self.step_syncing_blocks(*start_height, *target_height, *current_height)
             }
-            SyncStatus::SyncingState { checkpoint_height } => {
+            SyncStatus::SyncingState { checkpoint_height } {
                 self.step_syncing_state(*checkpoint_height)
             }
-            SyncStatus::Synced => {
+            SyncStatus::Synced {
                 // Already synced
                 Ok(())
             }
@@ -1197,46 +1180,46 @@ impl SyncManager {
     /// Internal: step untuk SyncingHeaders state.
     fn step_syncing_headers(
         &mut self,
-        start_height: u64,
-        target_height: u64,
-        _current_height: u64,
-    ) -> Result<()> {
-        let syncer = self.header_syncer.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("header_syncer not initialized"))?;
+        start_height u64,
+        target_height u64,
+        _current_height u64
+    ) effects(io, panic, write self) Result[()] {
+        syncer = self.header_syncer.as_ref()
+            .ok_or_else(|| anyhow::anyhow("header_syncer not initialized"))?
 
         // Check completion
         if syncer.is_complete() {
-            println!("   ✓ Header sync complete");
+            println("   ✓ Header sync complete")
             
             // Prepare headers list untuk BlockSyncer
-            let headers: Vec<(u64, Hash)> = (start_height..=target_height)
+            headers Vec[(u64, Hash)] = (start_height..=target_height)
                 .map(|h| {
                     // Get header hash dari DB (headers sudah di-persist)
-                    let header = self.chain.db.get_header(h)
+                    header = self.chain.db.get_header(h)
                         .ok()
                         .flatten()
                         .map(|hdr| Block::compute_hash(&hdr))
-                        .unwrap_or_else(|| Hash::from_bytes([0u8; 64]));
+                        .unwrap_or_else(|| Hash::from_bytes([0u8; 64]))
                     (h, header)
                 })
-                .collect();
+                .collect()
 
             // Initialize BlockSyncer
-            self.block_syncer = Some(BlockSyncer::new(headers));
+            self.block_syncer = Some(BlockSyncer::new(headers))
 
             // Transition to SyncingBlocks
             self.status = SyncStatus::SyncingBlocks {
-                start_height,
-                target_height,
-                current_height: start_height,
-            };
+                start_height = start_height
+                target_height = target_height
+                current_height = start_height
+            }
 
-            return Ok(());
+            return Ok(())
         }
 
         // Generate request untuk headers berikutnya
-        let request = syncer.request_next_headers();
-        println!("   📤 Header request: {:?}", request);
+        request = syncer.request_next_headers()
+        println("   📤 Header request: {:?}", request)
 
         // Note: Actual fetch dilakukan oleh P2P layer
         // SyncManager hanya generate request dan process response
@@ -1251,45 +1234,45 @@ impl SyncManager {
     /// Internal: step untuk SyncingBlocks state.
     fn step_syncing_blocks(
         &mut self,
-        start_height: u64,
-        target_height: u64,
-        _current_height: u64,
-    ) -> Result<()> {
-        let syncer = self.block_syncer.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("block_syncer not initialized"))?;
+        start_height u64,
+        target_height u64,
+        _current_height u64
+    ) effects(io, panic, write self) Result[()] {
+        syncer = self.block_syncer.as_ref()
+            .ok_or_else(|| anyhow::anyhow("block_syncer not initialized"))?
 
         // Check completion
         if syncer.is_complete() {
-            println!("   ✓ Block sync complete");
-            println!("   Fetched: {} blocks", syncer.fetched_count());
-            println!("   Failed:  {} blocks", syncer.failed_count());
+            println("   ✓ Block sync complete")
+            println("   Fetched: {} blocks", syncer.fetched_count())
+            println("   Failed:  {} blocks", syncer.failed_count())
 
             // Check for failed blocks
             if syncer.failed_count() > 0 {
-                anyhow::bail!(
+                anyhow::bail(
                     "sync failed: {} blocks could not be fetched after max retries",
                     syncer.failed_count()
-                );
+                )
             }
 
             // Initialize StateReplayEngine
             self.replay_engine = Some(StateReplayEngine::new(
                 self.chain.clone(),
                 start_height,
-                target_height,
-            ));
+                target_height
+            ))
 
             // Transition to SyncingState
             self.status = SyncStatus::SyncingState {
-                checkpoint_height: start_height,
-            };
+                checkpoint_height = start_height
+            }
 
-            return Ok(());
+            return Ok(())
         }
 
         // Generate request untuk blocks berikutnya
-        let request = syncer.request_next_blocks(self.config.batch_size);
-        println!("   📤 Block request: {:?}", request);
+        request = syncer.request_next_blocks(self.config.batch_size)
+        println("   📤 Block request: {:?}", request)
 
         // Note: Actual fetch dilakukan oleh P2P layer
 
@@ -1299,34 +1282,34 @@ impl SyncManager {
     /// Internal: step untuk SyncingState state.
     fn step_syncing_state(
         &mut self,
-        _checkpoint_height: u64,
-    ) -> Result<()> {
+        _checkpoint_height u64
+    ) effects(io, panic, write self) Result[()] {
         // Check replay engine completion
         if let Some(ref engine) = self.replay_engine {
             if engine.is_complete() {
-                println!("   ✓ State replay complete");
+                println("   ✓ State replay complete")
 
                 // Apply Celestia updates (control-plane sync)
-                if let Some(ref mut celestia) = self.celestia_syncer {
-                    celestia.apply_updates(&mut self.chain)?;
-                    println!("   ✓ Celestia control-plane updates applied");
+                if let Some(ref celestia) = self.celestia_syncer {
+                    celestia.lock().unwrap().apply_updates(&mut self.chain)?
+                    println("   ✓ Celestia control-plane updates applied")
                 }
 
                 // Get final state dari replay engine
-                let final_state = engine.get_final_state();
+                final_state = engine.get_final_state()
 
                 // ATOMIC COMMIT ke LMDB
                 // Ini adalah SATU-SATUNYA tempat state di-commit
-                self.finalize_sync(final_state)?;
+                self.finalize_sync(final_state)?
 
-                return Ok(());
+                return Ok(())
             }
         }
 
         // Replay masih berjalan
         // Note: replay_from_genesis() atau replay_from_checkpoint() sudah blocking
         // Untuk non-blocking, perlu replay per-block
-        println!("   🔄 State replay in progress...");
+        println("   🔄 State replay in progress...")
 
         Ok(())
     }
@@ -1334,89 +1317,94 @@ impl SyncManager {
     /// Finalize sync dengan atomic commit ke LMDB.
     ///
     /// CONSENSUS-CRITICAL: State hanya di-commit SATU KALI di sini.
-    fn finalize_sync(&mut self, final_state: ChainState) -> Result<()> {
-        println!("═══════════════════════════════════════════════════════════");
-        println!("💾 SYNC MANAGER: Finalizing sync (atomic commit)");
-        println!("═══════════════════════════════════════════════════════════");
+    fn finalize_sync(&mut self, final_state ChainState) effects(io, panic, write self) Result[()] {
+        println("═══════════════════════════════════════════════════════════")
+        println("💾 SYNC MANAGER: Finalizing sync (atomic commit)")
+        println("═══════════════════════════════════════════════════════════")
 
         // Update chain state
         {
-            let mut state_guard = self.chain.state.write();
-            *state_guard = final_state;
+            mut state_guard = self.chain.state.write()
+            *state_guard = final_state
         }
 
-          // Persist state ke LMDB
-        let state_snapshot = self.chain.state.read().clone();
-        self.chain.db.persist_state(&state_snapshot)?;
+        // Persist state ke LMDB
+        state_snapshot = self.chain.state.read().clone()
+        self.chain.db.persist_state(&state_snapshot)?
 
         // Update tip
         if let Some((target_height, target_hash)) = &self.target_tip {
-            self.chain.db.set_tip(*target_height, target_hash)?;
+            self.chain.db.set_tip(*target_height, target_hash)?
         }
 
         // Transition to Synced
-        self.status = SyncStatus::Synced;
+        self.status = SyncStatus::Synced
 
         // Cleanup
-        self.header_syncer = None;
-        self.block_syncer = None;
-        self.replay_engine = None;
+        self.header_syncer = None
+        self.block_syncer = None
+        self.replay_engine = None
 
-        println!("═══════════════════════════════════════════════════════════");
-        println!("✅ SYNC MANAGER: Sync complete!");
-        println!("═══════════════════════════════════════════════════════════");
+        println("═══════════════════════════════════════════════════════════")
+        println("✅ SYNC MANAGER: Sync complete!")
+        println("═══════════════════════════════════════════════════════════")
 
         Ok(())
     }
 
     /// Get current sync status.
-    pub fn get_status(&self) -> SyncStatus {
+    pub fn get_status(&self) SyncStatus {
         self.status.clone()
     }
 
     /// Get sync progress.
     ///
     /// Returns (current_height, target_height)
-    pub fn get_progress(&self) -> (u64, u64) {
+    pub fn get_progress(&self) (u64, u64) {
         match &self.status {
-            SyncStatus::Idle => (0, 0),
-            SyncStatus::SyncingHeaders { current_height, target_height, .. } => {
+            SyncStatus::Idle {
+                (0, 0)
+            }
+            SyncStatus::SyncingHeaders { current_height, target_height, .. } {
                 (*current_height, *target_height)
             }
-            SyncStatus::SyncingBlocks { current_height, target_height, .. } => {
+            SyncStatus::SyncingBlocks { current_height, target_height, .. } {
                 (*current_height, *target_height)
             }
-            SyncStatus::SyncingState { checkpoint_height } => {
+            SyncStatus::SyncingState { checkpoint_height } {
                 if let Some(ref engine) = self.replay_engine {
                     engine.get_progress()
                 } else {
                     (*checkpoint_height, self.target_tip.as_ref().map(|(h, _)| *h).unwrap_or(0))
                 }
             }
-            SyncStatus::Synced => {
-                let target = self.target_tip.as_ref().map(|(h, _)| *h).unwrap_or(0);
+            SyncStatus::Synced {
+                target = self.target_tip.as_ref().map(|(h, _)| *h).unwrap_or(0)
                 (target, target)
             }
         }
     }
 
     /// Cancel ongoing sync dan reset ke Idle.
-    pub fn cancel_sync(&mut self) {
-        println!("⚠️  SYNC MANAGER: Sync cancelled");
+    pub fn cancel_sync(&mut self) effects(io, write self) {
+        println("⚠️  SYNC MANAGER: Sync cancelled")
 
         // Reset all syncers
-        self.header_syncer = None;
-        self.block_syncer = None;
-        self.replay_engine = None;
-        self.target_tip = None;
+        self.header_syncer = None
+        self.block_syncer = None
+        self.replay_engine = None
+        self.target_tip = None
 
         // Transition to Idle
-        self.status = SyncStatus::Idle;
+        self.status = SyncStatus::Idle
     }
 
     /// Check apakah sync sudah selesai.
-    pub fn is_synced(&self) -> bool {
-        matches!(self.status, SyncStatus::Synced)
+    pub fn is_synced(&self) bool {
+        match self.status {
+            SyncStatus::Synced { true }
+            _ { false }
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1426,18 +1414,18 @@ impl SyncManager {
     /// Process header response dari peer.
     ///
     /// Dipanggil oleh P2P layer setelah menerima SyncResponse::Headers.
-    pub fn process_header_response(&mut self, headers: Vec<BlockHeader>) -> Result<()> {
+    pub fn process_header_response(&mut self, headers Vec[BlockHeader]) effects(io, panic, write self) Result[()] {
         if let Some(ref mut syncer) = self.header_syncer {
-            syncer.process_headers(headers, &self.chain.db)?;
+            syncer.process_headers(headers, &self.chain.db)?
 
             // Update status progress
-            let (current, target) = syncer.get_progress();
+            (current, target) = syncer.get_progress()
             if let SyncStatus::SyncingHeaders { start_height, target_height: _, current_height: _ } = &self.status {
                 self.status = SyncStatus::SyncingHeaders {
-                    start_height: *start_height,
-                    target_height: target,
-                    current_height: current,
-                };
+                    start_height = *start_height
+                    target_height = target
+                    current_height = current
+                }
             }
         }
         Ok(())
@@ -1446,27 +1434,27 @@ impl SyncManager {
     /// Process block response dari peer.
     ///
     /// Dipanggil oleh P2P layer setelah menerima SyncResponse::Blocks.
-    pub fn process_block_response(&mut self, blocks: Vec<Block>) -> Result<()> {
+    pub fn process_block_response(&mut self, blocks Vec[Block]) effects(io, panic, write self) Result[()] {
         if let Some(ref mut syncer) = self.block_syncer {
             for block in blocks {
-                let height = block.header.height;
+                height = block.header.height
                 
                 // Get expected header dari DB
                 if let Some(expected_header) = self.chain.db.get_header(height)? {
                     if let Err(e) = syncer.process_block(block, &expected_header) {
-                        println!("   ⚠️  Block {} processing error: {}", height, e);
+                        println("   ⚠️  Block {} processing error: {}", height, e)
                     }
                 }
             }
 
             // Update status progress
-            let fetched = syncer.fetched_count() as u64;
+            fetched = syncer.fetched_count() as u64
             if let SyncStatus::SyncingBlocks { start_height, target_height, current_height: _ } = &self.status {
                 self.status = SyncStatus::SyncingBlocks {
-                    start_height: *start_height,
-                    target_height: *target_height,
-                    current_height: *start_height + fetched,
-                };
+                    start_height = *start_height
+                    target_height = *target_height
+                    current_height = *start_height + fetched
+                }
             }
         }
         Ok(())
@@ -1475,16 +1463,16 @@ impl SyncManager {
     /// Trigger replay execution.
     ///
     /// Dipanggil setelah semua blocks tersedia.
-    pub fn execute_replay(&mut self) -> Result<()> {
+    pub fn execute_replay(&mut self) effects(io, panic, write self) Result[()] {
         if let Some(ref mut engine) = self.replay_engine {
-            engine.replay_from_genesis()?;
+            engine.replay_from_genesis()?
         }
         Ok(())
     }
 
     /// Set Celestia syncer untuk control-plane updates.
-    pub fn set_celestia_syncer(&mut self, syncer: crate::celestia::ControlPlaneSyncer) {
-        self.celestia_syncer = Some(syncer);
+    pub fn set_celestia_syncer(&mut self, syncer crate::celestia::ControlPlaneSyncer) effects(write self, alloc) {
+        self.celestia_syncer = Some(Arc::new(Mutex::new(syncer)))
     }
 }
 
@@ -1493,106 +1481,108 @@ impl SyncManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::*
 
     #[test]
     fn test_sync_config_default() {
-        let config = SyncConfig::default();
+        config = SyncConfig::default()
         
-        assert_eq!(config.max_headers_per_request, 500);
-        assert_eq!(config.max_blocks_per_request, 100);
-        assert_eq!(config.sync_timeout_ms, 30000);
-        assert_eq!(config.batch_size, 50);
+        assert_eq(config.max_headers_per_request, 500)
+        assert_eq(config.max_blocks_per_request, 100)
+        assert_eq(config.sync_timeout_ms, 30000)
+        assert_eq(config.batch_size, 50)
     }
 
     #[test]
     fn test_sync_status_variants() {
-        let idle = SyncStatus::Idle;
-        let synced = SyncStatus::Synced;
+        idle = SyncStatus::Idle
+        synced = SyncStatus::Synced
         
-        assert_ne!(idle, synced);
+        assert_ne(idle, synced)
         
-        let syncing = SyncStatus::SyncingHeaders {
-            start_height: 0,
-            target_height: 100,
-            current_height: 50,
-        };
+        syncing = SyncStatus::SyncingHeaders {
+            start_height = 0
+            target_height = 100
+            current_height = 50
+        }
         
-        assert_ne!(syncing, idle);
+        assert_ne(syncing, idle)
     }
 
     #[test]
-    fn test_sync_request_serialization() {
-        let req = SyncRequest::GetHeaders {
-            start_height: 100,
-            count: 50,
-        };
+    fn test_sync_request_serialization() effects(panic) {
+        req = SyncRequest::GetHeaders {
+            start_height = 100
+            count = 50
+        }
         
-        let json = serde_json::to_string(&req).unwrap();
-        let restored: SyncRequest = serde_json::from_str(&json).unwrap();
+        json = serde_json::to_string(&req).unwrap()
+        restored SyncRequest = serde_json::from_str(&json).unwrap()
         
-        assert_eq!(req, restored);
+        assert_eq(req, restored)
     }
 
     #[test]
-    fn test_sync_config_serialization() {
-        let config = SyncConfig::default();
-        let json = serde_json::to_string(&config).unwrap();
-        let restored: SyncConfig = serde_json::from_str(&json).unwrap();
+    fn test_sync_config_serialization() effects(panic) {
+        config = SyncConfig::default()
+        json = serde_json::to_string(&config).unwrap()
+        restored SyncConfig = serde_json::from_str(&json).unwrap()
         
-        assert_eq!(config, restored);
+        assert_eq(config, restored)
     }
 
     #[test]
     fn test_header_syncer_new() {
-        let local_tip = (100, Hash::from_bytes([0x11u8; 64]));
-        let target_tip = (200, Hash::from_bytes([0x22u8; 64]));
+        local_tip = (100, Hash::from_bytes([0x11u8; 64]))
+        target_tip = (200, Hash::from_bytes([0x22u8; 64]))
         
-        let syncer = HeaderSyncer::new(local_tip.clone(), target_tip.clone());
+        syncer = HeaderSyncer::new(local_tip.clone(), target_tip.clone())
         
-        assert_eq!(syncer.local_tip, local_tip);
-        assert_eq!(syncer.target_tip, target_tip);
-        assert!(syncer.pending_headers.is_empty());
-        assert!(syncer.verified_heights.is_empty());
+        assert_eq(syncer.local_tip, local_tip)
+        assert_eq(syncer.target_tip, target_tip)
+        assert(syncer.pending_headers.is_empty())
+        assert(syncer.verified_heights.is_empty())
     }
 
     #[test]
-    fn test_header_syncer_request_next() {
-        let local_tip = (100, Hash::from_bytes([0x11u8; 64]));
-        let target_tip = (200, Hash::from_bytes([0x22u8; 64]));
+    fn test_header_syncer_request_next() effects(panic) {
+        local_tip = (100, Hash::from_bytes([0x11u8; 64]))
+        target_tip = (200, Hash::from_bytes([0x22u8; 64]))
         
-        let syncer = HeaderSyncer::new(local_tip.clone(), target_tip.clone());
+        syncer = HeaderSyncer::new(local_tip.clone(), target_tip.clone())
         
-        let req = syncer.request_next_headers();
+        req = syncer.request_next_headers()
         match req {
-            SyncRequest::GetHeaders { start_height, count } => {
-                assert_eq!(start_height, 101);
-                assert_eq!(count, 100); // 200 - 101 + 1 = 100
+            SyncRequest::GetHeaders { start_height, count } {
+                assert_eq(start_height, 101)
+                assert_eq(count, 100) // 200 - 101 + 1 = 100
             }
-            _ => panic!("expected GetHeaders"),
+            _ {
+                panic("expected GetHeaders")
+            }
         }
     }
 
     #[test]
     fn test_header_syncer_progress() {
-        let local_tip = (100, Hash::from_bytes([0x11u8; 64]));
-        let target_tip = (200, Hash::from_bytes([0x22u8; 64]));
+        local_tip = (100, Hash::from_bytes([0x11u8; 64]))
+        target_tip = (200, Hash::from_bytes([0x22u8; 64]))
         
-        let mut syncer = HeaderSyncer::new(local_tip, target_tip);
+        mut syncer = HeaderSyncer::new(local_tip, target_tip)
         
-        let (current, target) = syncer.get_progress();
-        assert_eq!(current, 100);
-        assert_eq!(target, 200);
-        assert!(!syncer.is_complete());
+        (current, target) = syncer.get_progress()
+        assert_eq(current, 100)
+        assert_eq(target, 200)
+        assert(!syncer.is_complete())
         
         // Simulate verified heights
         for h in 101..=200 {
-            syncer.verified_heights.insert(h);
+            syncer.verified_heights.insert(h)
         }
         
-        let (current2, _) = syncer.get_progress();
-        assert_eq!(current2, 200);
-        assert!(syncer.is_complete());
+        (current2, _) = syncer.get_progress()
+        assert_eq(current2, 200)
+        assert(syncer.is_complete())
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1600,75 +1590,79 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_block_syncer_new() {
-        let headers = vec![
+    fn test_block_syncer_new() effects(alloc) {
+        headers = vec![
             (101, Hash::from_bytes([0x11u8; 64])),
             (102, Hash::from_bytes([0x22u8; 64])),
-            (103, Hash::from_bytes([0x33u8; 64])),
-        ];
+            (103, Hash::from_bytes([0x33u8; 64]))
+        ]
         
-        let syncer = BlockSyncer::new(headers.clone());
+        syncer = BlockSyncer::new(headers.clone())
         
-        assert_eq!(syncer.headers_to_fetch.len(), 3);
-        assert!(syncer.fetched_blocks.is_empty());
-        assert!(syncer.failed_heights.is_empty());
-        assert!(syncer.retry_count.is_empty());
-        assert!(!syncer.is_complete());
+        assert_eq(syncer.headers_to_fetch.len(), 3)
+        assert(syncer.fetched_blocks.is_empty())
+        assert(syncer.failed_heights.is_empty())
+        assert(syncer.retry_count.is_empty())
+        assert(!syncer.is_complete())
     }
 
     #[test]
-    fn test_block_syncer_request_next() {
-        let headers = vec![
+    fn test_block_syncer_request_next() effects(alloc, panic) {
+        headers = vec![
             (101, Hash::from_bytes([0x11u8; 64])),
             (102, Hash::from_bytes([0x22u8; 64])),
             (103, Hash::from_bytes([0x33u8; 64])),
             (104, Hash::from_bytes([0x44u8; 64])),
-            (105, Hash::from_bytes([0x55u8; 64])),
-        ];
+            (105, Hash::from_bytes([0x55u8; 64]))
+        ]
         
-        let syncer = BlockSyncer::new(headers);
+        syncer = BlockSyncer::new(headers)
         
         // Request batch of 3
-        let req = syncer.request_next_blocks(3);
+        req = syncer.request_next_blocks(3)
         match req {
-            SyncRequest::GetBlocks { heights } => {
-                assert_eq!(heights.len(), 3);
-                assert_eq!(heights, vec![101, 102, 103]);
+            SyncRequest::GetBlocks { heights } {
+                assert_eq(heights.len(), 3)
+                assert_eq(heights, vec![101, 102, 103])
             }
-            _ => panic!("expected GetBlocks"),
+            _ {
+                panic("expected GetBlocks")
+            }
         }
         
         // Request batch larger than remaining
-        let req2 = syncer.request_next_blocks(100);
+        req2 = syncer.request_next_blocks(100)
         match req2 {
-            SyncRequest::GetBlocks { heights } => {
-                assert_eq!(heights.len(), 5);
+            SyncRequest::GetBlocks { heights } {
+                assert_eq(heights.len(), 5)
             }
-            _ => panic!("expected GetBlocks"),
+            _ {
+                panic("expected GetBlocks")
+            }
         }
     }
 
     #[test]
-    fn test_block_syncer_pending_heights() {
-        let headers = vec![
+    fn test_block_syncer_pending_heights() effects(alloc) {
+        headers = vec![
             (101, Hash::from_bytes([0x11u8; 64])),
             (102, Hash::from_bytes([0x22u8; 64])),
-            (103, Hash::from_bytes([0x33u8; 64])),
-        ];
+            (103, Hash::from_bytes([0x33u8; 64]))
+        ]
         
-        let syncer = BlockSyncer::new(headers);
+        syncer = BlockSyncer::new(headers)
         
-        let pending = syncer.get_pending_heights();
-        assert_eq!(pending, vec![101, 102, 103]);
+        pending = syncer.get_pending_heights()
+        assert_eq(pending, vec![101, 102, 103])
     }
 
     #[test]
-    fn test_block_syncer_complete_when_empty() {
-        let syncer = BlockSyncer::new(vec![]);
+    fn test_block_syncer_complete_when_empty() effects(alloc) {
+        syncer = BlockSyncer::new(vec![])
         
-        assert!(syncer.is_complete());
-        assert_eq!(syncer.fetched_count(), 0);
-        assert_eq!(syncer.failed_count(), 0);
+        assert(syncer.is_complete())
+        assert_eq(syncer.fetched_count(), 0)
+        assert_eq(syncer.failed_count(), 0)
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1681,33 +1675,33 @@ mod tests {
         // (karena Chain membutuhkan DB path)
         
         // Verifikasi bahwa progress tracking berfungsi
-        let _start = 0u64;
-        let end = 100u64;
+        _start = 0u64
+        end = 100u64
         
         // Simulasi progress
-        let current = 50u64;
-        let is_done = current > end;
+        current = 50u64
+        is_done = current > end
         
-        assert_eq!((current, end), (50, 100));
-        assert!(!is_done);
+        assert_eq((current, end), (50, 100))
+        assert(!is_done)
         
-        let current2 = 101u64;
-        let is_done2 = current2 > end;
-        assert!(is_done2);
+        current2 = 101u64
+        is_done2 = current2 > end
+        assert(is_done2)
     }
 
     #[test]
-    fn test_state_replay_engine_checkpoint_state() {
+    fn test_state_replay_engine_checkpoint_state() effects(panic) {
         // Test ChainState checkpoint serialization
-        let state = crate::state::ChainState::new();
+        state = crate::state::ChainState::new()
         
         // Create checkpoint
-        let checkpoint = crate::state::create_checkpoint(&state);
-        assert!(checkpoint.is_ok());
+        checkpoint = crate::state::create_checkpoint(&state)
+        assert(checkpoint.is_ok())
         
         // Restore from checkpoint
-        let restored = crate::state::restore_from_checkpoint(&checkpoint.unwrap());
-        assert!(restored.is_ok());
+        restored = crate::state::restore_from_checkpoint(&checkpoint.unwrap())
+        assert(restored.is_ok())
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1719,84 +1713,84 @@ mod tests {
         // Test all valid state transitions
         
         // Idle → SyncingHeaders
-        let idle = SyncStatus::Idle;
-        let syncing_headers = SyncStatus::SyncingHeaders {
-            start_height: 1,
-            target_height: 100,
-            current_height: 1,
-        };
-        assert_ne!(idle, syncing_headers);
+        idle = SyncStatus::Idle
+        syncing_headers = SyncStatus::SyncingHeaders {
+            start_height = 1
+            target_height = 100
+            current_height = 1
+        }
+        assert_ne(idle, syncing_headers)
         
         // SyncingHeaders → SyncingBlocks
-        let syncing_blocks = SyncStatus::SyncingBlocks {
-            start_height: 1,
-            target_height: 100,
-            current_height: 1,
-        };
-        assert_ne!(syncing_headers, syncing_blocks);
+        syncing_blocks = SyncStatus::SyncingBlocks {
+            start_height = 1
+            target_height = 100
+            current_height = 1
+        }
+        assert_ne(syncing_headers, syncing_blocks)
         
         // SyncingBlocks → SyncingState
-        let syncing_state = SyncStatus::SyncingState {
-            checkpoint_height: 1,
-        };
-        assert_ne!(syncing_blocks, syncing_state);
+        syncing_state = SyncStatus::SyncingState {
+            checkpoint_height = 1
+        }
+        assert_ne(syncing_blocks, syncing_state)
         
         // SyncingState → Synced
-        let synced = SyncStatus::Synced;
-        assert_ne!(syncing_state, synced);
+        synced = SyncStatus::Synced
+        assert_ne(syncing_state, synced)
         
         // Synced → Idle (reset)
-        assert_ne!(synced, idle);
+        assert_ne(synced, idle)
         
         // All states are distinct
-        let all_states = vec![
+        all_states = vec![
             SyncStatus::Idle,
-            SyncStatus::SyncingHeaders { start_height: 0, target_height: 0, current_height: 0 },
-            SyncStatus::SyncingBlocks { start_height: 0, target_height: 0, current_height: 0 },
-            SyncStatus::SyncingState { checkpoint_height: 0 },
-            SyncStatus::Synced,
-        ];
+            SyncStatus::SyncingHeaders { start_height = 0, target_height = 0, current_height = 0 },
+            SyncStatus::SyncingBlocks { start_height = 0, target_height = 0, current_height = 0 },
+            SyncStatus::SyncingState { checkpoint_height = 0 },
+            SyncStatus::Synced
+        ]
         for i in 0..all_states.len() {
             for j in 0..all_states.len() {
                 if i != j {
-                    assert_ne!(
+                    assert_ne(
                         std::mem::discriminant(&all_states[i]),
                         std::mem::discriminant(&all_states[j])
-                    );
+                    )
                 }
             }
         }
     }
 
     #[test]
-    fn test_sync_status_serialization_roundtrip() {
+    fn test_sync_status_serialization_roundtrip() effects(panic, alloc) {
         // Test all SyncStatus variants serialize/deserialize correctly
-        let statuses = vec![
+        statuses = vec![
             SyncStatus::Idle,
-            SyncStatus::SyncingHeaders { start_height: 10, target_height: 100, current_height: 50 },
-            SyncStatus::SyncingBlocks { start_height: 10, target_height: 100, current_height: 75 },
-            SyncStatus::SyncingState { checkpoint_height: 100 },
-            SyncStatus::Synced,
-        ];
+            SyncStatus::SyncingHeaders { start_height = 10, target_height = 100, current_height = 50 },
+            SyncStatus::SyncingBlocks { start_height = 10, target_height = 100, current_height = 75 },
+            SyncStatus::SyncingState { checkpoint_height = 100 },
+            SyncStatus::Synced
+        ]
         
         for status in statuses {
-            let json = serde_json::to_string(&status).unwrap();
-            let restored: SyncStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(status, restored);
+            json = serde_json::to_string(&status).unwrap()
+            restored SyncStatus = serde_json::from_str(&json).unwrap()
+            assert_eq(status, restored)
         }
     }
 
     #[test]
-    fn test_header_chain_validation_rules() {
+    fn test_header_chain_validation_rules() effects(panic) {
         // Test CONSENSUS-CRITICAL header validation rules
-        let local_tip = (100, Hash::from_bytes([0x11u8; 64]));
-        let target_tip = (200, Hash::from_bytes([0x22u8; 64]));
+        local_tip = (100, Hash::from_bytes([0x11u8; 64]))
+        target_tip = (200, Hash::from_bytes([0x22u8; 64]))
         
-        let syncer = HeaderSyncer::new(local_tip, target_tip);
+        syncer = HeaderSyncer::new(local_tip, target_tip)
         
         // Rule: Empty headers should pass
-        let result = syncer.verify_header_chain(&[]);
-        assert!(result.is_ok());
+        result = syncer.verify_header_chain(&[])
+        assert(result.is_ok())
         
         // Create mock header with correct height
         // Note: Full header validation requires actual BlockHeader construction
@@ -1805,135 +1799,139 @@ mod tests {
 
     #[test]
     fn test_header_sync_complete_detection() {
-        let local_tip = (100, Hash::from_bytes([0x11u8; 64]));
-        let target_tip = (110, Hash::from_bytes([0x22u8; 64]));
+        local_tip = (100, Hash::from_bytes([0x11u8; 64]))
+        target_tip = (110, Hash::from_bytes([0x22u8; 64]))
         
-        let mut syncer = HeaderSyncer::new(local_tip, target_tip);
+        mut syncer = HeaderSyncer::new(local_tip, target_tip)
         
         // Initially not complete
-        assert!(!syncer.is_complete());
-        assert_eq!(syncer.verified_heights.len(), 0);
+        assert(!syncer.is_complete())
+        assert_eq(syncer.verified_heights.len(), 0)
         
         // Add verified heights one by one
         for h in 101..=110 {
-            syncer.verified_heights.insert(h);
+            syncer.verified_heights.insert(h)
         }
         
         // Now complete
-        assert!(syncer.is_complete());
+        assert(syncer.is_complete())
         
         // Progress should reflect completion
-        let (current, target) = syncer.get_progress();
-        assert_eq!(current, 110);
-        assert_eq!(target, 110);
+        (current, target) = syncer.get_progress()
+        assert_eq(current, 110)
+        assert_eq(target, 110)
     }
 
     #[test]
-    fn test_block_sync_retry_tracking() {
-        let headers = vec![
+    fn test_block_sync_retry_tracking() effects(alloc, panic) {
+        headers = vec![
             (101, Hash::from_bytes([0x11u8; 64])),
-            (102, Hash::from_bytes([0x22u8; 64])),
-        ];
+            (102, Hash::from_bytes([0x22u8; 64]))
+        ]
         
-        let mut syncer = BlockSyncer::new(headers);
+        mut syncer = BlockSyncer::new(headers)
         
         // Initially no retries
-        assert!(syncer.retry_count.is_empty());
-        assert!(syncer.failed_heights.is_empty());
+        assert(syncer.retry_count.is_empty())
+        assert(syncer.failed_heights.is_empty())
         
         // Simulate retry tracking
-        syncer.retry_count.insert(101, 1);
-        assert_eq!(*syncer.retry_count.get(&101).unwrap(), 1);
+        syncer.retry_count.insert(101, 1)
+        assert_eq(*syncer.retry_count.get(&101).unwrap(), 1)
         
-        syncer.retry_count.insert(101, 2);
-        assert_eq!(*syncer.retry_count.get(&101).unwrap(), 2);
+        syncer.retry_count.insert(101, 2)
+        assert_eq(*syncer.retry_count.get(&101).unwrap(), 2)
         
         // Simulate failure after max retries
-        syncer.retry_count.insert(101, 3);
-        syncer.failed_heights.insert(101);
+        syncer.retry_count.insert(101, 3)
+        syncer.failed_heights.insert(101)
         
-        assert!(syncer.failed_heights.contains(&101));
-        assert_eq!(syncer.failed_count(), 1);
+        assert(syncer.failed_heights.contains(&101))
+        assert_eq(syncer.failed_count(), 1)
     }
 
     #[test]
-    fn test_block_sync_batch_generation() {
-        let headers: Vec<(u64, Hash)> = (101..=120)
+    fn test_block_sync_batch_generation() effects(alloc, panic) {
+        headers Vec[(u64, Hash)] = (101..=120)
             .map(|h| (h, Hash::from_bytes([h as u8; 64])))
-            .collect();
+            .collect()
         
-        let syncer = BlockSyncer::new(headers);
+        syncer = BlockSyncer::new(headers)
         
         // Request batch of 5
-        let req = syncer.request_next_blocks(5);
+        req = syncer.request_next_blocks(5)
         match req {
-            SyncRequest::GetBlocks { heights } => {
-                assert_eq!(heights.len(), 5);
-                assert_eq!(heights, vec![101, 102, 103, 104, 105]);
+            SyncRequest::GetBlocks { heights } {
+                assert_eq(heights.len(), 5)
+                assert_eq(heights, vec![101, 102, 103, 104, 105])
             }
-            _ => panic!("expected GetBlocks"),
+            _ {
+                panic("expected GetBlocks")
+            }
         }
         
         // Request batch of 10
-        let req2 = syncer.request_next_blocks(10);
+        req2 = syncer.request_next_blocks(10)
         match req2 {
-            SyncRequest::GetBlocks { heights } => {
-                assert_eq!(heights.len(), 10);
+            SyncRequest::GetBlocks { heights } {
+                assert_eq(heights.len(), 10)
             }
-            _ => panic!("expected GetBlocks"),
+            _ {
+                panic("expected GetBlocks")
+            }
         }
     }
 
     #[test]
-    fn test_sync_config_defaults_values() {
-        let config = SyncConfig::default();
+    fn test_sync_config_defaults_values() effects(panic) {
+        config = SyncConfig::default()
         
         // Verify exact default values
-        assert_eq!(config.max_headers_per_request, 500);
-        assert_eq!(config.max_blocks_per_request, 100);
-        assert_eq!(config.sync_timeout_ms, 30000);
-        assert_eq!(config.batch_size, 50);
+        assert_eq(config.max_headers_per_request, 500)
+        assert_eq(config.max_blocks_per_request, 100)
+        assert_eq(config.sync_timeout_ms, 30000)
+        assert_eq(config.batch_size, 50)
         
         // Verify serialization preserves defaults
-        let json = serde_json::to_string(&config).unwrap();
-        let restored: SyncConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config, restored);
+        json = serde_json::to_string(&config).unwrap()
+        restored SyncConfig = serde_json::from_str(&json).unwrap()
+        assert_eq(config, restored)
     }
 
     #[test]
-    fn test_sync_request_variants() {
+    fn test_sync_request_variants() effects(panic, alloc) {
         // Test all SyncRequest variants
-        let requests = vec![
-            SyncRequest::GetHeaders { start_height: 100, count: 50 },
-            SyncRequest::GetBlock { height: 150 },
-            SyncRequest::GetBlocks { heights: vec![100, 101, 102] },
-            SyncRequest::GetChainTip,
-        ];
+        requests = vec![
+            SyncRequest::GetHeaders { start_height = 100, count = 50 },
+            SyncRequest::GetBlock { height = 150 },
+            SyncRequest::GetBlocks { heights = vec![100, 101, 102] },
+            SyncRequest::GetChainTip
+        ]
         
         for req in requests {
-            let json = serde_json::to_string(&req).unwrap();
-            let restored: SyncRequest = serde_json::from_str(&json).unwrap();
-            assert_eq!(req, restored);
+            json = serde_json::to_string(&req).unwrap()
+            restored SyncRequest = serde_json::from_str(&json).unwrap()
+            assert_eq(req, restored)
         }
     }
 
     #[test]
-    fn test_peer_sync_state_tracking() {
-        let state = PeerSyncState {
-            peer_id: "peer_001".to_string(),
-            tip_height: 12345,
-            tip_hash: Hash::from_bytes([0x42u8; 64]),
-            last_seen: 1700000000,
-            is_syncing: true,
-        };
+    fn test_peer_sync_state_tracking() effects(panic) {
+        state = PeerSyncState {
+            peer_id = "peer_001".to_string()
+            tip_height = 12345
+            tip_hash = Hash::from_bytes([0x42u8; 64])
+            last_seen = 1700000000
+            is_syncing = true
+        }
         
-        assert_eq!(state.peer_id, "peer_001");
-        assert_eq!(state.tip_height, 12345);
-        assert!(state.is_syncing);
+        assert_eq(state.peer_id, "peer_001")
+        assert_eq(state.tip_height, 12345)
+        assert(state.is_syncing)
         
         // Serialization roundtrip
-        let json = serde_json::to_string(&state).unwrap();
-        let restored: PeerSyncState = serde_json::from_str(&json).unwrap();
-        assert_eq!(state, restored);
+        json = serde_json::to_string(&state).unwrap()
+        restored PeerSyncState = serde_json::from_str(&json).unwrap()
+        assert_eq(state, restored)
     }
 }
