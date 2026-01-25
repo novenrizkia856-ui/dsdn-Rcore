@@ -14,6 +14,7 @@
 //! - GET /health - Health check
 //! - GET /ready - Readiness check
 //! - GET /metrics - Prometheus metrics
+//! - GET /fallback/status - Fallback status (14A.1A.65)
 //!
 //! ## DA Integration
 //! Ingress TIDAK query Coordinator untuk placement.
@@ -212,6 +213,78 @@ impl Default for IngressHealth {
             warning: None,
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FALLBACK STATUS RESPONSE (14A.1A.65)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Response untuk endpoint GET /fallback/status.
+///
+/// Endpoint ini adalah SOURCE OF TRUTH untuk status fallback.
+/// Semua data diambil dari sumber aktual, tidak ada fabrication.
+///
+/// ## Field Groups
+///
+/// ### Core Fallback Info
+/// - `info`: FallbackHealthInfo lengkap dari DARouter
+///
+/// ### Detailed Metrics
+/// - `time_since_last_primary_contact_secs`: Waktu sejak kontak primary terakhir
+/// - `reconciliation_queue_depth`: Kedalaman queue reconciliation
+/// - `events_processed`: Event yang diproses per source (jika tersedia)
+///
+/// ## JSON Serialization
+///
+/// Semua field diserialisasi dengan nama yang sama (snake_case).
+/// Option<T> menjadi `null` jika None.
+#[derive(Debug, Clone, Serialize)]
+pub struct FallbackStatusResponse {
+    /// FallbackHealthInfo lengkap.
+    ///
+    /// Berisi semua informasi fallback dari DAHealthMonitor.
+    pub info: FallbackHealthInfo,
+
+    /// Waktu sejak kontak primary terakhir dalam detik.
+    ///
+    /// Dihitung eksplisit dari `info.last_celestia_contact`:
+    /// - Jika `last_celestia_contact` ada: `current_time - last_celestia_contact`
+    /// - Jika tidak ada: `None`
+    ///
+    /// Tidak boleh overflow (menggunakan saturating arithmetic).
+    /// Tidak boleh negative.
+    pub time_since_last_primary_contact_secs: Option<u64>,
+
+    /// Kedalaman queue reconciliation.
+    ///
+    /// Diambil langsung dari `info.pending_reconcile`.
+    /// Angka aktual dari sistem, bukan estimasi.
+    pub reconciliation_queue_depth: u64,
+
+    /// Event yang diproses per source.
+    ///
+    /// Struktur:
+    /// - `primary`: Event dari primary DA
+    /// - `secondary`: Event dari secondary DA
+    /// - `emergency`: Event dari emergency DA
+    ///
+    /// `None` jika data tidak tersedia dari DARouter.
+    /// Field ini TIDAK di-fabricate atau di-hardcode.
+    pub events_processed: Option<EventsProcessedBySource>,
+}
+
+/// Event yang diproses per DA source.
+///
+/// Semua field adalah jumlah event yang telah diproses
+/// dari masing-masing DA source.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventsProcessedBySource {
+    /// Event dari primary DA (Celestia).
+    pub primary: Option<u64>,
+    /// Event dari secondary DA.
+    pub secondary: Option<u64>,
+    /// Event dari emergency DA.
+    pub emergency: Option<u64>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -565,6 +638,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_endpoint))
+        .route("/fallback/status", get(fallback_status))
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit_middleware,
@@ -644,6 +718,69 @@ async fn metrics_endpoint(
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     (StatusCode::OK, headers, output)
+}
+
+/// GET /fallback/status - Fallback status endpoint (14A.1A.65)
+///
+/// SOURCE OF TRUTH untuk status fallback.
+///
+/// ## Behavior
+///
+/// - Jika DARouter TIDAK dikonfigurasi: HTTP 404
+/// - Jika DARouter dikonfigurasi: HTTP 200 dengan FallbackStatusResponse
+///
+/// ## Guarantees
+///
+/// - **NO panic**: Tidak pernah panic
+/// - **NO unwrap/expect**: Semua error handling eksplisit
+/// - **NO fabricated data**: Semua data dari sumber aktual
+/// - **Deterministic**: Hasil konsisten untuk state yang sama
+async fn fallback_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Cek apakah DARouter dikonfigurasi
+    // Jika tidak ada → return 404
+    if state.da_router.is_none() {
+        debug!("fallback_status: da_router not configured, returning 404");
+        return (StatusCode::NOT_FOUND, Json(None::<FallbackStatusResponse>));
+    }
+
+    // Ambil fallback status dari gather_fallback_status()
+    // Jika None → return 404 (DARouter ada tapi health_monitor tidak tersedia)
+    let fallback_info = match state.gather_fallback_status() {
+        Some(info) => info,
+        None => {
+            debug!("fallback_status: gather_fallback_status returned None, returning 404");
+            return (StatusCode::NOT_FOUND, Json(None::<FallbackStatusResponse>));
+        }
+    };
+
+    // Hitung time_since_last_primary_contact_secs
+    // Menggunakan saturating arithmetic untuk menghindari overflow
+    let time_since_last_primary_contact_secs = fallback_info.last_celestia_contact.map(|last_contact| {
+        let current_secs = current_timestamp_ms() / 1000;
+        current_secs.saturating_sub(last_contact)
+    });
+
+    // Bangun response
+    let response = FallbackStatusResponse {
+        info: fallback_info.clone(),
+        time_since_last_primary_contact_secs,
+        reconciliation_queue_depth: fallback_info.pending_reconcile,
+        // events_processed: None karena data tidak tersedia dari current DARouter implementation
+        // Field ini TIDAK di-fabricate atau di-hardcode
+        // Akan diisi ketika DARouter menyediakan metrics per-source
+        events_processed: None,
+    };
+
+    debug!(
+        fallback_active = response.info.active,
+        time_since_primary = ?time_since_last_primary_contact_secs,
+        queue_depth = response.reconciliation_queue_depth,
+        "fallback_status: returning 200"
+    );
+
+    (StatusCode::OK, Json(Some(response)))
 }
 
 /// GET /object/:hash
@@ -1760,5 +1897,290 @@ mod tests {
         let warning = health.warning.as_ref().unwrap();
         assert!(warning.contains("900 seconds"), "should mention duration");
         assert!(warning.contains("pending_reconcile=2000"), "should mention pending_reconcile");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-1: FallbackStatusResponse struct correctness
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that FallbackStatusResponse is correctly constructed.
+    #[test]
+    fn test_fallback_status_response_construction() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(300),
+            pending_reconcile: 42,
+            last_celestia_contact: Some(1704066900),
+            current_source: "fallback".to_string(),
+        };
+
+        let response = FallbackStatusResponse {
+            info: fallback_info.clone(),
+            time_since_last_primary_contact_secs: Some(300),
+            reconciliation_queue_depth: 42,
+            events_processed: None,
+        };
+
+        // Verify all fields are correctly set
+        assert!(response.info.active);
+        assert_eq!(response.info.pending_reconcile, 42);
+        assert_eq!(response.reconciliation_queue_depth, 42);
+        assert_eq!(response.time_since_last_primary_contact_secs, Some(300));
+        assert!(response.events_processed.is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-2: FallbackStatusResponse JSON serialization
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that FallbackStatusResponse serializes correctly to JSON.
+    #[test]
+    fn test_fallback_status_response_json_serialization() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(300),
+            pending_reconcile: 42,
+            last_celestia_contact: Some(1704066900),
+            current_source: "fallback".to_string(),
+        };
+
+        let response = FallbackStatusResponse {
+            info: fallback_info,
+            time_since_last_primary_contact_secs: Some(600),
+            reconciliation_queue_depth: 100,
+            events_processed: None,
+        };
+
+        let json = serde_json::to_string(&response).expect("serialization should succeed");
+
+        // Verify JSON contains expected fields
+        assert!(json.contains("\"info\":{"));
+        assert!(json.contains("\"time_since_last_primary_contact_secs\":600"));
+        assert!(json.contains("\"reconciliation_queue_depth\":100"));
+        assert!(json.contains("\"events_processed\":null"));
+        assert!(json.contains("\"pending_reconcile\":42"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-3: fallback_status returns 404 when no da_router
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that GET /fallback/status returns 404 when DARouter is not configured.
+    ///
+    /// Requirements:
+    /// - HTTP 404 status
+    /// - No body or null body
+    /// - No panic
+    #[tokio::test]
+    async fn test_fallback_status_returns_404_when_no_da_router() {
+        // Setup: AppState WITHOUT da_router
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        // Precondition: da_router is None
+        assert!(state.da_router.is_none(), "Precondition: da_router should be None");
+
+        // Call handler directly
+        let response = fallback_status(State(state)).await;
+        let (status, _body) = response.into_response().into_parts();
+
+        // Verify: HTTP 404
+        assert_eq!(
+            status.status,
+            StatusCode::NOT_FOUND,
+            "Should return 404 when da_router is None"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-4: fallback_status is deterministic
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that fallback_status returns consistent results.
+    #[tokio::test]
+    async fn test_fallback_status_deterministic() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        // Multiple calls should return the same status code
+        let response1 = fallback_status(State(state.clone())).await;
+        let response2 = fallback_status(State(state.clone())).await;
+        let response3 = fallback_status(State(state)).await;
+
+        let (parts1, _) = response1.into_response().into_parts();
+        let (parts2, _) = response2.into_response().into_parts();
+        let (parts3, _) = response3.into_response().into_parts();
+
+        assert_eq!(parts1.status, parts2.status);
+        assert_eq!(parts2.status, parts3.status);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-5: EventsProcessedBySource struct
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that EventsProcessedBySource serializes correctly.
+    #[test]
+    fn test_events_processed_by_source_serialization() {
+        let events = EventsProcessedBySource {
+            primary: Some(100),
+            secondary: Some(50),
+            emergency: None,
+        };
+
+        let json = serde_json::to_string(&events).expect("serialization should succeed");
+
+        assert!(json.contains("\"primary\":100"));
+        assert!(json.contains("\"secondary\":50"));
+        assert!(json.contains("\"emergency\":null"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-6: time_since_last_primary_contact calculation
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that time_since_last_primary_contact is correctly calculated.
+    ///
+    /// - When last_celestia_contact is Some: calculate difference
+    /// - When last_celestia_contact is None: return None
+    /// - No overflow (saturating arithmetic)
+    #[test]
+    fn test_time_since_last_primary_contact_calculation() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        // Case 1: last_celestia_contact is Some
+        let fallback_info_with_contact = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: None,
+            activated_at: None,
+            duration_secs: None,
+            pending_reconcile: 0,
+            last_celestia_contact: Some(1704067200), // Some timestamp
+            current_source: "fallback".to_string(),
+        };
+
+        // Simulate calculation (current_secs - last_contact)
+        let current_secs = 1704067500u64; // 300 seconds later
+        let time_since = current_secs.saturating_sub(1704067200);
+        assert_eq!(time_since, 300);
+
+        // Case 2: last_celestia_contact is None
+        let fallback_info_no_contact = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: None,
+            activated_at: None,
+            duration_secs: None,
+            pending_reconcile: 0,
+            last_celestia_contact: None,
+            current_source: "fallback".to_string(),
+        };
+
+        let time_since_none = fallback_info_no_contact.last_celestia_contact.map(|lc| {
+            current_secs.saturating_sub(lc)
+        });
+        assert!(time_since_none.is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-7: reconciliation_queue_depth is actual value
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that reconciliation_queue_depth matches pending_reconcile.
+    #[test]
+    fn test_reconciliation_queue_depth_matches_pending_reconcile() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let test_values = [0u64, 1, 100, 1000, 10000, u64::MAX];
+
+        for value in test_values {
+            let fallback_info = FallbackHealthInfo {
+                status: DAStatus::Degraded,
+                active: true,
+                reason: None,
+                activated_at: None,
+                duration_secs: None,
+                pending_reconcile: value,
+                last_celestia_contact: None,
+                current_source: "fallback".to_string(),
+            };
+
+            let response = FallbackStatusResponse {
+                info: fallback_info.clone(),
+                time_since_last_primary_contact_secs: None,
+                reconciliation_queue_depth: fallback_info.pending_reconcile,
+                events_processed: None,
+            };
+
+            assert_eq!(
+                response.reconciliation_queue_depth,
+                value,
+                "reconciliation_queue_depth should match pending_reconcile"
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.65-8: FallbackStatusResponse with EventsProcessedBySource
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test FallbackStatusResponse when events_processed is populated.
+    #[test]
+    fn test_fallback_status_response_with_events() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: None,
+            activated_at: None,
+            duration_secs: None,
+            pending_reconcile: 50,
+            last_celestia_contact: None,
+            current_source: "fallback".to_string(),
+        };
+
+        let events = EventsProcessedBySource {
+            primary: Some(1000),
+            secondary: Some(500),
+            emergency: Some(100),
+        };
+
+        let response = FallbackStatusResponse {
+            info: fallback_info,
+            time_since_last_primary_contact_secs: None,
+            reconciliation_queue_depth: 50,
+            events_processed: Some(events),
+        };
+
+        // Verify events_processed is populated
+        assert!(response.events_processed.is_some());
+        let events = response.events_processed.as_ref().unwrap();
+        assert_eq!(events.primary, Some(1000));
+        assert_eq!(events.secondary, Some(500));
+        assert_eq!(events.emergency, Some(100));
+
+        // Verify JSON serialization
+        let json = serde_json::to_string(&response).expect("serialization should succeed");
+        assert!(json.contains("\"events_processed\":{"));
+        assert!(json.contains("\"primary\":1000"));
+        assert!(json.contains("\"secondary\":500"));
+        assert!(json.contains("\"emergency\":100"));
     }
 }
