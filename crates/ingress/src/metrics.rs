@@ -323,6 +323,110 @@ impl std::fmt::Display for TraceId {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FALLBACK METRICS (14A.1A.67)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Metrics khusus untuk fallback status.
+///
+/// Semua metrics thread-safe menggunakan atomic operations.
+/// Nilai di-update dari `FallbackHealthInfo` secara eksplisit.
+///
+/// ## Metrics
+///
+/// - `active`: 1 jika fallback aktif, 0 jika tidak
+/// - `duration_seconds`: Durasi fallback aktif dalam detik
+/// - `pending_reconcile`: Jumlah pending reconciliation
+/// - `da_primary_healthy`: 1 jika primary DA sehat, 0 jika tidak
+/// - `da_secondary_healthy`: 1 jika secondary DA sehat, 0 jika tidak (0 jika tidak dikonfigurasi)
+/// - `events_primary`: Event dari primary DA
+/// - `events_secondary`: Event dari secondary DA
+/// - `events_emergency`: Event dari emergency DA
+#[derive(Debug, Default)]
+pub struct FallbackMetrics {
+    /// Apakah fallback aktif (1 = aktif, 0 = tidak).
+    pub active: Gauge,
+    /// Durasi fallback aktif dalam detik.
+    pub duration_seconds: Gauge,
+    /// Jumlah pending reconciliation.
+    pub pending_reconcile: Gauge,
+    /// Kesehatan primary DA (1 = sehat, 0 = tidak).
+    pub da_primary_healthy: Gauge,
+    /// Kesehatan secondary DA (1 = sehat, 0 = tidak/tidak dikonfigurasi).
+    pub da_secondary_healthy: Gauge,
+    /// Total events dari primary source.
+    pub events_primary: Counter,
+    /// Total events dari secondary source.
+    pub events_secondary: Counter,
+    /// Total events dari emergency source.
+    pub events_emergency: Counter,
+}
+
+impl FallbackMetrics {
+    /// Membuat FallbackMetrics baru dengan nilai default (0).
+    pub fn new() -> Self {
+        Self {
+            active: Gauge::new(),
+            duration_seconds: Gauge::new(),
+            pending_reconcile: Gauge::new(),
+            da_primary_healthy: Gauge::new(),
+            da_secondary_healthy: Gauge::new(),
+            events_primary: Counter::new(),
+            events_secondary: Counter::new(),
+            events_emergency: Counter::new(),
+        }
+    }
+
+    /// Export fallback metrics dalam format Prometheus.
+    ///
+    /// ## Format
+    ///
+    /// Sesuai Prometheus exposition format dengan HELP dan TYPE annotations.
+    /// Urutan output deterministik.
+    pub fn to_prometheus(&self) -> String {
+        let mut output = String::with_capacity(2048);
+
+        // ingress_fallback_active
+        let _ = writeln!(output, "# HELP ingress_fallback_active Whether fallback mode is active (1=active, 0=inactive)");
+        let _ = writeln!(output, "# TYPE ingress_fallback_active gauge");
+        let _ = writeln!(output, "ingress_fallback_active {}", self.active.get());
+        let _ = writeln!(output);
+
+        // ingress_fallback_duration_seconds
+        let _ = writeln!(output, "# HELP ingress_fallback_duration_seconds Duration of fallback mode in seconds");
+        let _ = writeln!(output, "# TYPE ingress_fallback_duration_seconds gauge");
+        let _ = writeln!(output, "ingress_fallback_duration_seconds {}", self.duration_seconds.get());
+        let _ = writeln!(output);
+
+        // ingress_fallback_events_total (with labels)
+        let _ = writeln!(output, "# HELP ingress_fallback_events_total Total events processed per DA source");
+        let _ = writeln!(output, "# TYPE ingress_fallback_events_total counter");
+        let _ = writeln!(output, "ingress_fallback_events_total{{source=\"primary\"}} {}", self.events_primary.get());
+        let _ = writeln!(output, "ingress_fallback_events_total{{source=\"secondary\"}} {}", self.events_secondary.get());
+        let _ = writeln!(output, "ingress_fallback_events_total{{source=\"emergency\"}} {}", self.events_emergency.get());
+        let _ = writeln!(output);
+
+        // ingress_fallback_pending_reconcile
+        let _ = writeln!(output, "# HELP ingress_fallback_pending_reconcile Number of pending reconciliation items");
+        let _ = writeln!(output, "# TYPE ingress_fallback_pending_reconcile gauge");
+        let _ = writeln!(output, "ingress_fallback_pending_reconcile {}", self.pending_reconcile.get());
+        let _ = writeln!(output);
+
+        // ingress_da_primary_healthy
+        let _ = writeln!(output, "# HELP ingress_da_primary_healthy Whether primary DA is healthy (1=healthy, 0=unhealthy)");
+        let _ = writeln!(output, "# TYPE ingress_da_primary_healthy gauge");
+        let _ = writeln!(output, "ingress_da_primary_healthy {}", self.da_primary_healthy.get());
+        let _ = writeln!(output);
+
+        // ingress_da_secondary_healthy
+        let _ = writeln!(output, "# HELP ingress_da_secondary_healthy Whether secondary DA is healthy (1=healthy, 0=unhealthy/not configured)");
+        let _ = writeln!(output, "# TYPE ingress_da_secondary_healthy gauge");
+        let _ = writeln!(output, "ingress_da_secondary_healthy {}", self.da_secondary_healthy.get());
+
+        output
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // INGRESS METRICS
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -344,6 +448,8 @@ pub struct IngressMetrics {
     pub fallback_triggered: Counter,
     /// DA sync latency (last observed, in ms).
     pub da_sync_latency: Gauge,
+    /// Fallback-specific metrics (14A.1A.67).
+    pub fallback_metrics: FallbackMetrics,
 }
 
 impl Default for IngressMetrics {
@@ -363,6 +469,7 @@ impl IngressMetrics {
             cache_misses: Counter::new(),
             fallback_triggered: Counter::new(),
             da_sync_latency: Gauge::new(),
+            fallback_metrics: FallbackMetrics::new(),
         }
     }
 
@@ -401,9 +508,68 @@ impl IngressMetrics {
         self.da_sync_latency.set(latency_ms);
     }
 
+    /// Update fallback metrics dari FallbackHealthInfo (14A.1A.67).
+    ///
+    /// ## Parameters
+    ///
+    /// - `active`: Apakah fallback aktif
+    /// - `duration_secs`: Durasi fallback dalam detik (None jika tidak tersedia)
+    /// - `pending_reconcile`: Jumlah pending reconciliation
+    /// - `da_primary_healthy`: Kesehatan primary DA
+    /// - `da_secondary_healthy`: Kesehatan secondary DA (None jika tidak dikonfigurasi)
+    ///
+    /// ## Thread Safety
+    ///
+    /// Semua operasi menggunakan atomic store dengan SeqCst ordering.
+    pub fn update_fallback_metrics(
+        &self,
+        active: bool,
+        duration_secs: Option<u64>,
+        pending_reconcile: u64,
+        da_primary_healthy: bool,
+        da_secondary_healthy: Option<bool>,
+    ) {
+        // Set active gauge (1 jika aktif, 0 jika tidak)
+        self.fallback_metrics.active.set(if active { 1 } else { 0 });
+
+        // Set duration (0 jika tidak tersedia)
+        self.fallback_metrics.duration_seconds.set(duration_secs.unwrap_or(0));
+
+        // Set pending_reconcile
+        self.fallback_metrics.pending_reconcile.set(pending_reconcile);
+
+        // Set DA health gauges
+        self.fallback_metrics.da_primary_healthy.set(if da_primary_healthy { 1 } else { 0 });
+
+        // Secondary: 0 jika tidak dikonfigurasi atau tidak sehat
+        let secondary_value = da_secondary_healthy.map(|h| if h { 1 } else { 0 }).unwrap_or(0);
+        self.fallback_metrics.da_secondary_healthy.set(secondary_value);
+    }
+
+    /// Record event from specific DA source (14A.1A.67).
+    ///
+    /// ## Parameters
+    ///
+    /// - `source`: "primary", "secondary", atau "emergency"
+    ///
+    /// ## Behavior
+    ///
+    /// Increment counter untuk source yang sesuai.
+    /// Jika source tidak dikenali, tidak ada counter yang diincrement.
+    pub fn record_fallback_event(&self, source: &str) {
+        match source {
+            "primary" => self.fallback_metrics.events_primary.inc(),
+            "secondary" => self.fallback_metrics.events_secondary.inc(),
+            "emergency" => self.fallback_metrics.events_emergency.inc(),
+            _ => {
+                // Unknown source - no action to avoid fabricated data
+            }
+        }
+    }
+
     /// Export metrics in Prometheus exposition format.
     pub fn to_prometheus(&self) -> String {
-        let mut output = String::with_capacity(4096);
+        let mut output = String::with_capacity(8192);
 
         // requests_total
         let _ = writeln!(output, "# HELP ingress_requests_total Total number of requests received");
@@ -458,6 +624,10 @@ impl IngressMetrics {
         let _ = writeln!(output, "# HELP ingress_da_sync_latency_ms DA sync latency in milliseconds");
         let _ = writeln!(output, "# TYPE ingress_da_sync_latency_ms gauge");
         let _ = writeln!(output, "ingress_da_sync_latency_ms {}", self.da_sync_latency.get());
+        let _ = writeln!(output);
+
+        // Append fallback metrics (14A.1A.67)
+        output.push_str(&self.fallback_metrics.to_prometheus());
 
         output
     }
@@ -793,5 +963,252 @@ mod tests {
         assert_eq!(Histogram::find_bucket(1000), 8);
         assert_eq!(Histogram::find_bucket(1001), 9);
         assert_eq!(Histogram::find_bucket(u64::MAX), 9);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-1: FALLBACK METRICS STRUCT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_metrics_new() {
+        let metrics = FallbackMetrics::new();
+
+        // All values should start at 0
+        assert_eq!(metrics.active.get(), 0);
+        assert_eq!(metrics.duration_seconds.get(), 0);
+        assert_eq!(metrics.pending_reconcile.get(), 0);
+        assert_eq!(metrics.da_primary_healthy.get(), 0);
+        assert_eq!(metrics.da_secondary_healthy.get(), 0);
+        assert_eq!(metrics.events_primary.get(), 0);
+        assert_eq!(metrics.events_secondary.get(), 0);
+        assert_eq!(metrics.events_emergency.get(), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-2: FALLBACK METRICS PROMETHEUS OUTPUT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_metrics_prometheus_output() {
+        let metrics = FallbackMetrics::new();
+
+        // Set some values
+        metrics.active.set(1);
+        metrics.duration_seconds.set(300);
+        metrics.pending_reconcile.set(42);
+        metrics.da_primary_healthy.set(0);
+        metrics.da_secondary_healthy.set(1);
+        metrics.events_primary.inc_by(100);
+        metrics.events_secondary.inc_by(50);
+        metrics.events_emergency.inc_by(10);
+
+        let output = metrics.to_prometheus();
+
+        // Check HELP and TYPE annotations
+        assert!(output.contains("# HELP ingress_fallback_active"));
+        assert!(output.contains("# TYPE ingress_fallback_active gauge"));
+        assert!(output.contains("# HELP ingress_fallback_duration_seconds"));
+        assert!(output.contains("# TYPE ingress_fallback_duration_seconds gauge"));
+        assert!(output.contains("# HELP ingress_fallback_events_total"));
+        assert!(output.contains("# TYPE ingress_fallback_events_total counter"));
+        assert!(output.contains("# HELP ingress_fallback_pending_reconcile"));
+        assert!(output.contains("# TYPE ingress_fallback_pending_reconcile gauge"));
+        assert!(output.contains("# HELP ingress_da_primary_healthy"));
+        assert!(output.contains("# TYPE ingress_da_primary_healthy gauge"));
+        assert!(output.contains("# HELP ingress_da_secondary_healthy"));
+        assert!(output.contains("# TYPE ingress_da_secondary_healthy gauge"));
+
+        // Check metric values
+        assert!(output.contains("ingress_fallback_active 1"));
+        assert!(output.contains("ingress_fallback_duration_seconds 300"));
+        assert!(output.contains("ingress_fallback_pending_reconcile 42"));
+        assert!(output.contains("ingress_da_primary_healthy 0"));
+        assert!(output.contains("ingress_da_secondary_healthy 1"));
+
+        // Check labeled metrics
+        assert!(output.contains("ingress_fallback_events_total{source=\"primary\"} 100"));
+        assert!(output.contains("ingress_fallback_events_total{source=\"secondary\"} 50"));
+        assert!(output.contains("ingress_fallback_events_total{source=\"emergency\"} 10"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-3: UPDATE FALLBACK METRICS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_update_fallback_metrics() {
+        let metrics = IngressMetrics::new();
+
+        // Update with fallback active
+        metrics.update_fallback_metrics(
+            true,        // active
+            Some(600),   // duration_secs
+            1500,        // pending_reconcile
+            false,       // da_primary_healthy
+            Some(true),  // da_secondary_healthy
+        );
+
+        assert_eq!(metrics.fallback_metrics.active.get(), 1);
+        assert_eq!(metrics.fallback_metrics.duration_seconds.get(), 600);
+        assert_eq!(metrics.fallback_metrics.pending_reconcile.get(), 1500);
+        assert_eq!(metrics.fallback_metrics.da_primary_healthy.get(), 0);
+        assert_eq!(metrics.fallback_metrics.da_secondary_healthy.get(), 1);
+
+        // Update with fallback inactive
+        metrics.update_fallback_metrics(
+            false,       // active
+            None,        // duration_secs
+            0,           // pending_reconcile
+            true,        // da_primary_healthy
+            None,        // da_secondary_healthy (not configured)
+        );
+
+        assert_eq!(metrics.fallback_metrics.active.get(), 0);
+        assert_eq!(metrics.fallback_metrics.duration_seconds.get(), 0);
+        assert_eq!(metrics.fallback_metrics.pending_reconcile.get(), 0);
+        assert_eq!(metrics.fallback_metrics.da_primary_healthy.get(), 1);
+        assert_eq!(metrics.fallback_metrics.da_secondary_healthy.get(), 0); // 0 when not configured
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-4: RECORD FALLBACK EVENTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_record_fallback_events() {
+        let metrics = IngressMetrics::new();
+
+        // Record events from different sources
+        metrics.record_fallback_event("primary");
+        metrics.record_fallback_event("primary");
+        metrics.record_fallback_event("secondary");
+        metrics.record_fallback_event("emergency");
+        metrics.record_fallback_event("unknown"); // Should be ignored
+
+        assert_eq!(metrics.fallback_metrics.events_primary.get(), 2);
+        assert_eq!(metrics.fallback_metrics.events_secondary.get(), 1);
+        assert_eq!(metrics.fallback_metrics.events_emergency.get(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-5: PROMETHEUS OUTPUT INCLUDES FALLBACK METRICS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_prometheus_output_includes_fallback_metrics() {
+        let metrics = IngressMetrics::new();
+
+        // Set some values
+        metrics.update_fallback_metrics(
+            true,
+            Some(120),
+            100,
+            false,
+            Some(true),
+        );
+        metrics.record_fallback_event("primary");
+
+        let output = metrics.to_prometheus();
+
+        // Should contain both existing metrics and fallback metrics
+        assert!(output.contains("ingress_requests_total"));
+        assert!(output.contains("ingress_fallback_active 1"));
+        assert!(output.contains("ingress_fallback_duration_seconds 120"));
+        assert!(output.contains("ingress_fallback_pending_reconcile 100"));
+        assert!(output.contains("ingress_da_primary_healthy 0"));
+        assert!(output.contains("ingress_da_secondary_healthy 1"));
+        assert!(output.contains("ingress_fallback_events_total{source=\"primary\"} 1"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-6: FALLBACK METRICS DETERMINISTIC OUTPUT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_metrics_deterministic() {
+        let metrics = FallbackMetrics::new();
+        metrics.active.set(1);
+        metrics.duration_seconds.set(500);
+
+        // Multiple calls should produce identical output
+        let output1 = metrics.to_prometheus();
+        let output2 = metrics.to_prometheus();
+        let output3 = metrics.to_prometheus();
+
+        assert_eq!(output1, output2);
+        assert_eq!(output2, output3);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-7: SECONDARY HEALTHY DEFAULTS TO ZERO
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_secondary_healthy_defaults_to_zero() {
+        let metrics = IngressMetrics::new();
+
+        // When secondary is None (not configured), should be 0
+        metrics.update_fallback_metrics(
+            false,
+            None,
+            0,
+            true,
+            None, // Not configured
+        );
+
+        assert_eq!(metrics.fallback_metrics.da_secondary_healthy.get(), 0);
+
+        // When secondary is Some(false), should also be 0
+        metrics.update_fallback_metrics(
+            false,
+            None,
+            0,
+            true,
+            Some(false),
+        );
+
+        assert_eq!(metrics.fallback_metrics.da_secondary_healthy.get(), 0);
+
+        // When secondary is Some(true), should be 1
+        metrics.update_fallback_metrics(
+            false,
+            None,
+            0,
+            true,
+            Some(true),
+        );
+
+        assert_eq!(metrics.fallback_metrics.da_secondary_healthy.get(), 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.67-8: THREAD SAFETY FALLBACK METRICS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_metrics_thread_safety() {
+        use std::sync::Arc;
+
+        let metrics = Arc::new(IngressMetrics::new());
+        let mut handles = vec![];
+
+        // Spawn threads updating fallback metrics
+        for _ in 0..10 {
+            let m = metrics.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    m.record_fallback_event("primary");
+                    m.record_fallback_event("secondary");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Should have exactly 10 * 100 = 1000 events per source
+        assert_eq!(metrics.fallback_metrics.events_primary.get(), 1000);
+        assert_eq!(metrics.fallback_metrics.events_secondary.get(), 1000);
     }
 }
