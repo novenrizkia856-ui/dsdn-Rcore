@@ -49,6 +49,8 @@ mod routing;
 mod fallback;
 mod metrics;
 mod rate_limit;
+mod fallback_health;
+pub use fallback_health::FallbackHealthInfo;
 
 use coord_client::CoordinatorClient;
 use da_router::{DARouter, DEFAULT_CACHE_TTL_MS};

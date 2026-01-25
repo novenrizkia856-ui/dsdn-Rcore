@@ -64,8 +64,10 @@ use crate::da::{DAHealthStatus, DAConfig, DALayer};
 ///
 /// Enum ini adalah `Copy` type dan aman untuk digunakan di multi-threaded context.
 /// Tidak mengandung interior mutability atau heap allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DAStatus {
+
     /// DA layer beroperasi dalam kondisi optimal.
     ///
     /// ## Kondisi
@@ -724,6 +726,28 @@ pub struct DAHealthMonitor {
     /// RwLock untuk tracking previous status.
     /// Digunakan untuk menentukan transition logic (terutama Recovering).
     previous_da_status: RwLock<DAStatus>,
+
+        /// Unix timestamp (seconds) when fallback was first activated.
+    ///
+    /// Atomic for lock-free reads.
+    /// 0 if fallback is not currently active.
+    /// Set when transitioning to fallback mode (Degraded/Emergency).
+    /// Cleared when fallback is deactivated.
+    fallback_activated_at: AtomicU64,
+
+    /// Count of items pending reconciliation.
+    ///
+    /// Atomic for lock-free reads.
+    /// Updated externally by reconciliation components via `set_pending_reconcile_count()`.
+    /// This is a passive counter - DAHealthMonitor does not manage reconciliation.
+    pending_reconcile_count: AtomicU64,
+
+    /// Unix timestamp (seconds) of the last health check.
+    ///
+    /// Atomic for lock-free reads.
+    /// Updated every time `perform_health_check` runs.
+    /// Used for deterministic duration calculations without fetching current time.
+    last_health_check_at: AtomicU64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -770,6 +794,9 @@ impl DAHealthMonitor {
             shutdown_flag: AtomicBool::new(false),
             recovery_started_at: AtomicU64::new(0),
             previous_da_status: RwLock::new(DAStatus::Healthy),
+            fallback_activated_at: AtomicU64::new(0),
+            pending_reconcile_count: AtomicU64::new(0),
+            last_health_check_at: AtomicU64::new(0),
         }
     }
 
@@ -797,6 +824,107 @@ impl DAHealthMonitor {
             shutdown_flag: AtomicBool::new(false),
             recovery_started_at: AtomicU64::new(0),
             previous_da_status: RwLock::new(DAStatus::Healthy),
+            fallback_activated_at: AtomicU64::new(0),
+            pending_reconcile_count: AtomicU64::new(0),
+            last_health_check_at: AtomicU64::new(0),
+        }
+    }
+
+        /// Mendapatkan timestamp saat fallback diaktifkan.
+    ///
+    /// # Returns
+    ///
+    /// Unix timestamp (seconds) saat fallback pertama kali diaktifkan.
+    /// Returns 0 jika fallback tidak aktif atau belum pernah aktif.
+    ///
+    /// # Thread Safety
+    ///
+    /// Lock-free atomic read dengan Relaxed ordering.
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministik
+    /// - Tidak panic
+    /// - O(1) constant time
+    #[inline]
+    #[must_use]
+    pub fn fallback_activated_at(&self) -> u64 {
+        self.fallback_activated_at.load(Ordering::Relaxed)
+    }
+
+    /// Mendapatkan jumlah item yang menunggu reconciliation.
+    ///
+    /// # Returns
+    ///
+    /// Jumlah item pending reconciliation.
+    ///
+    /// # Thread Safety
+    ///
+    /// Lock-free atomic read dengan Relaxed ordering.
+    ///
+    /// # Note
+    ///
+    /// Nilai ini diupdate secara eksternal oleh komponen reconciliation.
+    /// DAHealthMonitor tidak mengelola reconciliation secara langsung.
+    #[inline]
+    #[must_use]
+    pub fn pending_reconcile_count(&self) -> u64 {
+        self.pending_reconcile_count.load(Ordering::Relaxed)
+    }
+
+    /// Set jumlah item yang menunggu reconciliation.
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - Jumlah item pending
+    ///
+    /// # Thread Safety
+    ///
+    /// Lock-free atomic write dengan Relaxed ordering.
+    #[inline]
+    pub fn set_pending_reconcile_count(&self, count: u64) {
+        self.pending_reconcile_count.store(count, Ordering::Relaxed);
+    }
+
+    /// Mendapatkan timestamp health check terakhir.
+    ///
+    /// # Returns
+    ///
+    /// Unix timestamp (seconds) health check terakhir.
+    /// Returns 0 jika belum ada health check.
+    ///
+    /// # Thread Safety
+    ///
+    /// Lock-free atomic read dengan Relaxed ordering.
+    #[inline]
+    #[must_use]
+    pub fn last_health_check_at(&self) -> u64 {
+        self.last_health_check_at.load(Ordering::Relaxed)
+    }
+
+    /// Mendapatkan sumber DA yang sedang digunakan.
+    ///
+    /// # Returns
+    ///
+    /// - `"celestia"` jika menggunakan primary DA (fallback tidak aktif)
+    /// - `"fallback"` jika fallback mode aktif
+    ///
+    /// # Thread Safety
+    ///
+    /// Lock-free, menggunakan `is_fallback_active()` yang atomic.
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministik berdasarkan state saat ini
+    /// - Tidak panic
+    /// - O(1) constant time
+    #[inline]
+    #[must_use]
+    pub fn current_source(&self) -> &'static str {
+        if self.is_fallback_active() {
+            "fallback"
+        } else {
+            "celestia"
         }
     }
 
