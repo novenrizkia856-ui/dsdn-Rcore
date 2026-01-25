@@ -162,6 +162,157 @@ impl From<RouterError> for RoutingError {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// DA SOURCE (14A.1A.69)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Sumber data DA yang digunakan untuk routing decision.
+///
+/// Merepresentasikan dari mana data placement berasal.
+/// Nilai ini akan di-inject ke header X-DA-Source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DASource {
+    /// Data berasal dari primary DA (Celestia).
+    Primary,
+    /// Data berasal dari fallback DA (secondary).
+    Fallback,
+    /// Data berasal dari emergency DA.
+    Emergency,
+}
+
+impl DASource {
+    /// Convert to header value string.
+    ///
+    /// Returns lowercase string untuk HTTP header.
+    #[must_use]
+    pub fn as_header_value(&self) -> &'static str {
+        match self {
+            DASource::Primary => "primary",
+            DASource::Fallback => "fallback",
+            DASource::Emergency => "emergency",
+        }
+    }
+}
+
+impl fmt::Display for DASource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_header_value())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FALLBACK CONTEXT (14A.1A.69)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Konteks fallback untuk routing decision.
+///
+/// Struct ini menyediakan informasi tentang status fallback
+/// yang diperlukan untuk membuat routing decision yang aware fallback.
+///
+/// ## Field Sources
+///
+/// Semua field harus diisi dari sumber eksternal (DAHealthMonitor/AppState).
+/// Tidak ada field yang di-infer atau diasumsikan.
+#[derive(Debug, Clone)]
+pub struct FallbackContext {
+    /// Apakah fallback mode sedang aktif.
+    ///
+    /// `true` jika sistem menggunakan fallback/emergency DA.
+    /// `false` jika menggunakan primary DA.
+    pub fallback_active: bool,
+
+    /// Sumber DA yang sedang digunakan.
+    ///
+    /// Menentukan dari mana data placement berasal.
+    pub current_source: DASource,
+
+    /// Apakah primary DA tersedia.
+    ///
+    /// `true` jika primary DA dapat di-query.
+    /// `false` jika primary DA tidak tersedia.
+    pub primary_available: bool,
+}
+
+impl FallbackContext {
+    /// Membuat FallbackContext untuk operasi normal (primary DA).
+    #[must_use]
+    pub fn normal() -> Self {
+        Self {
+            fallback_active: false,
+            current_source: DASource::Primary,
+            primary_available: true,
+        }
+    }
+
+    /// Membuat FallbackContext untuk fallback mode.
+    #[must_use]
+    pub fn fallback() -> Self {
+        Self {
+            fallback_active: true,
+            current_source: DASource::Fallback,
+            primary_available: false,
+        }
+    }
+
+    /// Membuat FallbackContext untuk emergency mode.
+    #[must_use]
+    pub fn emergency() -> Self {
+        Self {
+            fallback_active: true,
+            current_source: DASource::Emergency,
+            primary_available: false,
+        }
+    }
+
+    /// Membuat FallbackContext dengan semua field eksplisit.
+    #[must_use]
+    pub fn new(fallback_active: bool, current_source: DASource, primary_available: bool) -> Self {
+        Self {
+            fallback_active,
+            current_source,
+            primary_available,
+        }
+    }
+}
+
+impl Default for FallbackContext {
+    /// Default adalah operasi normal (primary DA).
+    fn default() -> Self {
+        Self::normal()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FALLBACK AWARE ROUTING DECISION (14A.1A.69)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Hasil keputusan routing yang aware fallback.
+///
+/// Extends `RoutingDecision` dengan informasi DA source
+/// dan metadata fallback untuk observability.
+#[derive(Debug, Clone)]
+pub struct FallbackAwareRoutingDecision {
+    /// Keputusan routing dasar.
+    pub decision: RoutingDecision,
+
+    /// Sumber DA yang digunakan.
+    ///
+    /// Nilai ini harus di-inject ke header X-DA-Source.
+    pub da_source: DASource,
+
+    /// Apakah fallback mode aktif saat routing.
+    pub fallback_active: bool,
+
+    /// Apakah node diprioritaskan berdasarkan cache.
+    ///
+    /// `true` jika routing memprioritaskan node dengan cached placement.
+    /// `false` jika routing menggunakan strategy normal.
+    pub cache_prioritized: bool,
+
+    /// Alasan pemilihan routing (untuk logging).
+    pub routing_reason: String,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // ROUTE REQUEST FUNCTION
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -263,6 +414,214 @@ pub fn route_request_with_strategy(
         cache_hit,
         routing_latency_ms,
     })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FALLBACK AWARE ROUTING (14A.1A.69)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Route request dengan fallback awareness.
+///
+/// # Arguments
+///
+/// * `router` - DARouter sebagai sumber data
+/// * `chunk_hash` - Hash chunk yang diminta
+/// * `client_info` - Informasi client
+/// * `fallback_ctx` - Konteks fallback dari DAHealthMonitor
+///
+/// # Returns
+///
+/// * `Ok(FallbackAwareRoutingDecision)` - Keputusan routing dengan metadata fallback
+/// * `Err(RoutingError)` - Error jika routing gagal
+///
+/// # Behavior
+///
+/// 1. Jika fallback AKTIF:
+///    - Prioritaskan node yang memiliki data di cache
+///    - Log keputusan dengan alasan "fallback_cache_priority"
+///
+/// 2. Jika fallback TIDAK aktif:
+///    - Gunakan routing normal (ZoneAffinity)
+///    - Log keputusan dengan alasan "normal_routing"
+///
+/// 3. Header X-DA-Source akan di-set berdasarkan `fallback_ctx.current_source`
+///
+/// # Thread Safety
+///
+/// Fungsi ini thread-safe dan tidak memiliki side effect.
+///
+/// # Guarantees
+///
+/// - Tidak panic
+/// - Tidak unwrap
+/// - Tidak block
+/// - Tidak mengubah behavior routing normal saat fallback tidak aktif
+/// - Semua keputusan di-log
+#[allow(dead_code)]
+pub fn route_with_fallback_awareness(
+    router: &DARouter,
+    chunk_hash: &str,
+    client_info: &ClientInfo,
+    fallback_ctx: &FallbackContext,
+) -> Result<FallbackAwareRoutingDecision, RoutingError> {
+    use tracing::{debug, info};
+
+    let start = std::time::Instant::now();
+
+    // Step 1: Determine if we should prioritize cached nodes
+    let should_prioritize_cache = fallback_ctx.fallback_active && !fallback_ctx.primary_available;
+
+    // Step 2: Get placement from DARouter
+    // This uses cached data if available
+    let nodes = router.get_placement(chunk_hash)?;
+
+    // Track cache hit status
+    let cache_hit = !router.is_cache_expired();
+
+    // Step 3: Apply routing strategy based on fallback status
+    let (target_node, remaining_nodes, cache_prioritized, routing_reason) = if should_prioritize_cache {
+        // Fallback active: prioritize nodes that are in cache
+        // Since get_placement already returns cached nodes, we use those
+        // and apply cache-aware selection
+        let result = apply_cache_priority_strategy(&nodes, client_info, router)?;
+        (result.0, result.1, true, "fallback_cache_priority".to_string())
+    } else {
+        // Normal operation: use standard ZoneAffinity
+        let result = apply_zone_affinity_strategy(&nodes, client_info)?;
+        (result.0, result.1, false, "normal_routing".to_string())
+    };
+
+    // Step 4: Build fallback node list
+    let fallback_nodes = build_fallback_list(&remaining_nodes, &target_node);
+
+    // Step 5: Calculate routing latency
+    let routing_latency_ms = start.elapsed().as_millis() as u64;
+
+    // Step 6: Build base routing decision
+    let decision = RoutingDecision {
+        target_node: target_node.clone(),
+        fallback_nodes,
+        cache_hit,
+        routing_latency_ms,
+    };
+
+    // Step 7: Log routing decision (deterministic, no side effects)
+    info!(
+        event = "routing_decision",
+        chunk_hash = %chunk_hash,
+        target_node = %target_node.id,
+        da_source = %fallback_ctx.current_source,
+        fallback_active = fallback_ctx.fallback_active,
+        cache_prioritized = cache_prioritized,
+        reason = %routing_reason,
+        cache_hit = cache_hit,
+        latency_ms = routing_latency_ms,
+        "Routing decision made"
+    );
+
+    debug!(
+        event = "routing_detail",
+        chunk_hash = %chunk_hash,
+        target_zone = ?target_node.zone,
+        client_zone = ?client_info.zone_hint,
+        primary_available = fallback_ctx.primary_available,
+        "Routing decision details"
+    );
+
+    Ok(FallbackAwareRoutingDecision {
+        decision,
+        da_source: fallback_ctx.current_source,
+        fallback_active: fallback_ctx.fallback_active,
+        cache_prioritized,
+        routing_reason,
+    })
+}
+
+/// Apply cache priority strategy for fallback mode.
+///
+/// Saat fallback aktif, prioritaskan node yang:
+/// 1. Ada di cache DARouter (sudah terverifikasi memiliki data)
+/// 2. Memiliki zone sama dengan client (secondary priority)
+/// 3. Deterministik (sorted by ID)
+///
+/// # Arguments
+///
+/// * `nodes` - Daftar node dari placement (sudah dari cache)
+/// * `client_info` - Informasi client
+/// * `router` - DARouter untuk verifikasi cache
+///
+/// # Returns
+///
+/// * `(target_node, remaining_nodes)` - Node target dan sisa node
+fn apply_cache_priority_strategy(
+    nodes: &[NodeInfo],
+    client_info: &ClientInfo,
+    router: &DARouter,
+) -> Result<(NodeInfo, Vec<NodeInfo>), RoutingError> {
+    if nodes.is_empty() {
+        return Err(RoutingError::Router(RouterError::NoAvailableNodes(
+            "empty nodes list in cache priority".to_string()
+        )));
+    }
+
+    // Get current cache state
+    let cache = router.get_cache();
+
+    // Separate nodes into:
+    // 1. Nodes that are in the node registry cache (verified available)
+    // 2. Nodes that might not be in cache
+    let (mut cached_nodes, mut uncached_nodes): (Vec<_>, Vec<_>) = nodes
+        .iter()
+        .cloned()
+        .partition(|n| cache.node_registry.contains_key(&n.id));
+
+    // If no cached nodes, fall back to all nodes
+    if cached_nodes.is_empty() {
+        cached_nodes = nodes.to_vec();
+        uncached_nodes = Vec::new();
+    }
+
+    // Within cached nodes, apply zone affinity as secondary priority
+    let (same_zone, diff_zone): (Vec<_>, Vec<_>) = if let Some(ref zone) = client_info.zone_hint {
+        cached_nodes.into_iter().partition(|n| n.zone.as_deref() == Some(zone.as_str()))
+    } else {
+        (cached_nodes, Vec::new())
+    };
+
+    // Priority order:
+    // 1. Cached + same zone
+    // 2. Cached + different zone
+    // 3. Uncached nodes (fallback)
+    let mut candidates = if !same_zone.is_empty() {
+        let mut c = same_zone;
+        c.extend(diff_zone);
+        c
+    } else {
+        diff_zone
+    };
+
+    // If still empty, use uncached nodes
+    if candidates.is_empty() {
+        candidates = uncached_nodes.clone();
+        uncached_nodes = Vec::new();
+    }
+
+    // Final fallback: use original nodes
+    if candidates.is_empty() {
+        candidates = nodes.to_vec();
+    }
+
+    // Sort for determinism
+    candidates.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Select first as target
+    let target = candidates.remove(0);
+
+    // Remaining for fallback
+    let mut remaining = candidates;
+    remaining.extend(uncached_nodes);
+
+    Ok((target, remaining))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -808,5 +1167,310 @@ mod tests {
 
         let c3 = ClientInfo::full(ip, Some("zone-b".to_string()), true);
         assert!(c3.prefer_dc);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-1: FALLBACK ACTIVE PRIORITIZES CACHED NODES
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_active_prioritizes_cached_nodes() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, Some("zone-x"));
+        mock.add_node_with_zone("node-b", "127.0.0.1:9002", true, Some("zone-y"));
+        mock.add_node_with_zone("node-c", "127.0.0.1:9003", true, Some("zone-x"));
+        mock.add_placement("chunk-1", vec!["node-a", "node-b", "node-c"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(Some("zone-x"));
+        let fallback_ctx = FallbackContext::fallback();
+
+        let result = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx);
+        assert!(result.is_ok());
+
+        let decision = result.unwrap();
+
+        // Should have fallback metadata
+        assert!(decision.fallback_active);
+        assert!(decision.cache_prioritized);
+        assert_eq!(decision.da_source, DASource::Fallback);
+        assert_eq!(decision.routing_reason, "fallback_cache_priority");
+
+        // Target should still prefer zone (secondary priority)
+        assert_eq!(decision.decision.target_node.zone, Some("zone-x".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-2: NORMAL ROUTING WHEN FALLBACK NOT ACTIVE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_normal_routing_when_fallback_not_active() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, Some("zone-x"));
+        mock.add_node_with_zone("node-b", "127.0.0.1:9002", true, Some("zone-y"));
+        mock.add_placement("chunk-1", vec!["node-a", "node-b"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(Some("zone-x"));
+        let fallback_ctx = FallbackContext::normal();
+
+        let result = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx);
+        assert!(result.is_ok());
+
+        let decision = result.unwrap();
+
+        // Should use normal routing
+        assert!(!decision.fallback_active);
+        assert!(!decision.cache_prioritized);
+        assert_eq!(decision.da_source, DASource::Primary);
+        assert_eq!(decision.routing_reason, "normal_routing");
+
+        // Zone affinity should work
+        assert_eq!(decision.decision.target_node.id, "node-a");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-3: DA SOURCE HEADER VALUES
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_da_source_header_values() {
+        assert_eq!(DASource::Primary.as_header_value(), "primary");
+        assert_eq!(DASource::Fallback.as_header_value(), "fallback");
+        assert_eq!(DASource::Emergency.as_header_value(), "emergency");
+
+        // Display trait should match header value
+        assert_eq!(format!("{}", DASource::Primary), "primary");
+        assert_eq!(format!("{}", DASource::Fallback), "fallback");
+        assert_eq!(format!("{}", DASource::Emergency), "emergency");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-4: FALLBACK CONTEXT CONSTRUCTORS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_context_constructors() {
+        // Normal context
+        let normal = FallbackContext::normal();
+        assert!(!normal.fallback_active);
+        assert_eq!(normal.current_source, DASource::Primary);
+        assert!(normal.primary_available);
+
+        // Fallback context
+        let fallback = FallbackContext::fallback();
+        assert!(fallback.fallback_active);
+        assert_eq!(fallback.current_source, DASource::Fallback);
+        assert!(!fallback.primary_available);
+
+        // Emergency context
+        let emergency = FallbackContext::emergency();
+        assert!(emergency.fallback_active);
+        assert_eq!(emergency.current_source, DASource::Emergency);
+        assert!(!emergency.primary_available);
+
+        // Default should be normal
+        let default_ctx: FallbackContext = Default::default();
+        assert!(!default_ctx.fallback_active);
+        assert_eq!(default_ctx.current_source, DASource::Primary);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-5: ROUTING DETERMINISTIC WITH FALLBACK
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_routing_deterministic_with_fallback() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-c", "127.0.0.1:9003", true, None);
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, None);
+        mock.add_node_with_zone("node-b", "127.0.0.1:9002", true, None);
+        mock.add_placement("chunk-1", vec!["node-c", "node-a", "node-b"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(None);
+        let fallback_ctx = FallbackContext::fallback();
+
+        // Multiple calls should return same result
+        let r1 = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx).unwrap();
+        let r2 = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx).unwrap();
+        let r3 = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx).unwrap();
+
+        assert_eq!(r1.decision.target_node.id, r2.decision.target_node.id);
+        assert_eq!(r2.decision.target_node.id, r3.decision.target_node.id);
+
+        // Should be sorted by ID (node-a is first)
+        assert_eq!(r1.decision.target_node.id, "node-a");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-6: EMERGENCY MODE DA SOURCE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_emergency_mode_da_source() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, None);
+        mock.add_placement("chunk-1", vec!["node-a"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(None);
+        let fallback_ctx = FallbackContext::emergency();
+
+        let result = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx);
+        assert!(result.is_ok());
+
+        let decision = result.unwrap();
+        assert_eq!(decision.da_source, DASource::Emergency);
+        assert!(decision.fallback_active);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-7: FALLBACK AWARE ROUTING ERROR HANDLING
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_fallback_aware_routing_error_handling() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, None);
+        // No placement for nonexistent chunk
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(None);
+        let fallback_ctx = FallbackContext::fallback();
+
+        let result = route_with_fallback_awareness(&router, "nonexistent", &client, &fallback_ctx);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            RoutingError::Router(RouterError::ChunkNotFound(hash)) => {
+                assert_eq!(hash, "nonexistent");
+            }
+            _ => panic!("Expected ChunkNotFound error"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-8: CUSTOM FALLBACK CONTEXT
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_custom_fallback_context() {
+        // Custom context with mixed state
+        let ctx = FallbackContext::new(true, DASource::Fallback, true);
+        assert!(ctx.fallback_active);
+        assert_eq!(ctx.current_source, DASource::Fallback);
+        assert!(ctx.primary_available);
+
+        // When primary is available but fallback is active,
+        // we still use fallback mode (recovering state)
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, None);
+        mock.add_placement("chunk-1", vec!["node-a"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(None);
+
+        // With primary_available=true, should still use normal routing
+        // because the condition is: fallback_active && !primary_available
+        let result = route_with_fallback_awareness(&router, "chunk-1", &client, &ctx);
+        assert!(result.is_ok());
+
+        let decision = result.unwrap();
+        // Even though fallback_active is true, primary_available means no cache priority
+        assert!(!decision.cache_prioritized);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-9: CONCURRENT FALLBACK ROUTING SAFE
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_concurrent_fallback_routing_safe() {
+        use std::thread;
+
+        let mock = Arc::new(MockDataSource::new());
+        for i in 0..5 {
+            mock.add_node_with_zone(
+                &format!("node-{}", i),
+                &format!("127.0.0.1:900{}", i),
+                true,
+                None
+            );
+        }
+        mock.add_placement("chunk-1", vec!["node-0", "node-1", "node-2"]);
+
+        let router = Arc::new(DARouter::new(mock));
+        router.refresh_cache().unwrap();
+
+        let mut handles = vec![];
+
+        // Half threads use normal context, half use fallback
+        for i in 0..10 {
+            let r = router.clone();
+            let is_fallback = i % 2 == 0;
+            handles.push(thread::spawn(move || {
+                let client = ClientInfo {
+                    ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    zone_hint: None,
+                    prefer_dc: false,
+                };
+                let ctx = if is_fallback {
+                    FallbackContext::fallback()
+                } else {
+                    FallbackContext::normal()
+                };
+
+                for _ in 0..50 {
+                    let result = route_with_fallback_awareness(&r, "chunk-1", &client, &ctx);
+                    assert!(result.is_ok());
+                    let decision = result.unwrap();
+                    assert_eq!(decision.fallback_active, is_fallback);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.69-10: ROUTING REASON LOGGED CORRECTLY
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_routing_reason_logged_correctly() {
+        let mock = Arc::new(MockDataSource::new());
+        mock.add_node_with_zone("node-a", "127.0.0.1:9001", true, None);
+        mock.add_placement("chunk-1", vec!["node-a"]);
+
+        let router = DARouter::new(mock);
+        router.refresh_cache().unwrap();
+
+        let client = create_client_info(None);
+
+        // Normal routing
+        let normal_ctx = FallbackContext::normal();
+        let normal_result = route_with_fallback_awareness(&router, "chunk-1", &client, &normal_ctx).unwrap();
+        assert_eq!(normal_result.routing_reason, "normal_routing");
+
+        // Fallback routing
+        let fallback_ctx = FallbackContext::fallback();
+        let fallback_result = route_with_fallback_awareness(&router, "chunk-1", &client, &fallback_ctx).unwrap();
+        assert_eq!(fallback_result.routing_reason, "fallback_cache_priority");
     }
 }
