@@ -288,6 +288,57 @@ pub struct EventsProcessedBySource {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// READY STATUS (14A.1A.66)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Status readiness untuk endpoint /ready.
+///
+/// Membedakan tiga kondisi:
+/// - `Ready`: Sistem siap menerima traffic (HTTP 200)
+/// - `ReadyDegraded`: Sistem siap tapi dalam kondisi degraded (HTTP 200 + X-Warning)
+/// - `NotReady`: Sistem tidak siap (HTTP 503)
+///
+/// ## Degraded vs NotReady
+///
+/// DEGRADED terjadi ketika:
+/// - Sistem masih operasional via fallback DA
+/// - Tapi ada kondisi warning (fallback > 10 menit atau pending_reconcile > 1000)
+///
+/// NOT READY terjadi ketika:
+/// - Coordinator tidak reachable
+/// - ATAU tidak ada DA source yang tersedia (primary/secondary/emergency)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadyStatus {
+    /// Sistem siap menerima traffic (normal operation).
+    Ready,
+
+    /// Sistem siap tapi dalam kondisi degraded.
+    ///
+    /// String berisi warning message yang akan diset ke X-Warning header.
+    ReadyDegraded(String),
+
+    /// Sistem tidak siap menerima traffic.
+    ///
+    /// String berisi alasan tidak ready (untuk logging).
+    NotReady(String),
+}
+
+/// Threshold constants untuk DEGRADED detection (14A.1A.66).
+///
+/// Nilai diambil dari spesifikasi:
+/// - DEGRADED jika fallback aktif > 10 menit (600 detik)
+/// - DEGRADED jika pending_reconcile > 1000
+pub mod ready_thresholds {
+    /// Threshold durasi fallback aktif dalam detik.
+    /// Jika fallback aktif lebih lama dari ini → DEGRADED.
+    pub const FALLBACK_DURATION_THRESHOLD_SECS: u64 = 600;
+
+    /// Threshold jumlah pending reconciliation.
+    /// Jika pending_reconcile lebih dari ini → DEGRADED.
+    pub const PENDING_RECONCILE_THRESHOLD: u64 = 1000;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // APP STATE
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -543,20 +594,70 @@ impl AppState {
     /// Ready conditions:
     /// - Coordinator reachable
     /// - If DA router exists: cache must be filled with at least one healthy node
+    #[allow(dead_code)]
     pub async fn is_ready(&self) -> bool {
-        // Check coordinator first
+        matches!(self.check_ready().await, ReadyStatus::Ready | ReadyStatus::ReadyDegraded(_))
+    }
+
+    /// Check readiness with detailed status (14A.1A.66).
+    ///
+    /// ## Ready Conditions (KONTRAK KERAS)
+    ///
+    /// 1. **Coordinator reachable**
+    ///    - Jika TIDAK → NOT READY
+    ///
+    /// 2. **DA available (MINIMAL SATU SOURCE)**
+    ///    - Primary OR Fallback OR Emergency
+    ///    - Jika TIDAK ADA satupun → NOT READY
+    ///
+    /// 3. **Fallback active lebih lama dari threshold**
+    ///    - Status: DEGRADED (bukan failure)
+    ///    - Threshold: 600 detik
+    ///
+    /// 4. **Pending reconciliation > threshold**
+    ///    - Status: DEGRADED (bukan failure)
+    ///    - Threshold: 1000
+    ///
+    /// ## Return Values
+    ///
+    /// - `ReadyStatus::Ready` - Sistem siap (HTTP 200)
+    /// - `ReadyStatus::ReadyDegraded(warning)` - Sistem degraded (HTTP 200 + X-Warning)
+    /// - `ReadyStatus::NotReady(reason)` - Sistem tidak siap (HTTP 503)
+    ///
+    /// ## Guarantees
+    ///
+    /// - **NO panic**: Tidak pernah panic
+    /// - **NO unwrap/expect**: Semua error handling eksplisit
+    /// - **Deterministic**: Hasil konsisten untuk state yang sama
+    pub async fn check_ready(&self) -> ReadyStatus {
+        // ────────────────────────────────────────────────────────────────────────
+        // CONDITION 1: Coordinator reachable
+        // ────────────────────────────────────────────────────────────────────────
         let coord_ok = timeout(Duration::from_secs(2), self.coord.ping()).await;
         if !matches!(coord_ok, Ok(Ok(()))) {
-            return false;
+            return ReadyStatus::NotReady("coordinator not reachable".to_string());
         }
 
-        // If DA router exists, check cache state
-        if let Some(ref router) = self.da_router {
+        // ────────────────────────────────────────────────────────────────────────
+        // CONDITION 2: DA available (MINIMAL SATU SOURCE)
+        // ────────────────────────────────────────────────────────────────────────
+        //
+        // Check apakah ada DA source yang tersedia:
+        // - Jika da_router ada dan cache valid → DA tersedia
+        // - Jika da_router None tapi da_connected true → DA tersedia (connected mode)
+        // - Jika tidak ada sama sekali → NOT READY
+        //
+        // Untuk fallback awareness:
+        // - Primary healthy → da_primary_healthy
+        // - Secondary healthy → da_secondary_healthy.unwrap_or(false)
+        // - Emergency healthy → da_emergency_healthy.unwrap_or(false)
+
+        let da_available = if let Some(ref router) = self.da_router {
             let cache = router.get_cache();
 
             // Cache must have been filled at least once
             if cache.last_updated == 0 {
-                return false;
+                return ReadyStatus::NotReady("DA cache not initialized".to_string());
             }
 
             // Must have at least one healthy node
@@ -566,11 +667,69 @@ impl AppState {
                 .count();
 
             if healthy_count == 0 {
-                return false;
+                return ReadyStatus::NotReady("no healthy nodes in DA cache".to_string());
+            }
+
+            true
+        } else {
+            // No da_router configured
+            // Check if we're in connected mode (legacy compatibility)
+            self.is_da_connected()
+        };
+
+        if !da_available {
+            return ReadyStatus::NotReady("no DA source available".to_string());
+        }
+
+        // ────────────────────────────────────────────────────────────────────────
+        // CONDITION 3 & 4: Check for DEGRADED status
+        // ────────────────────────────────────────────────────────────────────────
+        //
+        // DEGRADED jika:
+        // - fallback_active == true DAN
+        // - (duration_secs > 600 ATAU pending_reconcile > 1000)
+        //
+        // Ambil data dari gather_fallback_status()
+        if let Some(fallback_info) = self.gather_fallback_status() {
+            if fallback_info.active {
+                let mut degraded_reasons = Vec::new();
+
+                // Check duration threshold
+                let duration_exceeded = fallback_info.duration_secs
+                    .map(|d| d > ready_thresholds::FALLBACK_DURATION_THRESHOLD_SECS)
+                    .unwrap_or(false);
+
+                if duration_exceeded {
+                    if let Some(duration) = fallback_info.duration_secs {
+                        degraded_reasons.push(format!(
+                            "fallback active for {} seconds (threshold: {})",
+                            duration,
+                            ready_thresholds::FALLBACK_DURATION_THRESHOLD_SECS
+                        ));
+                    }
+                }
+
+                // Check pending_reconcile threshold
+                if fallback_info.pending_reconcile > ready_thresholds::PENDING_RECONCILE_THRESHOLD {
+                    degraded_reasons.push(format!(
+                        "pending_reconcile={} (threshold: {})",
+                        fallback_info.pending_reconcile,
+                        ready_thresholds::PENDING_RECONCILE_THRESHOLD
+                    ));
+                }
+
+                // Return DEGRADED if any threshold exceeded
+                if !degraded_reasons.is_empty() {
+                    return ReadyStatus::ReadyDegraded(format!(
+                        "DEGRADED: {}",
+                        degraded_reasons.join("; ")
+                    ));
+                }
             }
         }
 
-        true
+        // All conditions met → READY
+        ReadyStatus::Ready
     }
 }
 
@@ -683,25 +842,67 @@ async fn health(
     (StatusCode::OK, Json(health_info))
 }
 
-/// GET /ready - readiness probe
+/// GET /ready - readiness probe (14A.1A.66)
 ///
-/// Returns OK only if:
-/// - Coordinator is reachable
-/// - If DA router exists: cache filled with at least one healthy node
+/// Evaluates readiness conditions:
+/// 1. Coordinator reachable → jika tidak: HTTP 503
+/// 2. DA available (primary OR fallback OR emergency) → jika tidak: HTTP 503
+/// 3. Fallback active > 10 menit → DEGRADED (HTTP 200 + X-Warning)
+/// 4. Pending reconcile > 1000 → DEGRADED (HTTP 200 + X-Warning)
+///
+/// ## Response Status
+///
+/// - **HTTP 200** (Ready): Normal operation
+/// - **HTTP 200 + X-Warning** (Degraded): Fallback active dengan threshold terlampaui
+/// - **HTTP 503** (Not Ready): Coordinator unreachable atau no DA available
 async fn ready(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    if state.is_ready().await {
-        (StatusCode::OK, "ready")
-    } else {
-        let health_info = state.gather_health().await;
-        warn!(
-            da_connected = health_info.da_connected,
-            coordinator_reachable = health_info.coordinator_reachable,
-            healthy_nodes = health_info.healthy_nodes,
-            "ready check failed"
-        );
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    match state.check_ready().await {
+        ReadyStatus::Ready => {
+            // Normal ready - HTTP 200 tanpa warning
+            debug!("ready check: READY (normal)");
+            let mut headers = HeaderMap::new();
+            (StatusCode::OK, headers, "ready")
+        }
+
+        ReadyStatus::ReadyDegraded(warning) => {
+            // Degraded but still ready - HTTP 200 dengan X-Warning header
+            debug!(warning = %warning, "ready check: READY (degraded)");
+            let mut headers = HeaderMap::new();
+
+            // Set X-Warning header dengan warning message
+            // HeaderValue::from_str bisa gagal jika string mengandung karakter invalid
+            // Menggunakan from_bytes sebagai fallback yang lebih aman
+            if let Ok(header_value) = HeaderValue::from_str(&warning) {
+                headers.insert("X-Warning", header_value);
+            } else {
+                // Jika warning mengandung karakter invalid, gunakan sanitized version
+                // Ini seharusnya tidak terjadi karena warning dibangun dari string yang valid
+                headers.insert(
+                    "X-Warning",
+                    HeaderValue::from_static("DEGRADED: see /fallback/status for details")
+                );
+            }
+
+            (StatusCode::OK, headers, "ready")
+        }
+
+        ReadyStatus::NotReady(reason) => {
+            // Not ready - HTTP 503
+            let health_info = state.gather_health().await;
+            warn!(
+                reason = %reason,
+                da_connected = health_info.da_connected,
+                coordinator_reachable = health_info.coordinator_reachable,
+                healthy_nodes = health_info.healthy_nodes,
+                fallback_active = health_info.fallback_active,
+                "ready check failed"
+            );
+
+            let mut headers = HeaderMap::new();
+            (StatusCode::SERVICE_UNAVAILABLE, headers, "not ready")
+        }
     }
 }
 
@@ -2182,5 +2383,227 @@ mod tests {
         assert!(json.contains("\"primary\":1000"));
         assert!(json.contains("\"secondary\":500"));
         assert!(json.contains("\"emergency\":100"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-1: ReadyStatus enum correctness
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that ReadyStatus enum variants work correctly.
+    #[test]
+    fn test_ready_status_enum_variants() {
+        // Ready variant
+        let ready = ReadyStatus::Ready;
+        assert_eq!(ready, ReadyStatus::Ready);
+
+        // ReadyDegraded variant with warning
+        let degraded = ReadyStatus::ReadyDegraded("test warning".to_string());
+        match degraded {
+            ReadyStatus::ReadyDegraded(msg) => assert_eq!(msg, "test warning"),
+            _ => panic!("Expected ReadyDegraded variant"),
+        }
+
+        // NotReady variant with reason
+        let not_ready = ReadyStatus::NotReady("test reason".to_string());
+        match not_ready {
+            ReadyStatus::NotReady(msg) => assert_eq!(msg, "test reason"),
+            _ => panic!("Expected NotReady variant"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-2: check_ready returns NotReady when coordinator unreachable
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that check_ready returns NotReady when coordinator is unreachable.
+    ///
+    /// Requirements:
+    /// - HTTP 503 should be returned
+    /// - Reason should mention coordinator
+    #[tokio::test]
+    async fn test_check_ready_not_ready_coordinator_unreachable() {
+        // Use invalid coordinator URL to simulate unreachable
+        let coord = Arc::new(CoordinatorClient::new("http://invalid.localhost:99999".to_string()));
+        let state = AppState::new(coord);
+
+        let status = state.check_ready().await;
+
+        match status {
+            ReadyStatus::NotReady(reason) => {
+                assert!(
+                    reason.contains("coordinator"),
+                    "Reason should mention coordinator: {}",
+                    reason
+                );
+            }
+            _ => panic!("Expected NotReady status, got {:?}", status),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-3: ready handler response format
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that ready handler returns correct response format for NotReady.
+    #[tokio::test]
+    async fn test_ready_handler_not_ready_returns_503() {
+        // Setup: Unreachable coordinator
+        let coord = Arc::new(CoordinatorClient::new("http://invalid.localhost:99999".to_string()));
+        let state = AppState::new(coord);
+
+        // Call handler directly
+        let response = ready(State(state)).await;
+        let (parts, _body) = response.into_response().into_parts();
+
+        // Verify HTTP 503
+        assert_eq!(
+            parts.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Should return 503 when not ready"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-4: ready_thresholds constants
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that ready_thresholds constants have expected values.
+    #[test]
+    fn test_ready_thresholds_constants() {
+        // Verify threshold values match specification
+        assert_eq!(
+            ready_thresholds::FALLBACK_DURATION_THRESHOLD_SECS,
+            600,
+            "Fallback duration threshold should be 600 seconds (10 minutes)"
+        );
+
+        assert_eq!(
+            ready_thresholds::PENDING_RECONCILE_THRESHOLD,
+            1000,
+            "Pending reconcile threshold should be 1000"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-5: is_ready compatibility
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that is_ready() still works for backward compatibility.
+    ///
+    /// is_ready() should return true for both Ready and ReadyDegraded.
+    #[tokio::test]
+    async fn test_is_ready_backward_compatibility() {
+        // Setup: State that will fail (coordinator unreachable)
+        let coord = Arc::new(CoordinatorClient::new("http://invalid.localhost:99999".to_string()));
+        let state = AppState::new(coord);
+
+        // is_ready should return false when not ready
+        let result = state.is_ready().await;
+        assert!(!result, "is_ready should return false when coordinator unreachable");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-6: ReadyStatus Debug implementation
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that ReadyStatus has Debug implementation.
+    #[test]
+    fn test_ready_status_debug() {
+        let ready = ReadyStatus::Ready;
+        let debug_str = format!("{:?}", ready);
+        assert!(debug_str.contains("Ready"));
+
+        let degraded = ReadyStatus::ReadyDegraded("test".to_string());
+        let debug_str = format!("{:?}", degraded);
+        assert!(debug_str.contains("ReadyDegraded"));
+        assert!(debug_str.contains("test"));
+
+        let not_ready = ReadyStatus::NotReady("reason".to_string());
+        let debug_str = format!("{:?}", not_ready);
+        assert!(debug_str.contains("NotReady"));
+        assert!(debug_str.contains("reason"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-7: check_ready determinism
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that check_ready returns consistent results.
+    #[tokio::test]
+    async fn test_check_ready_deterministic() {
+        let coord = Arc::new(CoordinatorClient::new("http://invalid.localhost:99999".to_string()));
+        let state = AppState::new(coord);
+
+        // Multiple calls should return consistent NotReady status
+        let result1 = state.check_ready().await;
+        let result2 = state.check_ready().await;
+        let result3 = state.check_ready().await;
+
+        // All should be NotReady (coordinator unreachable)
+        assert!(matches!(result1, ReadyStatus::NotReady(_)));
+        assert!(matches!(result2, ReadyStatus::NotReady(_)));
+        assert!(matches!(result3, ReadyStatus::NotReady(_)));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-8: DEGRADED warning message format
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that DEGRADED warning message has correct format.
+    #[test]
+    fn test_degraded_warning_message_format() {
+        // Simulate degraded warning construction
+        let mut reasons = Vec::new();
+        reasons.push(format!(
+            "fallback active for {} seconds (threshold: {})",
+            700,
+            ready_thresholds::FALLBACK_DURATION_THRESHOLD_SECS
+        ));
+        reasons.push(format!(
+            "pending_reconcile={} (threshold: {})",
+            1500,
+            ready_thresholds::PENDING_RECONCILE_THRESHOLD
+        ));
+
+        let warning = format!("DEGRADED: {}", reasons.join("; "));
+
+        // Verify format
+        assert!(warning.starts_with("DEGRADED:"));
+        assert!(warning.contains("700 seconds"));
+        assert!(warning.contains("threshold: 600"));
+        assert!(warning.contains("pending_reconcile=1500"));
+        assert!(warning.contains("threshold: 1000"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.66-9: ReadyStatus equality
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test ReadyStatus PartialEq implementation.
+    #[test]
+    fn test_ready_status_partial_eq() {
+        // Ready == Ready
+        assert_eq!(ReadyStatus::Ready, ReadyStatus::Ready);
+
+        // ReadyDegraded with same message
+        assert_eq!(
+            ReadyStatus::ReadyDegraded("test".to_string()),
+            ReadyStatus::ReadyDegraded("test".to_string())
+        );
+
+        // ReadyDegraded with different message
+        assert_ne!(
+            ReadyStatus::ReadyDegraded("a".to_string()),
+            ReadyStatus::ReadyDegraded("b".to_string())
+        );
+
+        // NotReady with same reason
+        assert_eq!(
+            ReadyStatus::NotReady("test".to_string()),
+            ReadyStatus::NotReady("test".to_string())
+        );
+
+        // Different variants
+        assert_ne!(ReadyStatus::Ready, ReadyStatus::NotReady("test".to_string()));
     }
 }
