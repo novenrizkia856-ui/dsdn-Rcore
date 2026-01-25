@@ -1,31 +1,207 @@
 ﻿//! # DSDN Ingress (14A)
 //!
-//! HTTP gateway untuk akses data DSDN.
+//! HTTP gateway untuk akses data DSDN dengan fallback-aware routing.
 //!
 //! ## Architecture
+//!
 //! ```text
-//! Client → Ingress → DARouter → Node
-//!              │
-//!              └──→ Celestia DA (for placement info)
+//!                                    ┌─────────────────────────────────┐
+//!                                    │         DSDN Ingress            │
+//!                                    │     (HTTP Gateway - 14A)        │
+//!                                    └─────────────────────────────────┘
+//!                                                   │
+//!         ┌─────────────────────────────────────────┼─────────────────────────────────────────┐
+//!         │                                         │                                         │
+//!         ▼                                         ▼                                         ▼
+//!    ┌─────────┐                            ┌──────────────┐                          ┌──────────────┐
+//!    │ Client  │ ◀───── HTTP Request ─────▶ │   Router     │ ◀──── State ────────────▶│  AppState    │
+//!    └─────────┘                            └──────────────┘                          └──────────────┘
+//!                                                   │                                         │
+//!                                                   │                                         │
+//!                                                   ▼                                         ▼
+//!                                          ┌──────────────┐                          ┌──────────────┐
+//!                                          │  DARouter    │ ◀─── Fallback Info ─────▶│ AlertDispatch│
+//!                                          └──────────────┘                          └──────────────┘
+//!                                                   │
+//!                     ┌─────────────────────────────┼─────────────────────────────┐
+//!                     │                             │                             │
+//!                     ▼                             ▼                             ▼
+//!             ┌──────────────┐             ┌──────────────┐             ┌──────────────┐
+//!             │  Celestia    │             │  QuorumDA    │             │ EmergencyDA  │
+//!             │  (Primary)   │             │ (Secondary)  │             │  (Fallback)  │
+//!             └──────────────┘             └──────────────┘             └──────────────┘
+//!                     │                             │                             │
+//!                     └─────────────────────────────┴─────────────────────────────┘
+//!                                                   │
+//!                                                   ▼
+//!                                          ┌──────────────┐
+//!                                          │FallbackHealth│
+//!                                          │    Info      │
+//!                                          └──────────────┘
 //! ```
 //!
 //! ## Endpoints
-//! - GET /object/:hash - Fetch object by hash
-//! - GET /health - Health check
-//! - GET /ready - Readiness check
-//! - GET /metrics - Prometheus metrics
-//! - GET /fallback/status - Fallback status (14A.1A.65)
+//!
+//! ### Core Endpoints
+//!
+//! | Endpoint            | Method | Description                              |
+//! |---------------------|--------|------------------------------------------|
+//! | `/object/:hash`     | GET    | Fetch object by hash                     |
+//! | `/health`           | GET    | Health check (DA-aware)                  |
+//! | `/ready`            | GET    | Readiness probe (fallback-aware)         |
+//! | `/metrics`          | GET    | Prometheus metrics (includes fallback)   |
+//!
+//! ### Fallback Endpoints
+//!
+//! | Endpoint            | Method | Description                              |
+//! |---------------------|--------|------------------------------------------|
+//! | `/fallback/status`  | GET    | Fallback status (source of truth)        |
+//!
+//! ## Endpoint Details
+//!
+//! ### GET /health
+//!
+//! Returns comprehensive health information including:
+//! - DA connectivity status
+//! - Cache state (nodes, placements, age)
+//! - Coordinator reachability
+//! - Fallback status (if available)
+//! - DA layer health (primary, secondary, emergency)
+//!
+//! **Response:** `IngressHealth` JSON
+//!
+//! ### GET /ready
+//!
+//! Kubernetes-compatible readiness probe dengan fallback awareness.
+//!
+//! | Condition                          | HTTP Status | Header        |
+//! |------------------------------------|-------------|---------------|
+//! | Ready (normal)                     | 200         | -             |
+//! | Ready (degraded, fallback active)  | 200         | X-Warning     |
+//! | Not Ready (coordinator down)       | 503         | -             |
+//! | Not Ready (no DA available)        | 503         | -             |
+//!
+//! **Degraded Thresholds:**
+//! - Fallback active > 600 seconds (10 minutes)
+//! - Pending reconcile > 1000 items
+//!
+//! ### GET /metrics
+//!
+//! Prometheus-format metrics endpoint dengan fallback metrics:
+//!
+//! **Fallback Metrics:**
+//! - `ingress_fallback_active` (gauge): 1 if fallback active, 0 otherwise
+//! - `ingress_fallback_duration_seconds` (gauge): Duration of current fallback
+//! - `ingress_fallback_events_total` (counter): Total fallback events by source
+//! - `ingress_fallback_pending_reconcile` (gauge): Items pending reconciliation
+//! - `ingress_da_primary_healthy` (gauge): Primary DA health status
+//! - `ingress_da_secondary_healthy` (gauge): Secondary DA health status
+//!
+//! ### GET /fallback/status
+//!
+//! Source of truth untuk fallback status.
+//!
+//! **Response (200):** `FallbackStatusResponse` JSON dengan:
+//! - `info`: FallbackHealthInfo lengkap
+//! - `time_since_last_primary_contact_secs`: Waktu sejak primary DA terakhir kontak
+//! - `reconciliation_queue_depth`: Jumlah item menunggu rekonsiliasi
+//!
+//! **Response (404):** DARouter tidak dikonfigurasi atau tidak tersedia.
+//!
+//! ## Configuration
+//!
+//! ### Environment Variables
+//!
+//! | Variable            | Default                   | Description                    |
+//! |---------------------|---------------------------|--------------------------------|
+//! | `COORDINATOR_BASE`  | `http://127.0.0.1:8080`   | Coordinator service URL        |
+//! | `DA_ROUTER_TTL_MS`  | `30000`                   | DA router cache TTL (ms)       |
+//!
+//! ### Fallback Thresholds (Compile-time Constants)
+//!
+//! | Constant                            | Value  | Description                          |
+//! |-------------------------------------|--------|--------------------------------------|
+//! | `FALLBACK_DURATION_THRESHOLD_SECS`  | 600    | Degraded if fallback > 10 minutes    |
+//! | `PENDING_RECONCILE_THRESHOLD`       | 1000   | Degraded if pending > 1000 items     |
+//!
+//! ### Alerting Configuration
+//!
+//! Alerting hooks tersedia via `AlertDispatcher`:
+//! - `LoggingAlertHandler`: Default handler (structured logging)
+//! - `WebhookAlertHandler`: HTTP POST ke endpoint eksternal (feature-gated)
+//!
+//! Events yang di-alert:
+//! - Fallback activated
+//! - Fallback deactivated
+//! - Reconciliation complete
+//!
+//! ## Monitoring Recommendations
+//!
+//! ### Health Check Integration
+//!
+//! ```text
+//! Kubernetes Probes:
+//!   livenessProbe:
+//!     httpGet:
+//!       path: /health
+//!       port: 8088
+//!   readinessProbe:
+//!     httpGet:
+//!       path: /ready
+//!       port: 8088
+//! ```
+//!
+//! ### Degraded Detection
+//!
+//! Untuk mendeteksi kondisi DEGRADED:
+//! 1. **Endpoint /ready**: Check header `X-Warning` pada response 200
+//! 2. **Endpoint /metrics**: Monitor `ingress_fallback_active` dan `ingress_fallback_duration_seconds`
+//! 3. **Endpoint /fallback/status**: Detail lengkap status fallback
+//!
+//! ### Critical Alerts
+//!
+//! Set alert pada kondisi berikut:
+//!
+//! | Metric/Condition                        | Threshold    | Severity |
+//! |-----------------------------------------|--------------|----------|
+//! | `ingress_fallback_active == 1`          | immediate    | Warning  |
+//! | `ingress_fallback_duration_seconds`     | > 600        | Critical |
+//! | `ingress_fallback_pending_reconcile`    | > 1000       | Critical |
+//! | `ingress_da_primary_healthy == 0`       | immediate    | Warning  |
+//! | `/ready` returns 503                    | immediate    | Critical |
+//!
+//! ## Modules
+//!
+//! | Module           | Description                                      |
+//! |------------------|--------------------------------------------------|
+//! | `coord_client`   | Coordinator API client                           |
+//! | `da_router`      | DA-aware routing engine                          |
+//! | `routing`        | Request routing logic (fallback-aware)           |
+//! | `fallback`       | Fallback & retry mechanisms                      |
+//! | `fallback_health`| FallbackHealthInfo struct (14A.1A.59)            |
+//! | `alerting`       | Alert hooks for fallback events (14A.1A.68)      |
+//! | `metrics`        | Observability & Prometheus metrics               |
+//! | `rate_limit`     | Rate limiting middleware                         |
 //!
 //! ## DA Integration
-//! Ingress TIDAK query Coordinator untuk placement.
-//! Semua routing decision berdasarkan DA-derived state.
 //!
-//! ## Modules (imported)
-//! - da_router: DA-aware routing
-//! - routing: Request routing logic
-//! - fallback: Fallback & retry
-//! - rate_limit: Rate limiting
-//! - metrics: Observability
+//! Ingress TIDAK query Coordinator untuk placement decisions.
+//! Semua routing berdasarkan DA-derived state via DARouter.
+//!
+//! ### Fallback Hierarchy
+//!
+//! 1. **Primary (Celestia)**: Default DA layer
+//! 2. **Secondary (QuorumDA)**: Jika primary tidak tersedia
+//! 3. **Emergency**: Jika primary dan secondary tidak tersedia
+//!
+//! ### State Transitions
+//!
+//! ```text
+//! [Healthy] ──primary down──▶ [Degraded] ──all down──▶ [Emergency]
+//!     ▲                            │                        │
+//!     │                            │                        │
+//!     └────primary recovered───────┴────any recovered───────┘
+//! ```
 
 use axum::{
     extract::{Path, State},
