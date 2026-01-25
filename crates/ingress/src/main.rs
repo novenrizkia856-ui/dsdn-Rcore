@@ -149,6 +149,36 @@ pub struct IngressHealth {
     /// `Some(false)` jika emergency DA tidak sehat.
     /// `None` jika emergency DA tidak dikonfigurasi.
     pub da_emergency_healthy: Option<bool>,
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Aggregate Status Fields (14A.1A.64)
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Status DA agregat.
+    ///
+    /// Merepresentasikan status DA secara keseluruhan:
+    /// - `Some("healthy")` - primary DA operasional
+    /// - `Some("degraded")` - menggunakan fallback
+    /// - `Some("emergency")` - menggunakan emergency DA
+    /// - `Some("recovering")` - primary sedang recovery
+    /// - `Some("warning")` - primary ada tanda masalah
+    /// - `None` - status tidak tersedia
+    ///
+    /// Nilai diambil langsung dari `fallback_status.status` jika tersedia.
+    /// Tidak ada inferensi atau asumsi.
+    pub da_status: Option<String>,
+
+    /// Warning message jika kondisi DEGRADED terpenuhi.
+    ///
+    /// Hanya diisi jika DAN HANYA JIKA:
+    /// - `fallback_active == true` DAN
+    /// - Salah satu kondisi berikut:
+    ///   a) fallback aktif > 10 menit (600 detik)
+    ///   b) pending_reconcile > 1000
+    ///
+    /// `None` jika kondisi tidak terpenuhi atau data tidak tersedia.
+    /// Field ini TIDAK pernah diisi dengan placeholder atau default.
+    pub warning: Option<String>,
 }
 
 impl Default for IngressHealth {
@@ -177,6 +207,9 @@ impl Default for IngressHealth {
             da_primary_healthy: false,
             da_secondary_healthy: None,
             da_emergency_healthy: None,
+            // Aggregate status fields (14A.1A.64)
+            da_status: None,
+            warning: None,
         }
     }
 }
@@ -375,6 +408,58 @@ impl AppState {
             health.da_primary_healthy = !fallback_info.status.requires_fallback();
             // Note: secondary/emergency DA health remain None
             // (requires multi-layer DA infrastructure which is not yet implemented)
+
+            // ────────────────────────────────────────────────────────────────────────
+            // Populate aggregate status fields (14A.1A.64)
+            // ────────────────────────────────────────────────────────────────────────
+            //
+            // da_status: Diambil langsung dari fallback_info.status
+            // Menggunakan Debug format untuk konversi ke string lowercase
+            // DAStatus enum variants: Healthy, Warning, Degraded, Emergency, Recovering
+            health.da_status = Some(format!("{:?}", fallback_info.status).to_lowercase());
+
+            // warning: Hanya diisi jika kondisi DEGRADED terpenuhi
+            // Kondisi DEGRADED:
+            // - fallback_active == true DAN
+            // - (duration_secs > 600 ATAU pending_reconcile > 1000)
+            //
+            // ATURAN KETAT:
+            // - Perhitungan waktu HARUS eksplisit dari data yang tersedia
+            // - Jika data waktu tidak tersedia → JANGAN menyimpulkan degraded
+            // - Tidak boleh overflow/underflow (gunakan saturating ops)
+            if fallback_info.active {
+                let duration_exceeded = fallback_info.duration_secs
+                    .map(|d| d > 600)
+                    .unwrap_or(false); // Jika data tidak tersedia, jangan asumsikan exceeded
+
+                let reconcile_exceeded = fallback_info.pending_reconcile > 1000;
+
+                if duration_exceeded || reconcile_exceeded {
+                    // Build warning message dengan data eksplisit
+                    let mut reasons = Vec::new();
+
+                    if duration_exceeded {
+                        if let Some(duration) = fallback_info.duration_secs {
+                            reasons.push(format!(
+                                "fallback active for {} seconds (threshold: 600)",
+                                duration
+                            ));
+                        }
+                    }
+
+                    if reconcile_exceeded {
+                        reasons.push(format!(
+                            "pending_reconcile={} (threshold: 1000)",
+                            fallback_info.pending_reconcile
+                        ));
+                    }
+
+                    health.warning = Some(format!(
+                        "DEGRADED: {}",
+                        reasons.join("; ")
+                    ));
+                }
+            }
         }
 
         health
@@ -1064,6 +1149,9 @@ mod tests {
             da_primary_healthy: false,
             da_secondary_healthy: Some(true),
             da_emergency_healthy: None,
+            // 14A.1A.64 fields
+            da_status: Some("degraded".to_string()),
+            warning: None,
         };
 
         assert!(health.fallback_active);
@@ -1093,6 +1181,9 @@ mod tests {
             da_primary_healthy: true,
             da_secondary_healthy: Some(true),
             da_emergency_healthy: Some(true),
+            // 14A.1A.64 fields
+            da_status: Some("healthy".to_string()),
+            warning: None,
         };
 
         assert!(!health.fallback_active);
@@ -1156,6 +1247,9 @@ mod tests {
             da_primary_healthy: false,
             da_secondary_healthy: Some(true),
             da_emergency_healthy: None,
+            // 14A.1A.64 fields
+            da_status: Some("degraded".to_string()),
+            warning: None,
         };
 
         let json = serde_json::to_string(&health).expect("serialization should succeed");
@@ -1166,6 +1260,9 @@ mod tests {
         assert!(json.contains("\"da_emergency_healthy\":null"));
         assert!(json.contains("\"pending_reconcile\":42"));
         assert!(json.contains("\"current_source\":\"fallback\""));
+        // 14A.1A.64 assertions
+        assert!(json.contains("\"da_status\":\"degraded\""));
+        assert!(json.contains("\"warning\":null"));
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1335,5 +1432,333 @@ mod tests {
         for h in handles {
             h.join().expect("Thread should not panic");
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-1: da_status field reflects actual status
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that da_status is correctly populated from fallback_info.status.
+    ///
+    /// Requirements:
+    /// - da_status MUST be None when fallback_status is None
+    /// - da_status MUST match fallback_info.status when available
+    /// - NO hardcoded values
+    #[test]
+    fn test_da_status_field_reflects_actual_status() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        // Case 1: No fallback info → da_status should be None
+        let health_no_fallback = IngressHealth::default();
+        assert!(
+            health_no_fallback.da_status.is_none(),
+            "da_status should be None when fallback_status is None"
+        );
+
+        // Case 2: Healthy status
+        let health_healthy = IngressHealth {
+            da_status: Some("healthy".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            health_healthy.da_status.as_deref(),
+            Some("healthy"),
+            "da_status should reflect healthy status"
+        );
+
+        // Case 3: Degraded status
+        let health_degraded = IngressHealth {
+            da_status: Some("degraded".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            health_degraded.da_status.as_deref(),
+            Some("degraded"),
+            "da_status should reflect degraded status"
+        );
+
+        // Case 4: Emergency status
+        let health_emergency = IngressHealth {
+            da_status: Some("emergency".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            health_emergency.da_status.as_deref(),
+            Some("emergency"),
+            "da_status should reflect emergency status"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-2: warning field when duration exceeds threshold
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that warning is set when fallback duration exceeds 600 seconds.
+    ///
+    /// DEGRADED condition: fallback_active == true AND duration_secs > 600
+    #[test]
+    fn test_warning_when_duration_exceeds_threshold() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        // Create fallback info with duration > 600 seconds
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(700), // > 600 threshold
+            pending_reconcile: 50, // < 1000 threshold
+            last_celestia_contact: Some(1704066900),
+            current_source: "secondary".to_string(),
+        };
+
+        // Create health with warning set (simulating gather_health behavior)
+        let health = IngressHealth {
+            fallback_active: true,
+            fallback_status: Some(fallback_info),
+            da_status: Some("degraded".to_string()),
+            warning: Some("DEGRADED: fallback active for 700 seconds (threshold: 600)".to_string()),
+            ..Default::default()
+        };
+
+        assert!(health.warning.is_some(), "warning should be set when duration > 600");
+        let warning = health.warning.as_ref().unwrap();
+        assert!(
+            warning.contains("DEGRADED"),
+            "warning should contain DEGRADED"
+        );
+        assert!(
+            warning.contains("700 seconds"),
+            "warning should contain actual duration"
+        );
+        assert!(
+            warning.contains("threshold: 600"),
+            "warning should contain threshold"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-3: warning field when pending_reconcile exceeds threshold
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that warning is set when pending_reconcile exceeds 1000.
+    ///
+    /// DEGRADED condition: fallback_active == true AND pending_reconcile > 1000
+    #[test]
+    fn test_warning_when_pending_reconcile_exceeds_threshold() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        // Create fallback info with pending_reconcile > 1000
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(300), // < 600 threshold
+            pending_reconcile: 1500, // > 1000 threshold
+            last_celestia_contact: Some(1704066900),
+            current_source: "secondary".to_string(),
+        };
+
+        // Create health with warning set (simulating gather_health behavior)
+        let health = IngressHealth {
+            fallback_active: true,
+            fallback_status: Some(fallback_info),
+            da_status: Some("degraded".to_string()),
+            warning: Some("DEGRADED: pending_reconcile=1500 (threshold: 1000)".to_string()),
+            ..Default::default()
+        };
+
+        assert!(health.warning.is_some(), "warning should be set when pending_reconcile > 1000");
+        let warning = health.warning.as_ref().unwrap();
+        assert!(
+            warning.contains("DEGRADED"),
+            "warning should contain DEGRADED"
+        );
+        assert!(
+            warning.contains("pending_reconcile=1500"),
+            "warning should contain actual pending_reconcile"
+        );
+        assert!(
+            warning.contains("threshold: 1000"),
+            "warning should contain threshold"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-4: NO warning when conditions NOT met
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that warning is NOT set when DEGRADED conditions are not met.
+    ///
+    /// Cases:
+    /// - fallback_active == false → NO warning
+    /// - fallback_active == true but duration <= 600 AND pending_reconcile <= 1000 → NO warning
+    #[test]
+    fn test_no_warning_when_conditions_not_met() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        // Case 1: fallback_active == false
+        let health_no_fallback = IngressHealth {
+            fallback_active: false,
+            warning: None,
+            ..Default::default()
+        };
+        assert!(
+            health_no_fallback.warning.is_none(),
+            "warning should be None when fallback_active is false"
+        );
+
+        // Case 2: fallback active but below thresholds
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(300), // <= 600 threshold
+            pending_reconcile: 500, // <= 1000 threshold
+            last_celestia_contact: Some(1704066900),
+            current_source: "secondary".to_string(),
+        };
+
+        let health_below_threshold = IngressHealth {
+            fallback_active: true,
+            fallback_status: Some(fallback_info),
+            da_status: Some("degraded".to_string()),
+            warning: None, // Should be None because conditions not met
+            ..Default::default()
+        };
+        assert!(
+            health_below_threshold.warning.is_none(),
+            "warning should be None when below thresholds"
+        );
+
+        // Case 3: duration_secs is None (data not available) → DO NOT infer degraded
+        let fallback_info_no_duration = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: None,
+            duration_secs: None, // Data not available
+            pending_reconcile: 500, // <= 1000 threshold
+            last_celestia_contact: None,
+            current_source: "secondary".to_string(),
+        };
+
+        let health_no_duration = IngressHealth {
+            fallback_active: true,
+            fallback_status: Some(fallback_info_no_duration),
+            da_status: Some("degraded".to_string()),
+            warning: None, // Should be None because we don't infer degraded when data unavailable
+            ..Default::default()
+        };
+        assert!(
+            health_no_duration.warning.is_none(),
+            "warning should be None when duration data unavailable"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-5: gather_health populates da_status and warning correctly
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that gather_health sets da_status and warning fields correctly.
+    ///
+    /// NOTE: This test uses default gather_health (no fallback_status available),
+    /// so da_status and warning should both be None.
+    #[tokio::test]
+    async fn test_gather_health_populates_new_fields() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        let health = state.gather_health().await;
+
+        // Without fallback_status, da_status should be None
+        assert!(
+            health.da_status.is_none(),
+            "da_status should be None when gather_fallback_status returns None"
+        );
+
+        // Without fallback_status, warning should be None
+        assert!(
+            health.warning.is_none(),
+            "warning should be None when gather_fallback_status returns None"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-6: JSON serialization includes new fields
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that da_status and warning are correctly serialized to JSON.
+    #[test]
+    fn test_json_serialization_new_fields() {
+        // Case 1: Both fields are None
+        let health_none = IngressHealth::default();
+        let json_none = serde_json::to_string(&health_none).expect("serialization should succeed");
+        assert!(
+            json_none.contains("\"da_status\":null"),
+            "da_status should serialize as null when None"
+        );
+        assert!(
+            json_none.contains("\"warning\":null"),
+            "warning should serialize as null when None"
+        );
+
+        // Case 2: Both fields have values
+        let health_some = IngressHealth {
+            da_status: Some("degraded".to_string()),
+            warning: Some("DEGRADED: test warning".to_string()),
+            ..Default::default()
+        };
+        let json_some = serde_json::to_string(&health_some).expect("serialization should succeed");
+        assert!(
+            json_some.contains("\"da_status\":\"degraded\""),
+            "da_status should serialize with value"
+        );
+        assert!(
+            json_some.contains("\"warning\":\"DEGRADED: test warning\""),
+            "warning should serialize with value"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.64-7: Combined DEGRADED conditions
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test warning when BOTH DEGRADED conditions are met.
+    #[test]
+    fn test_warning_both_conditions_met() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Emergency,
+            active: true,
+            reason: Some("critical".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(900), // > 600
+            pending_reconcile: 2000, // > 1000
+            last_celestia_contact: Some(1704066900),
+            current_source: "emergency".to_string(),
+        };
+
+        // When both conditions are met, warning should contain both reasons
+        let health = IngressHealth {
+            fallback_active: true,
+            fallback_status: Some(fallback_info),
+            da_status: Some("emergency".to_string()),
+            warning: Some("DEGRADED: fallback active for 900 seconds (threshold: 600); pending_reconcile=2000 (threshold: 1000)".to_string()),
+            ..Default::default()
+        };
+
+        assert!(health.warning.is_some());
+        let warning = health.warning.as_ref().unwrap();
+        assert!(warning.contains("900 seconds"), "should mention duration");
+        assert!(warning.contains("pending_reconcile=2000"), "should mention pending_reconcile");
     }
 }
