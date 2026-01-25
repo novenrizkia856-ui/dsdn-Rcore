@@ -51,7 +51,9 @@ mod fallback;
 mod metrics;
 mod rate_limit;
 mod fallback_health;
+mod alerting;
 pub use fallback_health::FallbackHealthInfo;
+pub use alerting::{AlertHandler, AlertDispatcher, LoggingAlertHandler, ReconcileReport};
 
 use coord_client::CoordinatorClient;
 use da_router::{DARouter, DEFAULT_CACHE_TTL_MS};
@@ -355,6 +357,8 @@ pub struct AppState {
     pub da_last_sequence: Arc<std::sync::atomic::AtomicU64>,
     /// Metrics collector.
     pub metrics: Arc<IngressMetrics>,
+    /// Alert dispatcher untuk notifikasi fallback events (14A.1A.68).
+    pub alert_dispatcher: AlertDispatcher,
 }
 
 impl AppState {
@@ -366,6 +370,7 @@ impl AppState {
             da_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics: Arc::new(IngressMetrics::new()),
+            alert_dispatcher: AlertDispatcher::with_logging(),
         }
     }
 
@@ -378,6 +383,7 @@ impl AppState {
             da_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics: Arc::new(IngressMetrics::new()),
+            alert_dispatcher: AlertDispatcher::with_logging(),
         }
     }
 
@@ -390,6 +396,20 @@ impl AppState {
             da_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics,
+            alert_dispatcher: AlertDispatcher::with_logging(),
+        }
+    }
+
+    /// Membuat AppState dengan custom AlertDispatcher (14A.1A.68).
+    #[allow(dead_code)]
+    pub fn with_alert_dispatcher(coord: Arc<CoordinatorClient>, dispatcher: AlertDispatcher) -> Self {
+        Self {
+            coord,
+            da_router: None,
+            da_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics: Arc::new(IngressMetrics::new()),
+            alert_dispatcher: dispatcher,
         }
     }
 
@@ -2778,5 +2798,100 @@ mod tests {
 
         // Counter should have TYPE counter
         assert!(output.contains("# TYPE ingress_fallback_events_total counter"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.68-1: AppState has alert_dispatcher
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that AppState includes AlertDispatcher.
+    #[test]
+    fn test_app_state_has_alert_dispatcher() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        // Default state should have logging handler
+        assert!(state.alert_dispatcher.handler_count() > 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.68-2: AlertDispatcher notify does not panic
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that AlertDispatcher notify methods do not panic.
+    #[test]
+    fn test_alert_dispatcher_notify_no_panic() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        // Create test FallbackHealthInfo
+        use dsdn_common::DAStatus;
+        let info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test".to_string()),
+            activated_at: Some(1000),
+            duration_secs: Some(100),
+            pending_reconcile: 50,
+            last_celestia_contact: Some(900),
+            current_source: "fallback".to_string(),
+        };
+
+        // Should not panic
+        state.alert_dispatcher.notify_fallback_activated(&info);
+        state.alert_dispatcher.notify_fallback_deactivated(100);
+
+        let report = ReconcileReport::success(10, 50, "primary");
+        state.alert_dispatcher.notify_reconciliation_complete(&report);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.68-3: Custom AlertDispatcher can be set
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that custom AlertDispatcher can be set.
+    #[test]
+    fn test_custom_alert_dispatcher() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let dispatcher = AlertDispatcher::new(); // Empty dispatcher
+        let state = AppState::with_alert_dispatcher(coord, dispatcher);
+
+        assert_eq!(state.alert_dispatcher.handler_count(), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.68-4: ReconcileReport construction
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test ReconcileReport constructors.
+    #[test]
+    fn test_reconcile_report_constructors() {
+        // Success
+        let success = ReconcileReport::success(100, 500, "primary");
+        assert!(success.is_success());
+        assert_eq!(success.total_items(), 100);
+
+        // Partial failure
+        let failure = ReconcileReport::partial_failure(80, 20, 1000, "secondary", "error");
+        assert!(!failure.is_success());
+        assert_eq!(failure.total_items(), 100);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14A.1A.68-5: AlertDispatcher Clone
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that AlertDispatcher can be cloned (for use in handlers).
+    #[test]
+    fn test_alert_dispatcher_clone_for_handlers() {
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let state = AppState::new(coord);
+
+        // Clone state (which includes dispatcher)
+        let cloned_state = state.clone();
+
+        // Both should work independently
+        assert!(state.alert_dispatcher.handler_count() > 0);
+        assert!(cloned_state.alert_dispatcher.handler_count() > 0);
     }
 }
