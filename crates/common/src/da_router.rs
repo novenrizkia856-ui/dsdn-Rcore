@@ -1158,6 +1158,14 @@ pub struct DARouter {
     /// Tracking request counts, errors, dan pending reconcile.
     /// Wrapped in Arc for interior mutability.
     metrics: Arc<DARouterMetrics>,
+
+    /// Direct reference ke DAHealthMonitor (opsional).
+    ///
+    /// Digunakan untuk mendapatkan akses langsung ke DAHealthMonitor
+    /// untuk keperluan FallbackHealthInfo gathering (14A.1A.63).
+    ///
+    /// None jika tidak dikonfigurasi atau health provider bukan DAHealthMonitor.
+    health_monitor: Option<Arc<DAHealthMonitor>>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1207,6 +1215,7 @@ impl DARouter {
             health,
             config,
             metrics,
+            health_monitor: None,
         }
     }
 
@@ -1255,6 +1264,38 @@ impl DARouter {
     ) -> Self {
         self.secondary = secondary;
         self.emergency = emergency;
+        self
+    }
+
+    /// Set direct reference ke DAHealthMonitor.
+    ///
+    /// Builder-style method untuk mengkonfigurasi health_monitor
+    /// yang digunakan untuk FallbackHealthInfo gathering (14A.1A.63).
+    ///
+    /// # Arguments
+    ///
+    /// * `monitor` - Arc ke DAHealthMonitor
+    ///
+    /// # Returns
+    ///
+    /// Self dengan health_monitor ter-set.
+    ///
+    /// # Guarantees
+    ///
+    /// - Tidak panic
+    /// - Chainable (builder pattern)
+    /// - Tidak melakukan I/O
+    ///
+    /// # Usage
+    ///
+    /// ```rust,ignore
+    /// let monitor = Arc::new(DAHealthMonitor::new(config));
+    /// let router = DARouter::new(primary, health, config, metrics)
+    ///     .with_health_monitor(monitor);
+    /// ```
+    #[must_use]
+    pub fn with_health_monitor(mut self, monitor: Arc<DAHealthMonitor>) -> Self {
+        self.health_monitor = Some(monitor);
         self
     }
 
@@ -1316,6 +1357,30 @@ impl DARouter {
     #[must_use]
     pub fn has_emergency(&self) -> bool {
         self.emergency.is_some()
+    }
+
+    /// Mendapatkan reference ke DAHealthMonitor (jika tersedia).
+    ///
+    /// # Returns
+    ///
+    /// - `Some(&DAHealthMonitor)` jika health_monitor dikonfigurasi
+    /// - `None` jika tidak dikonfigurasi
+    ///
+    /// # Thread Safety
+    ///
+    /// Returns immutable reference, thread-safe untuk concurrent access.
+    ///
+    /// # Usage (14A.1A.63)
+    ///
+    /// ```rust,ignore
+    /// if let Some(monitor) = router.health_monitor() {
+    ///     let info = FallbackHealthInfo::from(monitor);
+    /// }
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn health_monitor(&self) -> Option<&DAHealthMonitor> {
+        self.health_monitor.as_ref().map(|arc| arc.as_ref())
     }
 
     /// Menghitung jumlah DA sources yang tersedia.
