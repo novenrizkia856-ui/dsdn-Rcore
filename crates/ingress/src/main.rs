@@ -64,29 +64,105 @@ use rate_limit::{RateLimiter, RateLimitState, rate_limit_middleware};
 /// Health status ingress yang DA-aware.
 ///
 /// Semua field merepresentasikan state real, bukan asumsi.
+///
+/// ## Field Groups
+///
+/// ### Core Health (existing)
+/// - `da_connected`, `da_last_sequence`: DA layer connectivity
+/// - `cached_nodes`, `cached_placements`, `cache_age_ms`: Cache state
+/// - `coordinator_reachable`: Coordinator connectivity
+/// - `healthy_nodes`, `total_nodes`: Node registry state
+///
+/// ### Fallback Status (14A.1A.62)
+/// - `fallback_active`: Apakah fallback mode sedang aktif
+/// - `fallback_status`: Detail lengkap status fallback (jika tersedia)
+/// - `da_primary_healthy`: Kesehatan primary DA (Celestia)
+/// - `da_secondary_healthy`: Kesehatan secondary DA (jika dikonfigurasi)
+/// - `da_emergency_healthy`: Kesehatan emergency DA (jika dikonfigurasi)
+///
+/// ## JSON Serialization
+///
+/// Semua field diserialisasi dengan nama yang sama (snake_case).
+/// Option<T> menjadi `null` jika None.
 #[derive(Debug, Clone, Serialize)]
 pub struct IngressHealth {
+    // ────────────────────────────────────────────────────────────────────────
+    // Core Health Fields (existing)
+    // ────────────────────────────────────────────────────────────────────────
+
     /// Apakah DA layer terhubung.
     pub da_connected: bool,
+
     /// Sequence terakhir dari DA (0 jika tidak tersedia).
     pub da_last_sequence: u64,
+
     /// Jumlah node dalam cache.
     pub cached_nodes: usize,
+
     /// Jumlah placement dalam cache.
     pub cached_placements: usize,
+
     /// Umur cache dalam milliseconds.
     pub cache_age_ms: u64,
+
     /// Apakah coordinator dapat dijangkau.
     pub coordinator_reachable: bool,
+
     /// Jumlah node sehat (active).
     pub healthy_nodes: usize,
+
     /// Total node dalam registry.
     pub total_nodes: usize,
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Fallback Status Fields (14A.1A.62)
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Apakah fallback mode sedang aktif.
+    ///
+    /// `true` jika sistem menggunakan fallback DA karena primary tidak tersedia.
+    /// `false` jika sistem menggunakan primary DA (normal operation).
+    pub fallback_active: bool,
+
+    /// Detail lengkap status fallback.
+    ///
+    /// `Some(info)` jika data fallback tersedia dari DAHealthMonitor.
+    /// `None` jika DAHealthMonitor tidak dikonfigurasi atau data tidak tersedia.
+    pub fallback_status: Option<FallbackHealthInfo>,
+
+    /// Kesehatan primary DA layer (Celestia).
+    ///
+    /// `true` jika primary DA responsif dan operasional.
+    /// `false` jika primary DA tidak tersedia atau degraded.
+    pub da_primary_healthy: bool,
+
+    /// Kesehatan secondary DA layer (jika dikonfigurasi).
+    ///
+    /// `Some(true)` jika secondary DA sehat.
+    /// `Some(false)` jika secondary DA tidak sehat.
+    /// `None` jika secondary DA tidak dikonfigurasi.
+    pub da_secondary_healthy: Option<bool>,
+
+    /// Kesehatan emergency DA layer (jika dikonfigurasi).
+    ///
+    /// `Some(true)` jika emergency DA sehat.
+    /// `Some(false)` jika emergency DA tidak sehat.
+    /// `None` jika emergency DA tidak dikonfigurasi.
+    pub da_emergency_healthy: Option<bool>,
 }
 
 impl Default for IngressHealth {
+    /// Default state untuk IngressHealth.
+    ///
+    /// ## Prinsip Default
+    ///
+    /// - Merepresentasikan state AMAN dan EKSPLISIT
+    /// - Tidak mengasumsikan fallback aktif
+    /// - Tidak mengasumsikan DA layer sehat tanpa verifikasi
+    /// - Semua Option adalah None (data tidak tersedia)
     fn default() -> Self {
         Self {
+            // Core health fields
             da_connected: false,
             da_last_sequence: 0,
             cached_nodes: 0,
@@ -95,6 +171,12 @@ impl Default for IngressHealth {
             coordinator_reachable: false,
             healthy_nodes: 0,
             total_nodes: 0,
+            // Fallback status fields (14A.1A.62)
+            fallback_active: false,
+            fallback_status: None,
+            da_primary_healthy: false,
+            da_secondary_healthy: None,
+            da_emergency_healthy: None,
         }
     }
 }
@@ -824,6 +906,7 @@ mod tests {
     fn test_ingress_health_default() {
         let health = IngressHealth::default();
 
+        // Core fields (existing)
         assert!(!health.da_connected);
         assert_eq!(health.da_last_sequence, 0);
         assert_eq!(health.cached_nodes, 0);
@@ -832,6 +915,13 @@ mod tests {
         assert!(!health.coordinator_reachable);
         assert_eq!(health.healthy_nodes, 0);
         assert_eq!(health.total_nodes, 0);
+
+        // Fallback fields (14A.1A.62)
+        assert!(!health.fallback_active, "fallback_active should default to false");
+        assert!(health.fallback_status.is_none(), "fallback_status should default to None");
+        assert!(!health.da_primary_healthy, "da_primary_healthy should default to false");
+        assert!(health.da_secondary_healthy.is_none(), "da_secondary_healthy should default to None");
+        assert!(health.da_emergency_healthy.is_none(), "da_emergency_healthy should default to None");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -894,5 +984,142 @@ mod tests {
         }
         // 6th should fail
         assert!(limiter.check_and_record("test_key", &config).is_err());
+    }
+        // ════════════════════════════════════════════════════════════════════════
+    // TEST: INGRESS HEALTH WITH FALLBACK FIELDS (14A.1A.62)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ingress_health_with_fallback_active() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("DA degraded: no success for 300 seconds".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(300),
+            pending_reconcile: 42,
+            last_celestia_contact: Some(1704066900),
+            current_source: "fallback".to_string(),
+        };
+
+        let health = IngressHealth {
+            da_connected: true,
+            da_last_sequence: 12345,
+            cached_nodes: 5,
+            cached_placements: 10,
+            cache_age_ms: 1000,
+            coordinator_reachable: true,
+            healthy_nodes: 4,
+            total_nodes: 5,
+            fallback_active: true,
+            fallback_status: Some(fallback_info),
+            da_primary_healthy: false,
+            da_secondary_healthy: Some(true),
+            da_emergency_healthy: None,
+        };
+
+        assert!(health.fallback_active);
+        assert!(health.fallback_status.is_some());
+        assert!(!health.da_primary_healthy);
+        assert_eq!(health.da_secondary_healthy, Some(true));
+        assert!(health.da_emergency_healthy.is_none());
+
+        let status = health.fallback_status.as_ref().unwrap();
+        assert_eq!(status.pending_reconcile, 42);
+        assert_eq!(status.current_source, "fallback");
+    }
+
+    #[test]
+    fn test_ingress_health_all_da_layers_healthy() {
+        let health = IngressHealth {
+            da_connected: true,
+            da_last_sequence: 99999,
+            cached_nodes: 10,
+            cached_placements: 50,
+            cache_age_ms: 500,
+            coordinator_reachable: true,
+            healthy_nodes: 10,
+            total_nodes: 10,
+            fallback_active: false,
+            fallback_status: None,
+            da_primary_healthy: true,
+            da_secondary_healthy: Some(true),
+            da_emergency_healthy: Some(true),
+        };
+
+        assert!(!health.fallback_active);
+        assert!(health.da_primary_healthy);
+        assert_eq!(health.da_secondary_healthy, Some(true));
+        assert_eq!(health.da_emergency_healthy, Some(true));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST: JSON SERIALIZATION (14A.1A.62)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ingress_health_json_serialization_default() {
+        let health = IngressHealth::default();
+
+        let json = serde_json::to_string(&health).expect("serialization should succeed");
+
+        // Verify all new fields are present
+        assert!(json.contains("\"fallback_active\""), "fallback_active missing from JSON");
+        assert!(json.contains("\"fallback_status\""), "fallback_status missing from JSON");
+        assert!(json.contains("\"da_primary_healthy\""), "da_primary_healthy missing from JSON");
+        assert!(json.contains("\"da_secondary_healthy\""), "da_secondary_healthy missing from JSON");
+        assert!(json.contains("\"da_emergency_healthy\""), "da_emergency_healthy missing from JSON");
+
+        // Verify default values
+        assert!(json.contains("\"fallback_active\":false"));
+        assert!(json.contains("\"fallback_status\":null"));
+        assert!(json.contains("\"da_primary_healthy\":false"));
+        assert!(json.contains("\"da_secondary_healthy\":null"));
+        assert!(json.contains("\"da_emergency_healthy\":null"));
+    }
+
+    #[test]
+    fn test_ingress_health_json_serialization_with_fallback() {
+        use fallback_health::FallbackHealthInfo;
+        use dsdn_common::DAStatus;
+
+        let fallback_info = FallbackHealthInfo {
+            status: DAStatus::Degraded,
+            active: true,
+            reason: Some("test reason".to_string()),
+            activated_at: Some(1704067200),
+            duration_secs: Some(300),
+            pending_reconcile: 42,
+            last_celestia_contact: Some(1704066900),
+            current_source: "fallback".to_string(),
+        };
+
+        let health = IngressHealth {
+            da_connected: true,
+            da_last_sequence: 12345,
+            cached_nodes: 5,
+            cached_placements: 10,
+            cache_age_ms: 1000,
+            coordinator_reachable: true,
+            healthy_nodes: 4,
+            total_nodes: 5,
+            fallback_active: true,
+            fallback_status: Some(fallback_info),
+            da_primary_healthy: false,
+            da_secondary_healthy: Some(true),
+            da_emergency_healthy: None,
+        };
+
+        let json = serde_json::to_string(&health).expect("serialization should succeed");
+
+        assert!(json.contains("\"fallback_active\":true"));
+        assert!(json.contains("\"da_primary_healthy\":false"));
+        assert!(json.contains("\"da_secondary_healthy\":true"));
+        assert!(json.contains("\"da_emergency_healthy\":null"));
+        assert!(json.contains("\"pending_reconcile\":42"));
+        assert!(json.contains("\"current_source\":\"fallback\""));
     }
 }
