@@ -1,0 +1,17 @@
+[package]
+name = "dsdn-tss"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/novenrizkia856-ui/dsdn"
+description = "DSDN Threshold Signature Scheme - foundational types and cryptographic primitives"
+
+[dependencies]
+rand = "0.8"
+sha3 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+zeroize = { version = "1.7", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

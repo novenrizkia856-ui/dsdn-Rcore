@@ -11,7 +11,8 @@ members = [
     "crates/runtime_vm",
     "crates/runtime_wasm",
     "crates/storage",
-    "crates/validator"
+    "crates/validator",
+    "crates/tss"
 ]
 
 resolver = "2"
