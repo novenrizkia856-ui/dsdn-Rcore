@@ -55,6 +55,14 @@
 //! - Hex encoding via `to_hex()`
 //! - Serialization via serde
 //!
+//! ### Error Types (tahap 14A.2B.1.2)
+//!
+//! | Type | Deskripsi |
+//! |------|-----------|
+//! | `DKGError` | Error dalam Distributed Key Generation protocol |
+//! | `SigningError` | Error dalam threshold signing protocol |
+//! | `TSSError` | Wrapper untuk semua TSS errors |
+//!
 //! ## Keamanan
 //!
 //! - Random identifier generation menggunakan cryptographically secure RNG
@@ -92,12 +100,18 @@
 /// Basic identifier types untuk TSS operations.
 pub mod types;
 
+/// Error types untuk DKG dan signing operations.
+pub mod error;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
 
 // Identifier types (14A.2B.1.1)
 pub use types::{ParticipantId, SessionId, SignerId, IDENTIFIER_SIZE};
+
+// Error types (14A.2B.1.2)
+pub use error::{DKGError, SigningError, TSSError};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CRATE-LEVEL CONSTANTS
@@ -139,5 +153,25 @@ mod tests {
         assert_send_sync::<SessionId>();
         assert_send_sync::<ParticipantId>();
         assert_send_sync::<SignerId>();
+    }
+
+    #[test]
+    fn test_error_re_exports_available() {
+        // Pastikan error types dapat diakses via crate root
+        let _dkg_err = DKGError::InvalidThreshold {
+            threshold: 5,
+            total: 3,
+        };
+        let _signing_err = SigningError::MessageMismatch;
+        let _tss_err = TSSError::Crypto("test".to_string());
+    }
+
+    #[test]
+    fn test_error_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        
+        assert_send_sync::<DKGError>();
+        assert_send_sync::<SigningError>();
+        assert_send_sync::<TSSError>();
     }
 }
