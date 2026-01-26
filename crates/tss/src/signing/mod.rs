@@ -8,6 +8,7 @@
 //! - `SigningSession`: Session controller untuk mengelola signing process
 //! - `PartialSignature`: Partial signature dari satu signer
 //! - `AggregateSignature`: Aggregate signature hasil FROST
+//! - `SigningCommitmentExt`: Extension trait untuk SigningCommitment
 //!
 //! ## Alur Protocol
 //!
@@ -51,64 +52,22 @@
 //! assert!(session.is_ok());
 //! ```
 
+pub mod commitment;
+pub mod partial;
 pub mod session;
 pub mod state;
 
+pub use commitment::SigningCommitmentExt;
+pub use partial::{
+    compute_binding_factor, compute_challenge, compute_group_commitment, PartialSignature,
+};
 pub use session::SigningSession;
 pub use state::SigningState;
 
 // Re-export SigningCommitment dari primitives untuk kemudahan
 pub use crate::primitives::SigningCommitment;
 
-use crate::primitives::{FrostSignature, FrostSignatureShare};
-use crate::types::SignerId;
-
-// ════════════════════════════════════════════════════════════════════════════════
-// PARTIAL SIGNATURE
-// ════════════════════════════════════════════════════════════════════════════════
-
-/// Partial signature dari satu signer dalam FROST signing.
-///
-/// `PartialSignature` mengenkapsulasi `FrostSignatureShare` dengan
-/// identifier signer untuk tracking.
-///
-/// ## Format
-///
-/// - `signer_id`: Identifier signer yang menghasilkan signature ini
-/// - `share`: Signature share (32 bytes scalar)
-#[derive(Debug, Clone)]
-pub struct PartialSignature {
-    /// Identifier signer yang menghasilkan partial signature ini.
-    signer_id: SignerId,
-
-    /// Signature share (scalar value).
-    share: FrostSignatureShare,
-}
-
-impl PartialSignature {
-    /// Membuat `PartialSignature` baru.
-    ///
-    /// # Arguments
-    ///
-    /// * `signer_id` - Identifier dari signer
-    /// * `share` - Signature share
-    #[must_use]
-    pub fn new(signer_id: SignerId, share: FrostSignatureShare) -> Self {
-        Self { signer_id, share }
-    }
-
-    /// Mengembalikan signer ID.
-    #[must_use]
-    pub fn signer_id(&self) -> &SignerId {
-        &self.signer_id
-    }
-
-    /// Mengembalikan reference ke signature share.
-    #[must_use]
-    pub fn share(&self) -> &FrostSignatureShare {
-        &self.share
-    }
-}
+use crate::primitives::FrostSignature;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // AGGREGATE SIGNATURE
@@ -155,12 +114,15 @@ impl AggregateSignature {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::FrostSignatureShare;
+    use crate::types::SignerId;
 
     #[test]
     fn test_partial_signature_new() {
         let signer_id = SignerId::from_bytes([0xAA; 32]);
         let share = FrostSignatureShare::from_bytes([0x01; 32]).unwrap();
-        let partial = PartialSignature::new(signer_id.clone(), share);
+        let commitment = SigningCommitment::from_parts([0x02; 32], [0x03; 32]).unwrap();
+        let partial = PartialSignature::new(signer_id.clone(), share, commitment);
 
         assert_eq!(partial.signer_id(), &signer_id);
     }

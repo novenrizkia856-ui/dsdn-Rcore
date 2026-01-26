@@ -532,7 +532,8 @@ mod tests {
 
     fn make_partial_signature(signer_id: SignerId) -> PartialSignature {
         let share = FrostSignatureShare::from_bytes([0x01; 32]).unwrap();
-        PartialSignature::new(signer_id, share)
+        let commitment = make_commitment();
+        PartialSignature::new(signer_id, share, commitment)
     }
 
     fn make_aggregate() -> AggregateSignature {
