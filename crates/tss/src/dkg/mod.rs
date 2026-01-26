@@ -97,9 +97,11 @@
 //! ```
 
 pub mod packages;
+pub mod participant;
 pub mod session;
 pub mod state;
 
 pub use packages::{Round1Package, Round2Package};
+pub use participant::{DKGParticipant, KeyShare, LocalDKGParticipant, LocalParticipantState};
 pub use session::{DKGSession, DKGSessionConfig};
 pub use state::DKGState;

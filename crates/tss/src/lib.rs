@@ -125,8 +125,11 @@ pub use primitives::{
     SecretShare, SigningCommitment, PUBLIC_KEY_SIZE, SCALAR_SIZE, SIGNATURE_SIZE,
 };
 
-// DKG types (14A.2B.1.4 & 14A.2B.1.5)
-pub use dkg::{DKGSession, DKGSessionConfig, DKGState, Round1Package, Round2Package};
+// DKG types (14A.2B.1.4, 14A.2B.1.5 & 14A.2B.1.6)
+pub use dkg::{
+    DKGParticipant, DKGSession, DKGSessionConfig, DKGState, KeyShare, LocalDKGParticipant,
+    LocalParticipantState, Round1Package, Round2Package,
+};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CRATE-LEVEL CONSTANTS
@@ -253,6 +256,20 @@ mod tests {
     }
 
     #[test]
+    fn test_dkg_participant_re_exports_available() {
+        // Pastikan DKG participant types dapat diakses via crate root
+        let session_id = SessionId::new();
+        let participant_id = ParticipantId::new();
+        let participant = LocalDKGParticipant::new(
+            participant_id,
+            session_id,
+            2,
+            3, // total participants
+        );
+        assert!(participant.is_ok());
+    }
+
+    #[test]
     fn test_dkg_types_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         
@@ -261,5 +278,8 @@ mod tests {
         assert_send_sync::<Round2Package>();
         assert_send_sync::<DKGSession>();
         assert_send_sync::<DKGSessionConfig>();
+        assert_send_sync::<LocalDKGParticipant>();
+        assert_send_sync::<LocalParticipantState>();
+        assert_send_sync::<KeyShare>();
     }
 }
