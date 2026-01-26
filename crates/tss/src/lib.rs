@@ -106,6 +106,9 @@ pub mod error;
 /// Cryptographic primitive types untuk FROST TSS.
 pub mod primitives;
 
+/// DKG (Distributed Key Generation) types dan state machine.
+pub mod dkg;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -121,6 +124,9 @@ pub use primitives::{
     EncryptionKey, FrostSignature, FrostSignatureShare, GroupPublicKey, ParticipantPublicKey,
     SecretShare, SigningCommitment, PUBLIC_KEY_SIZE, SCALAR_SIZE, SIGNATURE_SIZE,
 };
+
+// DKG types (14A.2B.1.4)
+pub use dkg::{DKGState, Round1Package, Round2Package};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CRATE-LEVEL CONSTANTS
@@ -214,5 +220,24 @@ mod tests {
         assert_send_sync::<FrostSignatureShare>();
         assert_send_sync::<SigningCommitment>();
         assert_send_sync::<EncryptionKey>();
+    }
+
+    #[test]
+    fn test_dkg_re_exports_available() {
+        // Pastikan DKG types dapat diakses via crate root
+        let _state = DKGState::Initialized;
+        let participant = ParticipantId::new();
+        let _package1 = Round1Package::new(participant.clone(), [0xAA; 32], [0xBB; 64]);
+        let session = SessionId::new();
+        let _package2 = Round2Package::new(session, participant.clone(), participant, vec![0xCC; 32]);
+    }
+
+    #[test]
+    fn test_dkg_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        
+        assert_send_sync::<DKGState>();
+        assert_send_sync::<Round1Package>();
+        assert_send_sync::<Round2Package>();
     }
 }
