@@ -103,6 +103,9 @@ pub mod types;
 /// Error types untuk DKG dan signing operations.
 pub mod error;
 
+/// Cryptographic primitive types untuk FROST TSS.
+pub mod primitives;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -112,6 +115,12 @@ pub use types::{ParticipantId, SessionId, SignerId, IDENTIFIER_SIZE};
 
 // Error types (14A.2B.1.2)
 pub use error::{DKGError, SigningError, TSSError};
+
+// Cryptographic primitives (14A.2B.1.3)
+pub use primitives::{
+    EncryptionKey, FrostSignature, FrostSignatureShare, GroupPublicKey, ParticipantPublicKey,
+    SecretShare, SigningCommitment, PUBLIC_KEY_SIZE, SCALAR_SIZE, SIGNATURE_SIZE,
+};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CRATE-LEVEL CONSTANTS
@@ -173,5 +182,37 @@ mod tests {
         assert_send_sync::<DKGError>();
         assert_send_sync::<SigningError>();
         assert_send_sync::<TSSError>();
+    }
+
+    #[test]
+    fn test_primitives_re_exports_available() {
+        // Pastikan primitive types dapat diakses via crate root
+        let _gpk = GroupPublicKey::from_bytes([0x02; 32]);
+        let _ppk = ParticipantPublicKey::from_bytes([0x02; 32]);
+        let _ss = SecretShare::from_bytes([0x42; 32]);
+        let _sig = FrostSignature::from_bytes([0x02; 64]);
+        let _share = FrostSignatureShare::from_bytes([0x42; 32]);
+        let _commit = SigningCommitment::from_parts([0xAA; 32], [0xBB; 32]);
+        let _ek = EncryptionKey::from_bytes([0x42; 32]);
+    }
+
+    #[test]
+    fn test_primitives_constants_available() {
+        assert_eq!(PUBLIC_KEY_SIZE, 32);
+        assert_eq!(SCALAR_SIZE, 32);
+        assert_eq!(SIGNATURE_SIZE, 64);
+    }
+
+    #[test]
+    fn test_primitives_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        
+        assert_send_sync::<GroupPublicKey>();
+        assert_send_sync::<ParticipantPublicKey>();
+        assert_send_sync::<SecretShare>();
+        assert_send_sync::<FrostSignature>();
+        assert_send_sync::<FrostSignatureShare>();
+        assert_send_sync::<SigningCommitment>();
+        assert_send_sync::<EncryptionKey>();
     }
 }
