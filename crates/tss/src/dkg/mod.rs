@@ -97,7 +97,9 @@
 //! ```
 
 pub mod packages;
+pub mod session;
 pub mod state;
 
 pub use packages::{Round1Package, Round2Package};
+pub use session::{DKGSession, DKGSessionConfig};
 pub use state::DKGState;
