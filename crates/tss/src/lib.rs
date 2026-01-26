@@ -109,6 +109,9 @@ pub mod primitives;
 /// DKG (Distributed Key Generation) types dan state machine.
 pub mod dkg;
 
+/// Signing types dan state machine untuk FROST threshold signing.
+pub mod signing;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -130,6 +133,9 @@ pub use dkg::{
     DKGParticipant, DKGSession, DKGSessionConfig, DKGState, KeyShare, LocalDKGParticipant,
     LocalParticipantState, Round1Package, Round2Package,
 };
+
+// Signing types (14A.2B.1.7)
+pub use signing::{AggregateSignature, PartialSignature, SigningSession, SigningState};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CRATE-LEVEL CONSTANTS
@@ -281,5 +287,29 @@ mod tests {
         assert_send_sync::<LocalDKGParticipant>();
         assert_send_sync::<LocalParticipantState>();
         assert_send_sync::<KeyShare>();
+    }
+
+    #[test]
+    fn test_signing_session_re_export_available() {
+        // Pastikan SigningSession dapat diakses via crate root
+        let session_id = SessionId::new();
+        let signers = vec![
+            SignerId::new(),
+            SignerId::new(),
+            SignerId::new(),
+        ];
+        let message = b"test message".to_vec();
+        let session = SigningSession::new(session_id, message, signers, 2);
+        assert!(session.is_ok());
+    }
+
+    #[test]
+    fn test_signing_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        
+        assert_send_sync::<SigningState>();
+        assert_send_sync::<SigningSession>();
+        assert_send_sync::<PartialSignature>();
+        assert_send_sync::<AggregateSignature>();
     }
 }
