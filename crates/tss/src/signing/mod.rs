@@ -52,60 +52,24 @@
 //! assert!(session.is_ok());
 //! ```
 
+pub mod aggregate;
 pub mod commitment;
 pub mod partial;
 pub mod session;
+pub mod signer;
 pub mod state;
 
+pub use aggregate::{aggregate_signatures, AggregateSignature};
 pub use commitment::SigningCommitmentExt;
 pub use partial::{
     compute_binding_factor, compute_challenge, compute_group_commitment, PartialSignature,
 };
 pub use session::SigningSession;
+pub use signer::{LocalThresholdSigner, ThresholdSigner};
 pub use state::SigningState;
 
 // Re-export SigningCommitment dari primitives untuk kemudahan
 pub use crate::primitives::SigningCommitment;
-
-use crate::primitives::FrostSignature;
-
-// ════════════════════════════════════════════════════════════════════════════════
-// AGGREGATE SIGNATURE
-// ════════════════════════════════════════════════════════════════════════════════
-
-/// Aggregate signature hasil FROST threshold signing.
-///
-/// `AggregateSignature` adalah hasil akhir dari proses signing
-/// setelah partial signatures di-aggregate.
-///
-/// ## Format
-///
-/// Sama dengan `FrostSignature`: (R || s) = 64 bytes.
-#[derive(Debug, Clone)]
-pub struct AggregateSignature {
-    /// Inner FROST signature.
-    signature: FrostSignature,
-}
-
-impl AggregateSignature {
-    /// Membuat `AggregateSignature` dari `FrostSignature`.
-    #[must_use]
-    pub fn new(signature: FrostSignature) -> Self {
-        Self { signature }
-    }
-
-    /// Mengembalikan reference ke inner signature.
-    #[must_use]
-    pub fn signature(&self) -> &FrostSignature {
-        &self.signature
-    }
-
-    /// Mengembalikan signature bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 64] {
-        self.signature.as_bytes()
-    }
-}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // UNIT TESTS
@@ -114,7 +78,7 @@ impl AggregateSignature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::FrostSignatureShare;
+    use crate::primitives::{FrostSignature, FrostSignatureShare};
     use crate::types::SignerId;
 
     #[test]
@@ -130,9 +94,12 @@ mod tests {
     #[test]
     fn test_aggregate_signature_new() {
         let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
-        let aggregate = AggregateSignature::new(sig.clone());
+        let signers = vec![SignerId::from_bytes([0xAA; 32])];
+        let message_hash = [0xBB; 32];
+        let aggregate = AggregateSignature::new(sig.clone(), signers, message_hash);
 
-        assert_eq!(aggregate.as_bytes(), sig.as_bytes());
+        assert_eq!(aggregate.signature().as_bytes(), sig.as_bytes());
+        assert_eq!(aggregate.signer_count(), 1);
     }
 
     #[test]

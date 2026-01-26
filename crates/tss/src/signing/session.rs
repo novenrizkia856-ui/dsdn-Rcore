@@ -538,7 +538,9 @@ mod tests {
 
     fn make_aggregate() -> AggregateSignature {
         let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
-        AggregateSignature::new(sig)
+        let signers = vec![SignerId::from_bytes([0xAA; 32])];
+        let message_hash = [0xBB; 32];
+        AggregateSignature::new(sig, signers, message_hash)
     }
 
     // ────────────────────────────────────────────────────────────────────────────

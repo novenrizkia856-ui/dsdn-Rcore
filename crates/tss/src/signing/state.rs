@@ -169,6 +169,18 @@ impl SigningState {
 mod tests {
     use super::*;
     use crate::primitives::FrostSignature;
+    use crate::types::SignerId;
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    fn make_aggregate() -> AggregateSignature {
+        let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
+        let signers = vec![SignerId::from_bytes([0xAA; 32])];
+        let message_hash = [0xBB; 32];
+        AggregateSignature::new(sig, signers, message_hash)
+    }
 
     // ────────────────────────────────────────────────────────────────────────────
     // IS_TERMINAL TESTS
@@ -199,9 +211,8 @@ mod tests {
 
     #[test]
     fn test_is_terminal_completed() {
-        let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
         let state = SigningState::Completed {
-            aggregate: AggregateSignature::new(sig),
+            aggregate: make_aggregate(),
         };
         assert!(state.is_terminal());
     }
@@ -242,9 +253,8 @@ mod tests {
 
     #[test]
     fn test_state_name_completed() {
-        let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
         let state = SigningState::Completed {
-            aggregate: AggregateSignature::new(sig),
+            aggregate: make_aggregate(),
         };
         assert_eq!(state.state_name(), "Completed");
     }
@@ -288,9 +298,8 @@ mod tests {
             commitments: HashMap::new(),
             partial_signatures: HashMap::new(),
         };
-        let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
         let next = SigningState::Completed {
-            aggregate: AggregateSignature::new(sig),
+            aggregate: make_aggregate(),
         };
         assert!(current.can_transition_to(&next));
     }
@@ -315,9 +324,8 @@ mod tests {
 
     #[test]
     fn test_terminal_cannot_transition() {
-        let sig = FrostSignature::from_bytes([0x01; 64]).unwrap();
         let completed = SigningState::Completed {
-            aggregate: AggregateSignature::new(sig),
+            aggregate: make_aggregate(),
         };
         let failed = SigningState::Failed {
             error: SigningError::MessageMismatch,
