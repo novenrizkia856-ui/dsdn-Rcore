@@ -12,6 +12,7 @@
 //! - Cryptographic utilities
 //! - Content addressing (CID)
 //! - Configuration management
+//! - Coordinator identifier types
 //!
 //! ## Arsitektur Fallback & DA Routing
 //!
@@ -136,6 +137,7 @@
 //! | `cid` | Content addressing utilities |
 //! | `config` | Configuration management |
 //! | `consistent_hash` | Consistent hashing for placement |
+//! | `coordinator` | Coordinator identifier types |
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -155,6 +157,9 @@ pub mod mock_da;
 // DA Health & Routing (14A.1A.11 - 14A.1A.19)
 pub mod da_health_monitor;
 pub mod da_router;
+
+// Coordinator types (14A.2B.1.11)
+pub mod coordinator;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
@@ -179,6 +184,9 @@ pub use da_router::{
     ReconcileTag,
     MetricsSnapshot,
 };
+
+// Coordinator types (14A.2B.1.11)
+pub use coordinator::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
