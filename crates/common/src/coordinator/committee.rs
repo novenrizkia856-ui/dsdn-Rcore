@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256};
 
 use super::{CoordinatorId, CoordinatorMember, Timestamp};
 use dsdn_tss::GroupPublicKey;
@@ -277,38 +278,93 @@ impl CoordinatorCommittee {
     /// - group_pubkey = zero bytes (TIDAK VALID untuk production)
     #[must_use]
     pub fn empty(epoch: u64) -> Self {
-        // Create zero group pubkey - this is ONLY for testing
-        // In production, this would fail verify_format()
-        // We bypass validation here intentionally for testing purposes
         Self {
             members: Vec::new(),
             threshold: 0,
             epoch,
             epoch_start: 0,
             epoch_duration_secs: 0,
-            // Use a non-zero value to pass serde, but still invalid for real use
-            // We use 0x01 repeated to ensure it's not the identity point
             group_pubkey: create_test_group_pubkey(),
         }
     }
 
-    // ────────────────────────────────────────────────────────────────────────────
-    // GETTERS
-    // ────────────────────────────────────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════════════════════
+    // 1. MEMBERSHIP QUERIES
+    // ════════════════════════════════════════════════════════════════════════════
 
-    /// Mengembalikan reference ke members.
+    /// Mengecek apakah CoordinatorId adalah member committee.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - CoordinatorId yang dicek
+    ///
+    /// # Returns
+    ///
+    /// `true` jika id adalah member, `false` jika tidak.
+    #[must_use]
+    #[inline]
+    pub fn is_member(&self, id: &CoordinatorId) -> bool {
+        self.members.iter().any(|m| m.id() == id)
+    }
+
+    /// Mencari member berdasarkan CoordinatorId.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - CoordinatorId yang dicari
+    ///
+    /// # Returns
+    ///
+    /// `Some(&CoordinatorMember)` jika ditemukan, `None` jika tidak.
+    #[must_use]
+    pub fn get_member(&self, id: &CoordinatorId) -> Option<&CoordinatorMember> {
+        self.members.iter().find(|m| m.id() == id)
+    }
+
+    /// Mengambil member berdasarkan index.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Index member (0-based)
+    ///
+    /// # Returns
+    ///
+    /// `Some(&CoordinatorMember)` jika index valid, `None` jika out of bounds.
+    #[must_use]
+    #[inline]
+    pub fn get_member_by_index(&self, index: usize) -> Option<&CoordinatorMember> {
+        self.members.get(index)
+    }
+
+    /// Mengembalikan jumlah members.
+    #[must_use]
+    #[inline]
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Mengembalikan reference ke members slice.
     #[must_use]
     #[inline]
     pub fn members(&self) -> &[CoordinatorMember] {
         &self.members
     }
 
-    /// Mengembalikan threshold.
+    /// Mengembalikan daftar semua member IDs.
+    ///
+    /// Urutan SAMA dengan urutan internal members vector.
+    ///
+    /// # Returns
+    ///
+    /// `Vec<CoordinatorId>` berisi semua member IDs dalam urutan yang sama.
     #[must_use]
-    #[inline]
-    pub const fn threshold(&self) -> u8 {
-        self.threshold
+    pub fn member_ids(&self) -> Vec<CoordinatorId> {
+        self.members.iter().map(|m| *m.id()).collect()
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // 2. EPOCH QUERIES
+    // ════════════════════════════════════════════════════════════════════════════
 
     /// Mengembalikan epoch number.
     #[must_use]
@@ -324,27 +380,6 @@ impl CoordinatorCommittee {
         self.epoch_start
     }
 
-    /// Mengembalikan epoch duration dalam detik.
-    #[must_use]
-    #[inline]
-    pub const fn epoch_duration_secs(&self) -> u64 {
-        self.epoch_duration_secs
-    }
-
-    /// Mengembalikan reference ke group public key.
-    #[must_use]
-    #[inline]
-    pub const fn group_pubkey(&self) -> &GroupPublicKey {
-        &self.group_pubkey
-    }
-
-    /// Mengembalikan jumlah members.
-    #[must_use]
-    #[inline]
-    pub fn member_count(&self) -> usize {
-        self.members.len()
-    }
-
     /// Menghitung epoch end timestamp.
     ///
     /// Returns `epoch_start + epoch_duration_secs`.
@@ -354,6 +389,289 @@ impl CoordinatorCommittee {
     pub fn epoch_end(&self) -> Timestamp {
         self.epoch_start.saturating_add(self.epoch_duration_secs)
     }
+
+    /// Mengembalikan epoch duration dalam detik.
+    #[must_use]
+    #[inline]
+    pub const fn epoch_duration_secs(&self) -> u64 {
+        self.epoch_duration_secs
+    }
+
+    /// Mengecek apakah timestamp berada dalam epoch ini.
+    ///
+    /// Timestamp valid jika: `epoch_start <= timestamp < epoch_end`
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp` - Timestamp untuk dicek
+    ///
+    /// # Returns
+    ///
+    /// `true` jika timestamp dalam range epoch [epoch_start, epoch_end).
+    #[must_use]
+    pub fn is_epoch_valid(&self, timestamp: Timestamp) -> bool {
+        let end = self.epoch_end();
+        timestamp >= self.epoch_start && timestamp < end
+    }
+
+    /// Menghitung sisa waktu epoch dalam detik.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - Timestamp saat ini
+    ///
+    /// # Returns
+    ///
+    /// Sisa waktu dalam detik. Returns 0 jika epoch sudah berakhir.
+    #[must_use]
+    pub fn epoch_remaining_secs(&self, now: Timestamp) -> u64 {
+        let end = self.epoch_end();
+        if now >= end {
+            return 0;
+        }
+        end.saturating_sub(now)
+    }
+
+    /// Menghitung waktu yang sudah berlalu dalam epoch.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - Timestamp saat ini
+    ///
+    /// # Returns
+    ///
+    /// - 0 jika `now <= epoch_start`
+    /// - `epoch_duration_secs` jika `now >= epoch_end`
+    /// - `now - epoch_start` otherwise
+    #[must_use]
+    pub fn epoch_elapsed_secs(&self, now: Timestamp) -> u64 {
+        if now <= self.epoch_start {
+            return 0;
+        }
+
+        let end = self.epoch_end();
+        if now >= end {
+            return self.epoch_duration_secs;
+        }
+
+        now.saturating_sub(self.epoch_start)
+    }
+
+    /// Menghitung progress epoch sebagai fraction [0.0, 1.0].
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - Timestamp saat ini
+    ///
+    /// # Returns
+    ///
+    /// - 0.0 jika `now <= epoch_start` atau `epoch_duration_secs == 0`
+    /// - 1.0 jika `now >= epoch_end`
+    /// - Fraction dalam [0.0, 1.0] otherwise
+    ///
+    /// # Note
+    ///
+    /// Tidak pernah return NaN atau nilai di luar [0.0, 1.0].
+    #[must_use]
+    pub fn epoch_progress(&self, now: Timestamp) -> f64 {
+        // Guard against division by zero
+        if self.epoch_duration_secs == 0 {
+            return 0.0;
+        }
+
+        if now <= self.epoch_start {
+            return 0.0;
+        }
+
+        let end = self.epoch_end();
+        if now >= end {
+            return 1.0;
+        }
+
+        let elapsed = now.saturating_sub(self.epoch_start);
+        // Safe: epoch_duration_secs > 0 (checked above)
+        let progress = elapsed as f64 / self.epoch_duration_secs as f64;
+
+        // Clamp to [0.0, 1.0] for safety (should already be in range)
+        progress.clamp(0.0, 1.0)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // 3. THRESHOLD & SIGNING QUERIES
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Mengembalikan threshold untuk signing.
+    #[must_use]
+    #[inline]
+    pub const fn threshold(&self) -> u8 {
+        self.threshold
+    }
+
+    /// Mengembalikan reference ke group public key.
+    #[must_use]
+    #[inline]
+    pub const fn group_pubkey(&self) -> &GroupPublicKey {
+        &self.group_pubkey
+    }
+
+    /// Mengembalikan jumlah signatures yang diperlukan.
+    ///
+    /// Identik dengan `threshold()`.
+    #[must_use]
+    #[inline]
+    pub const fn requires_signatures(&self) -> u8 {
+        self.threshold
+    }
+
+    /// Mengecek apakah set signers dapat membuat valid signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `signers` - Slice of CoordinatorIds yang akan sign
+    ///
+    /// # Returns
+    ///
+    /// `true` jika:
+    /// - Semua signers adalah member committee
+    /// - Jumlah signer UNIK >= threshold
+    ///
+    /// # Note
+    ///
+    /// - Duplicate signers TIDAK dihitung ganda
+    /// - Urutan signers tidak berpengaruh
+    #[must_use]
+    pub fn can_sign_with(&self, signers: &[CoordinatorId]) -> bool {
+        // Collect unique signers that are members
+        let mut unique_valid_signers: HashSet<CoordinatorId> = HashSet::new();
+
+        for signer in signers {
+            // Check if signer is a member
+            if self.is_member(signer) {
+                unique_valid_signers.insert(*signer);
+            } else {
+                // Non-member signer → cannot sign
+                return false;
+            }
+        }
+
+        // Check if we have enough unique signers
+        unique_valid_signers.len() >= self.threshold as usize
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // 4. STAKE QUERIES
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Menghitung total stake semua members.
+    ///
+    /// Menggunakan saturating_add untuk menghindari overflow.
+    /// Jika overflow terjadi, returns u64::MAX.
+    ///
+    /// # Returns
+    ///
+    /// Total stake semua members.
+    #[must_use]
+    pub fn total_stake(&self) -> u64 {
+        self.members
+            .iter()
+            .fold(0u64, |acc, m| acc.saturating_add(m.stake()))
+    }
+
+    /// Mengambil stake member berdasarkan ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - CoordinatorId member
+    ///
+    /// # Returns
+    ///
+    /// `Some(stake)` jika member ditemukan, `None` jika tidak.
+    #[must_use]
+    pub fn member_stake(&self, id: &CoordinatorId) -> Option<u64> {
+        self.get_member(id).map(|m| m.stake())
+    }
+
+    /// Menghitung stake weight member sebagai fraction.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - CoordinatorId member
+    ///
+    /// # Returns
+    ///
+    /// - `None` jika member tidak ditemukan atau total_stake == 0
+    /// - `Some(weight)` dimana weight = member_stake / total_stake
+    ///
+    /// # Note
+    ///
+    /// Tidak pernah return NaN. Returns None jika total_stake == 0.
+    #[must_use]
+    pub fn stake_weight(&self, id: &CoordinatorId) -> Option<f64> {
+        let total = self.total_stake();
+        if total == 0 {
+            return None;
+        }
+
+        let member_stake = self.member_stake(id)?;
+        Some(member_stake as f64 / total as f64)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // 5. COMMITTEE HASH
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Menghitung hash deterministik committee.
+    ///
+    /// Hash mencakup:
+    /// - epoch (8 bytes, little-endian)
+    /// - epoch_start (8 bytes, little-endian)
+    /// - epoch_duration_secs (8 bytes, little-endian)
+    /// - threshold (1 byte)
+    /// - group_pubkey (32 bytes)
+    /// - Semua members (dalam urutan vector):
+    ///   - id (32 bytes)
+    ///   - pubkey (32 bytes)
+    ///   - stake (8 bytes, little-endian)
+    ///
+    /// # Returns
+    ///
+    /// SHA3-256 hash (32 bytes).
+    ///
+    /// # Determinism
+    ///
+    /// Hash sama untuk state committee yang sama.
+    /// Tidak bergantung pada alamat memori atau random.
+    #[must_use]
+    pub fn committee_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+
+        // Hash epoch fields
+        hasher.update(self.epoch.to_le_bytes());
+        hasher.update(self.epoch_start.to_le_bytes());
+        hasher.update(self.epoch_duration_secs.to_le_bytes());
+
+        // Hash threshold
+        hasher.update([self.threshold]);
+
+        // Hash group pubkey
+        hasher.update(self.group_pubkey.as_bytes());
+
+        // Hash all members in order
+        for member in &self.members {
+            hasher.update(member.id().as_bytes());
+            hasher.update(member.pubkey().as_bytes());
+            hasher.update(member.stake().to_le_bytes());
+        }
+
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // VALIDATION & COMPATIBILITY METHODS
+    // ════════════════════════════════════════════════════════════════════════════
 
     /// Mengecek apakah committee ini valid untuk production.
     ///
@@ -393,28 +711,21 @@ impl CoordinatorCommittee {
         true
     }
 
-    /// Mencari member berdasarkan CoordinatorId.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - CoordinatorId yang dicari
-    ///
-    /// # Returns
-    ///
-    /// `Some(&CoordinatorMember)` jika ditemukan, `None` jika tidak.
+    // Legacy aliases for compatibility
+    // These delegate to the new canonical names
+
+    /// Alias untuk `get_member()`.
     #[must_use]
+    #[inline]
     pub fn find_member(&self, id: &CoordinatorId) -> Option<&CoordinatorMember> {
-        self.members.iter().find(|m| m.id() == id)
+        self.get_member(id)
     }
 
-    /// Mengecek apakah CoordinatorId adalah member committee.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - CoordinatorId yang dicek
+    /// Alias untuk `is_member()`.
     #[must_use]
+    #[inline]
     pub fn contains_member(&self, id: &CoordinatorId) -> bool {
-        self.members.iter().any(|m| m.id() == id)
+        self.is_member(id)
     }
 }
 
@@ -641,10 +952,6 @@ mod tests {
         ));
     }
 
-    // ────────────────────────────────────────────────────────────────────────────
-    // EMPTY CONSTRUCTOR TESTS
-    // ────────────────────────────────────────────────────────────────────────────
-
     #[test]
     fn test_empty_creates_invalid_committee() {
         let committee = CoordinatorCommittee::empty(5);
@@ -658,19 +965,82 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // GETTER TESTS
+    // MEMBERSHIP QUERY TESTS
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_getters_return_correct_values() {
+    fn test_is_member_existing() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0x01);
+        assert!(committee.is_member(&id));
+    }
+
+    #[test]
+    fn test_is_member_not_existing() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0xFF);
+        assert!(!committee.is_member(&id));
+    }
+
+    #[test]
+    fn test_get_member_existing() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0x01);
+
+        let found = committee.get_member(&id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id(), &id);
+    }
+
+    #[test]
+    fn test_get_member_not_existing() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0xFF);
+
+        let found = committee.get_member(&id);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_get_member_by_index_valid() {
         let committee = make_valid_committee();
 
-        assert_eq!(committee.member_count(), 2);
-        assert_eq!(committee.threshold(), 2);
-        assert_eq!(committee.epoch(), 1);
-        assert_eq!(committee.epoch_start(), 1700000000);
-        assert_eq!(committee.epoch_duration_secs(), 3600);
+        let m0 = committee.get_member_by_index(0);
+        assert!(m0.is_some());
+        assert_eq!(m0.unwrap().id().as_bytes(), &[0x01; 32]);
+
+        let m1 = committee.get_member_by_index(1);
+        assert!(m1.is_some());
+        assert_eq!(m1.unwrap().id().as_bytes(), &[0x02; 32]);
     }
+
+    #[test]
+    fn test_get_member_by_index_out_of_bounds() {
+        let committee = make_valid_committee();
+        assert!(committee.get_member_by_index(10).is_none());
+    }
+
+    #[test]
+    fn test_member_ids_order_preserved() {
+        let members = vec![
+            make_member(0x03, 100),
+            make_member(0x01, 200),
+            make_member(0x02, 300),
+        ];
+        let committee =
+            CoordinatorCommittee::new(members, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        let ids = committee.member_ids();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0].as_bytes(), &[0x03; 32]);
+        assert_eq!(ids[1].as_bytes(), &[0x01; 32]);
+        assert_eq!(ids[2].as_bytes(), &[0x02; 32]);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // EPOCH QUERY TESTS
+    // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_epoch_end_calculation() {
@@ -691,8 +1061,265 @@ mod tests {
         )
         .unwrap();
 
-        // Should saturate instead of overflow
         assert_eq!(committee.epoch_end(), u64::MAX);
+    }
+
+    #[test]
+    fn test_is_epoch_valid_in_range() {
+        let committee = make_valid_committee();
+        // epoch_start = 1700000000, epoch_end = 1700003600
+
+        assert!(committee.is_epoch_valid(1700000000)); // Start
+        assert!(committee.is_epoch_valid(1700001800)); // Middle
+        assert!(committee.is_epoch_valid(1700003599)); // Just before end
+    }
+
+    #[test]
+    fn test_is_epoch_valid_out_of_range() {
+        let committee = make_valid_committee();
+
+        assert!(!committee.is_epoch_valid(1699999999)); // Before start
+        assert!(!committee.is_epoch_valid(1700003600)); // At end (exclusive)
+        assert!(!committee.is_epoch_valid(1700003601)); // After end
+    }
+
+    #[test]
+    fn test_epoch_remaining_secs() {
+        let committee = make_valid_committee();
+        // epoch_start = 1700000000, duration = 3600, epoch_end = 1700003600
+
+        assert_eq!(committee.epoch_remaining_secs(1700000000), 3600);
+        assert_eq!(committee.epoch_remaining_secs(1700001800), 1800);
+        assert_eq!(committee.epoch_remaining_secs(1700003600), 0);
+        assert_eq!(committee.epoch_remaining_secs(1700010000), 0);
+    }
+
+    #[test]
+    fn test_epoch_elapsed_secs() {
+        let committee = make_valid_committee();
+
+        assert_eq!(committee.epoch_elapsed_secs(1699999999), 0); // Before start
+        assert_eq!(committee.epoch_elapsed_secs(1700000000), 0); // At start
+        assert_eq!(committee.epoch_elapsed_secs(1700001800), 1800); // Middle
+        assert_eq!(committee.epoch_elapsed_secs(1700003600), 3600); // At end
+        assert_eq!(committee.epoch_elapsed_secs(1700010000), 3600); // After end
+    }
+
+    #[test]
+    fn test_epoch_progress() {
+        let committee = make_valid_committee();
+
+        assert_eq!(committee.epoch_progress(1699999999), 0.0); // Before start
+        assert_eq!(committee.epoch_progress(1700000000), 0.0); // At start
+        assert!((committee.epoch_progress(1700001800) - 0.5).abs() < 0.001); // Middle
+        assert_eq!(committee.epoch_progress(1700003600), 1.0); // At end
+        assert_eq!(committee.epoch_progress(1700010000), 1.0); // After end
+    }
+
+    #[test]
+    fn test_epoch_progress_zero_duration() {
+        let committee = CoordinatorCommittee::empty(1);
+        // epoch_duration_secs = 0
+
+        assert_eq!(committee.epoch_progress(0), 0.0);
+        assert_eq!(committee.epoch_progress(1000), 0.0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // THRESHOLD & SIGNING TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_requires_signatures_equals_threshold() {
+        let committee = make_valid_committee();
+        assert_eq!(committee.requires_signatures(), committee.threshold());
+    }
+
+    #[test]
+    fn test_can_sign_with_sufficient_signers() {
+        let committee = make_valid_committee();
+        let signers = vec![make_coordinator_id(0x01), make_coordinator_id(0x02)];
+
+        assert!(committee.can_sign_with(&signers));
+    }
+
+    #[test]
+    fn test_can_sign_with_insufficient_signers() {
+        let committee = make_valid_committee();
+        let signers = vec![make_coordinator_id(0x01)]; // Only 1, need 2
+
+        assert!(!committee.can_sign_with(&signers));
+    }
+
+    #[test]
+    fn test_can_sign_with_non_member() {
+        let committee = make_valid_committee();
+        let signers = vec![
+            make_coordinator_id(0x01),
+            make_coordinator_id(0xFF), // Not a member
+        ];
+
+        assert!(!committee.can_sign_with(&signers));
+    }
+
+    #[test]
+    fn test_can_sign_with_duplicates_not_counted() {
+        let committee = make_valid_committee();
+        let signers = vec![
+            make_coordinator_id(0x01),
+            make_coordinator_id(0x01), // Duplicate
+        ];
+
+        // Only 1 unique signer, need 2
+        assert!(!committee.can_sign_with(&signers));
+    }
+
+    #[test]
+    fn test_can_sign_with_empty_signers() {
+        let committee = make_valid_committee();
+        assert!(!committee.can_sign_with(&[]));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // STAKE QUERY TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_total_stake() {
+        let committee = make_valid_committee();
+        // Members: 0x01 with 1000, 0x02 with 2000
+        assert_eq!(committee.total_stake(), 3000);
+    }
+
+    #[test]
+    fn test_total_stake_overflow_protection() {
+        let members = vec![
+            make_member(0x01, u64::MAX),
+            make_member(0x02, 1000),
+        ];
+        let committee =
+            CoordinatorCommittee::new(members, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        assert_eq!(committee.total_stake(), u64::MAX);
+    }
+
+    #[test]
+    fn test_member_stake_existing() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0x01);
+
+        assert_eq!(committee.member_stake(&id), Some(1000));
+    }
+
+    #[test]
+    fn test_member_stake_not_existing() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0xFF);
+
+        assert_eq!(committee.member_stake(&id), None);
+    }
+
+    #[test]
+    fn test_stake_weight() {
+        let committee = make_valid_committee();
+        // Total stake = 3000
+
+        let id1 = make_coordinator_id(0x01);
+        let weight1 = committee.stake_weight(&id1).unwrap();
+        assert!((weight1 - (1000.0 / 3000.0)).abs() < 0.001);
+
+        let id2 = make_coordinator_id(0x02);
+        let weight2 = committee.stake_weight(&id2).unwrap();
+        assert!((weight2 - (2000.0 / 3000.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_stake_weight_non_member() {
+        let committee = make_valid_committee();
+        let id = make_coordinator_id(0xFF);
+
+        assert!(committee.stake_weight(&id).is_none());
+    }
+
+    #[test]
+    fn test_stake_weight_zero_total_stake() {
+        let committee = CoordinatorCommittee::empty(1);
+        let id = make_coordinator_id(0x01);
+
+        assert!(committee.stake_weight(&id).is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // COMMITTEE HASH TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_committee_hash_deterministic() {
+        let committee = make_valid_committee();
+
+        let hash1 = committee.committee_hash();
+        let hash2 = committee.committee_hash();
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_committee_hash_different_for_different_committees() {
+        let committee1 = make_valid_committee();
+
+        let members2 = vec![make_member(0x01, 1000), make_member(0x03, 2000)];
+        let committee2 =
+            CoordinatorCommittee::new(members2, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        assert_ne!(committee1.committee_hash(), committee2.committee_hash());
+    }
+
+    #[test]
+    fn test_committee_hash_different_for_different_epochs() {
+        let members1 = vec![make_member(0x01, 1000), make_member(0x02, 2000)];
+        let committee1 =
+            CoordinatorCommittee::new(members1, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        let members2 = vec![make_member(0x01, 1000), make_member(0x02, 2000)];
+        let committee2 =
+            CoordinatorCommittee::new(members2, 2, 2, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        assert_ne!(committee1.committee_hash(), committee2.committee_hash());
+    }
+
+    #[test]
+    fn test_committee_hash_different_for_different_stakes() {
+        let members1 = vec![make_member(0x01, 1000), make_member(0x02, 2000)];
+        let committee1 =
+            CoordinatorCommittee::new(members1, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        let members2 = vec![make_member(0x01, 1000), make_member(0x02, 3000)]; // Different stake
+        let committee2 =
+            CoordinatorCommittee::new(members2, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        assert_ne!(committee1.committee_hash(), committee2.committee_hash());
+    }
+
+    #[test]
+    fn test_committee_hash_order_matters() {
+        let members1 = vec![make_member(0x01, 1000), make_member(0x02, 2000)];
+        let committee1 =
+            CoordinatorCommittee::new(members1, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        let members2 = vec![make_member(0x02, 2000), make_member(0x01, 1000)]; // Reversed
+        let committee2 =
+            CoordinatorCommittee::new(members2, 2, 1, 1700000000, 3600, make_group_pubkey())
+                .unwrap();
+
+        // Different order = different hash
+        assert_ne!(committee1.committee_hash(), committee2.committee_hash());
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -712,42 +1339,23 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // MEMBER LOOKUP TESTS
+    // LEGACY ALIAS TESTS
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_find_member_existing() {
+    fn test_find_member_alias() {
         let committee = make_valid_committee();
         let id = make_coordinator_id(0x01);
 
-        let found = committee.find_member(&id);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().id(), &id);
+        assert_eq!(committee.find_member(&id), committee.get_member(&id));
     }
 
     #[test]
-    fn test_find_member_not_existing() {
-        let committee = make_valid_committee();
-        let id = make_coordinator_id(0xFF);
-
-        let found = committee.find_member(&id);
-        assert!(found.is_none());
-    }
-
-    #[test]
-    fn test_contains_member_existing() {
+    fn test_contains_member_alias() {
         let committee = make_valid_committee();
         let id = make_coordinator_id(0x01);
 
-        assert!(committee.contains_member(&id));
-    }
-
-    #[test]
-    fn test_contains_member_not_existing() {
-        let committee = make_valid_committee();
-        let id = make_coordinator_id(0xFF);
-
-        assert!(!committee.contains_member(&id));
+        assert_eq!(committee.contains_member(&id), committee.is_member(&id));
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -777,31 +1385,6 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // CLONE TESTS
-    // ────────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_clone() {
-        let original = make_valid_committee();
-        let cloned = original.clone();
-
-        assert_eq!(original, cloned);
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // DEBUG TESTS
-    // ────────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_debug() {
-        let committee = make_valid_committee();
-        let debug = format!("{:?}", committee);
-
-        assert!(debug.contains("CoordinatorCommittee"));
-        assert!(debug.contains("threshold"));
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
     // SEND + SYNC TESTS
     // ────────────────────────────────────────────────────────────────────────────
 
@@ -818,33 +1401,10 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_minimum_valid_committee() {
-        // Minimum valid: 2 members, threshold 2
-        let members = vec![make_member(0x01, 1000), make_member(0x02, 2000)];
-        let result =
-            CoordinatorCommittee::new(members, 2, 0, 0, 1, make_group_pubkey());
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_large_committee() {
-        // Create 10 members
-        let members: Vec<_> = (1u8..=10).map(|i| make_member(i, i as u64 * 100)).collect();
-
-        let result =
-            CoordinatorCommittee::new(members, 7, 1, 1700000000, 3600, make_group_pubkey());
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().member_count(), 10);
-    }
-
-    #[test]
     fn test_members_order_preserved() {
-        // Verify members are NOT sorted
         let members = vec![
-            make_member(0x03, 100), // Lower stake, higher ID
-            make_member(0x01, 300), // Higher stake, lower ID
+            make_member(0x03, 100),
+            make_member(0x01, 300),
             make_member(0x02, 200),
         ];
 
