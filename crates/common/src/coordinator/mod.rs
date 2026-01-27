@@ -19,7 +19,7 @@
 //! use dsdn_common::{CoordinatorId, ValidatorId, WorkloadId, Timestamp, ParseError};
 //! use dsdn_common::CoordinatorMember;
 //! use dsdn_common::{CoordinatorCommittee, CommitteeError};
-//! use dsdn_common::{ReceiptData, ThresholdReceipt, NodeId, DecodeError};
+//! use dsdn_common::{ReceiptData, ThresholdReceipt, NodeId, DecodeError, ReceiptVerificationError};
 //! ```
 
 pub mod ids;
@@ -30,4 +30,4 @@ pub mod receipt;
 pub use ids::*;
 pub use member::CoordinatorMember;
 pub use committee::{CoordinatorCommittee, CommitteeError};
-pub use receipt::{DecodeError, NodeId, ReceiptData, ThresholdReceipt};
+pub use receipt::{DecodeError, NodeId, ReceiptData, ReceiptVerificationError, ThresholdReceipt};

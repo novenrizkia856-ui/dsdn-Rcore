@@ -32,13 +32,14 @@
 //! Ini adalah MESSAGE YANG AKAN DISIGN.
 //! Kesalahan hashing = kegagalan kriptografis sistem.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
-use super::{CoordinatorId, Timestamp, WorkloadId};
-use dsdn_tss::AggregateSignature;
+use super::{CoordinatorCommittee, CoordinatorId, Timestamp, WorkloadId};
+use dsdn_tss::{verify_aggregate_with_hash, AggregateSignature};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // NODE ID TYPE
@@ -368,6 +369,91 @@ impl ReceiptData {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// RECEIPT VERIFICATION ERROR
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk verifikasi `ThresholdReceipt`.
+///
+/// Setiap variant mendeskripsikan spesifik alasan kegagalan verifikasi.
+/// Error HARUS deterministik dan informatif.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptVerificationError {
+    /// Committee hash tidak cocok.
+    CommitteeHashMismatch {
+        /// Hash yang diharapkan (dari committee).
+        expected: [u8; 32],
+        /// Hash yang ditemukan (dari receipt).
+        got: [u8; 32],
+    },
+
+    /// Epoch tidak cocok.
+    EpochMismatch {
+        /// Epoch yang diharapkan (dari committee).
+        expected: u64,
+        /// Epoch yang ditemukan (dari receipt).
+        got: u64,
+    },
+
+    /// Signer bukan member committee.
+    InvalidSigner {
+        /// CoordinatorId yang tidak valid.
+        signer: CoordinatorId,
+    },
+
+    /// Signer duplikat ditemukan.
+    DuplicateSigner {
+        /// CoordinatorId yang duplikat.
+        signer: CoordinatorId,
+    },
+
+    /// Jumlah signer tidak mencukupi threshold.
+    InsufficientSigners {
+        /// Jumlah minimum yang diperlukan.
+        required: u8,
+        /// Jumlah yang ditemukan.
+        got: usize,
+    },
+
+    /// Signature cryptographic tidak valid.
+    InvalidSignature,
+}
+
+impl fmt::Display for ReceiptVerificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReceiptVerificationError::CommitteeHashMismatch { expected, got } => {
+                write!(
+                    f,
+                    "committee hash mismatch: expected {:02x}{:02x}..., got {:02x}{:02x}...",
+                    expected[0], expected[1], got[0], got[1]
+                )
+            }
+            ReceiptVerificationError::EpochMismatch { expected, got } => {
+                write!(f, "epoch mismatch: expected {}, got {}", expected, got)
+            }
+            ReceiptVerificationError::InvalidSigner { signer } => {
+                write!(f, "invalid signer: {}", signer)
+            }
+            ReceiptVerificationError::DuplicateSigner { signer } => {
+                write!(f, "duplicate signer: {}", signer)
+            }
+            ReceiptVerificationError::InsufficientSigners { required, got } => {
+                write!(
+                    f,
+                    "insufficient signers: required {}, got {}",
+                    required, got
+                )
+            }
+            ReceiptVerificationError::InvalidSignature => {
+                write!(f, "invalid cryptographic signature")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReceiptVerificationError {}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // THRESHOLD RECEIPT
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -567,6 +653,233 @@ impl ThresholdReceipt {
     #[inline]
     pub fn sequence(&self) -> u64 {
         self.receipt_data.sequence()
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // VERIFICATION METHODS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Verifikasi receipt terhadap committee.
+    ///
+    /// Menjalankan semua langkah verifikasi dalam urutan:
+    /// 1. verify_committee_hash
+    /// 2. verify_epoch
+    /// 3. verify_signers
+    /// 4. verify_threshold
+    /// 5. verify_signature
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `true` jika semua verifikasi lolos, `false` jika ada yang gagal.
+    ///
+    /// # Note
+    ///
+    /// Urutan verifikasi TIDAK BOLEH DIUBAH.
+    /// Method ini tidak panic dan tidak logging.
+    #[must_use]
+    pub fn verify(&self, committee: &CoordinatorCommittee) -> bool {
+        // Step 1: verify_committee_hash
+        if !self.verify_committee_hash(committee) {
+            return false;
+        }
+
+        // Step 2: verify_epoch
+        if !self.verify_epoch(committee) {
+            return false;
+        }
+
+        // Step 3: verify_signers
+        if !self.verify_signers(committee) {
+            return false;
+        }
+
+        // Step 4: verify_threshold
+        if !self.verify_threshold(committee) {
+            return false;
+        }
+
+        // Step 5: verify_signature
+        if !self.verify_signature(committee) {
+            return false;
+        }
+
+        true
+    }
+
+    /// Verifikasi receipt dengan error detail.
+    ///
+    /// Semantik IDENTIK dengan `verify()`, namun mengembalikan
+    /// error spesifik yang pertama ditemukan.
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` jika verifikasi lolos, `Err(ReceiptVerificationError)` jika gagal.
+    ///
+    /// # Note
+    ///
+    /// Error PERTAMA yang muncul akan dikembalikan.
+    /// Urutan verifikasi sama dengan `verify()`.
+    pub fn verify_detailed(
+        &self,
+        committee: &CoordinatorCommittee,
+    ) -> Result<(), ReceiptVerificationError> {
+        // Step 1: verify_committee_hash
+        let expected_hash = committee.committee_hash();
+        if self.committee_hash != expected_hash {
+            return Err(ReceiptVerificationError::CommitteeHashMismatch {
+                expected: expected_hash,
+                got: self.committee_hash,
+            });
+        }
+
+        // Step 2: verify_epoch
+        let expected_epoch = committee.epoch();
+        if self.epoch != expected_epoch {
+            return Err(ReceiptVerificationError::EpochMismatch {
+                expected: expected_epoch,
+                got: self.epoch,
+            });
+        }
+
+        // Step 3: verify_signers (check membership and duplicates)
+        let mut seen_signers: HashSet<CoordinatorId> = HashSet::with_capacity(self.signers.len());
+        for signer in &self.signers {
+            // Check for duplicates
+            if !seen_signers.insert(*signer) {
+                return Err(ReceiptVerificationError::DuplicateSigner { signer: *signer });
+            }
+
+            // Check membership
+            if !committee.is_member(signer) {
+                return Err(ReceiptVerificationError::InvalidSigner { signer: *signer });
+            }
+        }
+
+        // Step 4: verify_threshold
+        let required = committee.threshold();
+        let got = self.signers.len();
+        if got < required as usize {
+            return Err(ReceiptVerificationError::InsufficientSigners { required, got });
+        }
+
+        // Step 5: verify_signature
+        let message_hash = self.receipt_data.receipt_data_hash();
+        let is_valid =
+            verify_aggregate_with_hash(&self.aggregate_signature, &message_hash, committee.group_pubkey());
+        if !is_valid {
+            return Err(ReceiptVerificationError::InvalidSignature);
+        }
+
+        Ok(())
+    }
+
+    /// Verifikasi committee hash cocok.
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `true` jika `self.committee_hash == committee.committee_hash()`.
+    #[must_use]
+    #[inline]
+    pub fn verify_committee_hash(&self, committee: &CoordinatorCommittee) -> bool {
+        self.committee_hash == committee.committee_hash()
+    }
+
+    /// Verifikasi epoch cocok.
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `true` jika `self.epoch == committee.epoch()`.
+    #[must_use]
+    #[inline]
+    pub fn verify_epoch(&self, committee: &CoordinatorCommittee) -> bool {
+        self.epoch == committee.epoch()
+    }
+
+    /// Verifikasi semua signers adalah member dan tidak ada duplikat.
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `true` jika:
+    /// - Semua signer adalah member committee
+    /// - Tidak ada duplicate signer
+    ///
+    /// # Note
+    ///
+    /// Urutan signer TIDAK diasumsikan.
+    #[must_use]
+    pub fn verify_signers(&self, committee: &CoordinatorCommittee) -> bool {
+        let mut seen: HashSet<CoordinatorId> = HashSet::with_capacity(self.signers.len());
+
+        for signer in &self.signers {
+            // Check for duplicate
+            if !seen.insert(*signer) {
+                return false;
+            }
+
+            // Check membership
+            if !committee.is_member(signer) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Verifikasi jumlah signers memenuhi threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `true` jika `self.signers.len() >= committee.threshold()`.
+    #[must_use]
+    #[inline]
+    pub fn verify_threshold(&self, committee: &CoordinatorCommittee) -> bool {
+        self.signers.len() >= committee.threshold() as usize
+    }
+
+    /// Verifikasi cryptographic signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `committee` - Committee untuk verifikasi
+    ///
+    /// # Returns
+    ///
+    /// `true` jika aggregate signature valid terhadap:
+    /// - message = `receipt_data.receipt_data_hash()`
+    /// - public key = `committee.group_pubkey()`
+    ///
+    /// # Note
+    ///
+    /// Menggunakan API `dsdn_tss::verify_aggregate_with_hash`.
+    /// Tidak melakukan hash ulang di luar spesifikasi.
+    #[must_use]
+    pub fn verify_signature(&self, committee: &CoordinatorCommittee) -> bool {
+        let message_hash = self.receipt_data.receipt_data_hash();
+        verify_aggregate_with_hash(&self.aggregate_signature, &message_hash, committee.group_pubkey())
     }
 }
 
@@ -1439,5 +1752,729 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<ThresholdReceipt>();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // VERIFICATION TESTS
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // Note: Full verification tests require a valid committee + matching signature.
+    // These tests verify the sub-verification method behavior.
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // RECEIPT VERIFICATION ERROR TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verification_error_committee_hash_mismatch_display() {
+        let err = ReceiptVerificationError::CommitteeHashMismatch {
+            expected: [0xAA; 32],
+            got: [0xBB; 32],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("committee hash mismatch"));
+        assert!(msg.contains("aa"));
+        assert!(msg.contains("bb"));
+    }
+
+    #[test]
+    fn test_verification_error_epoch_mismatch_display() {
+        let err = ReceiptVerificationError::EpochMismatch {
+            expected: 10,
+            got: 20,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("epoch mismatch"));
+        assert!(msg.contains("10"));
+        assert!(msg.contains("20"));
+    }
+
+    #[test]
+    fn test_verification_error_invalid_signer_display() {
+        let err = ReceiptVerificationError::InvalidSigner {
+            signer: CoordinatorId::new([0xFF; 32]),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid signer"));
+    }
+
+    #[test]
+    fn test_verification_error_duplicate_signer_display() {
+        let err = ReceiptVerificationError::DuplicateSigner {
+            signer: CoordinatorId::new([0xAA; 32]),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate signer"));
+    }
+
+    #[test]
+    fn test_verification_error_insufficient_signers_display() {
+        let err = ReceiptVerificationError::InsufficientSigners {
+            required: 3,
+            got: 1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("insufficient signers"));
+        assert!(msg.contains("3"));
+        assert!(msg.contains("1"));
+    }
+
+    #[test]
+    fn test_verification_error_invalid_signature_display() {
+        let err = ReceiptVerificationError::InvalidSignature;
+        let msg = err.to_string();
+        assert!(msg.contains("invalid cryptographic signature"));
+    }
+
+    #[test]
+    fn test_verification_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(ReceiptVerificationError::InvalidSignature);
+        assert!(err.to_string().contains("invalid"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // VERIFY_COMMITTEE_HASH TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_committee_hash_match() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        // Create a committee
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Create receipt with matching committee_hash
+        let receipt_data = make_receipt();
+        let aggregate_signature = make_aggregate_signature();
+        let signers = vec![make_coordinator_id(0x01), make_coordinator_id(0x02)];
+        let committee_hash = committee.committee_hash();
+
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            aggregate_signature,
+            signers,
+            committee_hash,
+        );
+
+        assert!(receipt.verify_committee_hash(&committee));
+    }
+
+    #[test]
+    fn test_verify_committee_hash_mismatch() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Create receipt with WRONG committee_hash
+        let receipt_data = make_receipt();
+        let aggregate_signature = make_aggregate_signature();
+        let signers = vec![make_coordinator_id(0x01), make_coordinator_id(0x02)];
+        let wrong_hash = [0xFF; 32];
+
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            aggregate_signature,
+            signers,
+            wrong_hash,
+        );
+
+        assert!(!receipt.verify_committee_hash(&committee));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // VERIFY_EPOCH TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_epoch_match() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1, // epoch = 1
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Create receipt with epoch = 1 (matching)
+        let receipt_data = ReceiptData::new(
+            make_workload_id(0x01),
+            [0x02; 32],
+            vec![],
+            1700000000,
+            1,
+            1, // epoch = 1
+        );
+        let aggregate_signature = make_aggregate_signature();
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            aggregate_signature,
+            vec![],
+            committee.committee_hash(),
+        );
+
+        assert!(receipt.verify_epoch(&committee));
+    }
+
+    #[test]
+    fn test_verify_epoch_mismatch() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1, // epoch = 1
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Create receipt with epoch = 99 (NOT matching)
+        let receipt_data = ReceiptData::new(
+            make_workload_id(0x01),
+            [0x02; 32],
+            vec![],
+            1700000000,
+            1,
+            99, // epoch = 99
+        );
+        let aggregate_signature = make_aggregate_signature();
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            aggregate_signature,
+            vec![],
+            [0x00; 32],
+        );
+
+        assert!(!receipt.verify_epoch(&committee));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // VERIFY_SIGNERS TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_signers_all_valid() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // All signers are members
+        let signers = vec![
+            CoordinatorId::new([0x01; 32]),
+            CoordinatorId::new([0x02; 32]),
+        ];
+        let receipt = ThresholdReceipt::new(
+            make_receipt(),
+            make_aggregate_signature(),
+            signers,
+            [0x00; 32],
+        );
+
+        assert!(receipt.verify_signers(&committee));
+    }
+
+    #[test]
+    fn test_verify_signers_invalid_signer() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // One signer is NOT a member
+        let signers = vec![
+            CoordinatorId::new([0x01; 32]),
+            CoordinatorId::new([0xFF; 32]), // NOT a member
+        ];
+        let receipt = ThresholdReceipt::new(
+            make_receipt(),
+            make_aggregate_signature(),
+            signers,
+            [0x00; 32],
+        );
+
+        assert!(!receipt.verify_signers(&committee));
+    }
+
+    #[test]
+    fn test_verify_signers_duplicate() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Duplicate signer
+        let signers = vec![
+            CoordinatorId::new([0x01; 32]),
+            CoordinatorId::new([0x01; 32]), // DUPLICATE
+        ];
+        let receipt = ThresholdReceipt::new(
+            make_receipt(),
+            make_aggregate_signature(),
+            signers,
+            [0x00; 32],
+        );
+
+        assert!(!receipt.verify_signers(&committee));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // VERIFY_THRESHOLD TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_threshold_sufficient() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2, // threshold = 2
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // 2 signers >= threshold 2
+        let signers = vec![
+            CoordinatorId::new([0x01; 32]),
+            CoordinatorId::new([0x02; 32]),
+        ];
+        let receipt = ThresholdReceipt::new(
+            make_receipt(),
+            make_aggregate_signature(),
+            signers,
+            [0x00; 32],
+        );
+
+        assert!(receipt.verify_threshold(&committee));
+    }
+
+    #[test]
+    fn test_verify_threshold_insufficient() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2, // threshold = 2
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Only 1 signer < threshold 2
+        let signers = vec![CoordinatorId::new([0x01; 32])];
+        let receipt = ThresholdReceipt::new(
+            make_receipt(),
+            make_aggregate_signature(),
+            signers,
+            [0x00; 32],
+        );
+
+        assert!(!receipt.verify_threshold(&committee));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // VERIFY_DETAILED TESTS
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_detailed_committee_hash_error() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        let receipt = ThresholdReceipt::new(
+            make_receipt(),
+            make_aggregate_signature(),
+            vec![],
+            [0xFF; 32], // Wrong hash
+        );
+
+        let result = receipt.verify_detailed(&committee);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptVerificationError::CommitteeHashMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_verify_detailed_epoch_error() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1, // epoch = 1
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Receipt with wrong epoch
+        let receipt_data = ReceiptData::new(
+            make_workload_id(0x01),
+            [0x02; 32],
+            vec![],
+            1700000000,
+            1,
+            99, // Wrong epoch
+        );
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            make_aggregate_signature(),
+            vec![],
+            committee.committee_hash(),
+        );
+
+        let result = receipt.verify_detailed(&committee);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptVerificationError::EpochMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_verify_detailed_duplicate_signer_error() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Receipt with correct epoch but duplicate signers
+        let receipt_data = ReceiptData::new(
+            make_workload_id(0x01),
+            [0x02; 32],
+            vec![],
+            1700000000,
+            1,
+            1,
+        );
+        let signers = vec![
+            CoordinatorId::new([0x01; 32]),
+            CoordinatorId::new([0x01; 32]), // Duplicate
+        ];
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            make_aggregate_signature(),
+            signers,
+            committee.committee_hash(),
+        );
+
+        let result = receipt.verify_detailed(&committee);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptVerificationError::DuplicateSigner { .. }
+        ));
+    }
+
+    #[test]
+    fn test_verify_detailed_invalid_signer_error() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2,
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Receipt with invalid signer (not a member)
+        let receipt_data = ReceiptData::new(
+            make_workload_id(0x01),
+            [0x02; 32],
+            vec![],
+            1700000000,
+            1,
+            1,
+        );
+        let signers = vec![CoordinatorId::new([0xFF; 32])]; // Not a member
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            make_aggregate_signature(),
+            signers,
+            committee.committee_hash(),
+        );
+
+        let result = receipt.verify_detailed(&committee);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptVerificationError::InvalidSigner { .. }
+        ));
+    }
+
+    #[test]
+    fn test_verify_detailed_insufficient_signers_error() {
+        use crate::coordinator::{CoordinatorMember, ValidatorId};
+        use dsdn_tss::{GroupPublicKey, ParticipantPublicKey};
+
+        let id1 = CoordinatorId::new([0x01; 32]);
+        let vid1 = ValidatorId::new([0x01; 32]);
+        let pubkey1 = ParticipantPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let member1 = CoordinatorMember::with_timestamp(id1, vid1, pubkey1, 1000, 1700000000);
+
+        let id2 = CoordinatorId::new([0x02; 32]);
+        let vid2 = ValidatorId::new([0x02; 32]);
+        let pubkey2 = ParticipantPublicKey::from_bytes([0x02; 32]).expect("valid");
+        let member2 = CoordinatorMember::with_timestamp(id2, vid2, pubkey2, 2000, 1700000000);
+
+        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).expect("valid");
+        let committee = CoordinatorCommittee::new(
+            vec![member1, member2],
+            2, // threshold = 2
+            1,
+            1700000000,
+            3600,
+            group_pubkey,
+        )
+        .expect("valid committee");
+
+        // Receipt with only 1 valid signer (below threshold)
+        let receipt_data = ReceiptData::new(
+            make_workload_id(0x01),
+            [0x02; 32],
+            vec![],
+            1700000000,
+            1,
+            1,
+        );
+        let signers = vec![CoordinatorId::new([0x01; 32])]; // Only 1
+        let receipt = ThresholdReceipt::new(
+            receipt_data,
+            make_aggregate_signature(),
+            signers,
+            committee.committee_hash(),
+        );
+
+        let result = receipt.verify_detailed(&committee);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ReceiptVerificationError::InsufficientSigners { required: 2, got: 1 }
+        ));
     }
 }
