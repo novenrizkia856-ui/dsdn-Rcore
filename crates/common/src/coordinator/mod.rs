@@ -8,6 +8,7 @@
 //! |--------|-----------|
 //! | `ids` | Identifier types (CoordinatorId, ValidatorId, WorkloadId, Timestamp) |
 //! | `member` | CoordinatorMember struct untuk committee membership |
+//! | `committee` | CoordinatorCommittee struct untuk committee management |
 //!
 //! ## Re-exports
 //!
@@ -16,10 +17,13 @@
 //! ```rust,ignore
 //! use dsdn_common::{CoordinatorId, ValidatorId, WorkloadId, Timestamp, ParseError};
 //! use dsdn_common::CoordinatorMember;
+//! use dsdn_common::{CoordinatorCommittee, CommitteeError};
 //! ```
 
 pub mod ids;
 pub mod member;
+pub mod committee;
 
 pub use ids::*;
 pub use member::CoordinatorMember;
+pub use committee::{CoordinatorCommittee, CommitteeError};
