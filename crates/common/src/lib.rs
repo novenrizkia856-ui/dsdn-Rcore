@@ -12,7 +12,7 @@
 //! - Cryptographic utilities
 //! - Content addressing (CID)
 //! - Configuration management
-//! - Coordinator identifier types
+//! - Multi-coordinator committee management dengan TSS support
 //!
 //! ## Arsitektur Fallback & DA Routing
 //!
@@ -38,6 +38,32 @@
 //! │(Primary)│ │(Secondary)│ │(Foundation)│
 //! └────────┘ └─────────┘   └───────────┘
 //! ```
+//!
+//! ## Coordinator Committee System
+//!
+//! DSDN menggunakan committee of coordinators untuk threshold signing.
+//! Committee beroperasi dalam epoch-based rotation dengan handoff mechanism.
+//!
+//! ### Committee Lifecycle
+//!
+//! ```text
+//! Initializing → Active → InHandoff → Active (new epoch)
+//!                  ↓           ↓
+//!               Expire      Expire
+//!                  ↓           ↓
+//!               Expired     Expired
+//! ```
+//!
+//! ### Coordinator Types
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `CoordinatorId` | 32-byte unique identifier |
+//! | `CoordinatorMember` | Member dengan pubkey dan stake |
+//! | `CoordinatorCommittee` | Committee dengan threshold signing |
+//! | `ThresholdReceipt` | Receipt dengan aggregate signature |
+//! | `CommitteeTransition` | Epoch rotation dengan handoff |
+//! | `CommitteeStatus` | Lifecycle status tracking |
 //!
 //! ## Komponen Utama
 //!
@@ -105,6 +131,31 @@
 //! let blob_ref = router.post_blob(data).await?;
 //! ```
 //!
+//! ### Coordinator Committee Operations
+//!
+//! ```rust,ignore
+//! use dsdn_common::{
+//!     CoordinatorCommittee, CoordinatorMember, CoordinatorId,
+//!     ThresholdReceipt, CommitteeStatus,
+//! };
+//!
+//! // Create committee
+//! let committee = CoordinatorCommittee::new(
+//!     members, threshold, epoch, epoch_start, duration, group_pubkey
+//! )?;
+//!
+//! // Verify receipt
+//! if receipt.verify(&committee) {
+//!     // Receipt valid
+//! }
+//!
+//! // Track status
+//! let status = CommitteeStatus::active(committee, timestamp);
+//! if status.can_accept_receipts() {
+//!     // Process receipts
+//! }
+//! ```
+//!
 //! ### Fallback Activation
 //!
 //! Fallback diaktifkan ketika:
@@ -137,7 +188,7 @@
 //! | `cid` | Content addressing utilities |
 //! | `config` | Configuration management |
 //! | `consistent_hash` | Consistent hashing for placement |
-//! | `coordinator` | Coordinator identifier types |
+//! | `coordinator` | Multi-coordinator committee management dengan TSS | |
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
