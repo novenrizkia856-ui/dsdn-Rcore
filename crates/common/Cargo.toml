@@ -21,6 +21,10 @@ sha3 = "0.10"
 tracing = "0.1"
 serde_json = "1.0"
 parking_lot = "=0.12.3"
+bincode = "1.3"
+
+# TSS types for coordinator member pubkey
+dsdn-tss = { path = "../tss" }
 
 [dev-dependencies]
 wiremock = "0.5"
