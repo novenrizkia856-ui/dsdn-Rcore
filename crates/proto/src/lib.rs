@@ -27,6 +27,7 @@
 //! - [`pending_blob`]: PendingBlob struct untuk blobs menunggu reconciliation
 //! - [`reconcile_report`]: ReconcileReport dan related types untuk hasil reconciliation
 //! - [`consistency_report`]: ConsistencyReport dan related types untuk verifikasi konsistensi
+//! - [`tss`]: TSS protocol message types untuk threshold signing
 //!
 //! ## Architecture Overview
 //!
@@ -352,6 +353,9 @@ pub mod reconcile_report;
 /// Consistency report types for verification (14A.1A.7).
 pub mod consistency_report;
 
+/// TSS protocol message types (14A.2B.1.21).
+pub mod tss;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - DA Core Types
 // ════════════════════════════════════════════════════════════════════════════════
@@ -401,6 +405,12 @@ pub use consistency_report::{
     ConsistencyMismatch,
     MismatchType,
 };
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - TSS Types (14A.2B.1.21)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use tss::{BytesWrapper, SignatureBytes, BYTES_WRAPPER_SIZE, SIGNATURE_BYTES_SIZE};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
