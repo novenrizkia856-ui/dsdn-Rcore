@@ -35,6 +35,7 @@
 //! - Wrapper types untuk raw bytes (`BytesWrapper`, `SignatureBytes`)
 //! - DKG Round 1 proto message (`DKGRound1PackageProto`)
 //! - DKG Round 2 proto message (`DKGRound2PackageProto`)
+//! - DKG Result proto message (`DKGResultProto`)
 //!
 //! ## Submodules
 //!
@@ -67,6 +68,13 @@ pub use dkg::{
     decode_dkg_round2,
 };
 
+// Re-export DKG Result types
+pub use dkg::{
+    DKGResultProto,
+    encode_dkg_result,
+    decode_dkg_result,
+};
+
 // Re-export error types
 pub use dkg::{ValidationError, DecodeError};
 
@@ -76,4 +84,5 @@ pub use dkg::{
     PARTICIPANT_ID_SIZE,
     COMMITMENT_SIZE,
     PROOF_SIZE,
+    GROUP_PUBKEY_SIZE,
 };
