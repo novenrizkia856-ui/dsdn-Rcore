@@ -413,6 +413,23 @@ pub use consistency_report::{
 pub use tss::{BytesWrapper, SignatureBytes, BYTES_WRAPPER_SIZE, SIGNATURE_BYTES_SIZE};
 
 // ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - TSS DKG Types (14A.2B.1.22)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use tss::{
+    DKGRound1PackageProto,
+    ValidationError as DKGValidationError,
+    DecodeError as DKGDecodeError,
+    encode_dkg_round1,
+    decode_dkg_round1,
+    compute_dkg_round1_hash,
+    SESSION_ID_SIZE,
+    PARTICIPANT_ID_SIZE,
+    COMMITMENT_SIZE,
+    PROOF_SIZE,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ════════════════════════════════════════════════════════════════════════════════
 

@@ -31,24 +31,37 @@
 //!
 //! ## Current Status
 //!
-//! **PENTING**: Module ini dalam tahap struktural.
-//!
 //! Saat ini module menyediakan:
 //! - Wrapper types untuk raw bytes (`BytesWrapper`, `SignatureBytes`)
-//!
-//! Message types yang tercantum di tabel di atas BELUM diimplementasikan
-//! dan akan ditambahkan di tahap selanjutnya.
+//! - DKG Round 1 proto message (`DKGRound1PackageProto`)
 //!
 //! ## Submodules
 //!
 //! | Module | Description |
 //! |--------|-------------|
 //! | `types` | Basic wrapper types untuk bytes dan signatures |
+//! | `dkg` | DKG protocol message types |
 
 pub mod types;
+pub mod dkg;
 
 // Re-export wrapper types
 pub use types::{BytesWrapper, SignatureBytes};
 
 // Re-export size constants
 pub use types::{BYTES_WRAPPER_SIZE, SIGNATURE_BYTES_SIZE};
+
+// Re-export DKG types
+pub use dkg::{
+    DKGRound1PackageProto,
+    ValidationError,
+    DecodeError,
+    encode_dkg_round1,
+    decode_dkg_round1,
+    compute_dkg_round1_hash,
+    // Size constants
+    SESSION_ID_SIZE,
+    PARTICIPANT_ID_SIZE,
+    COMMITMENT_SIZE,
+    PROOF_SIZE,
+};
