@@ -34,6 +34,7 @@
 //! Saat ini module menyediakan:
 //! - Wrapper types untuk raw bytes (`BytesWrapper`, `SignatureBytes`)
 //! - DKG Round 1 proto message (`DKGRound1PackageProto`)
+//! - DKG Round 2 proto message (`DKGRound2PackageProto`)
 //!
 //! ## Submodules
 //!
@@ -51,15 +52,26 @@ pub use types::{BytesWrapper, SignatureBytes};
 // Re-export size constants
 pub use types::{BYTES_WRAPPER_SIZE, SIGNATURE_BYTES_SIZE};
 
-// Re-export DKG types
+// Re-export DKG Round 1 types
 pub use dkg::{
     DKGRound1PackageProto,
-    ValidationError,
-    DecodeError,
     encode_dkg_round1,
     decode_dkg_round1,
     compute_dkg_round1_hash,
-    // Size constants
+};
+
+// Re-export DKG Round 2 types
+pub use dkg::{
+    DKGRound2PackageProto,
+    encode_dkg_round2,
+    decode_dkg_round2,
+};
+
+// Re-export error types
+pub use dkg::{ValidationError, DecodeError};
+
+// Re-export size constants
+pub use dkg::{
     SESSION_ID_SIZE,
     PARTICIPANT_ID_SIZE,
     COMMITMENT_SIZE,

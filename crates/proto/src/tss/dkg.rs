@@ -84,6 +84,25 @@ pub enum ValidationError {
         /// Actual length.
         got: usize,
     },
+
+    /// from_participant length tidak valid (Round2).
+    InvalidFromParticipantLength {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        got: usize,
+    },
+
+    /// to_participant length tidak valid (Round2).
+    InvalidToParticipantLength {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        got: usize,
+    },
+
+    /// encrypted_share kosong (Round2).
+    EmptyEncryptedShare,
 }
 
 impl fmt::Display for ValidationError {
@@ -116,6 +135,23 @@ impl fmt::Display for ValidationError {
                     "invalid proof length: expected {}, got {}",
                     expected, got
                 )
+            }
+            ValidationError::InvalidFromParticipantLength { expected, got } => {
+                write!(
+                    f,
+                    "invalid from_participant length: expected {}, got {}",
+                    expected, got
+                )
+            }
+            ValidationError::InvalidToParticipantLength { expected, got } => {
+                write!(
+                    f,
+                    "invalid to_participant length: expected {}, got {}",
+                    expected, got
+                )
+            }
+            ValidationError::EmptyEncryptedShare => {
+                write!(f, "encrypted_share must not be empty")
             }
         }
     }
@@ -442,6 +478,243 @@ pub fn compute_dkg_round1_hash(pkg: &DKGRound1PackageProto) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
     hash
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DKG ROUND 2 PACKAGE PROTO
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Proto message untuk DKG Round 2 Package.
+///
+/// `DKGRound2PackageProto` adalah representasi serializable dari `Round2Package`
+/// yang digunakan untuk transport dan storage. Round 2 packages berisi
+/// encrypted secret shares yang dikirim dari satu participant ke participant lain.
+///
+/// ## Field Sizes
+///
+/// | Field | Expected Size |
+/// |-------|---------------|
+/// | `session_id` | 32 bytes |
+/// | `from_participant` | 32 bytes |
+/// | `to_participant` | 32 bytes |
+/// | `encrypted_share` | > 0 bytes (opaque) |
+///
+/// ## Validation
+///
+/// Gunakan `validate()` untuk memastikan semua field memiliki panjang yang benar.
+/// `encrypted_share` diperlakukan sebagai opaque bytes dan hanya divalidasi
+/// tidak kosong.
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// use dsdn_proto::tss::dkg::{DKGRound2PackageProto, encode_dkg_round2, decode_dkg_round2};
+///
+/// let proto = DKGRound2PackageProto {
+///     session_id: vec![0u8; 32],
+///     from_participant: vec![0u8; 32],
+///     to_participant: vec![0u8; 32],
+///     encrypted_share: vec![0x42u8; 48],
+/// };
+///
+/// // Validate
+/// assert!(proto.validate().is_ok());
+///
+/// // Encode
+/// let bytes = encode_dkg_round2(&proto);
+///
+/// // Decode (includes validation)
+/// let decoded = decode_dkg_round2(&bytes).unwrap();
+/// assert_eq!(proto, decoded);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DKGRound2PackageProto {
+    /// Session identifier (MUST be 32 bytes).
+    pub session_id: Vec<u8>,
+
+    /// Sender participant identifier (MUST be 32 bytes).
+    pub from_participant: Vec<u8>,
+
+    /// Recipient participant identifier (MUST be 32 bytes).
+    pub to_participant: Vec<u8>,
+
+    /// Encrypted secret share (MUST be > 0 bytes, opaque).
+    ///
+    /// Ini adalah ciphertext yang berisi share yang dienkripsi.
+    /// Format tidak diasumsikan - diperlakukan sebagai opaque bytes.
+    pub encrypted_share: Vec<u8>,
+}
+
+impl DKGRound2PackageProto {
+    /// Validates all field lengths.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if all fields have correct lengths
+    /// - `Err(ValidationError)` if any field has incorrect length
+    ///
+    /// # Validation Rules
+    ///
+    /// - `session_id.len() == 32`
+    /// - `from_participant.len() == 32`
+    /// - `to_participant.len() == 32`
+    /// - `encrypted_share.len() > 0`
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.session_id.len() != SESSION_ID_SIZE {
+            return Err(ValidationError::InvalidSessionIdLength {
+                expected: SESSION_ID_SIZE,
+                got: self.session_id.len(),
+            });
+        }
+
+        if self.from_participant.len() != PARTICIPANT_ID_SIZE {
+            return Err(ValidationError::InvalidFromParticipantLength {
+                expected: PARTICIPANT_ID_SIZE,
+                got: self.from_participant.len(),
+            });
+        }
+
+        if self.to_participant.len() != PARTICIPANT_ID_SIZE {
+            return Err(ValidationError::InvalidToParticipantLength {
+                expected: PARTICIPANT_ID_SIZE,
+                got: self.to_participant.len(),
+            });
+        }
+
+        if self.encrypted_share.is_empty() {
+            return Err(ValidationError::EmptyEncryptedShare);
+        }
+
+        Ok(())
+    }
+
+    /// Creates proto from native `Round2Package`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pkg` - Reference to `Round2Package`
+    ///
+    /// # Returns
+    ///
+    /// A `DKGRound2PackageProto` with all bytes copied.
+    ///
+    /// # Note
+    ///
+    /// This function is infallible because native types guarantee correct sizes.
+    #[cfg(feature = "tss-conversion")]
+    pub fn from_round2_package(pkg: &dsdn_tss::dkg::Round2Package) -> Self {
+        Self {
+            session_id: pkg.session_id().as_bytes().to_vec(),
+            from_participant: pkg.from_participant().as_bytes().to_vec(),
+            to_participant: pkg.to_participant().as_bytes().to_vec(),
+            encrypted_share: pkg.encrypted_share().to_vec(),
+        }
+    }
+
+    /// Converts proto back to native `Round2Package`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Round2Package)` if valid
+    /// - `Err(DecodeError)` if validation fails
+    ///
+    /// # Note
+    ///
+    /// This method calls `validate()` internally. If validation fails,
+    /// the error is returned immediately without attempting conversion.
+    #[cfg(feature = "tss-conversion")]
+    pub fn to_round2_package(&self) -> Result<dsdn_tss::dkg::Round2Package, DecodeError> {
+        // Validate first
+        self.validate()?;
+
+        // Safe to convert - validation ensures correct lengths
+
+        // Convert session_id
+        let mut session_bytes = [0u8; SESSION_ID_SIZE];
+        session_bytes.copy_from_slice(&self.session_id);
+        let session_id = dsdn_tss::SessionId::from_bytes(session_bytes);
+
+        // Convert from_participant
+        let mut from_bytes = [0u8; PARTICIPANT_ID_SIZE];
+        from_bytes.copy_from_slice(&self.from_participant);
+        let from_participant = dsdn_tss::ParticipantId::from_bytes(from_bytes);
+
+        // Convert to_participant
+        let mut to_bytes = [0u8; PARTICIPANT_ID_SIZE];
+        to_bytes.copy_from_slice(&self.to_participant);
+        let to_participant = dsdn_tss::ParticipantId::from_bytes(to_bytes);
+
+        // Build Round2Package
+        let package = dsdn_tss::dkg::Round2Package::new(
+            session_id,
+            from_participant,
+            to_participant,
+            self.encrypted_share.clone(),
+        );
+
+        Ok(package)
+    }
+}
+
+impl Default for DKGRound2PackageProto {
+    fn default() -> Self {
+        Self {
+            session_id: vec![0u8; SESSION_ID_SIZE],
+            from_participant: vec![0u8; PARTICIPANT_ID_SIZE],
+            to_participant: vec![0u8; PARTICIPANT_ID_SIZE],
+            encrypted_share: vec![0u8; 1], // Minimal non-empty
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ROUND 2 ENCODING FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Encodes `DKGRound2PackageProto` to bytes.
+///
+/// # Arguments
+///
+/// * `pkg` - Reference to proto message
+///
+/// # Returns
+///
+/// Bincode-encoded bytes (little-endian, deterministic).
+///
+/// # Note
+///
+/// This function does NOT validate the proto. Call `validate()` first
+/// if validation is needed.
+#[must_use]
+pub fn encode_dkg_round2(pkg: &DKGRound2PackageProto) -> Vec<u8> {
+    bincode::serialize(pkg).unwrap_or_else(|_| Vec::new())
+}
+
+/// Decodes bytes to `DKGRound2PackageProto`.
+///
+/// # Arguments
+///
+/// * `bytes` - Bincode-encoded bytes
+///
+/// # Returns
+///
+/// - `Ok(DKGRound2PackageProto)` if decoding and validation succeed
+/// - `Err(DecodeError)` if decoding or validation fails
+///
+/// # Note
+///
+/// This function calls `validate()` after deserialization.
+/// Invalid field lengths will result in `DecodeError::ValidationFailed`.
+pub fn decode_dkg_round2(bytes: &[u8]) -> Result<DKGRound2PackageProto, DecodeError> {
+    let proto: DKGRound2PackageProto =
+        bincode::deserialize(bytes).map_err(|e| DecodeError::DeserializationFailed {
+            reason: e.to_string(),
+        })?;
+
+    // Validate after deserialization
+    proto.validate()?;
+
+    Ok(proto)
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -804,6 +1077,266 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
+    // ROUND 2 VALIDATION TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_round2_validate_valid_proto() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![0xDD; 48],
+        };
+
+        assert!(proto.validate().is_ok());
+    }
+
+    #[test]
+    fn test_round2_validate_invalid_session_id_length() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 16], // Wrong length
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![0xDD; 48],
+        };
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::InvalidSessionIdLength { expected: 32, got: 16 }
+        ));
+    }
+
+    #[test]
+    fn test_round2_validate_invalid_from_participant_length() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 64], // Wrong length
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![0xDD; 48],
+        };
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::InvalidFromParticipantLength { expected: 32, got: 64 }
+        ));
+    }
+
+    #[test]
+    fn test_round2_validate_invalid_to_participant_length() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 16], // Wrong length
+            encrypted_share: vec![0xDD; 48],
+        };
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::InvalidToParticipantLength { expected: 32, got: 16 }
+        ));
+    }
+
+    #[test]
+    fn test_round2_validate_empty_encrypted_share() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![], // Empty
+        };
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::EmptyEncryptedShare
+        ));
+    }
+
+    #[test]
+    fn test_round2_validate_single_byte_encrypted_share() {
+        // Single byte should be valid
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![0x01], // Single byte is valid
+        };
+
+        assert!(proto.validate().is_ok());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // ROUND 2 ENCODING TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_round2_encode_decode_roundtrip() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0x11; 32],
+            from_participant: vec![0x22; 32],
+            to_participant: vec![0x33; 32],
+            encrypted_share: vec![0x44; 64],
+        };
+
+        let encoded = encode_dkg_round2(&proto);
+        let decoded = decode_dkg_round2(&encoded);
+
+        assert!(decoded.is_ok());
+        assert_eq!(proto, decoded.expect("valid"));
+    }
+
+    #[test]
+    fn test_round2_encode_deterministic() {
+        let proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![0xDD; 48],
+        };
+
+        let encoded1 = encode_dkg_round2(&proto);
+        let encoded2 = encode_dkg_round2(&proto);
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_round2_decode_invalid_bytes() {
+        let invalid_bytes = vec![0xFF; 10];
+        let result = decode_dkg_round2(&invalid_bytes);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DecodeError::DeserializationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_round2_decode_validates_after_deserialization() {
+        // Create invalid proto manually and serialize
+        let invalid_proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 16], // Invalid length
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![0xDD; 48],
+        };
+
+        // Serialize (bypassing validation)
+        let bytes = bincode::serialize(&invalid_proto).expect("serialize");
+
+        // Decode should fail validation
+        let result = decode_dkg_round2(&bytes);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DecodeError::ValidationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_round2_decode_validates_empty_share() {
+        // Create proto with empty encrypted_share
+        let invalid_proto = DKGRound2PackageProto {
+            session_id: vec![0xAA; 32],
+            from_participant: vec![0xBB; 32],
+            to_participant: vec![0xCC; 32],
+            encrypted_share: vec![], // Empty
+        };
+
+        // Serialize (bypassing validation)
+        let bytes = bincode::serialize(&invalid_proto).expect("serialize");
+
+        // Decode should fail validation
+        let result = decode_dkg_round2(&bytes);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DecodeError::ValidationFailed {
+                error: ValidationError::EmptyEncryptedShare
+            }
+        ));
+    }
+
+    #[test]
+    fn test_round2_variable_encrypted_share_lengths() {
+        // Test various valid lengths
+        for len in [1, 32, 48, 64, 128, 256] {
+            let proto = DKGRound2PackageProto {
+                session_id: vec![0xAA; 32],
+                from_participant: vec![0xBB; 32],
+                to_participant: vec![0xCC; 32],
+                encrypted_share: vec![0xDD; len],
+            };
+
+            assert!(proto.validate().is_ok(), "length {} should be valid", len);
+
+            let encoded = encode_dkg_round2(&proto);
+            let decoded = decode_dkg_round2(&encoded).expect("decode should succeed");
+            assert_eq!(proto, decoded, "roundtrip should preserve data for length {}", len);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // ROUND 2 DEFAULT TEST
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_round2_default() {
+        let proto = DKGRound2PackageProto::default();
+
+        assert_eq!(proto.session_id.len(), 32);
+        assert_eq!(proto.from_participant.len(), 32);
+        assert_eq!(proto.to_participant.len(), 32);
+        assert!(!proto.encrypted_share.is_empty());
+        assert!(proto.validate().is_ok());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // ROUND 2 ERROR DISPLAY TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_round2_validation_error_from_participant_display() {
+        let error = ValidationError::InvalidFromParticipantLength {
+            expected: 32,
+            got: 64,
+        };
+        let display = format!("{}", error);
+        assert!(display.contains("from_participant"));
+        assert!(display.contains("32"));
+        assert!(display.contains("64"));
+    }
+
+    #[test]
+    fn test_round2_validation_error_to_participant_display() {
+        let error = ValidationError::InvalidToParticipantLength {
+            expected: 32,
+            got: 16,
+        };
+        let display = format!("{}", error);
+        assert!(display.contains("to_participant"));
+        assert!(display.contains("32"));
+        assert!(display.contains("16"));
+    }
+
+    #[test]
+    fn test_round2_validation_error_empty_share_display() {
+        let error = ValidationError::EmptyEncryptedShare;
+        let display = format!("{}", error);
+        assert!(display.contains("encrypted_share"));
+        assert!(display.contains("empty"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
     // SEND + SYNC TESTS
     // ────────────────────────────────────────────────────────────────────────────
 
@@ -811,6 +1344,7 @@ mod tests {
     fn test_types_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DKGRound1PackageProto>();
+        assert_send_sync::<DKGRound2PackageProto>();
         assert_send_sync::<ValidationError>();
         assert_send_sync::<DecodeError>();
     }
