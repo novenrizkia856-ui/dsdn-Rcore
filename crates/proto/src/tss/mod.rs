@@ -36,6 +36,7 @@
 //! - DKG Round 1 proto message (`DKGRound1PackageProto`)
 //! - DKG Round 2 proto message (`DKGRound2PackageProto`)
 //! - DKG Result proto message (`DKGResultProto`)
+//! - Signing Request proto message (`SigningRequestProto`)
 //!
 //! ## Submodules
 //!
@@ -43,9 +44,11 @@
 //! |--------|-------------|
 //! | `types` | Basic wrapper types untuk bytes dan signatures |
 //! | `dkg` | DKG protocol message types |
+//! | `signing` | Threshold signing message types |
 
 pub mod types;
 pub mod dkg;
+pub mod signing;
 
 // Re-export wrapper types
 pub use types::{BytesWrapper, SignatureBytes};
@@ -75,14 +78,30 @@ pub use dkg::{
     decode_dkg_result,
 };
 
-// Re-export error types
+// Re-export DKG error types
 pub use dkg::{ValidationError, DecodeError};
 
-// Re-export size constants
+// Re-export DKG size constants
 pub use dkg::{
     SESSION_ID_SIZE,
     PARTICIPANT_ID_SIZE,
     COMMITMENT_SIZE,
     PROOF_SIZE,
     GROUP_PUBKEY_SIZE,
+};
+
+// Re-export Signing types
+pub use signing::{
+    SigningRequestProto,
+    encode_signing_request,
+    decode_signing_request,
+};
+
+// Re-export Signing error types
+pub use signing::{SigningValidationError, SigningDecodeError};
+
+// Re-export Signing size constants
+pub use signing::{
+    SIGNER_ID_SIZE,
+    MESSAGE_HASH_SIZE,
 };
