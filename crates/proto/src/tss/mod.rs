@@ -42,6 +42,8 @@
 //! - Aggregate Signature proto message (`AggregateSignatureProto`)
 //! - Coordinator Member proto message (`CoordinatorMemberProto`)
 //! - Coordinator Committee proto message (`CoordinatorCommitteeProto`)
+//! - Receipt Data proto message (`ReceiptDataProto`)
+//! - Threshold Receipt proto message (`ThresholdReceiptProto`)
 //!
 //! ## Submodules
 //!
@@ -156,4 +158,21 @@ pub use committee::{
     COORDINATOR_ID_SIZE,
     VALIDATOR_ID_SIZE,
     PUBKEY_SIZE,
+};
+
+// Re-export Receipt types
+pub use committee::{
+    ReceiptDataProto,
+    ThresholdReceiptProto,
+    encode_receipt,
+    decode_receipt,
+    compute_receipt_hash,
+};
+
+// Re-export Receipt size constants
+pub use committee::{
+    WORKLOAD_ID_SIZE,
+    BLOB_HASH_SIZE,
+    NODE_ID_SIZE,
+    COMMITTEE_HASH_SIZE,
 };
