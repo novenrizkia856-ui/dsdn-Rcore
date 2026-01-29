@@ -37,6 +37,8 @@
 //! - DKG Round 2 proto message (`DKGRound2PackageProto`)
 //! - DKG Result proto message (`DKGResultProto`)
 //! - Signing Request proto message (`SigningRequestProto`)
+//! - Signing Commitment proto message (`SigningCommitmentProto`)
+//! - Partial Signature proto message (`PartialSignatureProto`)
 //!
 //! ## Submodules
 //!
@@ -90,11 +92,25 @@ pub use dkg::{
     GROUP_PUBKEY_SIZE,
 };
 
-// Re-export Signing types
+// Re-export Signing Request types
 pub use signing::{
     SigningRequestProto,
     encode_signing_request,
     decode_signing_request,
+};
+
+// Re-export Signing Commitment types
+pub use signing::{
+    SigningCommitmentProto,
+    encode_signing_commitment,
+    decode_signing_commitment,
+};
+
+// Re-export Partial Signature types
+pub use signing::{
+    PartialSignatureProto,
+    encode_partial_signature,
+    decode_partial_signature,
 };
 
 // Re-export Signing error types
@@ -104,4 +120,7 @@ pub use signing::{SigningValidationError, SigningDecodeError};
 pub use signing::{
     SIGNER_ID_SIZE,
     MESSAGE_HASH_SIZE,
+    HIDING_SIZE,
+    BINDING_SIZE,
+    SIGNATURE_SHARE_SIZE,
 };
