@@ -39,6 +39,7 @@
 //! - Signing Request proto message (`SigningRequestProto`)
 //! - Signing Commitment proto message (`SigningCommitmentProto`)
 //! - Partial Signature proto message (`PartialSignatureProto`)
+//! - Aggregate Signature proto message (`AggregateSignatureProto`)
 //!
 //! ## Submodules
 //!
@@ -113,6 +114,14 @@ pub use signing::{
     decode_partial_signature,
 };
 
+// Re-export Aggregate Signature types
+pub use signing::{
+    AggregateSignatureProto,
+    encode_aggregate_signature,
+    decode_aggregate_signature,
+    compute_aggregate_signature_hash,
+};
+
 // Re-export Signing error types
 pub use signing::{SigningValidationError, SigningDecodeError};
 
@@ -123,4 +132,5 @@ pub use signing::{
     HIDING_SIZE,
     BINDING_SIZE,
     SIGNATURE_SHARE_SIZE,
+    FROST_SIGNATURE_SIZE,
 };

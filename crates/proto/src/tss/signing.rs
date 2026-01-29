@@ -56,6 +56,9 @@ pub const BINDING_SIZE: usize = 32;
 /// Expected size for signature_share field.
 pub const SIGNATURE_SHARE_SIZE: usize = 32;
 
+/// Expected size for FROST signature (R || s).
+pub const FROST_SIGNATURE_SIZE: usize = 64;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // ERROR TYPES
 // ════════════════════════════════════════════════════════════════════════════════
@@ -143,6 +146,37 @@ pub enum SigningValidationError {
         /// Underlying error message.
         reason: String,
     },
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // AGGREGATE SIGNATURE VALIDATION ERRORS
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /// signature length tidak valid (must be 64 bytes).
+    InvalidSignatureLength {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        got: usize,
+    },
+
+    /// signer_ids kosong.
+    EmptySignerIds,
+
+    /// Aggregate signer_id length tidak valid.
+    InvalidAggregateSignerIdLength {
+        /// Index of invalid signer.
+        index: usize,
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        got: usize,
+    },
+
+    /// Duplicate signer_id detected.
+    DuplicateSignerId {
+        /// Index of duplicate signer.
+        index: usize,
+    },
 }
 
 impl fmt::Display for SigningValidationError {
@@ -209,6 +243,26 @@ impl fmt::Display for SigningValidationError {
             }
             SigningValidationError::InvalidNestedCommitment { reason } => {
                 write!(f, "invalid nested commitment: {}", reason)
+            }
+            SigningValidationError::InvalidSignatureLength { expected, got } => {
+                write!(
+                    f,
+                    "invalid signature length: expected {}, got {}",
+                    expected, got
+                )
+            }
+            SigningValidationError::EmptySignerIds => {
+                write!(f, "signer_ids must not be empty")
+            }
+            SigningValidationError::InvalidAggregateSignerIdLength { index, expected, got } => {
+                write!(
+                    f,
+                    "invalid signer_ids[{}] length: expected {}, got {}",
+                    index, expected, got
+                )
+            }
+            SigningValidationError::DuplicateSignerId { index } => {
+                write!(f, "duplicate signer_id at index {}", index)
             }
         }
     }
@@ -1133,6 +1187,358 @@ pub fn decode_partial_signature(bytes: &[u8]) -> Result<PartialSignatureProto, S
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// AGGREGATE SIGNATURE PROTO
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Proto message untuk Aggregate Signature.
+///
+/// `AggregateSignatureProto` adalah representasi serializable dari aggregate
+/// signature hasil FROST threshold signing.
+///
+/// ## Field Sizes
+///
+/// | Field | Expected Size |
+/// |-------|---------------|
+/// | `signature` | 64 bytes (R ‖ s) |
+/// | `signer_ids[i]` | 32 bytes each |
+/// | `message_hash` | 32 bytes |
+///
+/// ## Important
+///
+/// - `signer_ids` adalah SET logis (tidak boleh duplikat)
+/// - `signature` adalah concatenation (R ‖ s) dalam format Schnorr
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// use dsdn_proto::tss::signing::{
+///     AggregateSignatureProto,
+///     encode_aggregate_signature,
+///     decode_aggregate_signature,
+/// };
+///
+/// let proto = AggregateSignatureProto {
+///     signature: vec![0x01; 64],
+///     signer_ids: vec![vec![0xAA; 32], vec![0xBB; 32]],
+///     message_hash: vec![0xCC; 32],
+///     aggregated_at: 1234567890,
+/// };
+///
+/// // Validate
+/// assert!(proto.validate().is_ok());
+///
+/// // Encode
+/// let bytes = encode_aggregate_signature(&proto);
+///
+/// // Decode (includes validation)
+/// let decoded = decode_aggregate_signature(&bytes).unwrap();
+/// assert_eq!(proto, decoded);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateSignatureProto {
+    /// FROST signature (MUST be 64 bytes: R ‖ s).
+    pub signature: Vec<u8>,
+
+    /// Signer identifiers (EACH MUST be 32 bytes, NO duplicates).
+    pub signer_ids: Vec<Vec<u8>>,
+
+    /// Hash of the signed message (MUST be 32 bytes).
+    pub message_hash: Vec<u8>,
+
+    /// Unix timestamp when aggregation was performed.
+    pub aggregated_at: u64,
+}
+
+impl AggregateSignatureProto {
+    /// Creates a new `AggregateSignatureProto`.
+    ///
+    /// # Arguments
+    ///
+    /// * `signature` - FROST signature bytes (64 bytes)
+    /// * `signer_ids` - List of signer identifier bytes (each 32 bytes)
+    /// * `message_hash` - Hash of the message (32 bytes)
+    ///
+    /// # Returns
+    ///
+    /// A proto with `aggregated_at` set to current Unix time.
+    #[must_use]
+    pub fn new_raw(
+        signature: Vec<u8>,
+        signer_ids: Vec<Vec<u8>>,
+        message_hash: Vec<u8>,
+    ) -> Self {
+        Self {
+            signature,
+            signer_ids,
+            message_hash,
+            aggregated_at: current_unix_timestamp(),
+        }
+    }
+
+    /// Creates proto from native aggregate signature types.
+    ///
+    /// # Arguments
+    ///
+    /// * `signature` - Reference to `FrostSignature`
+    /// * `signer_ids` - Slice of `SignerId`
+    /// * `message_hash` - Message hash
+    ///
+    /// # Returns
+    ///
+    /// A proto with all bytes copied and `aggregated_at` set.
+    #[cfg(feature = "tss-conversion")]
+    #[must_use]
+    pub fn new(
+        signature: &dsdn_tss::FrostSignature,
+        signer_ids: Vec<dsdn_tss::SignerId>,
+        message_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            signature: signature.as_bytes().to_vec(),
+            signer_ids: signer_ids.iter().map(|s| s.as_bytes().to_vec()).collect(),
+            message_hash: message_hash.to_vec(),
+            aggregated_at: current_unix_timestamp(),
+        }
+    }
+
+    /// Creates proto from native `AggregateSignature`.
+    ///
+    /// # Arguments
+    ///
+    /// * `agg` - Reference to `AggregateSignature`
+    ///
+    /// # Returns
+    ///
+    /// A proto with all bytes copied.
+    #[cfg(feature = "tss-conversion")]
+    #[must_use]
+    pub fn from_aggregate(agg: &dsdn_tss::signing::AggregateSignature) -> Self {
+        Self {
+            signature: agg.signature().as_bytes().to_vec(),
+            signer_ids: agg.signers().iter().map(|s| s.as_bytes().to_vec()).collect(),
+            message_hash: agg.message_hash().to_vec(),
+            aggregated_at: current_unix_timestamp(),
+        }
+    }
+
+    /// Validates all field lengths and uniqueness constraints.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if all fields are valid
+    /// - `Err(SigningValidationError)` if any validation fails
+    ///
+    /// # Validation Rules
+    ///
+    /// - `signature.len() == 64`
+    /// - `message_hash.len() == 32`
+    /// - `signer_ids` is not empty
+    /// - Each `signer_ids[i].len() == 32`
+    /// - No duplicate `signer_ids`
+    pub fn validate(&self) -> Result<(), SigningValidationError> {
+        // Validate signature length
+        if self.signature.len() != FROST_SIGNATURE_SIZE {
+            return Err(SigningValidationError::InvalidSignatureLength {
+                expected: FROST_SIGNATURE_SIZE,
+                got: self.signature.len(),
+            });
+        }
+
+        // Validate message_hash length
+        if self.message_hash.len() != MESSAGE_HASH_SIZE {
+            return Err(SigningValidationError::InvalidMessageHashLength {
+                expected: MESSAGE_HASH_SIZE,
+                got: self.message_hash.len(),
+            });
+        }
+
+        // Validate signer_ids not empty
+        if self.signer_ids.is_empty() {
+            return Err(SigningValidationError::EmptySignerIds);
+        }
+
+        // Validate each signer_id length and check for duplicates
+        let mut seen = std::collections::HashSet::with_capacity(self.signer_ids.len());
+        for (i, signer_id) in self.signer_ids.iter().enumerate() {
+            if signer_id.len() != SIGNER_ID_SIZE {
+                return Err(SigningValidationError::InvalidAggregateSignerIdLength {
+                    index: i,
+                    expected: SIGNER_ID_SIZE,
+                    got: signer_id.len(),
+                });
+            }
+
+            // Check for duplicates using the bytes directly
+            if !seen.insert(signer_id.as_slice()) {
+                return Err(SigningValidationError::DuplicateSignerId { index: i });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Converts proto back to native `AggregateSignature`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(AggregateSignature)` if valid
+    /// - `Err(SigningDecodeError)` if validation or conversion fails
+    ///
+    /// # Note
+    ///
+    /// This method calls `validate()` internally.
+    #[cfg(feature = "tss-conversion")]
+    pub fn to_aggregate(&self) -> Result<dsdn_tss::signing::AggregateSignature, SigningDecodeError> {
+        // Validate first
+        self.validate()?;
+
+        // Convert signature
+        let mut sig_bytes = [0u8; FROST_SIGNATURE_SIZE];
+        sig_bytes.copy_from_slice(&self.signature);
+        let signature = dsdn_tss::FrostSignature::from_bytes(sig_bytes)
+            .map_err(|e| SigningDecodeError::DeserializationFailed {
+                reason: format!("invalid signature: {}", e),
+            })?;
+
+        // Convert signer_ids
+        let mut signers = Vec::with_capacity(self.signer_ids.len());
+        for signer_bytes in &self.signer_ids {
+            let mut signer_arr = [0u8; SIGNER_ID_SIZE];
+            signer_arr.copy_from_slice(signer_bytes);
+            signers.push(dsdn_tss::SignerId::from_bytes(signer_arr));
+        }
+
+        // Convert message_hash
+        let mut hash_arr = [0u8; MESSAGE_HASH_SIZE];
+        hash_arr.copy_from_slice(&self.message_hash);
+
+        Ok(dsdn_tss::signing::AggregateSignature::new(
+            signature,
+            signers,
+            hash_arr,
+        ))
+    }
+
+    /// Returns the number of signers.
+    #[must_use]
+    pub fn signer_count(&self) -> usize {
+        self.signer_ids.len()
+    }
+
+    /// Checks if a signer is included in the signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `signer_id` - Signer identifier bytes to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the signer is included (exact byte match).
+    #[must_use]
+    pub fn contains_signer(&self, signer_id: &[u8]) -> bool {
+        self.signer_ids.iter().any(|s| s.as_slice() == signer_id)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// AGGREGATE SIGNATURE ENCODING FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Encodes `AggregateSignatureProto` to bytes.
+///
+/// # Arguments
+///
+/// * `agg` - Reference to proto message
+///
+/// # Returns
+///
+/// Bincode-encoded bytes (little-endian, deterministic).
+///
+/// # Note
+///
+/// This function does NOT validate the proto. Call `validate()` first
+/// if validation is needed.
+#[must_use]
+pub fn encode_aggregate_signature(agg: &AggregateSignatureProto) -> Vec<u8> {
+    bincode::serialize(agg).unwrap_or_else(|_| Vec::new())
+}
+
+/// Decodes bytes to `AggregateSignatureProto`.
+///
+/// # Arguments
+///
+/// * `bytes` - Bincode-encoded bytes
+///
+/// # Returns
+///
+/// - `Ok(AggregateSignatureProto)` if decoding and validation succeed
+/// - `Err(SigningDecodeError)` if decoding or validation fails
+///
+/// # Note
+///
+/// This function calls `validate()` after deserialization.
+pub fn decode_aggregate_signature(bytes: &[u8]) -> Result<AggregateSignatureProto, SigningDecodeError> {
+    let proto: AggregateSignatureProto =
+        bincode::deserialize(bytes).map_err(|e| SigningDecodeError::DeserializationFailed {
+            reason: e.to_string(),
+        })?;
+
+    // Validate after deserialization
+    proto.validate()?;
+
+    Ok(proto)
+}
+
+/// Computes deterministic hash of `AggregateSignatureProto`.
+///
+/// # Arguments
+///
+/// * `agg` - Reference to proto message
+///
+/// # Returns
+///
+/// 32-byte SHA3-256 hash computed from all fields.
+///
+/// # Determinism
+///
+/// The hash is computed in a deterministic order:
+/// 1. signature bytes
+/// 2. number of signers (8 bytes, little-endian)
+/// 3. each signer_id in order
+/// 4. message_hash
+/// 5. aggregated_at (8 bytes, little-endian)
+#[must_use]
+pub fn compute_aggregate_signature_hash(agg: &AggregateSignatureProto) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+
+    // Domain separator
+    hasher.update(b"dsdn-proto-aggregate-signature-v1");
+
+    // Signature
+    hasher.update(&agg.signature);
+
+    // Number of signers (deterministic)
+    let signer_count = agg.signer_ids.len() as u64;
+    hasher.update(signer_count.to_le_bytes());
+
+    // Signer IDs in order
+    for signer_id in &agg.signer_ids {
+        hasher.update(signer_id);
+    }
+
+    // Message hash
+    hasher.update(&agg.message_hash);
+
+    // Aggregated timestamp
+    hasher.update(agg.aggregated_at.to_le_bytes());
+
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -1853,5 +2259,336 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SigningCommitmentProto>();
         assert_send_sync::<PartialSignatureProto>();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // AGGREGATE SIGNATURE PROTO TESTS
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    fn make_valid_aggregate() -> AggregateSignatureProto {
+        AggregateSignatureProto {
+            signature: vec![0x01; 64],
+            signer_ids: vec![vec![0xAA; 32], vec![0xBB; 32]],
+            message_hash: vec![0xCC; 32],
+            aggregated_at: 1234567890,
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE VALIDATION TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_validate_valid() {
+        let proto = make_valid_aggregate();
+        assert!(proto.validate().is_ok());
+    }
+
+    #[test]
+    fn test_aggregate_validate_invalid_signature_length() {
+        let mut proto = make_valid_aggregate();
+        proto.signature = vec![0x01; 32]; // Wrong length
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningValidationError::InvalidSignatureLength { expected: 64, got: 32 }
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_validate_invalid_message_hash_length() {
+        let mut proto = make_valid_aggregate();
+        proto.message_hash = vec![0xCC; 16]; // Wrong length
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningValidationError::InvalidMessageHashLength { expected: 32, got: 16 }
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_validate_empty_signer_ids() {
+        let mut proto = make_valid_aggregate();
+        proto.signer_ids = vec![]; // Empty
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningValidationError::EmptySignerIds
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_validate_invalid_signer_id_length() {
+        let mut proto = make_valid_aggregate();
+        proto.signer_ids = vec![vec![0xAA; 32], vec![0xBB; 16]]; // Second one wrong
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningValidationError::InvalidAggregateSignerIdLength { index: 1, expected: 32, got: 16 }
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_validate_duplicate_signer() {
+        let mut proto = make_valid_aggregate();
+        proto.signer_ids = vec![vec![0xAA; 32], vec![0xAA; 32]]; // Duplicate
+
+        let result = proto.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningValidationError::DuplicateSignerId { index: 1 }
+        ));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE ENCODING TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_encode_decode_roundtrip() {
+        let proto = make_valid_aggregate();
+
+        let encoded = encode_aggregate_signature(&proto);
+        let decoded = decode_aggregate_signature(&encoded);
+
+        assert!(decoded.is_ok());
+        assert_eq!(proto, decoded.expect("valid"));
+    }
+
+    #[test]
+    fn test_aggregate_encode_deterministic() {
+        let proto = make_valid_aggregate();
+
+        let encoded1 = encode_aggregate_signature(&proto);
+        let encoded2 = encode_aggregate_signature(&proto);
+
+        assert_eq!(encoded1, encoded2);
+    }
+
+    #[test]
+    fn test_aggregate_decode_invalid_bytes() {
+        let invalid_bytes = vec![0xFF; 10];
+        let result = decode_aggregate_signature(&invalid_bytes);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningDecodeError::DeserializationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_decode_validates_after_deserialization() {
+        // Create invalid proto manually
+        let invalid_proto = AggregateSignatureProto {
+            signature: vec![0x01; 32], // Invalid length
+            signer_ids: vec![vec![0xAA; 32]],
+            message_hash: vec![0xCC; 32],
+            aggregated_at: 12345,
+        };
+
+        // Serialize (bypassing validation)
+        let bytes = bincode::serialize(&invalid_proto).expect("serialize");
+
+        // Decode should fail validation
+        let result = decode_aggregate_signature(&bytes);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SigningDecodeError::ValidationFailed { .. }
+        ));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE HASH TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_hash_deterministic() {
+        let proto = make_valid_aggregate();
+
+        let hash1 = compute_aggregate_signature_hash(&proto);
+        let hash2 = compute_aggregate_signature_hash(&proto);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_aggregate_hash_different_signature() {
+        let proto1 = make_valid_aggregate();
+        let mut proto2 = make_valid_aggregate();
+        proto2.signature = vec![0x02; 64]; // Different signature
+
+        let hash1 = compute_aggregate_signature_hash(&proto1);
+        let hash2 = compute_aggregate_signature_hash(&proto2);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_aggregate_hash_different_signers() {
+        let proto1 = make_valid_aggregate();
+        let mut proto2 = make_valid_aggregate();
+        proto2.signer_ids = vec![vec![0xDD; 32], vec![0xEE; 32]]; // Different signers
+
+        let hash1 = compute_aggregate_signature_hash(&proto1);
+        let hash2 = compute_aggregate_signature_hash(&proto2);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_aggregate_hash_different_message_hash() {
+        let proto1 = make_valid_aggregate();
+        let mut proto2 = make_valid_aggregate();
+        proto2.message_hash = vec![0xFF; 32]; // Different message hash
+
+        let hash1 = compute_aggregate_signature_hash(&proto1);
+        let hash2 = compute_aggregate_signature_hash(&proto2);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_aggregate_hash_different_timestamp() {
+        let proto1 = make_valid_aggregate();
+        let mut proto2 = make_valid_aggregate();
+        proto2.aggregated_at = 9999999; // Different timestamp
+
+        let hash1 = compute_aggregate_signature_hash(&proto1);
+        let hash2 = compute_aggregate_signature_hash(&proto2);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE QUERY TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_signer_count() {
+        let proto = make_valid_aggregate();
+        assert_eq!(proto.signer_count(), 2);
+    }
+
+    #[test]
+    fn test_aggregate_contains_signer_found() {
+        let proto = make_valid_aggregate();
+        assert!(proto.contains_signer(&[0xAA; 32]));
+        assert!(proto.contains_signer(&[0xBB; 32]));
+    }
+
+    #[test]
+    fn test_aggregate_contains_signer_not_found() {
+        let proto = make_valid_aggregate();
+        assert!(!proto.contains_signer(&[0xCC; 32]));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE ERROR DISPLAY TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_validation_error_signature_display() {
+        let error = SigningValidationError::InvalidSignatureLength {
+            expected: 64,
+            got: 32,
+        };
+        let display = format!("{}", error);
+        assert!(display.contains("signature"));
+        assert!(display.contains("64"));
+        assert!(display.contains("32"));
+    }
+
+    #[test]
+    fn test_aggregate_validation_error_empty_signers_display() {
+        let error = SigningValidationError::EmptySignerIds;
+        let display = format!("{}", error);
+        assert!(display.contains("signer_ids"));
+        assert!(display.contains("empty"));
+    }
+
+    #[test]
+    fn test_aggregate_validation_error_signer_length_display() {
+        let error = SigningValidationError::InvalidAggregateSignerIdLength {
+            index: 2,
+            expected: 32,
+            got: 16,
+        };
+        let display = format!("{}", error);
+        assert!(display.contains("signer_ids[2]"));
+        assert!(display.contains("32"));
+        assert!(display.contains("16"));
+    }
+
+    #[test]
+    fn test_aggregate_validation_error_duplicate_display() {
+        let error = SigningValidationError::DuplicateSignerId { index: 3 };
+        let display = format!("{}", error);
+        assert!(display.contains("duplicate"));
+        assert!(display.contains("3"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE SEND + SYNC TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AggregateSignatureProto>();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // AGGREGATE EDGE CASE TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_single_signer() {
+        let proto = AggregateSignatureProto {
+            signature: vec![0x01; 64],
+            signer_ids: vec![vec![0xAA; 32]],
+            message_hash: vec![0xCC; 32],
+            aggregated_at: 12345,
+        };
+
+        assert!(proto.validate().is_ok());
+        assert_eq!(proto.signer_count(), 1);
+    }
+
+    #[test]
+    fn test_aggregate_many_signers() {
+        let signers: Vec<Vec<u8>> = (0..100).map(|i| vec![i as u8; 32]).collect();
+        let proto = AggregateSignatureProto {
+            signature: vec![0x01; 64],
+            signer_ids: signers,
+            message_hash: vec![0xCC; 32],
+            aggregated_at: 12345,
+        };
+
+        assert!(proto.validate().is_ok());
+        assert_eq!(proto.signer_count(), 100);
+    }
+
+    #[test]
+    fn test_aggregate_new_raw_sets_timestamp() {
+        let proto = AggregateSignatureProto::new_raw(
+            vec![0x01; 64],
+            vec![vec![0xAA; 32]],
+            vec![0xCC; 32],
+        );
+
+        let now = current_unix_timestamp();
+        assert!(proto.aggregated_at <= now);
+        assert!(proto.aggregated_at > now - 10); // Within 10 seconds
     }
 }
