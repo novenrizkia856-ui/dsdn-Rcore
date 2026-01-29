@@ -413,20 +413,103 @@ pub use consistency_report::{
 pub use tss::{BytesWrapper, SignatureBytes, BYTES_WRAPPER_SIZE, SIGNATURE_BYTES_SIZE};
 
 // ════════════════════════════════════════════════════════════════════════════════
-// PUBLIC EXPORTS - TSS DKG Types (14A.2B.1.22)
+// PUBLIC EXPORTS - TSS DKG Types (14A.2B.1.22 - 14A.2B.1.24)
 // ════════════════════════════════════════════════════════════════════════════════
 
 pub use tss::{
+    // DKG proto messages
     DKGRound1PackageProto,
+    DKGRound2PackageProto,
+    DKGResultProto,
+    // DKG error types
     ValidationError as DKGValidationError,
     DecodeError as DKGDecodeError,
+    // DKG encoding functions
     encode_dkg_round1,
     decode_dkg_round1,
     compute_dkg_round1_hash,
+    encode_dkg_round2,
+    decode_dkg_round2,
+    encode_dkg_result,
+    decode_dkg_result,
+    // DKG size constants
     SESSION_ID_SIZE,
     PARTICIPANT_ID_SIZE,
     COMMITMENT_SIZE,
     PROOF_SIZE,
+    GROUP_PUBKEY_SIZE,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - TSS Signing Types (14A.2B.1.25 - 14A.2B.1.27)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use tss::{
+    // Signing proto messages
+    SigningRequestProto,
+    SigningCommitmentProto,
+    PartialSignatureProto,
+    AggregateSignatureProto,
+    // Signing error types
+    SigningValidationError,
+    SigningDecodeError,
+    // Signing encoding functions
+    encode_signing_request,
+    decode_signing_request,
+    encode_signing_commitment,
+    decode_signing_commitment,
+    encode_partial_signature,
+    decode_partial_signature,
+    encode_aggregate_signature,
+    decode_aggregate_signature,
+    compute_aggregate_signature_hash,
+    // Signing size constants
+    SIGNER_ID_SIZE,
+    MESSAGE_HASH_SIZE,
+    HIDING_SIZE,
+    BINDING_SIZE,
+    SIGNATURE_SHARE_SIZE,
+    FROST_SIGNATURE_SIZE,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - TSS Committee Types (14A.2B.1.28)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use tss::{
+    // Committee proto messages
+    CoordinatorMemberProto,
+    CoordinatorCommitteeProto,
+    // Committee error types
+    CommitteeValidationError,
+    CommitteeDecodeError,
+    // Committee encoding functions
+    encode_committee,
+    decode_committee,
+    compute_committee_hash,
+    // Committee size constants
+    COORDINATOR_ID_SIZE,
+    VALIDATOR_ID_SIZE,
+    PUBKEY_SIZE,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - TSS Receipt Types (14A.2B.1.29)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use tss::{
+    // Receipt proto messages
+    ReceiptDataProto,
+    ThresholdReceiptProto,
+    // Receipt encoding functions
+    encode_receipt,
+    decode_receipt,
+    compute_receipt_hash,
+    // Receipt size constants
+    WORKLOAD_ID_SIZE,
+    BLOB_HASH_SIZE,
+    NODE_ID_SIZE,
+    COMMITTEE_HASH_SIZE,
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
