@@ -40,6 +40,8 @@
 //! - Signing Commitment proto message (`SigningCommitmentProto`)
 //! - Partial Signature proto message (`PartialSignatureProto`)
 //! - Aggregate Signature proto message (`AggregateSignatureProto`)
+//! - Coordinator Member proto message (`CoordinatorMemberProto`)
+//! - Coordinator Committee proto message (`CoordinatorCommitteeProto`)
 //!
 //! ## Submodules
 //!
@@ -48,10 +50,12 @@
 //! | `types` | Basic wrapper types untuk bytes dan signatures |
 //! | `dkg` | DKG protocol message types |
 //! | `signing` | Threshold signing message types |
+//! | `committee` | Committee coordination message types |
 
 pub mod types;
 pub mod dkg;
 pub mod signing;
+pub mod committee;
 
 // Re-export wrapper types
 pub use types::{BytesWrapper, SignatureBytes};
@@ -133,4 +137,23 @@ pub use signing::{
     BINDING_SIZE,
     SIGNATURE_SHARE_SIZE,
     FROST_SIGNATURE_SIZE,
+};
+
+// Re-export Committee types
+pub use committee::{
+    CoordinatorMemberProto,
+    CoordinatorCommitteeProto,
+    encode_committee,
+    decode_committee,
+    compute_committee_hash,
+};
+
+// Re-export Committee error types
+pub use committee::{CommitteeValidationError, CommitteeDecodeError};
+
+// Re-export Committee size constants
+pub use committee::{
+    COORDINATOR_ID_SIZE,
+    VALIDATOR_ID_SIZE,
+    PUBKEY_SIZE,
 };
