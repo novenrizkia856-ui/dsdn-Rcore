@@ -318,7 +318,7 @@ pub fn verify_epoch_seed(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Committee Verification (14A.2B.2.8)
+// Committee Verification (14A.2B.2.8 + 14A.2B.2.9)
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Error type untuk committee verification failures.
@@ -381,6 +381,42 @@ pub enum VerificationError {
     PubkeyMismatch {
         /// Validator ID
         validator_id: [u8; 32],
+    },
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Additional variants (14A.2B.2.9)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Committee hasil re-selection tidak cocok dengan claimed committee (14A.2B.2.9)
+    CommitteeMismatch {
+        /// Deskripsi perbedaan
+        reason: String,
+    },
+
+    /// Member tidak valid atau tidak ada di validator set (14A.2B.2.9)
+    InvalidMember {
+        /// Validator ID dari member yang tidak valid
+        validator_id: [u8; 32],
+        /// Deskripsi masalah
+        reason: String,
+    },
+
+    /// Threshold tidak valid (14A.2B.2.9)
+    InvalidThreshold {
+        /// Threshold yang diklaim
+        claimed: u8,
+        /// Nilai yang diharapkan atau batas
+        expected: u8,
+        /// Deskripsi masalah
+        reason: String,
+    },
+
+    /// Seed yang digunakan tidak cocok dengan yang diharapkan (14A.2B.2.9)
+    SeedMismatch {
+        /// Seed yang diklaim
+        claimed: [u8; 32],
+        /// Seed yang diharapkan
+        expected: [u8; 32],
     },
 }
 
@@ -445,6 +481,33 @@ impl std::fmt::Display for VerificationError {
                     "pubkey mismatch for validator {:02x}{:02x}...{:02x}{:02x}",
                     validator_id[0], validator_id[1],
                     validator_id[30], validator_id[31]
+                )
+            }
+            VerificationError::CommitteeMismatch { reason } => {
+                write!(f, "committee mismatch: {}", reason)
+            }
+            VerificationError::InvalidMember { validator_id, reason } => {
+                write!(
+                    f,
+                    "invalid member {:02x}{:02x}...{:02x}{:02x}: {}",
+                    validator_id[0], validator_id[1],
+                    validator_id[30], validator_id[31],
+                    reason
+                )
+            }
+            VerificationError::InvalidThreshold { claimed, expected, reason } => {
+                write!(
+                    f,
+                    "invalid threshold: claimed {}, expected {}, reason: {}",
+                    claimed, expected, reason
+                )
+            }
+            VerificationError::SeedMismatch { claimed, expected } => {
+                write!(
+                    f,
+                    "seed mismatch: claimed {:02x}{:02x}..., expected {:02x}{:02x}...",
+                    claimed[0], claimed[1],
+                    expected[0], expected[1]
                 )
             }
         }

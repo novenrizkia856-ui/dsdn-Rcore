@@ -37,6 +37,11 @@
 
 pub mod verification;
 
+// Comprehensive selection tests (14A.2B.2.9)
+#[cfg(test)]
+#[path = "tests.rs"]
+mod selection_tests;
+
 // Re-export verification types (14A.2B.2.6)
 pub use verification::{DAMerkleProof, SeedVerificationResult, verify_epoch_seed, verify_merkle_proof};
 
@@ -297,7 +302,7 @@ impl std::fmt::Display for SelectorConfigError {
 impl std::error::Error for SelectorConfigError {}
 
 // ════════════════════════════════════════════════════════════════════════════════
-// SelectionError (14A.2B.2.7)
+// SelectionError (14A.2B.2.7 + 14A.2B.2.9)
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Error type untuk committee selection failures.
@@ -331,6 +336,21 @@ pub enum SelectionError {
 
     /// Internal error (should never happen in correct implementation)
     Internal(String),
+
+    /// Invalid configuration parameters (14A.2B.2.9)
+    InvalidConfig {
+        /// Deskripsi masalah konfigurasi
+        reason: String,
+    },
+
+    /// Tidak ada validator yang eligible sama sekali (14A.2B.2.9)
+    NoEligibleValidators,
+
+    /// Seed derivation gagal (14A.2B.2.9)
+    SeedDerivationFailed {
+        /// Deskripsi penyebab kegagalan
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SelectionError {
@@ -359,6 +379,15 @@ impl std::fmt::Display for SelectionError {
             }
             SelectionError::Internal(msg) => {
                 write!(f, "internal selection error: {}", msg)
+            }
+            SelectionError::InvalidConfig { reason } => {
+                write!(f, "invalid selection config: {}", reason)
+            }
+            SelectionError::NoEligibleValidators => {
+                write!(f, "no eligible validators: all validators below minimum stake")
+            }
+            SelectionError::SeedDerivationFailed { reason } => {
+                write!(f, "seed derivation failed: {}", reason)
             }
         }
     }
