@@ -5,6 +5,12 @@
 //! 2. Sesuai dengan epoch yang diklaim
 //! 3. Diverifikasi menggunakan Merkle proof secara deterministik
 //!
+//! # Committee Verification (14A.2B.2.8)
+//!
+//! Selain seed verification, module ini juga menyediakan:
+//! - `verify_committee_selection` - Verifikasi committee hasil selection
+//! - `verify_member_eligibility` - Verifikasi member eligibility
+//!
 //! # Merkle Specification
 //!
 //! - Hash function: SHA3-512 (truncated to 32 bytes)
@@ -18,6 +24,12 @@
 
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_512};
+
+// Import types dari parent module untuk committee verification
+use super::{
+    CoordinatorCommittee, CoordinatorMember, CoordinatorSelector,
+    SelectionConfig, SelectionError, ValidatorCandidate,
+};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // DAMerkleProof
@@ -303,6 +315,340 @@ pub fn verify_epoch_seed(
                 .to_string(),
         )
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Committee Verification (14A.2B.2.8)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk committee verification failures.
+///
+/// Returned ketika `verify_committee_selection` menemukan ketidakcocokan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationError {
+    /// Re-selection gagal karena error dari selection algorithm
+    SelectionFailed(SelectionError),
+
+    /// Jumlah members tidak cocok
+    MemberCountMismatch {
+        /// Jumlah members di committee yang diklaim
+        claimed: usize,
+        /// Jumlah members dari re-selection
+        expected: usize,
+    },
+
+    /// Threshold tidak cocok dengan config
+    ThresholdMismatch {
+        /// Threshold di committee yang diklaim
+        claimed: u8,
+        /// Threshold dari config
+        expected: u8,
+    },
+
+    /// Epoch tidak cocok
+    EpochMismatch {
+        /// Epoch di committee yang diklaim
+        claimed: u64,
+        /// Epoch yang diharapkan
+        expected: u64,
+    },
+
+    /// Member pada index tertentu tidak cocok
+    MemberMismatch {
+        /// Index member yang tidak cocok
+        index: usize,
+        /// Deskripsi field yang berbeda
+        field: String,
+    },
+
+    /// Member tidak ditemukan di validator set
+    MemberNotInValidatorSet {
+        /// Validator ID dari member yang tidak ditemukan
+        validator_id: [u8; 32],
+    },
+
+    /// Stake tidak cocok dengan validator source
+    StakeMismatch {
+        /// Validator ID
+        validator_id: [u8; 32],
+        /// Stake di member
+        member_stake: u64,
+        /// Stake di validator
+        validator_stake: u64,
+    },
+
+    /// Pubkey tidak cocok dengan validator source
+    PubkeyMismatch {
+        /// Validator ID
+        validator_id: [u8; 32],
+    },
+}
+
+impl std::fmt::Display for VerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerificationError::SelectionFailed(e) => {
+                write!(f, "re-selection failed: {}", e)
+            }
+            VerificationError::MemberCountMismatch { claimed, expected } => {
+                write!(
+                    f,
+                    "member count mismatch: claimed {}, expected {}",
+                    claimed, expected
+                )
+            }
+            VerificationError::ThresholdMismatch { claimed, expected } => {
+                write!(
+                    f,
+                    "threshold mismatch: claimed {}, expected {}",
+                    claimed, expected
+                )
+            }
+            VerificationError::EpochMismatch { claimed, expected } => {
+                write!(
+                    f,
+                    "epoch mismatch: claimed {}, expected {}",
+                    claimed, expected
+                )
+            }
+            VerificationError::MemberMismatch { index, field } => {
+                write!(
+                    f,
+                    "member mismatch at index {}: {} differs",
+                    index, field
+                )
+            }
+            VerificationError::MemberNotInValidatorSet { validator_id } => {
+                write!(
+                    f,
+                    "member with validator_id {:02x}{:02x}...{:02x}{:02x} not found in validator set",
+                    validator_id[0], validator_id[1],
+                    validator_id[30], validator_id[31]
+                )
+            }
+            VerificationError::StakeMismatch {
+                validator_id,
+                member_stake,
+                validator_stake,
+            } => {
+                write!(
+                    f,
+                    "stake mismatch for validator {:02x}{:02x}...{:02x}{:02x}: member has {}, validator has {}",
+                    validator_id[0], validator_id[1],
+                    validator_id[30], validator_id[31],
+                    member_stake, validator_stake
+                )
+            }
+            VerificationError::PubkeyMismatch { validator_id } => {
+                write!(
+                    f,
+                    "pubkey mismatch for validator {:02x}{:02x}...{:02x}{:02x}",
+                    validator_id[0], validator_id[1],
+                    validator_id[30], validator_id[31]
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerificationError {}
+
+impl From<SelectionError> for VerificationError {
+    fn from(e: SelectionError) -> Self {
+        VerificationError::SelectionFailed(e)
+    }
+}
+
+/// Verify bahwa member berasal dari validator set dengan data yang cocok.
+///
+/// # Verification Steps
+///
+/// 1. Cari validator dengan `validator_id` yang cocok
+/// 2. Verifikasi `stake` cocok
+/// 3. Verifikasi `pubkey` cocok
+///
+/// # Determinism
+///
+/// - Same inputs = same output
+/// - Tidak ada randomness
+/// - Linear search (O(n)) untuk deterministic ordering
+///
+/// # Arguments
+///
+/// * `member` - CoordinatorMember yang akan diverifikasi
+/// * `validators` - Slice of ValidatorCandidate sebagai reference
+///
+/// # Returns
+///
+/// `true` jika member valid dan berasal dari validator set.
+/// `false` jika tidak ditemukan atau data tidak cocok.
+pub fn verify_member_eligibility(
+    member: &CoordinatorMember,
+    validators: &[ValidatorCandidate],
+) -> bool {
+    // Linear search untuk deterministic ordering
+    for validator in validators {
+        // Check if this is the source validator
+        if validator.id == member.validator_id {
+            // Verify stake matches
+            if validator.stake != member.stake {
+                return false;
+            }
+
+            // Verify pubkey matches
+            if validator.pubkey != member.pubkey {
+                return false;
+            }
+
+            // All checks passed
+            return true;
+        }
+    }
+
+    // Validator not found
+    false
+}
+
+/// Verify bahwa committee adalah hasil sah dari selection algorithm.
+///
+/// # Verification Algorithm (URUTAN WAJIB)
+///
+/// 1. Jalankan ulang `select_committee` dengan input yang sama
+/// 2. Bandingkan hasil:
+///    - Jumlah member HARUS sama
+///    - Threshold HARUS cocok dengan config
+///    - Setiap member HARUS identik (byte-wise)
+/// 3. Verifikasi setiap member ada di validator set
+/// 4. Verifikasi stake dan pubkey cocok dengan validator source
+///
+/// # Determinism
+///
+/// - Same inputs = same output
+/// - Tidak ada randomness
+/// - Tidak ada HashMap iteration
+/// - Exact byte-wise comparison
+///
+/// # Arguments
+///
+/// * `committee` - Committee yang diklaim untuk diverifikasi
+/// * `validators` - Validator set saat selection
+/// * `seed` - Epoch seed yang digunakan untuk selection
+/// * `config` - Selection config yang digunakan
+///
+/// # Returns
+///
+/// `Ok(true)` jika committee valid dan identik dengan re-selection.
+/// `Err(VerificationError)` jika ada ketidakcocokan.
+///
+/// # Note
+///
+/// Function ini TIDAK pernah return `Ok(false)`. Semua kegagalan
+/// dikembalikan sebagai `Err(VerificationError)` dengan detail penyebab.
+pub fn verify_committee_selection(
+    committee: &CoordinatorCommittee,
+    validators: &[ValidatorCandidate],
+    seed: &[u8; 32],
+    config: &SelectionConfig,
+) -> Result<bool, VerificationError> {
+    // Step 1: Verify threshold matches config
+    if committee.threshold != config.threshold {
+        return Err(VerificationError::ThresholdMismatch {
+            claimed: committee.threshold,
+            expected: config.threshold,
+        });
+    }
+
+    // Step 2: Create selector dan re-run selection
+    let selector = CoordinatorSelector::new(config.clone()).map_err(|e| {
+        VerificationError::SelectionFailed(SelectionError::Internal(format!(
+            "invalid config: {}",
+            e
+        )))
+    })?;
+
+    let expected_committee = selector.select_committee(validators, committee.epoch, seed)?;
+
+    // Step 3: Verify member count
+    if committee.members.len() != expected_committee.members.len() {
+        return Err(VerificationError::MemberCountMismatch {
+            claimed: committee.members.len(),
+            expected: expected_committee.members.len(),
+        });
+    }
+
+    // Step 4: Verify each member (byte-wise comparison)
+    for (index, (claimed, expected)) in committee
+        .members
+        .iter()
+        .zip(expected_committee.members.iter())
+        .enumerate()
+    {
+        // Check member id
+        if claimed.id != expected.id {
+            return Err(VerificationError::MemberMismatch {
+                index,
+                field: "id".to_string(),
+            });
+        }
+
+        // Check validator_id
+        if claimed.validator_id != expected.validator_id {
+            return Err(VerificationError::MemberMismatch {
+                index,
+                field: "validator_id".to_string(),
+            });
+        }
+
+        // Check pubkey
+        if claimed.pubkey != expected.pubkey {
+            return Err(VerificationError::MemberMismatch {
+                index,
+                field: "pubkey".to_string(),
+            });
+        }
+
+        // Check stake
+        if claimed.stake != expected.stake {
+            return Err(VerificationError::MemberMismatch {
+                index,
+                field: "stake".to_string(),
+            });
+        }
+    }
+
+    // Step 5: Verify all members exist in validator set with matching data
+    for member in &committee.members {
+        // Find validator
+        let validator = validators.iter().find(|v| v.id == member.validator_id);
+
+        match validator {
+            None => {
+                return Err(VerificationError::MemberNotInValidatorSet {
+                    validator_id: member.validator_id,
+                });
+            }
+            Some(v) => {
+                // Verify stake
+                if v.stake != member.stake {
+                    return Err(VerificationError::StakeMismatch {
+                        validator_id: member.validator_id,
+                        member_stake: member.stake,
+                        validator_stake: v.stake,
+                    });
+                }
+
+                // Verify pubkey
+                if v.pubkey != member.pubkey {
+                    return Err(VerificationError::PubkeyMismatch {
+                        validator_id: member.validator_id,
+                    });
+                }
+            }
+        }
+    }
+
+    // All checks passed
+    Ok(true)
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -738,5 +1084,291 @@ mod tests {
 
         // Order MUST matter
         assert_ne!(hash_ab, hash_ba);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Committee Verification Tests (14A.2B.2.8)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    fn make_validator_for_verification(seed: u8, zone: &str, stake: u64) -> ValidatorCandidate {
+        let mut id = [0u8; 32];
+        id[0] = seed;
+        id[31] = seed.wrapping_add(1);
+
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = seed.wrapping_add(100);
+        pubkey[31] = seed.wrapping_add(101);
+
+        ValidatorCandidate {
+            id,
+            pubkey,
+            stake,
+            zone: zone.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_verify_member_eligibility_valid() {
+        let validators = vec![
+            make_validator_for_verification(1, "zone-a", 1000),
+            make_validator_for_verification(2, "zone-b", 2000),
+            make_validator_for_verification(3, "zone-c", 3000),
+        ];
+
+        // Create member from validator 2
+        let member = CoordinatorMember {
+            id: [0x99u8; 32], // member id can be different
+            validator_id: validators[1].id,
+            pubkey: validators[1].pubkey,
+            stake: validators[1].stake,
+        };
+
+        assert!(verify_member_eligibility(&member, &validators));
+    }
+
+    #[test]
+    fn test_verify_member_eligibility_not_in_set() {
+        let validators = vec![
+            make_validator_for_verification(1, "zone-a", 1000),
+            make_validator_for_verification(2, "zone-b", 2000),
+        ];
+
+        // Create member with unknown validator_id
+        let member = CoordinatorMember {
+            id: [0x99u8; 32],
+            validator_id: [0xFFu8; 32], // not in validators
+            pubkey: [0xAAu8; 32],
+            stake: 1000,
+        };
+
+        assert!(!verify_member_eligibility(&member, &validators));
+    }
+
+    #[test]
+    fn test_verify_member_eligibility_stake_mismatch() {
+        let validators = vec![
+            make_validator_for_verification(1, "zone-a", 1000),
+        ];
+
+        let member = CoordinatorMember {
+            id: [0x99u8; 32],
+            validator_id: validators[0].id,
+            pubkey: validators[0].pubkey,
+            stake: 9999, // different stake
+        };
+
+        assert!(!verify_member_eligibility(&member, &validators));
+    }
+
+    #[test]
+    fn test_verify_member_eligibility_pubkey_mismatch() {
+        let validators = vec![
+            make_validator_for_verification(1, "zone-a", 1000),
+        ];
+
+        let member = CoordinatorMember {
+            id: [0x99u8; 32],
+            validator_id: validators[0].id,
+            pubkey: [0xFFu8; 32], // different pubkey
+            stake: validators[0].stake,
+        };
+
+        assert!(!verify_member_eligibility(&member, &validators));
+    }
+
+    #[test]
+    fn test_verify_committee_selection_valid() {
+        let config = SelectionConfig {
+            committee_size: 3,
+            threshold: 2,
+            min_stake: 100,
+        };
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_for_verification(i, &format!("zone-{}", i % 3), 1000 + (i as u64 * 100)))
+            .collect();
+
+        let seed = [0x42u8; 32];
+        let epoch = 1u64;
+
+        // Create committee using selection algorithm
+        let selector = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let committee = selector.select_committee(&validators, epoch, &seed).expect("selection");
+
+        // Verify should pass
+        let result = verify_committee_selection(&committee, &validators, &seed, &config);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_verify_committee_selection_deterministic() {
+        let config = SelectionConfig {
+            committee_size: 4,
+            threshold: 3,
+            min_stake: 100,
+        };
+
+        let validators: Vec<ValidatorCandidate> = (0..15)
+            .map(|i| make_validator_for_verification(i, &format!("zone-{}", i % 4), 1000))
+            .collect();
+
+        let seed = [0x55u8; 32];
+        let epoch = 5u64;
+
+        let selector = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let committee = selector.select_committee(&validators, epoch, &seed).expect("selection");
+
+        // Verify 100 times - all should pass
+        for _ in 0..100 {
+            let result = verify_committee_selection(&committee, &validators, &seed, &config);
+            assert!(result.is_ok());
+            assert!(result.unwrap());
+        }
+    }
+
+    #[test]
+    fn test_verify_committee_selection_wrong_seed() {
+        let config = SelectionConfig {
+            committee_size: 3,
+            threshold: 2,
+            min_stake: 100,
+        };
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_for_verification(i, &format!("zone-{}", i % 3), 1000))
+            .collect();
+
+        let seed1 = [0x11u8; 32];
+        let seed2 = [0x22u8; 32]; // different seed
+
+        let selector = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let committee = selector.select_committee(&validators, 1, &seed1).expect("selection");
+
+        // Verify with wrong seed should fail
+        let result = verify_committee_selection(&committee, &validators, &seed2, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_committee_selection_wrong_threshold() {
+        let config1 = SelectionConfig {
+            committee_size: 3,
+            threshold: 2,
+            min_stake: 100,
+        };
+        let config2 = SelectionConfig {
+            committee_size: 3,
+            threshold: 3, // different threshold
+            min_stake: 100,
+        };
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_for_verification(i, "zone-a", 1000))
+            .collect();
+
+        let seed = [0x33u8; 32];
+
+        let selector = CoordinatorSelector::new(config1).expect("valid config");
+        let committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        // Verify with wrong config should fail
+        let result = verify_committee_selection(&committee, &validators, &seed, &config2);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            VerificationError::ThresholdMismatch { claimed, expected } => {
+                assert_eq!(claimed, 2);
+                assert_eq!(expected, 3);
+            }
+            _ => panic!("expected ThresholdMismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_verify_committee_selection_different_validators() {
+        let config = SelectionConfig {
+            committee_size: 3,
+            threshold: 2,
+            min_stake: 100,
+        };
+
+        let validators1: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_for_verification(i, "zone-a", 1000))
+            .collect();
+
+        let validators2: Vec<ValidatorCandidate> = (10..20) // different validators
+            .map(|i| make_validator_for_verification(i, "zone-a", 1000))
+            .collect();
+
+        let seed = [0x44u8; 32];
+
+        let selector = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let committee = selector.select_committee(&validators1, 1, &seed).expect("selection");
+
+        // Verify with different validator set should fail
+        let result = verify_committee_selection(&committee, &validators2, &seed, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_committee_selection_tampered_member() {
+        let config = SelectionConfig {
+            committee_size: 3,
+            threshold: 2,
+            min_stake: 100,
+        };
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_for_verification(i, "zone-a", 1000))
+            .collect();
+
+        let seed = [0x55u8; 32];
+
+        let selector = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let mut committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        // Tamper with first member's stake
+        committee.members[0].stake = 99999;
+
+        // Verify should fail
+        let result = verify_committee_selection(&committee, &validators, &seed, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verification_error_display() {
+        let err1 = VerificationError::MemberCountMismatch {
+            claimed: 5,
+            expected: 3,
+        };
+        assert!(err1.to_string().contains("5"));
+        assert!(err1.to_string().contains("3"));
+
+        let err2 = VerificationError::ThresholdMismatch {
+            claimed: 2,
+            expected: 3,
+        };
+        assert!(err2.to_string().contains("2"));
+        assert!(err2.to_string().contains("3"));
+
+        let err3 = VerificationError::MemberMismatch {
+            index: 1,
+            field: "pubkey".to_string(),
+        };
+        assert!(err3.to_string().contains("1"));
+        assert!(err3.to_string().contains("pubkey"));
+
+        let err4 = VerificationError::MemberNotInValidatorSet {
+            validator_id: [0xAB; 32],
+        };
+        assert!(err4.to_string().contains("ab"));
+
+        let err5 = VerificationError::StakeMismatch {
+            validator_id: [0xCD; 32],
+            member_stake: 1000,
+            validator_stake: 2000,
+        };
+        assert!(err5.to_string().contains("1000"));
+        assert!(err5.to_string().contains("2000"));
     }
 }

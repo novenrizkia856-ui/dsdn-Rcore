@@ -21,6 +21,12 @@
 //! - `verify_epoch_seed` - Verify epoch seed dengan Merkle proof
 //! - `verify_merkle_proof` - Verify generic Merkle proof
 //!
+//! # Committee Verification (14A.2B.2.8)
+//!
+//! - `VerificationError` - Error type untuk committee verification
+//! - `verify_committee_selection` - Verify committee adalah hasil selection yang valid
+//! - `verify_member_eligibility` - Verify member berasal dari validator set
+//!
 //! # Invariants
 //!
 //! - `CoordinatorCommittee`: threshold <= members.len()
@@ -33,6 +39,9 @@ pub mod verification;
 
 // Re-export verification types (14A.2B.2.6)
 pub use verification::{DAMerkleProof, SeedVerificationResult, verify_epoch_seed, verify_merkle_proof};
+
+// Re-export committee verification types (14A.2B.2.8)
+pub use verification::{VerificationError, verify_committee_selection, verify_member_eligibility};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // Imports
