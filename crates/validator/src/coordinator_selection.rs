@@ -25,6 +25,9 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+// SHA3-256 untuk epoch seed derivation (14A.2B.2.5)
+use sha3::{Digest, Sha3_256};
+
 // ════════════════════════════════════════════════════════════════════════════════
 // ValidatorCandidate
 // ════════════════════════════════════════════════════════════════════════════════
@@ -592,6 +595,144 @@ impl CoordinatorSelector {
 
         buffer
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Epoch Seed Derivation (14A.2B.2.5)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Derive epoch seed deterministik untuk committee selection.
+///
+/// # Algorithm
+///
+/// ```text
+/// seed = SHA3-256(epoch_be_8 || da_blob_hash_32 || prev_committee_hash_32)
+/// ```
+///
+/// # Input Layout (72 bytes total)
+///
+/// | Offset | Size | Field |
+/// |--------|------|-------|
+/// | 0      | 8    | epoch (big-endian) |
+/// | 8      | 32   | da_blob_hash |
+/// | 40     | 32   | prev_committee_hash |
+///
+/// # Determinism
+///
+/// - Same inputs = same output (across all nodes/architectures)
+/// - Urutan concatenation TIDAK BERUBAH
+/// - Epoch di-encode dalam big-endian (network byte order)
+/// - Hash inputs digunakan apa adanya
+///
+/// # Security
+///
+/// - Menggunakan SHA3-256 (Keccak)
+/// - Output tepat 32 bytes
+/// - Tidak ada salt atau entropy tambahan
+///
+/// # Arguments
+///
+/// * `epoch` - Epoch number
+/// * `da_blob_hash` - Hash dari DA blob untuk epoch ini
+/// * `prev_committee_hash` - Hash dari committee epoch sebelumnya
+///
+/// # Returns
+///
+/// 32-byte epoch seed.
+pub fn derive_epoch_seed(
+    epoch: u64,
+    da_blob_hash: &[u8; 32],
+    prev_committee_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+
+    // 1. Epoch dalam big-endian (8 bytes)
+    hasher.update(epoch.to_be_bytes());
+
+    // 2. DA blob hash (32 bytes)
+    hasher.update(da_blob_hash);
+
+    // 3. Previous committee hash (32 bytes)
+    hasher.update(prev_committee_hash);
+
+    // Finalize dan convert ke [u8; 32]
+    let result = hasher.finalize();
+
+    // SHA3-256 output is exactly 32 bytes
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&result);
+    seed
+}
+
+/// Compute deterministic hash dari CoordinatorCommittee.
+///
+/// # Determinism
+///
+/// Hash DIJAMIN deterministik karena:
+/// - Semua fields di-hash dalam urutan tetap
+/// - Semua angka di-encode dalam big-endian
+/// - Vec<CoordinatorMember> di-iterate secara sequential (urutan Vec dipertahankan)
+/// - Tidak bergantung pada memory layout atau pointer
+///
+/// # Hash Layout
+///
+/// ```text
+/// SHA3-256(
+///     epoch_be_8 ||
+///     threshold_1 ||
+///     group_pubkey_32 ||
+///     member_count_be_8 ||
+///     for each member:
+///         member.id_32 ||
+///         member.validator_id_32 ||
+///         member.pubkey_32 ||
+///         member.stake_be_8
+/// )
+/// ```
+///
+/// # Arguments
+///
+/// * `committee` - CoordinatorCommittee to hash
+///
+/// # Returns
+///
+/// 32-byte deterministic hash.
+pub fn compute_committee_hash(committee: &CoordinatorCommittee) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+
+    // 1. Epoch (8 bytes, big-endian)
+    hasher.update(committee.epoch.to_be_bytes());
+
+    // 2. Threshold (1 byte)
+    hasher.update([committee.threshold]);
+
+    // 3. Group public key (32 bytes)
+    hasher.update(committee.group_pubkey);
+
+    // 4. Member count (8 bytes, big-endian) - untuk disambiguasi
+    hasher.update((committee.members.len() as u64).to_be_bytes());
+
+    // 5. Each member in order (deterministic karena Vec maintains order)
+    for member in &committee.members {
+        // Member ID (32 bytes)
+        hasher.update(member.id);
+
+        // Validator ID (32 bytes)
+        hasher.update(member.validator_id);
+
+        // Public key (32 bytes)
+        hasher.update(member.pubkey);
+
+        // Stake (8 bytes, big-endian)
+        hasher.update(member.stake.to_be_bytes());
+    }
+
+    // Finalize
+    let result = hasher.finalize();
+
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2019,5 +2160,325 @@ mod tests {
         let mut sorted = result1.clone();
         sorted.sort();
         assert_eq!(sorted, items);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Epoch Seed Derivation Tests (14A.2B.2.5)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_epoch_seed_deterministic() {
+        let epoch = 42u64;
+        let da_blob_hash = [0xAAu8; 32];
+        let prev_committee_hash = [0xBBu8; 32];
+
+        // Call multiple times
+        let seed1 = derive_epoch_seed(epoch, &da_blob_hash, &prev_committee_hash);
+        let seed2 = derive_epoch_seed(epoch, &da_blob_hash, &prev_committee_hash);
+        let seed3 = derive_epoch_seed(epoch, &da_blob_hash, &prev_committee_hash);
+
+        // All must be identical
+        assert_eq!(seed1, seed2);
+        assert_eq!(seed2, seed3);
+
+        // Seed should not be all zeros (extremely unlikely with SHA3)
+        assert_ne!(seed1, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_epoch_seed_diff_epoch() {
+        let da_blob_hash = [0xAAu8; 32];
+        let prev_committee_hash = [0xBBu8; 32];
+
+        let seed1 = derive_epoch_seed(1, &da_blob_hash, &prev_committee_hash);
+        let seed2 = derive_epoch_seed(2, &da_blob_hash, &prev_committee_hash);
+        let seed3 = derive_epoch_seed(u64::MAX, &da_blob_hash, &prev_committee_hash);
+
+        // Different epochs = different seeds
+        assert_ne!(seed1, seed2);
+        assert_ne!(seed2, seed3);
+        assert_ne!(seed1, seed3);
+    }
+
+    #[test]
+    fn test_epoch_seed_diff_da_blob() {
+        let epoch = 100u64;
+        let prev_committee_hash = [0xBBu8; 32];
+
+        let da_hash1 = [0x00u8; 32];
+        let da_hash2 = [0x01u8; 32];
+        let da_hash3 = [0xFFu8; 32];
+
+        let seed1 = derive_epoch_seed(epoch, &da_hash1, &prev_committee_hash);
+        let seed2 = derive_epoch_seed(epoch, &da_hash2, &prev_committee_hash);
+        let seed3 = derive_epoch_seed(epoch, &da_hash3, &prev_committee_hash);
+
+        // Different DA hashes = different seeds
+        assert_ne!(seed1, seed2);
+        assert_ne!(seed2, seed3);
+        assert_ne!(seed1, seed3);
+    }
+
+    #[test]
+    fn test_epoch_seed_diff_committee() {
+        let epoch = 100u64;
+        let da_blob_hash = [0xAAu8; 32];
+
+        let comm_hash1 = [0x00u8; 32];
+        let comm_hash2 = [0x01u8; 32];
+        let comm_hash3 = [0xFFu8; 32];
+
+        let seed1 = derive_epoch_seed(epoch, &da_blob_hash, &comm_hash1);
+        let seed2 = derive_epoch_seed(epoch, &da_blob_hash, &comm_hash2);
+        let seed3 = derive_epoch_seed(epoch, &da_blob_hash, &comm_hash3);
+
+        // Different committee hashes = different seeds
+        assert_ne!(seed1, seed2);
+        assert_ne!(seed2, seed3);
+        assert_ne!(seed1, seed3);
+    }
+
+    #[test]
+    fn test_epoch_seed_edge_cases() {
+        // Test with all zeros
+        let seed_zeros = derive_epoch_seed(0, &[0u8; 32], &[0u8; 32]);
+        assert_ne!(seed_zeros, [0u8; 32]);
+
+        // Test with all 0xFF
+        let seed_ones = derive_epoch_seed(u64::MAX, &[0xFFu8; 32], &[0xFFu8; 32]);
+        assert_ne!(seed_ones, [0xFFu8; 32]);
+
+        // Different inputs should produce different outputs
+        assert_ne!(seed_zeros, seed_ones);
+    }
+
+    #[test]
+    fn test_epoch_seed_ordering_matters() {
+        // Verify that order of inputs matters
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+
+        let seed1 = derive_epoch_seed(1, &a, &b);
+        let seed2 = derive_epoch_seed(1, &b, &a); // Swapped
+
+        // Order should matter
+        assert_ne!(seed1, seed2);
+    }
+
+    #[test]
+    fn test_committee_hash_deterministic() {
+        let members = vec![
+            make_coordinator_member(1),
+            make_coordinator_member(2),
+            make_coordinator_member(3),
+        ];
+        let group_pubkey = [0xCDu8; 32];
+
+        let committee = CoordinatorCommittee::new(members, 2, 100, group_pubkey)
+            .expect("valid committee");
+
+        // Hash multiple times
+        let hash1 = compute_committee_hash(&committee);
+        let hash2 = compute_committee_hash(&committee);
+        let hash3 = compute_committee_hash(&committee);
+
+        // All must be identical
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash2, hash3);
+
+        // Hash should not be all zeros
+        assert_ne!(hash1, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_committee_hash_diff_epoch() {
+        let members = vec![make_coordinator_member(1)];
+        let group_pubkey = [0xAAu8; 32];
+
+        let comm1 = CoordinatorCommittee::new(members.clone(), 1, 1, group_pubkey)
+            .expect("valid committee");
+        let comm2 = CoordinatorCommittee::new(members.clone(), 1, 2, group_pubkey)
+            .expect("valid committee");
+        let comm3 = CoordinatorCommittee::new(members, 1, u64::MAX, group_pubkey)
+            .expect("valid committee");
+
+        let hash1 = compute_committee_hash(&comm1);
+        let hash2 = compute_committee_hash(&comm2);
+        let hash3 = compute_committee_hash(&comm3);
+
+        // Different epochs = different hashes
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash2, hash3);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_committee_hash_diff_threshold() {
+        let members = vec![
+            make_coordinator_member(1),
+            make_coordinator_member(2),
+            make_coordinator_member(3),
+        ];
+        let group_pubkey = [0xBBu8; 32];
+
+        let comm1 = CoordinatorCommittee::new(members.clone(), 1, 1, group_pubkey)
+            .expect("valid committee");
+        let comm2 = CoordinatorCommittee::new(members.clone(), 2, 1, group_pubkey)
+            .expect("valid committee");
+        let comm3 = CoordinatorCommittee::new(members, 3, 1, group_pubkey)
+            .expect("valid committee");
+
+        let hash1 = compute_committee_hash(&comm1);
+        let hash2 = compute_committee_hash(&comm2);
+        let hash3 = compute_committee_hash(&comm3);
+
+        // Different thresholds = different hashes
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash2, hash3);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_committee_hash_diff_members() {
+        let group_pubkey = [0xCCu8; 32];
+
+        let comm1 = CoordinatorCommittee::new(
+            vec![make_coordinator_member(1)],
+            1,
+            1,
+            group_pubkey,
+        ).expect("valid committee");
+
+        let comm2 = CoordinatorCommittee::new(
+            vec![make_coordinator_member(2)],
+            1,
+            1,
+            group_pubkey,
+        ).expect("valid committee");
+
+        let comm3 = CoordinatorCommittee::new(
+            vec![make_coordinator_member(1), make_coordinator_member(2)],
+            1,
+            1,
+            group_pubkey,
+        ).expect("valid committee");
+
+        let hash1 = compute_committee_hash(&comm1);
+        let hash2 = compute_committee_hash(&comm2);
+        let hash3 = compute_committee_hash(&comm3);
+
+        // Different members = different hashes
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash2, hash3);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_committee_hash_member_order_matters() {
+        let group_pubkey = [0xDDu8; 32];
+
+        // Same members, different order
+        let comm1 = CoordinatorCommittee::new(
+            vec![make_coordinator_member(1), make_coordinator_member(2)],
+            1,
+            1,
+            group_pubkey,
+        ).expect("valid committee");
+
+        let comm2 = CoordinatorCommittee::new(
+            vec![make_coordinator_member(2), make_coordinator_member(1)],
+            1,
+            1,
+            group_pubkey,
+        ).expect("valid committee");
+
+        let hash1 = compute_committee_hash(&comm1);
+        let hash2 = compute_committee_hash(&comm2);
+
+        // Order matters - different order = different hash
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_committee_hash_diff_group_pubkey() {
+        let members = vec![make_coordinator_member(1)];
+
+        let comm1 = CoordinatorCommittee::new(members.clone(), 1, 1, [0x00u8; 32])
+            .expect("valid committee");
+        let comm2 = CoordinatorCommittee::new(members.clone(), 1, 1, [0x01u8; 32])
+            .expect("valid committee");
+        let comm3 = CoordinatorCommittee::new(members, 1, 1, [0xFFu8; 32])
+            .expect("valid committee");
+
+        let hash1 = compute_committee_hash(&comm1);
+        let hash2 = compute_committee_hash(&comm2);
+        let hash3 = compute_committee_hash(&comm3);
+
+        // Different group pubkeys = different hashes
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash2, hash3);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_committee_hash_empty_members() {
+        let group_pubkey = [0xEEu8; 32];
+
+        let comm = CoordinatorCommittee::new(vec![], 0, 1, group_pubkey)
+            .expect("valid committee");
+
+        let hash = compute_committee_hash(&comm);
+
+        // Should produce valid hash even with empty members
+        assert_ne!(hash, [0u8; 32]);
+
+        // Should be deterministic
+        let hash2 = compute_committee_hash(&comm);
+        assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn test_epoch_seed_and_committee_hash_integration() {
+        // Create a committee
+        let members = vec![
+            make_coordinator_member(1),
+            make_coordinator_member(2),
+            make_coordinator_member(3),
+        ];
+        let group_pubkey = [0xFFu8; 32];
+
+        let committee = CoordinatorCommittee::new(members, 2, 1, group_pubkey)
+            .expect("valid committee");
+
+        // Compute committee hash
+        let committee_hash = compute_committee_hash(&committee);
+
+        // Use it in epoch seed derivation
+        let da_blob_hash = [0x12u8; 32];
+        let epoch_seed = derive_epoch_seed(2, &da_blob_hash, &committee_hash);
+
+        // Should be valid
+        assert_ne!(epoch_seed, [0u8; 32]);
+
+        // Should be deterministic
+        let committee_hash2 = compute_committee_hash(&committee);
+        let epoch_seed2 = derive_epoch_seed(2, &da_blob_hash, &committee_hash2);
+        assert_eq!(epoch_seed, epoch_seed2);
+    }
+
+    #[test]
+    fn test_committee_hash_clone_equality() {
+        let members = vec![make_coordinator_member(5)];
+        let group_pubkey = [0x55u8; 32];
+
+        let committee1 = CoordinatorCommittee::new(members.clone(), 1, 10, group_pubkey)
+            .expect("valid committee");
+        let committee2 = committee1.clone();
+
+        let hash1 = compute_committee_hash(&committee1);
+        let hash2 = compute_committee_hash(&committee2);
+
+        // Cloned committees should have identical hashes
+        assert_eq!(hash1, hash2);
     }
 }
