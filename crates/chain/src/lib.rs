@@ -552,7 +552,7 @@
 //! ```
 pub mod types;
 pub mod crypto;
-pub mod state;
+pub mod state; //direktori = /state/mod.rs
 pub mod receipt;
 pub mod db;
 pub mod tx;

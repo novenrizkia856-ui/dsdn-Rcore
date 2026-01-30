@@ -282,6 +282,10 @@ pub mod quorum_da
 pub mod signature_collector
 pub mod metrics_tracking
 
+// Coordinator Selection (14A.2B.2)
+#[path = "coordinator_selection.rs"]
+pub mod coordinator_selection
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
 // ════════════════════════════════════════════════════════════════════════════════
@@ -326,6 +330,20 @@ pub use signature_collector::{
 
 /// Metrics tracking untuk QuorumDA dengan Prometheus export.
 pub use metrics_tracking::QuorumMetrics
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - Coordinator Selection (14A.2B.2)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Coordinator selection types untuk multi-coordinator consensus.
+pub use coordinator_selection::{
+    ValidatorCandidate
+    SelectionWeight
+    CoordinatorMember
+    CoordinatorCommittee
+    CommitteeInvariantError
+    SelectionConfig
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MANIFEST VALIDATION TYPES
