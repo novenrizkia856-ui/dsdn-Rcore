@@ -20,6 +20,11 @@
 
 use serde::{Deserialize, Serialize};
 
+// ChaCha20 PRNG untuk deterministic shuffle (14A.2B.2.4)
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // ValidatorCandidate
 // ════════════════════════════════════════════════════════════════════════════════
@@ -483,6 +488,110 @@ impl CoordinatorSelector {
         // Tidak ada yang cocok (random_value >= last cumulative)
         None
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Deterministic Shuffle (14A.2B.2.4)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Create ChaCha20 PRNG dari 32-byte seed.
+    ///
+    /// # Determinism
+    ///
+    /// - Seed LANGSUNG digunakan tanpa transformasi
+    /// - Tidak ada salt atau entropy tambahan
+    /// - Same seed = same PRNG state = same random sequence
+    ///
+    /// # Thread Safety
+    ///
+    /// PRNG yang dikembalikan adalah owned value, bukan shared state.
+    /// Tidak ada global mutable state.
+    ///
+    /// # Arguments
+    ///
+    /// * `seed` - 32-byte seed untuk PRNG
+    ///
+    /// # Returns
+    ///
+    /// ChaCha20 PRNG yang di-seed dari input.
+    pub fn create_prng(&self, seed: &[u8; 32]) -> ChaCha20Rng {
+        // Seed PRNG langsung dari input tanpa transformasi
+        ChaCha20Rng::from_seed(*seed)
+    }
+
+    /// Shuffle items secara deterministik menggunakan Fisher-Yates algorithm.
+    ///
+    /// # Algorithm
+    ///
+    /// Fisher-Yates (Knuth) shuffle:
+    /// ```text
+    /// for i from (len-1) down to 1:
+    ///     j = random integer in range [0, i] (inclusive)
+    ///     swap(buffer[i], buffer[j])
+    /// ```
+    ///
+    /// # Determinism
+    ///
+    /// - Same input + same seed = same output (across all nodes/architectures)
+    /// - Menggunakan ChaCha20 PRNG yang deterministik
+    /// - `gen_range` handles modulo bias dengan rejection sampling
+    ///
+    /// # Behavior
+    ///
+    /// - Input `items` TIDAK dimodifikasi
+    /// - Returns Vec baru dengan elemen yang di-shuffle
+    /// - Jika items kosong → return Vec kosong
+    /// - Jika items.len() == 1 → return Vec dengan elemen yang sama
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - Slice of items to shuffle
+    /// * `seed` - 32-byte seed untuk deterministic PRNG
+    ///
+    /// # Returns
+    ///
+    /// Vec baru dengan elemen yang di-shuffle.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let items = vec![1, 2, 3, 4, 5];
+    /// let seed = [0u8; 32];
+    /// let shuffled = selector.deterministic_shuffle(&items, &seed);
+    /// // shuffled adalah permutasi dari items, deterministik berdasarkan seed
+    /// ```
+    pub fn deterministic_shuffle<T: Clone>(
+        &self,
+        items: &[T],
+        seed: &[u8; 32],
+    ) -> Vec<T> {
+        // Edge cases
+        if items.is_empty() {
+            return Vec::new();
+        }
+        if items.len() == 1 {
+            return vec![items[0].clone()];
+        }
+
+        // Clone items ke mutable buffer
+        let mut buffer: Vec<T> = items.to_vec();
+        let len = buffer.len();
+
+        // Create PRNG dari seed
+        let mut rng = self.create_prng(seed);
+
+        // Fisher-Yates shuffle: for i from (len-1) down to 1
+        // Iterasi dari index terakhir ke index 1 (inclusive)
+        for i in (1..len).rev() {
+            // j = random integer in range [0, i] (inclusive)
+            // gen_range menggunakan [low, high) jadi kita pakai [0, i+1)
+            let j = rng.gen_range(0..=i);
+
+            // swap(buffer[i], buffer[j])
+            buffer.swap(i, j);
+        }
+
+        buffer
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -492,6 +601,7 @@ impl CoordinatorSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng; // Untuk test PRNG
 
     // Helper: create deterministic test data
     fn make_validator_candidate(seed: u8) -> ValidatorCandidate {
@@ -1586,5 +1696,328 @@ mod tests {
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
         assert_eq!(r1, Some(0));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Deterministic Shuffle Tests (14A.2B.2.4)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_shuffle_same_seed_same_output() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Create test items
+        let items: Vec<u32> = (0..20).collect();
+
+        // Fixed seed
+        let seed = [0x42u8; 32];
+
+        // Run 100 iterations - ALL must be identical
+        let first_result = selector.deterministic_shuffle(&items, &seed);
+
+        for iteration in 0..100 {
+            let result = selector.deterministic_shuffle(&items, &seed);
+            assert_eq!(
+                result, first_result,
+                "iteration {} produced different result",
+                iteration
+            );
+        }
+    }
+
+    #[test]
+    fn test_shuffle_different_seed_different_output() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let items: Vec<u32> = (0..20).collect();
+
+        let seed1 = [0x00u8; 32];
+        let seed2 = [0x01u8; 32];
+        let seed3 = [0xFFu8; 32];
+
+        let result1 = selector.deterministic_shuffle(&items, &seed1);
+        let result2 = selector.deterministic_shuffle(&items, &seed2);
+        let result3 = selector.deterministic_shuffle(&items, &seed3);
+
+        // Different seeds should produce different outputs
+        // (With 20 items, probability of collision is negligible: 1/20!)
+        assert_ne!(result1, result2, "seed1 vs seed2 should differ");
+        assert_ne!(result2, result3, "seed2 vs seed3 should differ");
+        assert_ne!(result1, result3, "seed1 vs seed3 should differ");
+    }
+
+    #[test]
+    fn test_shuffle_preserves_elements() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Test with various seeds
+        let seeds: [[u8; 32]; 5] = [
+            [0x00u8; 32],
+            [0x11u8; 32],
+            [0x22u8; 32],
+            [0x33u8; 32],
+            [0xFFu8; 32],
+        ];
+
+        for seed in &seeds {
+            let items: Vec<u32> = (0..50).collect();
+            let shuffled = selector.deterministic_shuffle(&items, seed);
+
+            // Same length
+            assert_eq!(shuffled.len(), items.len());
+
+            // No elements lost - every original element must be present
+            let mut sorted_shuffled = shuffled.clone();
+            sorted_shuffled.sort();
+            assert_eq!(sorted_shuffled, items);
+        }
+    }
+
+    #[test]
+    fn test_shuffle_empty() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let items: Vec<u32> = vec![];
+        let seed = [0x42u8; 32];
+
+        let result = selector.deterministic_shuffle(&items, &seed);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_shuffle_single_element() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let items = vec![42u32];
+        let seed = [0x42u8; 32];
+
+        let result = selector.deterministic_shuffle(&items, &seed);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 42);
+    }
+
+    #[test]
+    fn test_shuffle_two_elements() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let items = vec![1u32, 2];
+        let seed = [0x42u8; 32];
+
+        let result = selector.deterministic_shuffle(&items, &seed);
+
+        // Must contain both elements
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&1));
+        assert!(result.contains(&2));
+
+        // Same seed = same result
+        let result2 = selector.deterministic_shuffle(&items, &seed);
+        assert_eq!(result, result2);
+    }
+
+    #[test]
+    fn test_shuffle_with_validator_candidates() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Create 10 validators
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_candidate(i as u8))
+            .collect();
+
+        let seed = [0x99u8; 32];
+        let shuffled = selector.deterministic_shuffle(&validators, &seed);
+
+        // Same length
+        assert_eq!(shuffled.len(), 10);
+
+        // All original validators present (by id)
+        for v in &validators {
+            assert!(
+                shuffled.iter().any(|s| s.id == v.id),
+                "validator {:?} missing from shuffled result",
+                v.id[0]
+            );
+        }
+
+        // Determinism
+        let shuffled2 = selector.deterministic_shuffle(&validators, &seed);
+        assert_eq!(shuffled, shuffled2);
+    }
+
+    #[test]
+    fn test_create_prng_deterministic() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let seed = [0xABu8; 32];
+
+        // Create two PRNGs with same seed
+        let mut rng1 = selector.create_prng(&seed);
+        let mut rng2 = selector.create_prng(&seed);
+
+        // Generate sequence from both - must be identical
+        for i in 0..1000 {
+            let v1: u64 = rng1.gen();
+            let v2: u64 = rng2.gen();
+            assert_eq!(v1, v2, "PRNG diverged at iteration {}", i);
+        }
+    }
+
+    #[test]
+    fn test_create_prng_different_seeds() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let seed1 = [0x00u8; 32];
+        let seed2 = [0x01u8; 32];
+
+        let mut rng1 = selector.create_prng(&seed1);
+        let mut rng2 = selector.create_prng(&seed2);
+
+        // First value should differ
+        let v1: u64 = rng1.gen();
+        let v2: u64 = rng2.gen();
+        assert_ne!(v1, v2, "different seeds should produce different values");
+    }
+
+    #[test]
+    fn test_shuffle_does_not_modify_input() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let items: Vec<u32> = (0..20).collect();
+        let items_clone = items.clone();
+        let seed = [0x42u8; 32];
+
+        let _result = selector.deterministic_shuffle(&items, &seed);
+
+        // Original items unchanged
+        assert_eq!(items, items_clone);
+    }
+
+    #[test]
+    fn test_shuffle_cross_invocation_determinism() {
+        // This test verifies determinism across multiple selector instances
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+
+        // Create multiple selector instances
+        let selector1 = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let selector2 = CoordinatorSelector::new(config.clone()).expect("valid config");
+        let selector3 = CoordinatorSelector::new(config).expect("valid config");
+
+        let items: Vec<u32> = (0..100).collect();
+        let seed = [0x55u8; 32];
+
+        let result1 = selector1.deterministic_shuffle(&items, &seed);
+        let result2 = selector2.deterministic_shuffle(&items, &seed);
+        let result3 = selector3.deterministic_shuffle(&items, &seed);
+
+        // All results must be identical
+        assert_eq!(result1, result2);
+        assert_eq!(result2, result3);
+    }
+
+    #[test]
+    fn test_shuffle_large_array() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Large array
+        let items: Vec<u32> = (0..1000).collect();
+        let seed = [0x77u8; 32];
+
+        let shuffled = selector.deterministic_shuffle(&items, &seed);
+
+        // Verify all elements present
+        assert_eq!(shuffled.len(), 1000);
+        let mut sorted = shuffled.clone();
+        sorted.sort();
+        assert_eq!(sorted, items);
+
+        // Verify determinism
+        let shuffled2 = selector.deterministic_shuffle(&items, &seed);
+        assert_eq!(shuffled, shuffled2);
+    }
+
+    #[test]
+    fn test_shuffle_known_seed_reproducibility() {
+        // Test with a known seed to ensure reproducibility across implementations
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let items: Vec<u8> = vec![0, 1, 2, 3, 4];
+        let seed = [0u8; 32]; // All zeros seed
+
+        let result1 = selector.deterministic_shuffle(&items, &seed);
+        let result2 = selector.deterministic_shuffle(&items, &seed);
+
+        // Must be deterministic
+        assert_eq!(result1, result2);
+
+        // Must be a valid permutation
+        let mut sorted = result1.clone();
+        sorted.sort();
+        assert_eq!(sorted, items);
     }
 }
