@@ -265,6 +265,158 @@
 //!
 //! ## Metrics
 //! - `QuorumMetrics` - Metrics tracking with Prometheus export
+//!
+//! ## Coordinator Selection (14A.2B.2)
+//!
+//! Sistem seleksi committee deterministik untuk multi-coordinator consensus.
+//!
+//! ### Architecture Diagram
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │                     Coordinator Selection System                         │
+//! │                                                                          │
+//! │  ┌──────────────┐     ┌───────────────────┐     ┌──────────────────┐    │
+//! │  │  Validators  │────>│ CoordinatorSelector│────>│ CoordinatorCommittee│ │
+//! │  │  (candidates)│     │   (selection)      │     │  (members + threshold)│
+//! │  └──────────────┘     └───────────────────┘     └──────────────────┘    │
+//! │         │                      │                         │               │
+//! │         │              ┌───────┴───────┐                 │               │
+//! │         │              │               │                 │               │
+//! │         ▼              ▼               ▼                 ▼               │
+//! │  ┌──────────┐   ┌───────────┐   ┌───────────┐   ┌──────────────┐        │
+//! │  │ValidatorID│   │ EpochSeed │   │ Selection │   │ Verification │        │
+//! │  │ + Stake  │   │(DA + prev)│   │   Config  │   │  (re-select) │        │
+//! │  │ + Zone   │   └───────────┘   └───────────┘   └──────────────┘        │
+//! │  └──────────┘                                                            │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Selection Flow Diagram
+//!
+//! ```text
+//! ┌───────────────────────────────────────────────────────────────────────┐
+//! │                       Selection Algorithm Flow                         │
+//! │                                                                        │
+//! │  Step 1: Validator Filtering                                           │
+//! │  ┌────────────────┐                                                    │
+//! │  │ All Validators │                                                    │
+//! │  └───────┬────────┘                                                    │
+//! │          │ filter: stake >= min_stake                                  │
+//! │          ▼                                                             │
+//! │  ┌────────────────┐                                                    │
+//! │  │    Eligible    │                                                    │
+//! │  │   Validators   │                                                    │
+//! │  └───────┬────────┘                                                    │
+//! │          │                                                             │
+//! │  Step 2: Deterministic Shuffle (ChaCha20 PRNG seeded by epoch_seed)    │
+//! │          │                                                             │
+//! │          ▼                                                             │
+//! │  ┌────────────────┐                                                    │
+//! │  │    Shuffled    │                                                    │
+//! │  │   Candidates   │                                                    │
+//! │  └───────┬────────┘                                                    │
+//! │          │                                                             │
+//! │  Step 3: Zone Diversity Selection (max 1/3 per zone, best effort)      │
+//! │          │                                                             │
+//! │          ▼                                                             │
+//! │  ┌────────────────┐                                                    │
+//! │  │   Selected     │                                                    │
+//! │  │   Members      │                                                    │
+//! │  └───────┬────────┘                                                    │
+//! │          │                                                             │
+//! │  Step 4: Final Sort (by stake descending)                              │
+//! │          │                                                             │
+//! │          ▼                                                             │
+//! │  ┌────────────────┐                                                    │
+//! │  │ Coordinator    │ threshold = config.threshold                       │
+//! │  │ Committee      │ epoch = input epoch                                │
+//! │  │                │ group_pubkey = placeholder (DKG later)             │
+//! │  └────────────────┘                                                    │
+//! └───────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Trust Model
+//!
+//! | Aspek | Status | Keterangan |
+//! |-------|--------|------------|
+//! | Epoch Seed | Deterministic | Derived from DA blob hash + prev committee hash |
+//! | Selection Algorithm | Deterministic | Same inputs = same output (ChaCha20 PRNG) |
+//! | Committee Verification | Verifiable | Any node can re-run selection to verify |
+//! | Validator Set | Trusted Input | Must come from trusted source (governance) |
+//! | Merkle Proof | Verifiable | SHA3-512 truncated, standard Merkle verification |
+//!
+//! **Determinism Guarantee**: Given identical inputs (validators, epoch, seed, config),
+//! `select_committee` ALWAYS produces identical output on any node, any architecture.
+//!
+//! **Verifiability**: Any node receiving a claimed committee can verify it by:
+//! 1. Re-running `select_committee` with same inputs
+//! 2. Comparing byte-wise equality of all fields
+//! 3. Verifying epoch seed via Merkle proof against DA layer
+//!
+//! ### Public API Summary
+//!
+//! | Type/Function | Role |
+//! |---------------|------|
+//! | `ValidatorCandidate` | Validator eligible for selection (id, pubkey, stake, zone) |
+//! | `SelectionWeight` | Weight data for cumulative stake calculation |
+//! | `CoordinatorMember` | Selected member in committee |
+//! | `CoordinatorCommittee` | Committee with members, threshold, epoch, group_pubkey |
+//! | `SelectionConfig` | Configuration: committee_size, threshold, min_stake |
+//! | `CoordinatorSelector` | Stateless selection engine |
+//! | `SelectionError` | Errors during selection (insufficient validators, etc.) |
+//! | `VerificationError` | Errors during committee verification |
+//! | `derive_epoch_seed` | Derive epoch seed from DA blob and prev committee |
+//! | `verify_epoch_seed` | Verify epoch seed against Merkle proof |
+//! | `verify_committee_selection` | Verify committee is valid selection result |
+//! | `verify_member_eligibility` | Verify member exists in validator set |
+//!
+//! ### Usage Example
+//!
+//! ```ignore
+//! use dsdn_validator::{
+//!     SelectionConfig, CoordinatorSelector, ValidatorCandidate,
+//!     derive_epoch_seed,
+//! };
+//!
+//! // 1. Create configuration
+//! let config = SelectionConfig {
+//!     committee_size: 5,
+//!     threshold: 3,
+//!     min_stake: 1000,
+//! };
+//!
+//! // 2. Create selector (returns Result, no unwrap in production)
+//! let selector = match CoordinatorSelector::new(config) {
+//!     Ok(s) => s,
+//!     Err(e) => {
+//!         eprintln!("Invalid config: {}", e);
+//!         return;
+//!     }
+//! };
+//!
+//! // 3. Prepare validators (from governance/registry)
+//! let validators: Vec<ValidatorCandidate> = vec![
+//!     // ... populate from trusted source
+//! ];
+//!
+//! // 4. Derive epoch seed
+//! let epoch = 100u64;
+//! let da_blob_hash = [0u8; 32];      // from DA layer
+//! let prev_committee_hash = [0u8; 32]; // from previous committee
+//! let seed = derive_epoch_seed(epoch, &da_blob_hash, &prev_committee_hash);
+//!
+//! // 5. Select committee (returns Result)
+//! match selector.select_committee(&validators, epoch, &seed) {
+//!     Ok(committee) => {
+//!         println!("Selected {} members", committee.members.len());
+//!         println!("Threshold: {}", committee.threshold);
+//!     }
+//!     Err(e) => {
+//!         eprintln!("Selection failed: {}", e);
+//!     }
+//! }
+//! ```
 
 //RUSTS+ CODE
 use std::collections::{HashMap, HashSet}
@@ -348,11 +500,20 @@ pub use coordinator_selection::{
     CoordinatorSelector
     SelectorConfigError
 
-    // Verification (14A.2B.2.6)
+    // Selection errors (14A.2B.2.7 + 14A.2B.2.9)
+    SelectionError
+
+    // Seed derivation (14A.2B.2.5)
+    derive_epoch_seed
+
+    // Verification (14A.2B.2.6 + 14A.2B.2.8)
     DAMerkleProof
     SeedVerificationResult
     verify_epoch_seed
     verify_merkle_proof
+    VerificationError
+    verify_committee_selection
+    verify_member_eligibility
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
