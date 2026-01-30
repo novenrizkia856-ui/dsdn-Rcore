@@ -287,6 +287,76 @@ impl std::fmt::Display for SelectorConfigError {
 
 impl std::error::Error for SelectorConfigError {}
 
+// ════════════════════════════════════════════════════════════════════════════════
+// SelectionError (14A.2B.2.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk committee selection failures.
+///
+/// Returned ketika `select_committee` tidak dapat membentuk committee yang valid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectionError {
+    /// Tidak cukup validators untuk membentuk committee
+    InsufficientValidators {
+        /// Jumlah validators yang tersedia
+        available: usize,
+        /// Jumlah minimum yang dibutuhkan (committee_size)
+        required: usize,
+    },
+
+    /// Tidak cukup eligible validators (setelah filter min_stake)
+    InsufficientEligibleValidators {
+        /// Jumlah eligible validators
+        eligible: usize,
+        /// Jumlah minimum yang dibutuhkan
+        required: usize,
+    },
+
+    /// Committee invariant violation (threshold > members)
+    CommitteeInvariant {
+        /// Threshold yang dikonfigurasi
+        threshold: u8,
+        /// Jumlah members yang berhasil dipilih
+        members_count: usize,
+    },
+
+    /// Internal error (should never happen in correct implementation)
+    Internal(String),
+}
+
+impl std::fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelectionError::InsufficientValidators { available, required } => {
+                write!(
+                    f,
+                    "insufficient validators: {} available, {} required",
+                    available, required
+                )
+            }
+            SelectionError::InsufficientEligibleValidators { eligible, required } => {
+                write!(
+                    f,
+                    "insufficient eligible validators: {} eligible, {} required",
+                    eligible, required
+                )
+            }
+            SelectionError::CommitteeInvariant { threshold, members_count } => {
+                write!(
+                    f,
+                    "committee invariant violated: threshold ({}) > members ({})",
+                    threshold, members_count
+                )
+            }
+            SelectionError::Internal(msg) => {
+                write!(f, "internal selection error: {}", msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
 /// Stateless coordinator selection engine.
 ///
 /// CoordinatorSelector adalah pure computation engine tanpa side effects.
@@ -615,6 +685,270 @@ impl CoordinatorSelector {
 
         buffer
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Committee Selection Algorithm (14A.2B.2.7)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Check apakah menambahkan candidate akan melanggar zone diversity.
+    ///
+    /// # Zone Diversity Rule
+    ///
+    /// Satu zone maksimal 1/3 dari committee_size.
+    /// Dihitung berdasarkan jumlah validator, bukan stake.
+    ///
+    /// # Arguments
+    ///
+    /// * `selected` - Validators yang sudah terpilih
+    /// * `candidate` - Candidate yang akan ditambahkan
+    ///
+    /// # Returns
+    ///
+    /// `true` jika candidate DAPAT ditambahkan tanpa melanggar zone diversity.
+    /// `false` jika menambahkan candidate akan melanggar batas 1/3.
+    ///
+    /// # Determinism
+    ///
+    /// - Same inputs = same output
+    /// - Tidak ada randomness
+    /// - Tidak bergantung pada HashMap ordering (menggunakan counting)
+    pub fn ensure_zone_diversity(
+        &self,
+        selected: &[ValidatorCandidate],
+        candidate: &ValidatorCandidate,
+    ) -> bool {
+        // Hitung batas maksimum per zone: 1/3 dari committee_size (rounded up)
+        // Menggunakan ceiling division: (a + b - 1) / b
+        let max_per_zone = (self.config.committee_size as usize + 2) / 3;
+
+        // Hitung berapa kali zone candidate muncul di selected
+        let zone_count = selected
+            .iter()
+            .filter(|v| v.zone == candidate.zone)
+            .count();
+
+        // Jika menambahkan candidate akan melebihi limit, return false
+        // zone_count + 1 (untuk candidate) <= max_per_zone
+        zone_count < max_per_zone
+    }
+
+    /// Select committee secara deterministik dari daftar validators.
+    ///
+    /// # Algorithm (URUTAN WAJIB)
+    ///
+    /// 1. Ambil daftar validator input APA ADANYA
+    /// 2. Filter berdasarkan min_stake (eligible validators)
+    /// 3. Validasi: cukup eligible validators untuk committee_size
+    /// 4. Deterministic shuffle menggunakan epoch seed
+    /// 5. Iterasi hasil shuffle untuk memilih committee:
+    ///    a. Skip validator yang sudah terpilih
+    ///    b. Cek zone diversity via ensure_zone_diversity
+    ///    c. Jika lolos → masukkan
+    ///    d. Jika tidak ada kandidat zone-diverse → fallback ke stake tertinggi
+    /// 6. Hentikan seleksi tepat saat committee_size tercapai
+    /// 7. Urutkan hasil akhir berdasarkan stake DESCENDING
+    /// 8. Bentuk CoordinatorCommittee dengan placeholder group_pubkey
+    ///
+    /// # Determinism
+    ///
+    /// - Same input + same seed = same output (across all nodes/architectures)
+    /// - Tidak ada randomness non-seeded
+    /// - Tidak bergantung pada iteration order non-deterministic
+    ///
+    /// # Arguments
+    ///
+    /// * `validators` - Slice of validator candidates
+    /// * `epoch` - Epoch number untuk committee ini
+    /// * `seed` - 32-byte deterministic seed (dari derive_epoch_seed)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(CoordinatorCommittee)` jika selection berhasil.
+    /// `Err(SelectionError)` jika selection gagal.
+    ///
+    /// # Note on group_pubkey
+    ///
+    /// `group_pubkey` dalam hasil adalah **placeholder deterministik** yang
+    /// dihitung dari SHA3-256 concatenation of members' pubkeys.
+    /// Nilai ini HARUS di-replace setelah DKG ceremony selesai.
+    pub fn select_committee(
+        &self,
+        validators: &[ValidatorCandidate],
+        epoch: u64,
+        seed: &[u8; 32],
+    ) -> Result<CoordinatorCommittee, SelectionError> {
+        let committee_size = self.config.committee_size as usize;
+        let threshold = self.config.threshold;
+
+        // Step 1: Validasi input cukup
+        if validators.len() < committee_size {
+            return Err(SelectionError::InsufficientValidators {
+                available: validators.len(),
+                required: committee_size,
+            });
+        }
+
+        // Step 2: Filter eligible validators (stake >= min_stake)
+        let eligible = self.compute_eligible_validators(validators, self.config.min_stake);
+
+        // Step 3: Validasi eligible cukup
+        if eligible.len() < committee_size {
+            return Err(SelectionError::InsufficientEligibleValidators {
+                eligible: eligible.len(),
+                required: committee_size,
+            });
+        }
+
+        // Step 4: Deterministic shuffle
+        let shuffled = self.deterministic_shuffle(&eligible, seed);
+
+        // Step 5: Select committee dengan zone diversity
+        let mut selected: Vec<ValidatorCandidate> = Vec::with_capacity(committee_size);
+
+        // Pass 1: Select dengan zone diversity constraint
+        for candidate in &shuffled {
+            if selected.len() >= committee_size {
+                break;
+            }
+
+            // Skip jika sudah terpilih (cek by id)
+            if selected.iter().any(|s| s.id == candidate.id) {
+                continue;
+            }
+
+            // Cek zone diversity
+            if self.ensure_zone_diversity(&selected, candidate) {
+                selected.push(candidate.clone());
+            }
+        }
+
+        // Pass 2: Fallback jika belum cukup (relax zone diversity, pilih by stake)
+        if selected.len() < committee_size {
+            // Collect remaining candidates yang belum terpilih
+            let mut remaining: Vec<&ValidatorCandidate> = shuffled
+                .iter()
+                .filter(|c| !selected.iter().any(|s| s.id == c.id))
+                .collect();
+
+            // Sort by stake descending untuk deterministic fallback
+            remaining.sort_by(|a, b| b.stake.cmp(&a.stake));
+
+            // Add sampai committee_size tercapai
+            for candidate in remaining {
+                if selected.len() >= committee_size {
+                    break;
+                }
+                selected.push(candidate.clone());
+            }
+        }
+
+        // Validasi: harus tepat committee_size
+        if selected.len() != committee_size {
+            return Err(SelectionError::Internal(format!(
+                "failed to select {} members, only got {}",
+                committee_size,
+                selected.len()
+            )));
+        }
+
+        // Step 6: Sort hasil akhir by stake DESCENDING
+        selected.sort_by(|a, b| b.stake.cmp(&a.stake));
+
+        // Step 7: Convert ValidatorCandidate ke CoordinatorMember
+        let members: Vec<CoordinatorMember> = selected
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                // Generate deterministic member ID dari validator ID + epoch + index
+                let member_id = compute_member_id(&v.id, epoch, idx);
+
+                CoordinatorMember {
+                    id: member_id,
+                    validator_id: v.id,
+                    pubkey: v.pubkey,
+                    stake: v.stake,
+                }
+            })
+            .collect();
+
+        // Step 8: Compute placeholder group_pubkey (akan di-replace setelah DKG)
+        let group_pubkey = compute_placeholder_group_pubkey(&members);
+
+        // Step 9: Create CoordinatorCommittee
+        CoordinatorCommittee::new(members, threshold, epoch, group_pubkey).map_err(|e| {
+            SelectionError::CommitteeInvariant {
+                threshold: e.threshold,
+                members_count: e.members_count,
+            }
+        })
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Helper Functions for Committee Selection (14A.2B.2.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Compute deterministic member ID dari validator ID, epoch, dan index.
+///
+/// # Algorithm
+///
+/// ```text
+/// member_id = SHA3-256(validator_id_32 || epoch_be_8 || index_be_8)
+/// ```
+///
+/// # Determinism
+///
+/// Same inputs = same output (cross-platform).
+fn compute_member_id(validator_id: &[u8; 32], epoch: u64, index: usize) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(validator_id);
+    hasher.update(epoch.to_be_bytes());
+    hasher.update((index as u64).to_be_bytes());
+
+    let result = hasher.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&result);
+    id
+}
+
+/// Compute placeholder group_pubkey dari committee members.
+///
+/// # PENTING
+///
+/// Ini adalah **PLACEHOLDER** yang HARUS di-replace setelah DKG ceremony.
+/// Nilai ini digunakan agar CoordinatorCommittee dapat dibentuk sebelum DKG.
+///
+/// # Algorithm
+///
+/// ```text
+/// placeholder = SHA3-256(
+///     0x01 ||  // domain separator
+///     member_count_be_8 ||
+///     for each member: member.pubkey_32
+/// )
+/// ```
+///
+/// # Determinism
+///
+/// Same members (same order) = same placeholder.
+fn compute_placeholder_group_pubkey(members: &[CoordinatorMember]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+
+    // Domain separator untuk menandakan ini placeholder
+    hasher.update([0x01]);
+
+    // Member count
+    hasher.update((members.len() as u64).to_be_bytes());
+
+    // Each member's pubkey (order matters)
+    for member in members {
+        hasher.update(member.pubkey);
+    }
+
+    let result = hasher.finalize();
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&result);
+    pubkey
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2500,5 +2834,410 @@ mod tests {
 
         // Cloned committees should have identical hashes
         assert_eq!(hash1, hash2);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Committee Selection Tests (14A.2B.2.7)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    fn make_validator_with_zone(seed: u8, zone: &str, stake: u64) -> ValidatorCandidate {
+        let mut id = [0u8; 32];
+        id[0] = seed;
+        id[31] = seed.wrapping_add(1);
+
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = seed.wrapping_add(100);
+        pubkey[31] = seed.wrapping_add(101);
+
+        ValidatorCandidate {
+            id,
+            pubkey,
+            stake,
+            zone: zone.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_ensure_zone_diversity_allows_within_limit() {
+        let config = SelectionConfig {
+            committee_size: 9,
+            threshold: 6,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Max per zone = (9 + 2) / 3 = 3
+        let selected = vec![
+            make_validator_with_zone(1, "zone-a", 1000),
+            make_validator_with_zone(2, "zone-a", 1000),
+        ];
+
+        let candidate = make_validator_with_zone(3, "zone-a", 1000);
+
+        // 2 existing + 1 candidate = 3, which is <= 3 (max)
+        assert!(selector.ensure_zone_diversity(&selected, &candidate));
+    }
+
+    #[test]
+    fn test_ensure_zone_diversity_blocks_over_limit() {
+        let config = SelectionConfig {
+            committee_size: 9,
+            threshold: 6,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Max per zone = (9 + 2) / 3 = 3
+        let selected = vec![
+            make_validator_with_zone(1, "zone-a", 1000),
+            make_validator_with_zone(2, "zone-a", 1000),
+            make_validator_with_zone(3, "zone-a", 1000),
+        ];
+
+        let candidate = make_validator_with_zone(4, "zone-a", 1000);
+
+        // 3 existing + 1 candidate = 4, which is > 3 (max)
+        assert!(!selector.ensure_zone_diversity(&selected, &candidate));
+    }
+
+    #[test]
+    fn test_ensure_zone_diversity_different_zone_allowed() {
+        let config = SelectionConfig {
+            committee_size: 9,
+            threshold: 6,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let selected = vec![
+            make_validator_with_zone(1, "zone-a", 1000),
+            make_validator_with_zone(2, "zone-a", 1000),
+            make_validator_with_zone(3, "zone-a", 1000),
+        ];
+
+        // Different zone should be allowed
+        let candidate = make_validator_with_zone(4, "zone-b", 1000);
+        assert!(selector.ensure_zone_diversity(&selected, &candidate));
+    }
+
+    #[test]
+    fn test_select_committee_deterministic() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000 + (i as u64 * 100)))
+            .collect();
+
+        let seed = [0x42u8; 32];
+        let epoch = 1;
+
+        // Run 3 times - must be identical
+        let committee1 = selector.select_committee(&validators, epoch, &seed).expect("selection 1");
+        let committee2 = selector.select_committee(&validators, epoch, &seed).expect("selection 2");
+        let committee3 = selector.select_committee(&validators, epoch, &seed).expect("selection 3");
+
+        assert_eq!(committee1.members.len(), committee2.members.len());
+        assert_eq!(committee2.members.len(), committee3.members.len());
+
+        for i in 0..committee1.members.len() {
+            assert_eq!(committee1.members[i].validator_id, committee2.members[i].validator_id);
+            assert_eq!(committee2.members[i].validator_id, committee3.members[i].validator_id);
+        }
+    }
+
+    #[test]
+    fn test_select_committee_different_seeds_different_results() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000 + (i as u64 * 100)))
+            .collect();
+
+        let seed1 = [0x11u8; 32];
+        let seed2 = [0x22u8; 32];
+        let epoch = 1;
+
+        let committee1 = selector.select_committee(&validators, epoch, &seed1).expect("selection 1");
+        let committee2 = selector.select_committee(&validators, epoch, &seed2).expect("selection 2");
+
+        // Different seeds should produce different committees (with high probability)
+        let ids1: Vec<[u8; 32]> = committee1.members.iter().map(|m| m.validator_id).collect();
+        let ids2: Vec<[u8; 32]> = committee2.members.iter().map(|m| m.validator_id).collect();
+
+        // At least one member should be different
+        assert_ne!(ids1, ids2);
+    }
+
+    #[test]
+    fn test_select_committee_correct_size() {
+        let config = SelectionConfig {
+            committee_size: 7,
+            threshold: 5,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..20)
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 4), 1000))
+            .collect();
+
+        let seed = [0x33u8; 32];
+        let committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        assert_eq!(committee.members.len(), 7);
+        assert_eq!(committee.threshold, 5);
+    }
+
+    #[test]
+    fn test_select_committee_sorted_by_stake_descending() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 5), 100 + (i as u64 * 500)))
+            .collect();
+
+        let seed = [0x44u8; 32];
+        let committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        // Verify sorted by stake descending
+        for i in 1..committee.members.len() {
+            assert!(
+                committee.members[i - 1].stake >= committee.members[i].stake,
+                "members should be sorted by stake descending"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_committee_no_duplicates() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000))
+            .collect();
+
+        let seed = [0x55u8; 32];
+        let committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        // Check no duplicate validator_ids
+        let mut seen = std::collections::HashSet::new();
+        for member in &committee.members {
+            assert!(
+                seen.insert(member.validator_id),
+                "duplicate validator_id found"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_committee_respects_min_stake() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 500,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Some validators below min_stake
+        let mut validators = Vec::new();
+        for i in 0..5 {
+            validators.push(make_validator_with_zone(i, "zone-a", 100)); // Below min_stake
+        }
+        for i in 5..15 {
+            validators.push(make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000)); // Above min_stake
+        }
+
+        let seed = [0x66u8; 32];
+        let committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        // All members should have stake >= min_stake
+        for member in &committee.members {
+            assert!(member.stake >= 500, "member stake should be >= min_stake");
+        }
+    }
+
+    #[test]
+    fn test_select_committee_insufficient_validators_error() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 7,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Only 5 validators, but need 10
+        let validators: Vec<ValidatorCandidate> = (0..5)
+            .map(|i| make_validator_with_zone(i, "zone-a", 1000))
+            .collect();
+
+        let seed = [0x77u8; 32];
+        let result = selector.select_committee(&validators, 1, &seed);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SelectionError::InsufficientValidators { available, required } => {
+                assert_eq!(available, 5);
+                assert_eq!(required, 10);
+            }
+            _ => panic!("expected InsufficientValidators error"),
+        }
+    }
+
+    #[test]
+    fn test_select_committee_insufficient_eligible_error() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // 10 validators but only 3 with sufficient stake
+        let mut validators = Vec::new();
+        for i in 0..7 {
+            validators.push(make_validator_with_zone(i, "zone-a", 100)); // Below min_stake
+        }
+        for i in 7..10 {
+            validators.push(make_validator_with_zone(i, "zone-b", 2000)); // Above min_stake
+        }
+
+        let seed = [0x88u8; 32];
+        let result = selector.select_committee(&validators, 1, &seed);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SelectionError::InsufficientEligibleValidators { eligible, required } => {
+                assert_eq!(eligible, 3);
+                assert_eq!(required, 5);
+            }
+            _ => panic!("expected InsufficientEligibleValidators error"),
+        }
+    }
+
+    #[test]
+    fn test_select_committee_zone_diversity_best_effort() {
+        let config = SelectionConfig {
+            committee_size: 6,
+            threshold: 4,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Max per zone = (6 + 2) / 3 = 2
+        // Create 10 validators: 7 in zone-a, 3 in other zones
+        let mut validators = Vec::new();
+        for i in 0..7 {
+            validators.push(make_validator_with_zone(i, "zone-a", 1000 + (i as u64 * 100)));
+        }
+        for i in 7..10 {
+            validators.push(make_validator_with_zone(i, &format!("zone-{}", i), 1000));
+        }
+
+        let seed = [0x99u8; 32];
+        let committee = selector.select_committee(&validators, 1, &seed).expect("selection");
+
+        // Committee should be formed (fallback allows exceeding zone limit)
+        assert_eq!(committee.members.len(), 6);
+    }
+
+    #[test]
+    fn test_select_committee_epoch_affects_member_ids() {
+        let config = SelectionConfig {
+            committee_size: 3,
+            threshold: 2,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..5)
+            .map(|i| make_validator_with_zone(i, "zone-a", 1000))
+            .collect();
+
+        let seed = [0xAAu8; 32];
+
+        let committee1 = selector.select_committee(&validators, 1, &seed).expect("epoch 1");
+        let committee2 = selector.select_committee(&validators, 2, &seed).expect("epoch 2");
+
+        // Same validator_ids (same seed)
+        for i in 0..committee1.members.len() {
+            assert_eq!(committee1.members[i].validator_id, committee2.members[i].validator_id);
+        }
+
+        // But different member_ids (different epoch)
+        for i in 0..committee1.members.len() {
+            assert_ne!(committee1.members[i].id, committee2.members[i].id);
+        }
+    }
+
+    #[test]
+    fn test_select_committee_group_pubkey_deterministic() {
+        let config = SelectionConfig {
+            committee_size: 4,
+            threshold: 3,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000))
+            .collect();
+
+        let seed = [0xBBu8; 32];
+
+        let committee1 = selector.select_committee(&validators, 1, &seed).expect("selection 1");
+        let committee2 = selector.select_committee(&validators, 1, &seed).expect("selection 2");
+
+        // group_pubkey should be deterministic
+        assert_eq!(committee1.group_pubkey, committee2.group_pubkey);
+
+        // group_pubkey should not be all zeros
+        assert_ne!(committee1.group_pubkey, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_selection_error_display() {
+        let err1 = SelectionError::InsufficientValidators {
+            available: 5,
+            required: 10,
+        };
+        assert!(err1.to_string().contains("5"));
+        assert!(err1.to_string().contains("10"));
+
+        let err2 = SelectionError::InsufficientEligibleValidators {
+            eligible: 3,
+            required: 7,
+        };
+        assert!(err2.to_string().contains("3"));
+        assert!(err2.to_string().contains("7"));
+
+        let err3 = SelectionError::CommitteeInvariant {
+            threshold: 5,
+            members_count: 3,
+        };
+        assert!(err3.to_string().contains("5"));
+        assert!(err3.to_string().contains("3"));
+
+        let err4 = SelectionError::Internal("test error".to_string());
+        assert!(err4.to_string().contains("test error"));
     }
 }
