@@ -283,7 +283,6 @@ pub mod signature_collector
 pub mod metrics_tracking
 
 // Coordinator Selection (14A.2B.2)
-#[path = "coordinator_selection.rs"]
 pub mod coordinator_selection
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -348,6 +347,12 @@ pub use coordinator_selection::{
     // Selector (14A.2B.2.2)
     CoordinatorSelector
     SelectorConfigError
+
+    // Verification (14A.2B.2.6)
+    DAMerkleProof
+    SeedVerificationResult
+    verify_epoch_seed
+    verify_merkle_proof
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

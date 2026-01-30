@@ -14,9 +14,29 @@
 //! - `CoordinatorCommittee` - Committee dengan threshold requirement
 //! - `SelectionConfig` - Konfigurasi selection parameters
 //!
+//! # Verification (14A.2B.2.6)
+//!
+//! - `DAMerkleProof` - Merkle proof untuk DA verification
+//! - `SeedVerificationResult` - Result dari epoch seed verification
+//! - `verify_epoch_seed` - Verify epoch seed dengan Merkle proof
+//! - `verify_merkle_proof` - Verify generic Merkle proof
+//!
 //! # Invariants
 //!
 //! - `CoordinatorCommittee`: threshold <= members.len()
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Submodules
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub mod verification;
+
+// Re-export verification types (14A.2B.2.6)
+pub use verification::{DAMerkleProof, SeedVerificationResult, verify_epoch_seed, verify_merkle_proof};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Imports
+// ════════════════════════════════════════════════════════════════════════════════
 
 use serde::{Deserialize, Serialize};
 
