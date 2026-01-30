@@ -337,12 +337,17 @@ pub use metrics_tracking::QuorumMetrics
 
 /// Coordinator selection types untuk multi-coordinator consensus.
 pub use coordinator_selection::{
+    // Base types (14A.2B.2.1)
     ValidatorCandidate
     SelectionWeight
     CoordinatorMember
     CoordinatorCommittee
     CommitteeInvariantError
     SelectionConfig
+
+    // Selector (14A.2B.2.2)
+    CoordinatorSelector
+    SelectorConfigError
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

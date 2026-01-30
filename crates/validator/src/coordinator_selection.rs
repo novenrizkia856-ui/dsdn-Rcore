@@ -232,6 +232,149 @@ pub struct SelectionConfig {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// CoordinatorSelector (14A.2B.2.2)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk CoordinatorSelector construction.
+///
+/// Returned ketika config violates invariant: threshold <= committee_size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorConfigError {
+    /// Threshold yang diminta
+    pub threshold: u8,
+
+    /// Committee size yang dikonfigurasi
+    pub committee_size: u8,
+}
+
+impl std::fmt::Display for SelectorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "selector config invalid: threshold ({}) > committee_size ({})",
+            self.threshold, self.committee_size
+        )
+    }
+}
+
+impl std::error::Error for SelectorConfigError {}
+
+/// Stateless coordinator selection engine.
+///
+/// CoordinatorSelector adalah pure computation engine tanpa side effects.
+/// Semua methods deterministik dan thread-safe.
+///
+/// # Invariant
+///
+/// `config.threshold <= config.committee_size` HARUS selalu terpenuhi.
+/// Invariant ini dijaga oleh constructor `new()`.
+///
+/// # Example
+///
+/// ```ignore
+/// let config = SelectionConfig {
+///     committee_size: 5,
+///     threshold: 3,
+///     min_stake: 1000,
+/// };
+/// let selector = CoordinatorSelector::new(config)?;
+///
+/// let eligible = selector.compute_eligible_validators(&candidates, 1000);
+/// let total = selector.total_stake(&eligible);
+/// ```
+#[derive(Clone, Debug)]
+pub struct CoordinatorSelector {
+    /// Selection configuration
+    config: SelectionConfig,
+}
+
+impl CoordinatorSelector {
+    /// Create new CoordinatorSelector dengan config validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SelectorConfigError` jika `config.threshold > config.committee_size`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = SelectionConfig {
+    ///     committee_size: 5,
+    ///     threshold: 3,
+    ///     min_stake: 1000,
+    /// };
+    /// let selector = CoordinatorSelector::new(config)?;
+    /// ```
+    pub fn new(config: SelectionConfig) -> Result<Self, SelectorConfigError> {
+        // Invariant: threshold <= committee_size
+        if config.threshold > config.committee_size {
+            return Err(SelectorConfigError {
+                threshold: config.threshold,
+                committee_size: config.committee_size,
+            });
+        }
+
+        Ok(Self { config })
+    }
+
+    /// Get reference ke internal config.
+    #[inline]
+    pub fn config(&self) -> &SelectionConfig {
+        &self.config
+    }
+
+    /// Filter validators berdasarkan minimum stake requirement.
+    ///
+    /// # Behavior
+    ///
+    /// - Filter: `validator.stake >= min_stake`
+    /// - Urutan input dipertahankan (stable)
+    /// - Tidak ada sorting
+    /// - Tidak ada dedup
+    /// - Return adalah clone dari matching validators
+    ///
+    /// # Arguments
+    ///
+    /// * `validators` - Slice of validator candidates
+    /// * `min_stake` - Minimum stake threshold untuk eligibility
+    ///
+    /// # Returns
+    ///
+    /// Vec of validators yang memenuhi kriteria stake.
+    pub fn compute_eligible_validators(
+        &self,
+        validators: &[ValidatorCandidate],
+        min_stake: u64,
+    ) -> Vec<ValidatorCandidate> {
+        validators
+            .iter()
+            .filter(|v| v.stake >= min_stake)
+            .cloned()
+            .collect()
+    }
+
+    /// Compute total stake dari slice of validators.
+    ///
+    /// # Overflow Handling
+    ///
+    /// Menggunakan saturating addition. Jika total melebihi u64::MAX,
+    /// result akan saturate ke u64::MAX tanpa panic atau wrap-around.
+    ///
+    /// # Arguments
+    ///
+    /// * `validators` - Slice of validator candidates
+    ///
+    /// # Returns
+    ///
+    /// Total stake (saturating sum).
+    pub fn total_stake(&self, validators: &[ValidatorCandidate]) -> u64 {
+        validators
+            .iter()
+            .fold(0u64, |acc, v| acc.saturating_add(v.stake))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // UNIT TESTS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -567,5 +710,351 @@ mod tests {
         let s1 = serde_json::to_string(&c1).expect("s1");
         let s2 = serde_json::to_string(&c2).expect("s2");
         assert_eq!(s1, s2);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // CoordinatorSelector Tests (14A.2B.2.2)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_selector_new_valid_config() {
+        // threshold < committee_size: valid
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+
+        let result = CoordinatorSelector::new(config.clone());
+        assert!(result.is_ok());
+
+        let selector = result.expect("should succeed");
+        assert_eq!(selector.config().committee_size, 5);
+        assert_eq!(selector.config().threshold, 3);
+        assert_eq!(selector.config().min_stake, 1000);
+    }
+
+    #[test]
+    fn test_selector_new_threshold_equals_committee_size() {
+        // threshold == committee_size: valid (edge case)
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 5,
+            min_stake: 1000,
+        };
+
+        let result = CoordinatorSelector::new(config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_selector_new_invalid_config() {
+        // threshold > committee_size: INVALID
+        let config = SelectionConfig {
+            committee_size: 3,
+            threshold: 5,
+            min_stake: 1000,
+        };
+
+        let result = CoordinatorSelector::new(config);
+        assert!(result.is_err());
+
+        let err = result.expect_err("should fail");
+        assert_eq!(err.threshold, 5);
+        assert_eq!(err.committee_size, 3);
+
+        // Verify Display impl
+        let msg = format!("{}", err);
+        assert!(msg.contains("threshold"));
+        assert!(msg.contains("committee_size"));
+    }
+
+    #[test]
+    fn test_selector_new_zero_values() {
+        // Both zero: valid edge case
+        let config = SelectionConfig {
+            committee_size: 0,
+            threshold: 0,
+            min_stake: 0,
+        };
+
+        let result = CoordinatorSelector::new(config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compute_eligible_validators_filters_correctly() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Create validators with different stakes
+        let mut v1 = make_validator_candidate(1); // stake = 2000
+        v1.stake = 500; // below threshold
+
+        let mut v2 = make_validator_candidate(2); // stake = 3000
+        v2.stake = 1000; // at threshold
+
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 1500; // above threshold
+
+        let mut v4 = make_validator_candidate(4);
+        v4.stake = 999; // just below
+
+        let mut v5 = make_validator_candidate(5);
+        v5.stake = 5000; // well above
+
+        let validators = vec![v1.clone(), v2.clone(), v3.clone(), v4.clone(), v5.clone()];
+
+        // Filter with min_stake = 1000
+        let eligible = selector.compute_eligible_validators(&validators, 1000);
+
+        // Should include v2, v3, v5 (stake >= 1000)
+        assert_eq!(eligible.len(), 3);
+
+        // Order preserved
+        assert_eq!(eligible[0].stake, 1000); // v2
+        assert_eq!(eligible[1].stake, 1500); // v3
+        assert_eq!(eligible[2].stake, 5000); // v5
+    }
+
+    #[test]
+    fn test_compute_eligible_validators_empty_input() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = vec![];
+        let eligible = selector.compute_eligible_validators(&validators, 1000);
+
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn test_compute_eligible_validators_none_eligible() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // All validators below threshold
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 100;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 200;
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 300;
+
+        let validators = vec![v1, v2, v3];
+        let eligible = selector.compute_eligible_validators(&validators, 1000);
+
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn test_compute_eligible_validators_all_eligible() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let v1 = make_validator_candidate(1); // stake = 2000
+        let v2 = make_validator_candidate(2); // stake = 3000
+        let v3 = make_validator_candidate(3); // stake = 4000
+
+        let validators = vec![v1.clone(), v2.clone(), v3.clone()];
+        let eligible = selector.compute_eligible_validators(&validators, 100);
+
+        assert_eq!(eligible.len(), 3);
+        assert_eq!(eligible, validators);
+    }
+
+    #[test]
+    fn test_compute_eligible_validators_stake_zero() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 0,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 0;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 0;
+
+        let validators = vec![v1.clone(), v2.clone()];
+
+        // min_stake = 0, so stake >= 0 passes
+        let eligible = selector.compute_eligible_validators(&validators, 0);
+        assert_eq!(eligible.len(), 2);
+
+        // min_stake = 1, stake = 0 fails
+        let eligible = selector.compute_eligible_validators(&validators, 1);
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn test_compute_eligible_validators_preserves_order() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Create validators with specific order
+        let validators: Vec<ValidatorCandidate> = (0..10)
+            .map(|i| {
+                let mut v = make_validator_candidate(i as u8);
+                v.stake = 1000 + (i as u64 * 100);
+                v
+            })
+            .collect();
+
+        let eligible = selector.compute_eligible_validators(&validators, 100);
+
+        // All should be eligible and order preserved
+        assert_eq!(eligible.len(), 10);
+        for (i, v) in eligible.iter().enumerate() {
+            assert_eq!(v.stake, 1000 + (i as u64 * 100));
+        }
+    }
+
+    #[test]
+    fn test_total_stake_correct() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 2000;
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 3000;
+
+        let validators = vec![v1, v2, v3];
+        let total = selector.total_stake(&validators);
+
+        assert_eq!(total, 6000);
+    }
+
+    #[test]
+    fn test_total_stake_empty() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = vec![];
+        let total = selector.total_stake(&validators);
+
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_total_stake_zero_stakes() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 0,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 0;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 0;
+
+        let validators = vec![v1, v2];
+        let total = selector.total_stake(&validators);
+
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_total_stake_overflow_saturates() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = u64::MAX;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 1000;
+
+        let validators = vec![v1, v2];
+        let total = selector.total_stake(&validators);
+
+        // Should saturate to u64::MAX, not overflow/panic
+        assert_eq!(total, u64::MAX);
+    }
+
+    #[test]
+    fn test_total_stake_large_values() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Large but not overflowing
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = u64::MAX / 2;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = u64::MAX / 2;
+
+        let validators = vec![v1, v2];
+        let total = selector.total_stake(&validators);
+
+        // (MAX/2) + (MAX/2) = MAX - 1 (due to integer division)
+        assert_eq!(total, (u64::MAX / 2) + (u64::MAX / 2));
+    }
+
+    #[test]
+    fn test_selector_is_clone() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+        let cloned = selector.clone();
+
+        assert_eq!(selector.config(), cloned.config());
+    }
+
+    #[test]
+    fn test_selector_is_debug() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Should not panic
+        let debug_str = format!("{:?}", selector);
+        assert!(debug_str.contains("CoordinatorSelector"));
     }
 }
