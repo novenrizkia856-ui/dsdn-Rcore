@@ -372,6 +372,117 @@ impl CoordinatorSelector {
             .iter()
             .fold(0u64, |acc, v| acc.saturating_add(v.stake))
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // Selection Weight Computation (14A.2B.2.3)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Compute selection weights dengan cumulative distribution.
+    ///
+    /// # Formula
+    ///
+    /// - `weight[i] = stake[i]` (tanpa normalisasi, u64)
+    /// - `cumulative[i] = sum(stake[0..=i])` (inclusive)
+    ///
+    /// # Behavior
+    ///
+    /// - Jika `validators` kosong → return Vec kosong
+    /// - Urutan input dipertahankan
+    /// - Cumulative monotonically increasing
+    /// - Overflow di-handle dengan saturating addition
+    ///
+    /// # Arguments
+    ///
+    /// * `validators` - Slice of validator candidates
+    ///
+    /// # Returns
+    ///
+    /// Vec of SelectionWeight dengan cumulative distribution.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // validators: [stake=1000, stake=2000, stake=3000]
+    /// // result:
+    /// //   [0]: weight=1000, cumulative=1000
+    /// //   [1]: weight=2000, cumulative=3000
+    /// //   [2]: weight=3000, cumulative=6000
+    /// ```
+    pub fn compute_selection_weights(
+        &self,
+        validators: &[ValidatorCandidate],
+    ) -> Vec<SelectionWeight> {
+        if validators.is_empty() {
+            return Vec::new();
+        }
+
+        let mut cumulative: u64 = 0;
+        let mut weights = Vec::with_capacity(validators.len());
+
+        for validator in validators {
+            // Saturating add untuk prevent overflow
+            cumulative = cumulative.saturating_add(validator.stake);
+
+            weights.push(SelectionWeight {
+                validator_id: validator.id,
+                weight: validator.stake,
+                cumulative,
+            });
+        }
+
+        weights
+    }
+
+    /// Select validator index berdasarkan random value dan cumulative weights.
+    ///
+    /// # Algorithm
+    ///
+    /// Kembalikan index TERKECIL `i` dimana `random_value < weights[i].cumulative`.
+    ///
+    /// # Behavior
+    ///
+    /// - Jika `weights` kosong → return None
+    /// - Jika tidak ada yang cocok → return None
+    /// - `weights` diasumsikan SUDAH cumulative (tidak di-validate)
+    ///
+    /// # Arguments
+    ///
+    /// * `weights` - Slice of SelectionWeight (harus sudah cumulative)
+    /// * `random_value` - Random value untuk selection
+    ///
+    /// # Returns
+    ///
+    /// `Some(index)` jika ditemukan, `None` jika tidak.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // weights: [cum=1000, cum=3000, cum=6000]
+    /// // random_value = 0    → returns Some(0)  (0 < 1000)
+    /// // random_value = 999  → returns Some(0)  (999 < 1000)
+    /// // random_value = 1000 → returns Some(1)  (1000 < 3000)
+    /// // random_value = 5999 → returns Some(2)  (5999 < 6000)
+    /// // random_value = 6000 → returns None     (6000 >= 6000)
+    /// ```
+    pub fn select_by_weight(
+        &self,
+        weights: &[SelectionWeight],
+        random_value: u64,
+    ) -> Option<usize> {
+        if weights.is_empty() {
+            return None;
+        }
+
+        // Linear search untuk index terkecil dimana random_value < cumulative
+        for (index, weight) in weights.iter().enumerate() {
+            if random_value < weight.cumulative {
+                return Some(index);
+            }
+        }
+
+        // Tidak ada yang cocok (random_value >= last cumulative)
+        None
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1056,5 +1167,424 @@ mod tests {
         // Should not panic
         let debug_str = format!("{:?}", selector);
         assert!(debug_str.contains("CoordinatorSelector"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Selection Weight Computation Tests (14A.2B.2.3)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_compute_weights_single_validator() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 5000;
+
+        let validators = vec![v1.clone()];
+        let weights = selector.compute_selection_weights(&validators);
+
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].validator_id, v1.id);
+        assert_eq!(weights[0].weight, 5000);
+        assert_eq!(weights[0].cumulative, 5000);
+    }
+
+    #[test]
+    fn test_compute_weights_equal_stake() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // 3 validators dengan stake equal
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 1000;
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 1000;
+
+        let validators = vec![v1.clone(), v2.clone(), v3.clone()];
+        let weights = selector.compute_selection_weights(&validators);
+
+        assert_eq!(weights.len(), 3);
+
+        // weights harus sama
+        assert_eq!(weights[0].weight, 1000);
+        assert_eq!(weights[1].weight, 1000);
+        assert_eq!(weights[2].weight, 1000);
+
+        // cumulative harus increasing
+        assert_eq!(weights[0].cumulative, 1000);
+        assert_eq!(weights[1].cumulative, 2000);
+        assert_eq!(weights[2].cumulative, 3000);
+
+        // validator_id harus match
+        assert_eq!(weights[0].validator_id, v1.id);
+        assert_eq!(weights[1].validator_id, v2.id);
+        assert_eq!(weights[2].validator_id, v3.id);
+    }
+
+    #[test]
+    fn test_compute_weights_proportional() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Different stakes: 1000, 2000, 3000
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 2000;
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 3000;
+
+        let validators = vec![v1, v2, v3];
+        let weights = selector.compute_selection_weights(&validators);
+
+        assert_eq!(weights.len(), 3);
+
+        // Individual weights = stake
+        assert_eq!(weights[0].weight, 1000);
+        assert_eq!(weights[1].weight, 2000);
+        assert_eq!(weights[2].weight, 3000);
+
+        // Cumulative: 1000, 3000, 6000
+        assert_eq!(weights[0].cumulative, 1000);
+        assert_eq!(weights[1].cumulative, 3000);
+        assert_eq!(weights[2].cumulative, 6000);
+    }
+
+    #[test]
+    fn test_cumulative_monotonic() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Various stakes including 0
+        let stakes = [0u64, 100, 50, 200, 0, 1000, 500];
+        let validators: Vec<ValidatorCandidate> = stakes
+            .iter()
+            .enumerate()
+            .map(|(i, &stake)| {
+                let mut v = make_validator_candidate(i as u8);
+                v.stake = stake;
+                v
+            })
+            .collect();
+
+        let weights = selector.compute_selection_weights(&validators);
+
+        assert_eq!(weights.len(), 7);
+
+        // Verify monotonically increasing (non-decreasing since some stakes are 0)
+        let mut prev_cumulative = 0u64;
+        for (i, w) in weights.iter().enumerate() {
+            assert!(
+                w.cumulative >= prev_cumulative,
+                "cumulative not monotonic at index {}: {} < {}",
+                i,
+                w.cumulative,
+                prev_cumulative
+            );
+            prev_cumulative = w.cumulative;
+        }
+
+        // Verify total
+        let expected_total: u64 = stakes.iter().sum();
+        assert_eq!(weights.last().map(|w| w.cumulative), Some(expected_total));
+    }
+
+    #[test]
+    fn test_compute_weights_empty() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let validators: Vec<ValidatorCandidate> = vec![];
+        let weights = selector.compute_selection_weights(&validators);
+
+        assert!(weights.is_empty());
+    }
+
+    #[test]
+    fn test_compute_weights_preserves_order() {
+        let config = SelectionConfig {
+            committee_size: 10,
+            threshold: 5,
+            min_stake: 100,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Create validators in specific order
+        let validators: Vec<ValidatorCandidate> = (0..5)
+            .map(|i| {
+                let mut v = make_validator_candidate(i as u8);
+                v.stake = ((5 - i) * 1000) as u64; // 5000, 4000, 3000, 2000, 1000
+                v
+            })
+            .collect();
+
+        let weights = selector.compute_selection_weights(&validators);
+
+        // Verify order preserved
+        assert_eq!(weights.len(), 5);
+        for (i, (v, w)) in validators.iter().zip(weights.iter()).enumerate() {
+            assert_eq!(
+                w.validator_id, v.id,
+                "order not preserved at index {}",
+                i
+            );
+            assert_eq!(w.weight, v.stake);
+        }
+    }
+
+    #[test]
+    fn test_compute_weights_overflow_saturates() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 0,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = u64::MAX;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 1000;
+
+        let validators = vec![v1, v2];
+        let weights = selector.compute_selection_weights(&validators);
+
+        assert_eq!(weights.len(), 2);
+        assert_eq!(weights[0].cumulative, u64::MAX);
+        // Saturating: MAX + 1000 = MAX
+        assert_eq!(weights[1].cumulative, u64::MAX);
+    }
+
+    #[test]
+    fn test_select_by_weight_basic() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Stakes: 1000, 2000, 3000 → cumulative: 1000, 3000, 6000
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 2000;
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 3000;
+
+        let validators = vec![v1, v2, v3];
+        let weights = selector.compute_selection_weights(&validators);
+
+        // Test various random values
+        // 0-999 should select index 0
+        assert_eq!(selector.select_by_weight(&weights, 0), Some(0));
+        assert_eq!(selector.select_by_weight(&weights, 500), Some(0));
+        assert_eq!(selector.select_by_weight(&weights, 999), Some(0));
+
+        // 1000-2999 should select index 1
+        assert_eq!(selector.select_by_weight(&weights, 1000), Some(1));
+        assert_eq!(selector.select_by_weight(&weights, 1500), Some(1));
+        assert_eq!(selector.select_by_weight(&weights, 2999), Some(1));
+
+        // 3000-5999 should select index 2
+        assert_eq!(selector.select_by_weight(&weights, 3000), Some(2));
+        assert_eq!(selector.select_by_weight(&weights, 4500), Some(2));
+        assert_eq!(selector.select_by_weight(&weights, 5999), Some(2));
+    }
+
+    #[test]
+    fn test_select_by_weight_edge_low() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+
+        let validators = vec![v1];
+        let weights = selector.compute_selection_weights(&validators);
+
+        // random_value = 0 should select first
+        assert_eq!(selector.select_by_weight(&weights, 0), Some(0));
+    }
+
+    #[test]
+    fn test_select_by_weight_edge_high() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 2000;
+
+        let validators = vec![v1, v2];
+        let weights = selector.compute_selection_weights(&validators);
+        // cumulative: 1000, 3000
+
+        // random_value = cumulative[-1] should return None
+        assert_eq!(selector.select_by_weight(&weights, 3000), None);
+
+        // random_value > cumulative[-1] should return None
+        assert_eq!(selector.select_by_weight(&weights, 5000), None);
+        assert_eq!(selector.select_by_weight(&weights, u64::MAX), None);
+    }
+
+    #[test]
+    fn test_select_empty() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let weights: Vec<SelectionWeight> = vec![];
+
+        assert_eq!(selector.select_by_weight(&weights, 0), None);
+        assert_eq!(selector.select_by_weight(&weights, 1000), None);
+        assert_eq!(selector.select_by_weight(&weights, u64::MAX), None);
+    }
+
+    #[test]
+    fn test_select_by_weight_boundary_exact() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        // Stakes: 100, 100, 100 → cumulative: 100, 200, 300
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 100;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 100;
+        let mut v3 = make_validator_candidate(3);
+        v3.stake = 100;
+
+        let validators = vec![v1, v2, v3];
+        let weights = selector.compute_selection_weights(&validators);
+
+        // Exact boundary tests
+        // random_value < 100 → index 0
+        assert_eq!(selector.select_by_weight(&weights, 99), Some(0));
+        // random_value = 100 → index 1 (100 < 200)
+        assert_eq!(selector.select_by_weight(&weights, 100), Some(1));
+        // random_value = 199 → index 1
+        assert_eq!(selector.select_by_weight(&weights, 199), Some(1));
+        // random_value = 200 → index 2 (200 < 300)
+        assert_eq!(selector.select_by_weight(&weights, 200), Some(2));
+        // random_value = 299 → index 2
+        assert_eq!(selector.select_by_weight(&weights, 299), Some(2));
+        // random_value = 300 → None (300 >= 300)
+        assert_eq!(selector.select_by_weight(&weights, 300), None);
+    }
+
+    #[test]
+    fn test_select_by_weight_single_validator() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 5000;
+
+        let validators = vec![v1];
+        let weights = selector.compute_selection_weights(&validators);
+
+        // Any value < 5000 should return Some(0)
+        assert_eq!(selector.select_by_weight(&weights, 0), Some(0));
+        assert_eq!(selector.select_by_weight(&weights, 2500), Some(0));
+        assert_eq!(selector.select_by_weight(&weights, 4999), Some(0));
+
+        // value >= 5000 should return None
+        assert_eq!(selector.select_by_weight(&weights, 5000), None);
+    }
+
+    #[test]
+    fn test_compute_weights_deterministic() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 2000;
+
+        let validators = vec![v1, v2];
+
+        // Compute multiple times
+        let w1 = selector.compute_selection_weights(&validators);
+        let w2 = selector.compute_selection_weights(&validators);
+        let w3 = selector.compute_selection_weights(&validators);
+
+        // All should be identical
+        assert_eq!(w1, w2);
+        assert_eq!(w2, w3);
+    }
+
+    #[test]
+    fn test_select_by_weight_deterministic() {
+        let config = SelectionConfig {
+            committee_size: 5,
+            threshold: 3,
+            min_stake: 1000,
+        };
+        let selector = CoordinatorSelector::new(config).expect("valid config");
+
+        let mut v1 = make_validator_candidate(1);
+        v1.stake = 1000;
+        let mut v2 = make_validator_candidate(2);
+        v2.stake = 2000;
+
+        let validators = vec![v1, v2];
+        let weights = selector.compute_selection_weights(&validators);
+
+        // Same random_value should always return same result
+        let r1 = selector.select_by_weight(&weights, 500);
+        let r2 = selector.select_by_weight(&weights, 500);
+        let r3 = selector.select_by_weight(&weights, 500);
+
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+        assert_eq!(r1, Some(0));
     }
 }
