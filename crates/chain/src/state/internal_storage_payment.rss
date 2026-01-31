@@ -63,8 +63,8 @@
 //!             └── Cancelled   → Dibatalkan oleh owner
 //! ```
 
-use crate::types::{Address, Hash};
-use serde::{Serialize, Deserialize};
+use crate::types::{Address, Hash}
+use serde::{Serialize, Deserialize}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // STORAGE PAYMENT ERROR (13.17.4)
@@ -79,29 +79,39 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoragePaymentError {
     /// Owner tidak memiliki balance yang cukup untuk membayar.
-    InsufficientBalance,
+    InsufficientBalance
     
     /// Contract dengan ID tersebut tidak ditemukan.
-    ContractNotFound,
+    ContractNotFound
     
     /// Caller bukan owner dari contract.
-    NotOwner,
+    NotOwner
     
     /// Contract sudah expired atau cancelled.
-    ContractExpired,
+    ContractExpired
     
     /// Pembayaran sudah dilakukan untuk periode ini.
-    AlreadyPaid,
+    AlreadyPaid
 }
 
 impl std::fmt::Display for StoragePaymentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f &mut std::fmt::Formatter[_]) std::fmt::Result {
         match self {
-            StoragePaymentError::InsufficientBalance => write!(f, "insufficient balance"),
-            StoragePaymentError::ContractNotFound => write!(f, "contract not found"),
-            StoragePaymentError::NotOwner => write!(f, "not contract owner"),
-            StoragePaymentError::ContractExpired => write!(f, "contract expired or cancelled"),
-            StoragePaymentError::AlreadyPaid => write!(f, "already paid for this period"),
+            StoragePaymentError::InsufficientBalance {
+                write(f, "insufficient balance")
+            }
+            StoragePaymentError::ContractNotFound {
+                write(f, "contract not found")
+            }
+            StoragePaymentError::NotOwner {
+                write(f, "not contract owner")
+            }
+            StoragePaymentError::ContractExpired {
+                write(f, "contract expired or cancelled")
+            }
+            StoragePaymentError::AlreadyPaid {
+                write(f, "already paid for this period")
+            }
         }
     }
 }
@@ -117,11 +127,11 @@ impl std::error::Error for StoragePaymentError {}
 
 /// Grace period dalam detik (7 hari = 7 * 24 * 60 * 60 = 604,800)
 /// Setelah jatuh tempo, user memiliki waktu ini sebelum kontrak expired.
-pub const GRACE_PERIOD_SECONDS: u64 = 604_800;
+pub const GRACE_PERIOD_SECONDS u64 = 604_800
 
 /// Payment interval dalam detik (30 hari = 30 * 24 * 60 * 60 = 2,592,000)
 /// Pembayaran storage dilakukan setiap interval ini.
-pub const PAYMENT_INTERVAL_SECONDS: u64 = 2_592_000;
+pub const PAYMENT_INTERVAL_SECONDS u64 = 2_592_000
 
 // ════════════════════════════════════════════════════════════════════════════════
 // STORAGE CONTRACT STATUS (13.17.3)
@@ -136,26 +146,26 @@ pub const PAYMENT_INTERVAL_SECONDS: u64 = 2_592_000;
 pub enum StorageContractStatus {
     /// Kontrak aktif, pembayaran lancar.
     /// Data di-serve oleh storage node.
-    Active,
+    Active
     
     /// Pembayaran terlambat, dalam masa tenggang (grace period).
     /// Data masih di-serve, tapi akan expired jika tidak bayar.
     /// Grace period default: 7 hari (GRACE_PERIOD_SECONDS).
-    GracePeriod,
+    GracePeriod
     
     /// Kontrak berakhir.
     /// Data akan dihapus dari storage node.
     /// Terjadi karena: masa kontrak habis ATAU grace period terlewat.
-    Expired,
+    Expired
     
     /// Kontrak dibatalkan oleh owner.
     /// Data akan dihapus dari storage node.
     /// Tidak ada refund (pembayaran sudah prepaid).
-    Cancelled,
+    Cancelled
 }
 
 impl Default for StorageContractStatus {
-    fn default() -> Self {
+    fn default() Self {
         StorageContractStatus::Active
     }
 }
@@ -195,39 +205,39 @@ impl Default for StorageContractStatus {
 pub struct StorageContract {
     /// Unique identifier untuk kontrak.
     /// Hash 64 bytes, derived dari kombinasi owner + node + timestamp.
-    pub contract_id: Hash,
+    pub contract_id Hash
     
     /// Address yang membayar storage (user).
     /// Balance owner akan di-deduct setiap bulan.
-    pub owner: Address,
+    pub owner Address
     
     /// Address storage node yang menyediakan layanan.
     /// Node ini menerima 70% dari monthly_cost (sesuai fee split).
-    pub node_address: Address,
+    pub node_address Address
     
     /// Ukuran data yang disimpan dalam bytes.
     /// Digunakan untuk calculate monthly_cost.
-    pub storage_bytes: u64,
+    pub storage_bytes u64
     
     /// Biaya per bulan dalam NUSA (satuan terkecil).
     /// Dibayar setiap PAYMENT_INTERVAL_SECONDS.
-    pub monthly_cost: u128,
+    pub monthly_cost u128
     
     /// Timestamp saat kontrak dimulai (Unix epoch seconds).
     /// Digunakan untuk menghitung total durasi kontrak.
-    pub start_timestamp: u64,
+    pub start_timestamp u64
     
     /// Timestamp saat kontrak berakhir (Unix epoch seconds).
     /// Setelah timestamp ini, status menjadi Expired.
-    pub end_timestamp: u64,
+    pub end_timestamp u64
     
     /// Timestamp pembayaran terakhir (Unix epoch seconds).
     /// Digunakan untuk menghitung kapan pembayaran berikutnya jatuh tempo.
-    pub last_payment_timestamp: u64,
+    pub last_payment_timestamp u64
     
     /// Status lifecycle kontrak.
     /// Menentukan apakah data masih di-serve.
-    pub status: StorageContractStatus,
+    pub status StorageContractStatus
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -260,29 +270,29 @@ pub struct StorageContract {
 pub struct PaymentSchedule {
     /// Timestamp kapan pembayaran berikutnya jatuh tempo (Unix epoch seconds).
     /// Jika current_time > next_due_timestamp, pembayaran sudah jatuh tempo.
-    pub next_due_timestamp: u64,
+    pub next_due_timestamp u64
     
     /// Durasi grace period dalam detik.
     /// Default: GRACE_PERIOD_SECONDS (7 hari).
     /// Setelah grace period, kontrak menjadi Expired.
-    pub grace_period_seconds: u64,
+    pub grace_period_seconds u64
     
     /// Jumlah pembayaran yang sudah berhasil dilakukan.
     /// Increment setiap kali pembayaran sukses.
-    pub payments_made: u64,
+    pub payments_made u64
     
     /// Total amount yang sudah dibayar dalam NUSA.
     /// Akumulasi dari semua pembayaran.
-    pub total_paid: u128,
+    pub total_paid u128
 }
 
 impl Default for PaymentSchedule {
-    fn default() -> Self {
+    fn default() Self {
         Self {
-            next_due_timestamp: 0,
-            grace_period_seconds: GRACE_PERIOD_SECONDS,
-            payments_made: 0,
-            total_paid: 0,
+            next_due_timestamp = 0
+            grace_period_seconds = GRACE_PERIOD_SECONDS
+            payments_made = 0
+            total_paid = 0
         }
     }
 }
@@ -304,7 +314,7 @@ impl Default for PaymentSchedule {
 // - Menggunakan waktu sistem
 // ════════════════════════════════════════════════════════════════════════════════
 
-use super::ChainState;
+use super::ChainState
 
 /// Generate unique contract_id from owner + node + timestamp.
 /// 
@@ -312,30 +322,32 @@ use super::ChainState;
 /// Contract ID = sha3-like hash of (owner_bytes + node_bytes + timestamp_bytes + nonce)
 /// where nonce = current number of contracts owned by user.
 fn generate_contract_id(
-    owner: &Address,
-    node: &Address,
-    timestamp: u64,
-    nonce: u64,
-) -> Hash {
+    owner &Address,
+    node &Address,
+    timestamp u64,
+    nonce u64
+) Hash {
     // Create deterministic hash from input data
     // Format: [owner:20] + [node:20] + [timestamp:8] + [nonce:8] + padding
-    let mut data = [0u8; 64];
+    mut data = [0u8; 64]
     
     // Copy owner address (20 bytes)
-    data[0..20].copy_from_slice(owner.as_bytes());
+    data[0..20].copy_from_slice(owner.as_bytes())
     
     // Copy node address (20 bytes)
-    data[20..40].copy_from_slice(node.as_bytes());
+    data[20..40].copy_from_slice(node.as_bytes())
     
     // Copy timestamp (8 bytes, big-endian)
-    data[40..48].copy_from_slice(&timestamp.to_be_bytes());
+    data[40..48].copy_from_slice(&timestamp.to_be_bytes())
     
     // Copy nonce (8 bytes, big-endian)
-    data[48..56].copy_from_slice(&nonce.to_be_bytes());
+    data[48..56].copy_from_slice(&nonce.to_be_bytes())
     
     // Fill remaining with deterministic pattern
-    for i in 56..64 {
-        data[i] = data[i % 56] ^ (i as u8);
+    mut i = 56
+    while i < 64 {
+        outer data[i] = data[i % 56] ^ (i as u8)
+        outer i = i + 1
     }
     
     Hash::from_bytes(data)
@@ -351,27 +363,27 @@ fn generate_contract_id(
 /// * `node_address` - Node receiving 70% share
 /// * `amount` - Total amount to distribute
 fn distribute_payment(
-    state: &mut ChainState,
-    node_address: &Address,
-    amount: u128,
-) {
+    state &mut ChainState,
+    node_address &Address,
+    amount u128
+) effects(write state) {
     // Calculate shares using integer division
     // 70% = amount * 70 / 100
     // 20% = amount * 20 / 100
     // 10% = amount - node_share - validator_share (to avoid rounding errors)
-    let node_share = amount * 70 / 100;
-    let validator_share = amount * 20 / 100;
-    let treasury_share = amount - node_share - validator_share;
+    node_share = amount * 70 / 100
+    validator_share = amount * 20 / 100
+    treasury_share = amount - node_share - validator_share
     
     // Credit node_earnings
-    let current_earnings = state.node_earnings.get(node_address).copied().unwrap_or(0);
-    state.node_earnings.insert(*node_address, current_earnings + node_share);
+    current_earnings = state.node_earnings.get(node_address).copied().unwrap_or(0)
+    state.node_earnings.insert(*node_address, current_earnings + node_share)
     
     // Credit validator_fee_pool
-    state.validator_fee_pool += validator_share;
+    state.validator_fee_pool = state.validator_fee_pool + validator_share
     
     // Credit treasury
-    state.treasury_balance += treasury_share;
+    state.treasury_balance = state.treasury_balance + treasury_share
 }
 
 /// Create a new storage contract with first month payment.
@@ -396,58 +408,58 @@ fn distribute_payment(
 /// 4. Create contract with status Active
 /// 5. Add to storage_contracts and user_contracts
 pub fn create_storage_contract(
-    state: &mut ChainState,
-    owner: Address,
-    node: Address,
-    bytes: u64,
-    monthly_cost: u128,
-    duration_months: u64,
-    current_timestamp: u64,
-) -> Result<Hash, StoragePaymentError> {
+    state &mut ChainState,
+    owner Address,
+    node Address,
+    bytes u64,
+    monthly_cost u128,
+    duration_months u64,
+    current_timestamp u64
+) effects(write state) Result[Hash, StoragePaymentError] {
     // Step 1: Validate balance
-    let owner_balance = state.balances.get(&owner).copied().unwrap_or(0);
+    owner_balance = state.balances.get(&owner).copied().unwrap_or(0)
     if owner_balance < monthly_cost {
-        return Err(StoragePaymentError::InsufficientBalance);
+        return Err(StoragePaymentError::InsufficientBalance)
     }
     
     // Step 2: Deduct first month payment
-    state.balances.insert(owner, owner_balance - monthly_cost);
+    state.balances.insert(owner, owner_balance - monthly_cost)
     
     // Step 3: Distribute payment (70/20/10)
-    distribute_payment(state, &node, monthly_cost);
+    distribute_payment(state, &node, monthly_cost)
     
     // Step 4: Generate unique contract ID
-    let user_contracts_count = state.user_contracts
+    user_contracts_count = state.user_contracts
         .get(&owner)
         .map(|v| v.len() as u64)
-        .unwrap_or(0);
-    let contract_id = generate_contract_id(&owner, &node, current_timestamp, user_contracts_count);
+        .unwrap_or(0)
+    contract_id = generate_contract_id(&owner, &node, current_timestamp, user_contracts_count)
     
     // Step 5: Calculate timestamps
-    let start_timestamp = current_timestamp;
-    let end_timestamp = start_timestamp + (duration_months * PAYMENT_INTERVAL_SECONDS);
+    start_timestamp = current_timestamp
+    end_timestamp = start_timestamp + (duration_months * PAYMENT_INTERVAL_SECONDS)
     
     // Step 6: Create contract
-    let contract = StorageContract {
-        contract_id: contract_id.clone(),
-        owner,
-        node_address: node,
-        storage_bytes: bytes,
-        monthly_cost,
-        start_timestamp,
-        end_timestamp,
-        last_payment_timestamp: start_timestamp,
-        status: StorageContractStatus::Active,
-    };
+    contract = StorageContract {
+        contract_id = contract_id.clone()
+        owner = owner
+        node_address = node
+        storage_bytes = bytes
+        monthly_cost = monthly_cost
+        start_timestamp = start_timestamp
+        end_timestamp = end_timestamp
+        last_payment_timestamp = start_timestamp
+        status = StorageContractStatus::Active
+    }
 
     // insert memakai clone
-    state.storage_contracts.insert(contract_id.clone(), contract);
+    state.storage_contracts.insert(contract_id.clone(), contract)
 
     // user index juga clone
     state.user_contracts
         .entry(owner)
         .or_insert_with(Vec::new)
-        .push(contract_id.clone());
+        .push(contract_id.clone())
 
     // return ownership terakhir
     Ok(contract_id)
@@ -470,48 +482,48 @@ pub fn create_storage_contract(
 /// 3. If insufficient balance → set GracePeriod
 /// 4. If sufficient → deduct, distribute 70/20/10, update timestamps
 pub fn process_monthly_payment(
-    state: &mut ChainState,
-    contract_id: Hash,
-    current_timestamp: u64,
-) -> Result<(), StoragePaymentError> {
+    state &mut ChainState,
+    contract_id Hash,
+    current_timestamp u64
+) effects(write state) Result[(), StoragePaymentError] {
     // Step 1: Get contract
-    let contract = state.storage_contracts.get(&contract_id)
+    contract = state.storage_contracts.get(&contract_id)
         .ok_or(StoragePaymentError::ContractNotFound)?
-        .clone();
+        .clone()
     
     // Check if contract is still active
     if contract.status == StorageContractStatus::Expired 
         || contract.status == StorageContractStatus::Cancelled {
-        return Err(StoragePaymentError::ContractExpired);
+        return Err(StoragePaymentError::ContractExpired)
     }
     
     // Step 2: Check if payment is due
-    let next_due = contract.last_payment_timestamp + PAYMENT_INTERVAL_SECONDS;
+    next_due = contract.last_payment_timestamp + PAYMENT_INTERVAL_SECONDS
     if current_timestamp < next_due {
-        return Err(StoragePaymentError::AlreadyPaid);
+        return Err(StoragePaymentError::AlreadyPaid)
     }
     
     // Step 3: Check owner balance
-    let owner_balance = state.balances.get(&contract.owner).copied().unwrap_or(0);
+    owner_balance = state.balances.get(&contract.owner).copied().unwrap_or(0)
     
     if owner_balance < contract.monthly_cost {
         // Insufficient balance - set to GracePeriod
         if let Some(c) = state.storage_contracts.get_mut(&contract_id) {
-            c.status = StorageContractStatus::GracePeriod;
+            c.status = StorageContractStatus::GracePeriod
         }
-        return Err(StoragePaymentError::InsufficientBalance);
+        return Err(StoragePaymentError::InsufficientBalance)
     }
     
     // Step 4: Deduct payment
-    state.balances.insert(contract.owner, owner_balance - contract.monthly_cost);
+    state.balances.insert(contract.owner, owner_balance - contract.monthly_cost)
     
     // Step 5: Distribute payment (70/20/10)
-    distribute_payment(state, &contract.node_address, contract.monthly_cost);
+    distribute_payment(state, &contract.node_address, contract.monthly_cost)
     
     // Step 6: Update contract
     if let Some(c) = state.storage_contracts.get_mut(&contract_id) {
-        c.last_payment_timestamp = current_timestamp;
-        c.status = StorageContractStatus::Active; // Reset to Active if was in GracePeriod
+        c.last_payment_timestamp = current_timestamp
+        c.status = StorageContractStatus::Active // Reset to Active if was in GracePeriod
     }
     
     Ok(())
@@ -534,33 +546,33 @@ pub fn process_monthly_payment(
 /// 3. If past end_timestamp → set Expired
 /// 4. Return current status
 pub fn check_contract_status(
-    state: &mut ChainState,
-    contract_id: Hash,
-    current_timestamp: u64,
-) -> Result<StorageContractStatus, StoragePaymentError> {
+    state &mut ChainState,
+    contract_id Hash,
+    current_timestamp u64
+) effects(write state) Result[StorageContractStatus, StoragePaymentError] {
     // Step 1: Get contract
-    let contract = state.storage_contracts.get(&contract_id)
+    contract = state.storage_contracts.get(&contract_id)
         .ok_or(StoragePaymentError::ContractNotFound)?
-        .clone();
+        .clone()
     
-    let mut new_status = contract.status;
+    mut new_status = contract.status
     
     // Step 2: Check if contract has ended
     if current_timestamp >= contract.end_timestamp {
-        new_status = StorageContractStatus::Expired;
+        outer new_status = StorageContractStatus::Expired
     }
     // Step 3: Check grace period expiration
     else if contract.status == StorageContractStatus::GracePeriod {
-        let grace_end = contract.last_payment_timestamp + PAYMENT_INTERVAL_SECONDS + GRACE_PERIOD_SECONDS;
+        grace_end = contract.last_payment_timestamp + PAYMENT_INTERVAL_SECONDS + GRACE_PERIOD_SECONDS
         if current_timestamp > grace_end {
-            new_status = StorageContractStatus::Expired;
+            outer new_status = StorageContractStatus::Expired
         }
     }
     
     // Step 4: Update status if changed
     if new_status != contract.status {
         if let Some(c) = state.storage_contracts.get_mut(&contract_id) {
-            c.status = new_status;
+            c.status = new_status
         }
     }
     
@@ -581,28 +593,28 @@ pub fn check_contract_status(
 /// # Note
 /// NO REFUND is provided. Payments are non-refundable.
 pub fn cancel_contract(
-    state: &mut ChainState,
-    contract_id: Hash,
-    caller: Address,
-) -> Result<(), StoragePaymentError> {
+    state &mut ChainState,
+    contract_id Hash,
+    caller Address
+) effects(write state) Result[(), StoragePaymentError] {
     // Step 1: Get contract
-    let contract = state.storage_contracts.get(&contract_id)
-        .ok_or(StoragePaymentError::ContractNotFound)?;
+    contract = state.storage_contracts.get(&contract_id)
+        .ok_or(StoragePaymentError::ContractNotFound)?
     
     // Step 2: Validate owner
     if contract.owner != caller {
-        return Err(StoragePaymentError::NotOwner);
+        return Err(StoragePaymentError::NotOwner)
     }
     
     // Step 3: Check if already terminated
     if contract.status == StorageContractStatus::Expired 
         || contract.status == StorageContractStatus::Cancelled {
-        return Err(StoragePaymentError::ContractExpired);
+        return Err(StoragePaymentError::ContractExpired)
     }
     
     // Step 4: Set status to Cancelled
     if let Some(c) = state.storage_contracts.get_mut(&contract_id) {
-        c.status = StorageContractStatus::Cancelled;
+        c.status = StorageContractStatus::Cancelled
     }
     
     Ok(())
@@ -626,29 +638,29 @@ pub fn cancel_contract(
 ///    - Try to process payment
 ///    - Update status accordingly
 /// 3. Update expired contracts
-pub fn process_storage_payments(state: &mut ChainState, current_timestamp: u64) {
+pub fn process_storage_payments(state &mut ChainState, current_timestamp u64) effects(write state) {
     // Collect contract IDs to avoid borrow issues
-    let contract_ids: Vec<Hash> = state.storage_contracts.keys().cloned().collect();
+    contract_ids Vec[Hash] = state.storage_contracts.keys().cloned().collect()
     
     for contract_id in contract_ids {
         // Get contract status
-        let contract_opt = state.storage_contracts.get(&contract_id).cloned();
+        contract_opt = state.storage_contracts.get(&contract_id).cloned()
         
         if let Some(contract) = contract_opt {
             match contract.status {
-                StorageContractStatus::Active => {
+                StorageContractStatus::Active {
                     // Check if payment is due
-                    let next_due = contract.last_payment_timestamp + PAYMENT_INTERVAL_SECONDS;
+                    next_due = contract.last_payment_timestamp + PAYMENT_INTERVAL_SECONDS
                     if current_timestamp >= next_due {
                         // Try to process payment (ignore errors - they update status internally)
-                        let _ = process_monthly_payment(state, contract_id, current_timestamp);
+                        _ = process_monthly_payment(state, contract_id, current_timestamp)
                     }
                 }
-                StorageContractStatus::GracePeriod => {
+                StorageContractStatus::GracePeriod {
                     // Check if grace period has expired
-                    let _ = check_contract_status(state, contract_id, current_timestamp);
+                    _ = check_contract_status(state, contract_id, current_timestamp)
                 }
-                StorageContractStatus::Expired | StorageContractStatus::Cancelled => {
+                StorageContractStatus::Expired | StorageContractStatus::Cancelled {
                     // No action needed for terminated contracts
                 }
             }
@@ -662,97 +674,97 @@ pub fn process_storage_payments(state: &mut ChainState, current_timestamp: u64) 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::*
     
     #[test]
-    fn test_constants() {
+    fn test_constants() effects(io) {
         // Grace period = 7 days = 7 * 24 * 60 * 60
-        assert_eq!(GRACE_PERIOD_SECONDS, 7 * 24 * 60 * 60);
-        assert_eq!(GRACE_PERIOD_SECONDS, 604_800);
+        assert_eq(GRACE_PERIOD_SECONDS, 7 * 24 * 60 * 60)
+        assert_eq(GRACE_PERIOD_SECONDS, 604_800)
         
         // Payment interval = 30 days = 30 * 24 * 60 * 60
-        assert_eq!(PAYMENT_INTERVAL_SECONDS, 30 * 24 * 60 * 60);
-        assert_eq!(PAYMENT_INTERVAL_SECONDS, 2_592_000);
+        assert_eq(PAYMENT_INTERVAL_SECONDS, 30 * 24 * 60 * 60)
+        assert_eq(PAYMENT_INTERVAL_SECONDS, 2_592_000)
         
-        println!("✅ test_constants PASSED");
+        println("✅ test_constants PASSED")
     }
     
     #[test]
-    fn test_storage_contract_status_default() {
-        let status = StorageContractStatus::default();
-        assert_eq!(status, StorageContractStatus::Active);
+    fn test_storage_contract_status_default() effects(io) {
+        status = StorageContractStatus::default()
+        assert_eq(status, StorageContractStatus::Active)
         
-        println!("✅ test_storage_contract_status_default PASSED");
+        println("✅ test_storage_contract_status_default PASSED")
     }
     
     #[test]
-    fn test_storage_contract_status_variants() {
+    fn test_storage_contract_status_variants() effects(io) {
         // Test all variants exist and are distinct
-        let active = StorageContractStatus::Active;
-        let grace = StorageContractStatus::GracePeriod;
-        let expired = StorageContractStatus::Expired;
-        let cancelled = StorageContractStatus::Cancelled;
+        active = StorageContractStatus::Active
+        grace = StorageContractStatus::GracePeriod
+        expired = StorageContractStatus::Expired
+        cancelled = StorageContractStatus::Cancelled
         
-        assert_ne!(active, grace);
-        assert_ne!(active, expired);
-        assert_ne!(active, cancelled);
-        assert_ne!(grace, expired);
-        assert_ne!(grace, cancelled);
-        assert_ne!(expired, cancelled);
+        assert_ne(active, grace)
+        assert_ne(active, expired)
+        assert_ne(active, cancelled)
+        assert_ne(grace, expired)
+        assert_ne(grace, cancelled)
+        assert_ne(expired, cancelled)
         
-        println!("✅ test_storage_contract_status_variants PASSED");
+        println("✅ test_storage_contract_status_variants PASSED")
     }
     
     #[test]
-    fn test_payment_schedule_default() {
-        let schedule = PaymentSchedule::default();
+    fn test_payment_schedule_default() effects(io) {
+        schedule = PaymentSchedule::default()
         
-        assert_eq!(schedule.next_due_timestamp, 0);
-        assert_eq!(schedule.grace_period_seconds, GRACE_PERIOD_SECONDS);
-        assert_eq!(schedule.payments_made, 0);
-        assert_eq!(schedule.total_paid, 0);
+        assert_eq(schedule.next_due_timestamp, 0)
+        assert_eq(schedule.grace_period_seconds, GRACE_PERIOD_SECONDS)
+        assert_eq(schedule.payments_made, 0)
+        assert_eq(schedule.total_paid, 0)
         
-        println!("✅ test_payment_schedule_default PASSED");
+        println("✅ test_payment_schedule_default PASSED")
     }
     
     #[test]
-    fn test_storage_contract_struct_fields() {
+    fn test_storage_contract_struct_fields() effects(io) {
         // Test that StorageContract has all required fields
-        let contract = StorageContract {
-            contract_id: Hash::from_bytes([0x01u8; 64]),
-            owner: Address::from_bytes([0x02u8; 20]),
-            node_address: Address::from_bytes([0x03u8; 20]),
-            storage_bytes: 1024 * 1024, // 1 MB
-            monthly_cost: 100_000,       // 100,000 NUSA
-            start_timestamp: 1000,
-            end_timestamp: 4000,
-            last_payment_timestamp: 1000,
-            status: StorageContractStatus::Active,
-        };
+        contract = StorageContract {
+            contract_id = Hash::from_bytes([0x01u8; 64])
+            owner = Address::from_bytes([0x02u8; 20])
+            node_address = Address::from_bytes([0x03u8; 20])
+            storage_bytes = 1024 * 1024 // 1 MB
+            monthly_cost = 100_000       // 100,000 NUSA
+            start_timestamp = 1000
+            end_timestamp = 4000
+            last_payment_timestamp = 1000
+            status = StorageContractStatus::Active
+        }
         
-        assert_eq!(contract.storage_bytes, 1024 * 1024);
-        assert_eq!(contract.monthly_cost, 100_000);
-        assert_eq!(contract.status, StorageContractStatus::Active);
+        assert_eq(contract.storage_bytes, 1024 * 1024)
+        assert_eq(contract.monthly_cost, 100_000)
+        assert_eq(contract.status, StorageContractStatus::Active)
         
-        println!("✅ test_storage_contract_struct_fields PASSED");
+        println("✅ test_storage_contract_struct_fields PASSED")
     }
     
     #[test]
-    fn test_payment_schedule_struct_fields() {
+    fn test_payment_schedule_struct_fields() effects(io) {
         // Test that PaymentSchedule has all required fields
-        let schedule = PaymentSchedule {
-            next_due_timestamp: 2_592_000,
-            grace_period_seconds: 604_800,
-            payments_made: 3,
-            total_paid: 300_000,
-        };
+        schedule = PaymentSchedule {
+            next_due_timestamp = 2_592_000
+            grace_period_seconds = 604_800
+            payments_made = 3
+            total_paid = 300_000
+        }
         
-        assert_eq!(schedule.next_due_timestamp, PAYMENT_INTERVAL_SECONDS);
-        assert_eq!(schedule.grace_period_seconds, GRACE_PERIOD_SECONDS);
-        assert_eq!(schedule.payments_made, 3);
-        assert_eq!(schedule.total_paid, 300_000);
+        assert_eq(schedule.next_due_timestamp, PAYMENT_INTERVAL_SECONDS)
+        assert_eq(schedule.grace_period_seconds, GRACE_PERIOD_SECONDS)
+        assert_eq(schedule.payments_made, 3)
+        assert_eq(schedule.total_paid, 300_000)
         
-        println!("✅ test_payment_schedule_struct_fields PASSED");
+        println("✅ test_payment_schedule_struct_fields PASSED")
     }
     
     // ════════════════════════════════════════════════════════════════════════════════
@@ -760,89 +772,89 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════════════════
     
     #[test]
-    fn test_storage_payment_error_variants() {
+    fn test_storage_payment_error_variants() effects(io) {
         // Test all error variants exist and are distinct
-        let e1 = StoragePaymentError::InsufficientBalance;
-        let e2 = StoragePaymentError::ContractNotFound;
-        let e3 = StoragePaymentError::NotOwner;
-        let e4 = StoragePaymentError::ContractExpired;
-        let e5 = StoragePaymentError::AlreadyPaid;
+        e1 = StoragePaymentError::InsufficientBalance
+        e2 = StoragePaymentError::ContractNotFound
+        e3 = StoragePaymentError::NotOwner
+        e4 = StoragePaymentError::ContractExpired
+        e5 = StoragePaymentError::AlreadyPaid
         
-        assert_ne!(e1, e2);
-        assert_ne!(e1, e3);
-        assert_ne!(e1, e4);
-        assert_ne!(e1, e5);
-        assert_ne!(e2, e3);
-        assert_ne!(e2, e4);
-        assert_ne!(e2, e5);
-        assert_ne!(e3, e4);
-        assert_ne!(e3, e5);
-        assert_ne!(e4, e5);
+        assert_ne(e1, e2)
+        assert_ne(e1, e3)
+        assert_ne(e1, e4)
+        assert_ne(e1, e5)
+        assert_ne(e2, e3)
+        assert_ne(e2, e4)
+        assert_ne(e2, e5)
+        assert_ne(e3, e4)
+        assert_ne(e3, e5)
+        assert_ne(e4, e5)
         
-        println!("✅ test_storage_payment_error_variants PASSED");
+        println("✅ test_storage_payment_error_variants PASSED")
     }
     
     #[test]
-    fn test_storage_payment_error_display() {
-        assert!(format!("{}", StoragePaymentError::InsufficientBalance).contains("insufficient"));
-        assert!(format!("{}", StoragePaymentError::ContractNotFound).contains("not found"));
-        assert!(format!("{}", StoragePaymentError::NotOwner).contains("not"));
-        assert!(format!("{}", StoragePaymentError::ContractExpired).contains("expired"));
-        assert!(format!("{}", StoragePaymentError::AlreadyPaid).contains("already"));
+    fn test_storage_payment_error_display() effects(io) {
+        assert(format("{}", StoragePaymentError::InsufficientBalance).contains("insufficient"))
+        assert(format("{}", StoragePaymentError::ContractNotFound).contains("not found"))
+        assert(format("{}", StoragePaymentError::NotOwner).contains("not"))
+        assert(format("{}", StoragePaymentError::ContractExpired).contains("expired"))
+        assert(format("{}", StoragePaymentError::AlreadyPaid).contains("already"))
         
-        println!("✅ test_storage_payment_error_display PASSED");
+        println("✅ test_storage_payment_error_display PASSED")
     }
     
     #[test]
-    fn test_generate_contract_id_determinism() {
-        let owner = Address::from_bytes([0x01u8; 20]);
-        let node = Address::from_bytes([0x02u8; 20]);
-        let timestamp = 1000u64;
-        let nonce = 0u64;
+    fn test_generate_contract_id_determinism() effects(io) {
+        owner = Address::from_bytes([0x01u8; 20])
+        node = Address::from_bytes([0x02u8; 20])
+        timestamp u64 = 1000
+        nonce u64 = 0
         
         // Same inputs should produce same output
-        let id1 = generate_contract_id(&owner, &node, timestamp, nonce);
-        let id2 = generate_contract_id(&owner, &node, timestamp, nonce);
+        id1 = generate_contract_id(&owner, &node, timestamp, nonce)
+        id2 = generate_contract_id(&owner, &node, timestamp, nonce)
         
-        assert_eq!(id1, id2);
+        assert_eq(id1, id2)
         
         // Different inputs should produce different output
-        let id3 = generate_contract_id(&owner, &node, timestamp, 1);
-        assert_ne!(id1, id3);
+        id3 = generate_contract_id(&owner, &node, timestamp, 1)
+        assert_ne(id1, id3)
         
-        println!("✅ test_generate_contract_id_determinism PASSED");
+        println("✅ test_generate_contract_id_determinism PASSED")
     }
     
     #[test]
-    fn test_fee_split_70_20_10() {
+    fn test_fee_split_70_20_10() effects(io) {
         // Test that 70/20/10 split is calculated correctly
-        let amount: u128 = 100_000;
+        amount u128 = 100_000
         
-        let node_share = amount * 70 / 100;
-        let validator_share = amount * 20 / 100;
-        let treasury_share = amount - node_share - validator_share;
+        node_share = amount * 70 / 100
+        validator_share = amount * 20 / 100
+        treasury_share = amount - node_share - validator_share
         
-        assert_eq!(node_share, 70_000);
-        assert_eq!(validator_share, 20_000);
-        assert_eq!(treasury_share, 10_000);
-        assert_eq!(node_share + validator_share + treasury_share, amount);
+        assert_eq(node_share, 70_000)
+        assert_eq(validator_share, 20_000)
+        assert_eq(treasury_share, 10_000)
+        assert_eq(node_share + validator_share + treasury_share, amount)
         
-        println!("✅ test_fee_split_70_20_10 PASSED");
+        println("✅ test_fee_split_70_20_10 PASSED")
     }
     
     #[test]
-    fn test_fee_split_no_rounding_loss() {
+    fn test_fee_split_no_rounding_loss() effects(io) {
         // Test various amounts to ensure no rounding loss
         for amount in [100, 1000, 10_000, 100_000, 1_000_000, 7_777_777u128] {
-            let node_share = amount * 70 / 100;
-            let validator_share = amount * 20 / 100;
-            let treasury_share = amount - node_share - validator_share;
+            node_share = amount * 70 / 100
+            validator_share = amount * 20 / 100
+            treasury_share = amount - node_share - validator_share
             
             // Total should always equal original amount
-            assert_eq!(node_share + validator_share + treasury_share, amount,
-                "Fee split failed for amount {}", amount);
+            assert_eq(node_share + validator_share + treasury_share, amount,
+                "Fee split failed for amount {}", amount)
         }
         
-        println!("✅ test_fee_split_no_rounding_loss PASSED");
+        println("✅ test_fee_split_no_rounding_loss PASSED")
     }
 }
