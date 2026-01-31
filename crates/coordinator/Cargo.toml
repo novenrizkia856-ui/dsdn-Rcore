@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 dsdn-common = { path = "../common" }
 dsdn-proto = { path = "../proto" }
+dsdn-tss = { path = "../tss" }
 axum = "0.7"
 tokio = { version = "1.32", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

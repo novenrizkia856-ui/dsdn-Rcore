@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -39,6 +39,13 @@
 //! - **NetworkError** - Error type untuk network failures
 //! - **MockNetwork** - In-memory mock implementation untuk testing
 //!
+//! ## Consensus (14A.2B.2.15)
+//!
+//! - **ReceiptConsensus** - State machine untuk consensus satu receipt
+//! - **ConsensusState** - State dalam consensus lifecycle
+//! - **ConsensusError** - Error type untuk consensus failures
+//! - **StateTransition** - Hasil dari add_vote operation
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -47,6 +54,7 @@
 //!     ConnectionState, PeerConnection, PeerConfig, PeerManager,
 //!     CoordinatorMessage, MessageVote,
 //!     CoordinatorNetwork, NetworkError, MockNetwork,
+//!     ReceiptConsensus, ConsensusState, ConsensusError, StateTransition,
 //! };
 //!
 //! // Create coordinator identity
@@ -65,12 +73,19 @@
 //! let network = MockNetwork::new(coord_id.clone());
 //! let ping = CoordinatorMessage::ping_now();
 //! network.broadcast(ping).await?;
+//!
+//! // Run consensus
+//! let mut consensus = ReceiptConsensus::new(
+//!     workload_id, receipt_data, proposer_id, 3, 30000, now_ms,
+//! );
+//! let transition = consensus.add_vote(voter_id, vote, now_ms);
 //! ```
 
 mod types;
 mod peer;
 mod message;
 mod network;
+mod consensus;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -123,4 +138,19 @@ pub use network::{
 
     // Mock implementation
     MockNetwork,
+};
+
+// Re-export all public types from consensus module (14A.2B.2.15)
+pub use consensus::{
+    // State machine
+    ReceiptConsensus,
+
+    // State enum
+    ConsensusState,
+
+    // Error type
+    ConsensusError,
+
+    // Transition result
+    StateTransition,
 };
