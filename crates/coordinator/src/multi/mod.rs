@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -33,6 +33,12 @@
 //! - **MessageVote** - Vote decision (Approve/Reject)
 //! - **MessageDecodeError** - Error type untuk decode failures
 //!
+//! ## Network (14A.2B.2.14)
+//!
+//! - **CoordinatorNetwork** - Async trait untuk network operations
+//! - **NetworkError** - Error type untuk network failures
+//! - **MockNetwork** - In-memory mock implementation untuk testing
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -40,6 +46,7 @@
 //!     CoordinatorId, SessionId, WorkloadId, Vote, PendingReceipt,
 //!     ConnectionState, PeerConnection, PeerConfig, PeerManager,
 //!     CoordinatorMessage, MessageVote,
+//!     CoordinatorNetwork, NetworkError, MockNetwork,
 //! };
 //!
 //! // Create coordinator identity
@@ -54,15 +61,16 @@
 //! manager.add_peer(coord_id.clone(), "192.168.1.1:8080".to_string());
 //! manager.mark_seen(&coord_id);
 //!
-//! // Send messages
+//! // Send messages via network
+//! let network = MockNetwork::new(coord_id.clone());
 //! let ping = CoordinatorMessage::ping_now();
-//! let bytes = ping.encode();
-//! let decoded = CoordinatorMessage::decode(&bytes)?;
+//! network.broadcast(ping).await?;
 //! ```
 
 mod types;
 mod peer;
 mod message;
+mod network;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -103,4 +111,16 @@ pub use message::{
 
     // Error types
     MessageDecodeError,
+};
+
+// Re-export all public types from network module (14A.2B.2.14)
+pub use network::{
+    // Trait
+    CoordinatorNetwork,
+
+    // Error type
+    NetworkError,
+
+    // Mock implementation
+    MockNetwork,
 };
