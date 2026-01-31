@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -39,12 +39,14 @@
 //! - **NetworkError** - Error type untuk network failures
 //! - **MockNetwork** - In-memory mock implementation untuk testing
 //!
-//! ## Consensus (14A.2B.2.15)
+//! ## Consensus (14A.2B.2.15, 14A.2B.2.16)
 //!
 //! - **ReceiptConsensus** - State machine untuk consensus satu receipt
 //! - **ConsensusState** - State dalam consensus lifecycle
 //! - **ConsensusError** - Error type untuk consensus failures
-//! - **StateTransition** - Hasil dari add_vote operation
+//! - **StateTransition** - Record transisi state yang auditable (struct)
+//! - **TransitionTrigger** - Enum trigger yang menyebabkan transisi
+//! - **AddVoteResult** - Hasil dari operasi add_vote
 //!
 //! # Usage
 //!
@@ -54,7 +56,8 @@
 //!     ConnectionState, PeerConnection, PeerConfig, PeerManager,
 //!     CoordinatorMessage, MessageVote,
 //!     CoordinatorNetwork, NetworkError, MockNetwork,
-//!     ReceiptConsensus, ConsensusState, ConsensusError, StateTransition,
+//!     ReceiptConsensus, ConsensusState, ConsensusError,
+//!     StateTransition, TransitionTrigger, AddVoteResult,
 //! };
 //!
 //! // Create coordinator identity
@@ -74,11 +77,14 @@
 //! let ping = CoordinatorMessage::ping_now();
 //! network.broadcast(ping).await?;
 //!
-//! // Run consensus
+//! // Run consensus with explicit state transitions
 //! let mut consensus = ReceiptConsensus::new(
 //!     workload_id, receipt_data, proposer_id, 3, 30000, now_ms,
 //! );
-//! let transition = consensus.add_vote(voter_id, vote, now_ms);
+//! let transition = consensus.transition_to_voting()?;
+//! let result = consensus.add_vote(voter_id, vote, now_ms);
+//! let transition = consensus.transition_to_signing(session_id)?;
+//! let transition = consensus.complete_signing(receipt)?;
 //! ```
 
 mod types;
@@ -140,7 +146,7 @@ pub use network::{
     MockNetwork,
 };
 
-// Re-export all public types from consensus module (14A.2B.2.15)
+// Re-export all public types from consensus module (14A.2B.2.15, 14A.2B.2.16)
 pub use consensus::{
     // State machine
     ReceiptConsensus,
@@ -151,6 +157,10 @@ pub use consensus::{
     // Error type
     ConsensusError,
 
-    // Transition result
+    // Transition types (14A.2B.2.16)
     StateTransition,
+    TransitionTrigger,
+
+    // Add vote result (renamed from StateTransition enum)
+    AddVoteResult,
 };
