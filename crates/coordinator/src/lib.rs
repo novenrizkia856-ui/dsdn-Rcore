@@ -219,6 +219,100 @@
 //! | `/fallback/reconcile` | POST | Trigger manual reconciliation |
 //! | `/fallback/consistency` | GET | Verify state consistency |
 //!
+//! ## Multi-Coordinator Consensus Architecture (14A.2B.2.11–20)
+//!
+//! The coordinator supports a multi-coordinator consensus mode where multiple
+//! coordinator instances run in parallel to eliminate single points of failure.
+//! Receipt signing uses threshold cryptography (t-of-n) so that no single
+//! coordinator can unilaterally produce valid receipts.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────────────┐
+//! │                     MULTI-COORDINATOR CONSENSUS                          │
+//! │                                                                          │
+//! │  ┌────────────────────────────────────────────────────────────────────┐ │
+//! │  │                      MultiCoordinator                              │ │
+//! │  │           (Single entry point — 14A.2B.2.20)                      │ │
+//! │  │                                                                    │ │
+//! │  │  ┌──────────┐  ┌───────────────┐  ┌─────────────────────────┐    │ │
+//! │  │  │    id    │  │  key_share    │  │      committee          │    │ │
+//! │  │  │ (immut.) │  │  (threshold)  │  │  (immut. per epoch)     │    │ │
+//! │  │  └──────────┘  └───────────────┘  └─────────────────────────┘    │ │
+//! │  │                                                                    │ │
+//! │  │  ┌──────────────────────┐  ┌────────────────────────────────┐    │ │
+//! │  │  │     PeerManager     │  │   Arc<dyn CoordinatorNetwork>  │    │ │
+//! │  │  │  (connection track) │  │    (send/recv messages)        │    │ │
+//! │  │  └──────────────────────┘  └────────────────────────────────┘    │ │
+//! │  │                                                                    │ │
+//! │  │  ┌──────────────────────────────────────────────────────────┐    │ │
+//! │  │  │              MultiCoordinatorState                       │    │ │
+//! │  │  │  ┌──────────────────┐  ┌───────────────────────────┐   │    │ │
+//! │  │  │  │ pending_receipts │  │   signing_sessions        │   │    │ │
+//! │  │  │  │ HashMap<WID,     │  │   HashMap<SID,            │   │    │ │
+//! │  │  │  │  ReceiptConsensus│  │    SigningSession>         │   │    │ │
+//! │  │  │  └──────────────────┘  └───────────────────────────┘   │    │ │
+//! │  │  └──────────────────────────────────────────────────────────┘    │ │
+//! │  └────────────────────────────────────────────────────────────────────┘ │
+//! │                                                                          │
+//! │  Message Flow:                                                           │
+//! │                                                                          │
+//! │  propose_receipt(data)                                                   │
+//! │    ├─ validate → create ReceiptConsensus → auto-vote → broadcast        │
+//! │    └─ returns WorkloadId                                                │
+//! │                                                                          │
+//! │  handle_message(from, msg)                                              │
+//! │    ├─ Ping/Pong       → peer tracking + direct reply                    │
+//! │    ├─ ProposeReceipt  → create consensus + auto-vote                    │
+//! │    ├─ VoteReceipt     → add_vote → if threshold: initiate signing      │
+//! │    ├─ SigningCommit.  → collect commitments → if quorum: partials       │
+//! │    ├─ PartialSig.    → collect partials → if quorum: aggregate         │
+//! │    └─ EpochHandoff   → acknowledge                                     │
+//! │                                                                          │
+//! │  Consensus Lifecycle:                                                    │
+//! │                                                                          │
+//! │    Proposed → Voting → Signing → Completed                              │
+//! │                  │                                                       │
+//! │                  └── Rejected ──→ Failed                                │
+//! │                                                                          │
+//! │  Optimistic Path (optional):                                            │
+//! │                                                                          │
+//! │    OptimisticReceipt (single-sig, fast) → upgrade to ThresholdReceipt   │
+//! │                                                                          │
+//! └──────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Multi-Coordinator Components
+//!
+//! | Component | Module | Description |
+//! |-----------|--------|-------------|
+//! | `CoordinatorId`, `KeyShare`, `SessionId`, `WorkloadId`, `Vote` | `types` (14A.2B.2.11) | Identity and base types |
+//! | `PeerManager`, `PeerConnection`, `PeerConfig` | `peer` (14A.2B.2.12) | Connection tracking |
+//! | `CoordinatorMessage`, `MessageVote` | `message` (14A.2B.2.13) | Wire protocol messages |
+//! | `CoordinatorNetwork`, `MockNetwork` | `network` (14A.2B.2.14) | Async send/recv trait |
+//! | `ReceiptConsensus`, `ConsensusState` | `consensus` (14A.2B.2.15–16) | Per-receipt state machine |
+//! | `MultiCoordinatorState`, handler functions | `handlers` (14A.2B.2.17) | Message → state mutation |
+//! | `SigningSession`, `SigningState` | `signing` (14A.2B.2.18) | Threshold signing protocol |
+//! | `OptimisticReceipt` | `optimistic` (14A.2B.2.19) | Low-latency single-sig receipt |
+//! | `MultiCoordinator`, `MultiCoordinatorConfig` | `coordinator` (14A.2B.2.20) | Main orchestrator struct |
+//!
+//! ### MultiCoordinator Configuration ([`multi::MultiCoordinatorConfig`])
+//!
+//! | Option | Type | Description |
+//! |--------|------|-------------|
+//! | `proposal_timeout_ms` | `u64` | Timeout for receipt proposal consensus (must be > 0) |
+//! | `signing_timeout_ms` | `u64` | Timeout for threshold signing session (must be > 0) |
+//! | `enable_optimistic` | `bool` | Enable optimistic (single-sig) receipts |
+//! | `challenge_window_secs` | `u64` | Challenge window for optimistic receipts (> 0 if enabled) |
+//!
+//! ### Multi-Coordinator Invariants
+//!
+//! - **Deterministic**: Same messages in same order → same state on every node
+//! - **Atomic updates**: One message → at most one consensus state transition
+//! - **No partial state**: Construction validates all invariants; operations never leave half-done state
+//! - **No panic**: Zero `panic!`, `unwrap()`, `expect()` in production paths
+//! - **Committee immutability**: Committee is fixed for the entire epoch
+//! - **Network tolerance**: Broadcast failure does not cancel local consensus
+//!
 //! ## Modules
 //!
 //! - **scheduler**: Node scoring and workload-aware scheduling
@@ -227,6 +321,7 @@
 //! - **state_rebuild**: State reconstruction from DA history
 //! - **event_publisher**: Event batching and publishing to DA
 //! - **reconciliation**: Fallback blob reconciliation to Celestia (14A.1A.31-34)
+//! - **multi**: Multi-coordinator consensus with threshold signing (14A.2B.2.11–20)
 //!
 //! ## Key Invariant
 //!
@@ -265,7 +360,7 @@ pub mod state_rebuild;
 pub mod event_publisher;
 pub mod reconciliation;
 
-// Multi-coordinator module (14A.2B.2.11)
+// Multi-coordinator module (14A.2B.2.11–20)
 pub mod multi;
 
 pub use scheduler::{NodeStats, Workload, Scheduler};

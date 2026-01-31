@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17, 14A.2B.2.18, 14A.2B.2.19)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17, 14A.2B.2.18, 14A.2B.2.19, 14A.2B.2.20)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -73,6 +73,13 @@
 //! - **OptimisticReceiptError** - Error type untuk optimistic receipt operations
 //! - **create_placeholder_signature** - Helper untuk testing
 //!
+//! ## MultiCoordinator (14A.2B.2.20)
+//!
+//! - **MultiCoordinator** - Main entry point untuk multi-coordinator consensus
+//! - **MultiCoordinatorConfig** - Configuration struct
+//! - **MultiCoordinatorError** - Error type untuk construction failures
+//! - **ConfigError** - Error type untuk config validation
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -125,6 +132,7 @@ mod consensus;
 mod handlers;
 mod signing;
 mod optimistic;
+mod coordinator;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -249,4 +257,17 @@ pub use optimistic::{
 
     // Helper functions
     create_placeholder_signature,
+};
+
+// Re-export all public types from coordinator module (14A.2B.2.20)
+pub use coordinator::{
+    // Main struct
+    MultiCoordinator,
+
+    // Config
+    MultiCoordinatorConfig,
+
+    // Error types
+    MultiCoordinatorError,
+    ConfigError,
 };
