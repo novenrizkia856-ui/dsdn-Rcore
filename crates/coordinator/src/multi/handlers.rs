@@ -39,11 +39,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use dsdn_common::coordinator::ReceiptData;
+use dsdn_proto::tss::signing::{PartialSignatureProto, SigningCommitmentProto};
 
 use super::{
     AddVoteResult, CoordinatorId, CoordinatorMessage, ConsensusState,
     MessageVote, ReceiptConsensus, SessionId, Vote, WorkloadId,
 };
+use super::signing::{SigningError, SigningSession, SigningState, validate_commitment, validate_partial};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // VALIDATION ERROR
@@ -152,6 +154,18 @@ pub enum HandlerError {
         /// Received session ID.
         received: SessionId,
     },
+
+    /// Signing session not found.
+    SigningSessionNotFound {
+        /// Session ID yang dicari.
+        session_id: SessionId,
+    },
+
+    /// Signing error wrapper.
+    SigningError {
+        /// Inner signing error.
+        error: SigningError,
+    },
 }
 
 impl fmt::Display for HandlerError {
@@ -206,6 +220,16 @@ impl fmt::Display for HandlerError {
                     received.as_bytes()
                 )
             }
+            HandlerError::SigningSessionNotFound { session_id } => {
+                write!(
+                    f,
+                    "signing session not found: {:?}",
+                    session_id.as_bytes()
+                )
+            }
+            HandlerError::SigningError { error } => {
+                write!(f, "signing error: {}", error)
+            }
         }
     }
 }
@@ -215,6 +239,12 @@ impl std::error::Error for HandlerError {}
 impl From<ValidationError> for HandlerError {
     fn from(err: ValidationError) -> Self {
         HandlerError::InvalidProposal { validation: err }
+    }
+}
+
+impl From<SigningError> for HandlerError {
+    fn from(err: SigningError) -> Self {
+        HandlerError::SigningError { error: err }
     }
 }
 
@@ -249,6 +279,9 @@ pub struct MultiCoordinatorState {
 
     /// Map dari WorkloadId ke SessionId untuk tracking.
     session_map: HashMap<WorkloadId, SessionId>,
+
+    /// Map dari SessionId ke SigningSession (14A.2B.2.18).
+    signing_sessions: HashMap<SessionId, SigningSession>,
 
     /// Committee members untuk validasi voter.
     committee_members: HashSet<CoordinatorId>,
@@ -285,6 +318,7 @@ impl MultiCoordinatorState {
             self_id,
             consensus_map: HashMap::new(),
             session_map: HashMap::new(),
+            signing_sessions: HashMap::new(),
             committee_members,
             threshold,
             consensus_timeout_ms,
@@ -358,6 +392,30 @@ impl MultiCoordinatorState {
         self.consensus_map.len()
     }
 
+    /// Mendapatkan signing session untuk session_id.
+    #[must_use]
+    pub fn get_signing_session(&self, session_id: &SessionId) -> Option<&SigningSession> {
+        self.signing_sessions.get(session_id)
+    }
+
+    /// Mendapatkan mutable signing session untuk session_id.
+    #[must_use]
+    pub fn get_signing_session_mut(&mut self, session_id: &SessionId) -> Option<&mut SigningSession> {
+        self.signing_sessions.get_mut(session_id)
+    }
+
+    /// Memeriksa apakah signing session sudah ada.
+    #[must_use]
+    pub fn has_signing_session(&self, session_id: &SessionId) -> bool {
+        self.signing_sessions.contains_key(session_id)
+    }
+
+    /// Mengembalikan jumlah signing sessions aktif.
+    #[must_use]
+    pub fn signing_session_count(&self) -> usize {
+        self.signing_sessions.len()
+    }
+
     // ────────────────────────────────────────────────────────────────────────────
     // INTERNAL MUTATIONS
     // ────────────────────────────────────────────────────────────────────────────
@@ -376,6 +434,15 @@ impl MultiCoordinatorState {
         self.consensus_map.insert(workload_id.clone(), consensus);
         self.session_map.insert(workload_id, session_id);
     }
+
+    /// Menambahkan signing session baru.
+    ///
+    /// # Note
+    ///
+    /// Internal method - gunakan handler functions untuk public API.
+    fn insert_signing_session(&mut self, session_id: SessionId, session: SigningSession) {
+        self.signing_sessions.insert(session_id, session);
+    }
 }
 
 impl fmt::Debug for MultiCoordinatorState {
@@ -383,6 +450,7 @@ impl fmt::Debug for MultiCoordinatorState {
         f.debug_struct("MultiCoordinatorState")
             .field("self_id", &self.self_id)
             .field("consensus_count", &self.consensus_map.len())
+            .field("signing_session_count", &self.signing_sessions.len())
             .field("committee_size", &self.committee_members.len())
             .field("threshold", &self.threshold)
             .field("consensus_timeout_ms", &self.consensus_timeout_ms)
@@ -763,9 +831,232 @@ pub fn handle_message(
             }
             handle_vote_receipt(state, session_id, workload_id, vote, voter, now_ms)
         }
+        CoordinatorMessage::SigningCommitment {
+            session_id,
+            commitment,
+        } => {
+            handle_signing_commitment(state, session_id, commitment, from)
+        }
+        CoordinatorMessage::PartialSignature {
+            session_id,
+            partial,
+        } => {
+            handle_partial_signature(state, session_id, partial, from)
+        }
         // Other message types are not handled here
         _ => Ok(None),
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SIGNING HANDLERS (14A.2B.2.18)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Handle SigningCommitment message.
+///
+/// # Arguments
+///
+/// * `state` - Mutable reference ke MultiCoordinatorState
+/// * `session_id` - Session ID dari commitment
+/// * `commitment` - SigningCommitmentProto
+/// * `from` - CoordinatorId pengirim
+///
+/// # Returns
+///
+/// - `Ok(Some(CoordinatorMessage))` - Response jika quorum tercapai
+/// - `Ok(None)` - Belum quorum
+/// - `Err(HandlerError)` - Jika validasi gagal
+///
+/// # Rules
+///
+/// 1. SigningSession HARUS sudah ada
+/// 2. from HARUS anggota committee
+/// 3. Duplicate commitment DITOLAK
+/// 4. Commitment HARUS divalidasi
+/// 5. Setelah quorum commitments tercapai: transisi ke CollectingSignatures
+pub fn handle_signing_commitment(
+    state: &mut MultiCoordinatorState,
+    session_id: SessionId,
+    commitment: SigningCommitmentProto,
+    from: CoordinatorId,
+) -> Result<Option<CoordinatorMessage>, HandlerError> {
+    // 1. Validate from is committee member
+    if !state.is_committee_member(&from) {
+        return Err(HandlerError::InvalidVoter { voter: from });
+    }
+
+    // 2. Validate commitment proto
+    validate_commitment(&commitment)?;
+
+    // 3. Check if signing session exists
+    if !state.has_signing_session(&session_id) {
+        return Err(HandlerError::SigningSessionNotFound {
+            session_id: session_id.clone(),
+        });
+    }
+
+    // 4. Get signing session
+    let session = state
+        .get_signing_session_mut(&session_id)
+        .ok_or_else(|| HandlerError::SigningSessionNotFound {
+            session_id: session_id.clone(),
+        })?;
+
+    // 5. Check if session is in correct state
+    if !matches!(session.state(), SigningState::CollectingCommitments) {
+        return Err(HandlerError::InvalidState {
+            current_state: session.state().name().to_string(),
+            operation: "add_commitment".to_string(),
+        });
+    }
+
+    // 6. Add commitment
+    let quorum_reached = session.add_commitment(from, commitment)?;
+
+    // 7. If quorum reached, return signal (caller should create their partial)
+    if quorum_reached {
+        // Return None - the caller should check session state and create partial
+        Ok(None)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Handle PartialSignature message.
+///
+/// # Arguments
+///
+/// * `state` - Mutable reference ke MultiCoordinatorState
+/// * `session_id` - Session ID dari partial
+/// * `partial` - PartialSignatureProto
+/// * `from` - CoordinatorId pengirim
+///
+/// # Returns
+///
+/// - `Ok(Some(CoordinatorMessage))` - Response jika aggregation berhasil (not implemented)
+/// - `Ok(None)` - Belum quorum atau aggregation pending
+/// - `Err(HandlerError)` - Jika validasi gagal
+///
+/// # Rules
+///
+/// 1. SigningSession HARUS ada
+/// 2. State HARUS CollectingSignatures
+/// 3. from HARUS anggota committee
+/// 4. Duplicate partial DITOLAK
+/// 5. Partial HARUS divalidasi
+/// 6. Jika quorum partials tercapai: trigger aggregation
+pub fn handle_partial_signature(
+    state: &mut MultiCoordinatorState,
+    session_id: SessionId,
+    partial: PartialSignatureProto,
+    from: CoordinatorId,
+) -> Result<Option<CoordinatorMessage>, HandlerError> {
+    // 1. Validate from is committee member
+    if !state.is_committee_member(&from) {
+        return Err(HandlerError::InvalidVoter { voter: from });
+    }
+
+    // 2. Validate partial proto
+    validate_partial(&partial)?;
+
+    // 3. Check if signing session exists
+    if !state.has_signing_session(&session_id) {
+        return Err(HandlerError::SigningSessionNotFound {
+            session_id: session_id.clone(),
+        });
+    }
+
+    // 4. Get signing session
+    let session = state
+        .get_signing_session_mut(&session_id)
+        .ok_or_else(|| HandlerError::SigningSessionNotFound {
+            session_id: session_id.clone(),
+        })?;
+
+    // 5. Check if session is in correct state
+    if !matches!(session.state(), SigningState::CollectingSignatures) {
+        return Err(HandlerError::InvalidState {
+            current_state: session.state().name().to_string(),
+            operation: "add_partial".to_string(),
+        });
+    }
+
+    // 6. Add partial
+    let quorum_reached = session.add_partial(from, partial)?;
+
+    // 7. If quorum reached, try aggregate
+    if quorum_reached {
+        let _aggregate = session.try_aggregate()?;
+        // Note: Actual implementation would create ThresholdReceipt and broadcast
+        // For now, return None - caller should check session state
+        Ok(None)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Initiate signing session for a consensus that reached voting threshold.
+///
+/// # Arguments
+///
+/// * `state` - Mutable reference ke MultiCoordinatorState
+/// * `workload_id` - WorkloadId yang consensusnya sudah threshold
+///
+/// # Returns
+///
+/// - `Ok(SessionId)` - Session ID dari signing session yang dibuat
+/// - `Err(HandlerError)` - Jika consensus tidak ada atau belum ready
+///
+/// # Rules
+///
+/// - Consensus HARUS sudah ada dan dalam state Signing
+/// - SigningSession belum boleh ada untuk session_id ini
+pub fn initiate_signing_session(
+    state: &mut MultiCoordinatorState,
+    workload_id: &WorkloadId,
+) -> Result<SessionId, HandlerError> {
+    // 1. Check consensus exists
+    let consensus = state
+        .get_consensus(workload_id)
+        .ok_or_else(|| HandlerError::ConsensusNotFound {
+            workload_id: workload_id.clone(),
+        })?;
+
+    // 2. Check consensus is in Signing state
+    if !matches!(consensus.state(), ConsensusState::Signing { .. }) {
+        return Err(HandlerError::InvalidState {
+            current_state: consensus.state().name().to_string(),
+            operation: "initiate_signing".to_string(),
+        });
+    }
+
+    // 3. Get session_id
+    let session_id = state
+        .get_session(workload_id)
+        .ok_or_else(|| HandlerError::ConsensusNotFound {
+            workload_id: workload_id.clone(),
+        })?
+        .clone();
+
+    // 4. Check signing session doesn't already exist
+    if state.has_signing_session(&session_id) {
+        return Err(HandlerError::InvalidState {
+            current_state: "SigningSession already exists".to_string(),
+            operation: "initiate_signing".to_string(),
+        });
+    }
+
+    // 5. Create signing session
+    let signing_session = SigningSession::new(
+        session_id.clone(),
+        workload_id.clone(),
+        state.threshold,
+    );
+
+    // 6. Insert signing session
+    state.insert_signing_session(session_id.clone(), signing_session);
+
+    Ok(session_id)
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1299,5 +1590,363 @@ mod tests {
         let msg2 = create_vote_response(session_id, workload_id, my_id, true, None);
 
         assert_eq!(msg1, msg2);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Signing Handler Tests (14A.2B.2.18)
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    fn make_commitment(seed: u8) -> SigningCommitmentProto {
+        SigningCommitmentProto {
+            session_id: vec![seed; 32],
+            signer_id: vec![seed; 32],
+            hiding: vec![seed; 32],
+            binding: vec![seed; 32],
+            timestamp: 1700000000,
+        }
+    }
+
+    fn make_partial(seed: u8) -> PartialSignatureProto {
+        PartialSignatureProto {
+            session_id: vec![seed; 32],
+            signer_id: vec![seed; 32],
+            signature_share: vec![seed; 32],
+            commitment: make_commitment(seed),
+        }
+    }
+
+    #[test]
+    fn test_initiate_signing_session_success() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // Create proposal and vote to reach threshold
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id.clone(),
+            data,
+            proposer,
+            1700000000,
+        );
+
+        // Vote from another member to reach threshold (threshold = 2)
+        let _ = handle_vote_receipt(
+            &mut state,
+            session_id,
+            workload_id.clone(),
+            MessageVote::approve(),
+            make_coord_id(0x02),
+            1700000001,
+        );
+
+        // Now consensus should be in Signing state
+        let consensus = state.get_consensus(&workload_id).unwrap();
+        assert_eq!(consensus.state().name(), "Signing");
+
+        // Initiate signing session
+        let result = initiate_signing_session(&mut state, &workload_id);
+        assert!(result.is_ok());
+        assert_eq!(state.signing_session_count(), 1);
+    }
+
+    #[test]
+    fn test_initiate_signing_session_consensus_not_found() {
+        let mut state = make_state();
+        let workload_id = make_workload_id(0x99);
+
+        let result = initiate_signing_session(&mut state, &workload_id);
+        assert!(matches!(result, Err(HandlerError::ConsensusNotFound { .. })));
+    }
+
+    #[test]
+    fn test_initiate_signing_session_wrong_state() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // Create proposal but don't reach threshold
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id,
+            data,
+            proposer,
+            1700000000,
+        );
+
+        // Consensus is in Voting state, not Signing
+        let result = initiate_signing_session(&mut state, &workload_id);
+        assert!(matches!(result, Err(HandlerError::InvalidState { .. })));
+    }
+
+    #[test]
+    fn test_handle_signing_commitment_session_not_found() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x99);
+        let commitment = make_commitment(0x01);
+        let from = make_coord_id(0x01);
+
+        let result = handle_signing_commitment(&mut state, session_id, commitment, from);
+        assert!(matches!(result, Err(HandlerError::SigningSessionNotFound { .. })));
+    }
+
+    #[test]
+    fn test_handle_signing_commitment_invalid_voter() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let commitment = make_commitment(0x01);
+        let from = make_coord_id(0xFF); // Not in committee
+
+        let result = handle_signing_commitment(&mut state, session_id, commitment, from);
+        assert!(matches!(result, Err(HandlerError::InvalidVoter { .. })));
+    }
+
+    #[test]
+    fn test_handle_signing_commitment_success() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // Setup: Create proposal and reach signing state
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id.clone(),
+            data,
+            proposer,
+            1700000000,
+        );
+        let _ = handle_vote_receipt(
+            &mut state,
+            session_id.clone(),
+            workload_id.clone(),
+            MessageVote::approve(),
+            make_coord_id(0x02),
+            1700000001,
+        );
+
+        // Initiate signing session
+        let _ = initiate_signing_session(&mut state, &workload_id);
+
+        // Add commitment
+        let result = handle_signing_commitment(
+            &mut state,
+            session_id.clone(),
+            make_commitment(0x01),
+            make_coord_id(0x01),
+        );
+
+        assert!(result.is_ok());
+
+        // Verify commitment was added
+        let session = state.get_signing_session(&session_id).unwrap();
+        assert_eq!(session.commitment_count(), 1);
+    }
+
+    #[test]
+    fn test_handle_signing_commitment_quorum() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // Setup
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id.clone(),
+            data,
+            proposer,
+            1700000000,
+        );
+        let _ = handle_vote_receipt(
+            &mut state,
+            session_id.clone(),
+            workload_id.clone(),
+            MessageVote::approve(),
+            make_coord_id(0x02),
+            1700000001,
+        );
+        let _ = initiate_signing_session(&mut state, &workload_id);
+
+        // Add commitments to reach quorum (threshold = 2)
+        let _ = handle_signing_commitment(
+            &mut state,
+            session_id.clone(),
+            make_commitment(0x01),
+            make_coord_id(0x01),
+        );
+        let _ = handle_signing_commitment(
+            &mut state,
+            session_id.clone(),
+            make_commitment(0x02),
+            make_coord_id(0x02),
+        );
+
+        // Verify state transition
+        let session = state.get_signing_session(&session_id).unwrap();
+        assert_eq!(session.state().name(), "CollectingSignatures");
+    }
+
+    #[test]
+    fn test_handle_partial_signature_session_not_found() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x99);
+        let partial = make_partial(0x01);
+        let from = make_coord_id(0x01);
+
+        let result = handle_partial_signature(&mut state, session_id, partial, from);
+        assert!(matches!(result, Err(HandlerError::SigningSessionNotFound { .. })));
+    }
+
+    #[test]
+    fn test_handle_partial_signature_wrong_state() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // Setup: reach Signing and initiate session
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id.clone(),
+            data,
+            proposer,
+            1700000000,
+        );
+        let _ = handle_vote_receipt(
+            &mut state,
+            session_id.clone(),
+            workload_id.clone(),
+            MessageVote::approve(),
+            make_coord_id(0x02),
+            1700000001,
+        );
+        let _ = initiate_signing_session(&mut state, &workload_id);
+
+        // Try to add partial without reaching commitment quorum
+        let result = handle_partial_signature(
+            &mut state,
+            session_id,
+            make_partial(0x01),
+            make_coord_id(0x01),
+        );
+
+        assert!(matches!(result, Err(HandlerError::InvalidState { .. })));
+    }
+
+    #[test]
+    fn test_full_signing_flow() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // 1. Create proposal
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id.clone(),
+            data,
+            proposer,
+            1700000000,
+        );
+
+        // 2. Vote to reach threshold
+        let _ = handle_vote_receipt(
+            &mut state,
+            session_id.clone(),
+            workload_id.clone(),
+            MessageVote::approve(),
+            make_coord_id(0x02),
+            1700000001,
+        );
+
+        // 3. Initiate signing
+        let _ = initiate_signing_session(&mut state, &workload_id);
+
+        // 4. Collect commitments
+        let _ = handle_signing_commitment(
+            &mut state,
+            session_id.clone(),
+            make_commitment(0x01),
+            make_coord_id(0x01),
+        );
+        let _ = handle_signing_commitment(
+            &mut state,
+            session_id.clone(),
+            make_commitment(0x02),
+            make_coord_id(0x02),
+        );
+
+        // 5. Collect partials
+        let _ = handle_partial_signature(
+            &mut state,
+            session_id.clone(),
+            make_partial(0x01),
+            make_coord_id(0x01),
+        );
+        let _ = handle_partial_signature(
+            &mut state,
+            session_id.clone(),
+            make_partial(0x02),
+            make_coord_id(0x02),
+        );
+
+        // 6. Verify completed
+        let session = state.get_signing_session(&session_id).unwrap();
+        assert_eq!(session.state().name(), "Completed");
+        assert!(session.aggregated_signature().is_some());
+    }
+
+    #[test]
+    fn test_signing_no_double_commitment() {
+        let mut state = make_state();
+        let session_id = make_session_id(0x01);
+        let workload_id = make_workload_id(0x01);
+        let data = make_receipt_data(0x01);
+        let proposer = make_coord_id(0x01);
+
+        // Setup
+        let _ = handle_propose_receipt(
+            &mut state,
+            session_id.clone(),
+            data,
+            proposer,
+            1700000000,
+        );
+        let _ = handle_vote_receipt(
+            &mut state,
+            session_id.clone(),
+            workload_id.clone(),
+            MessageVote::approve(),
+            make_coord_id(0x02),
+            1700000001,
+        );
+        let _ = initiate_signing_session(&mut state, &workload_id);
+
+        // First commitment
+        let _ = handle_signing_commitment(
+            &mut state,
+            session_id.clone(),
+            make_commitment(0x01),
+            make_coord_id(0x01),
+        );
+
+        // Duplicate commitment
+        let result = handle_signing_commitment(
+            &mut state,
+            session_id,
+            make_commitment(0x01),
+            make_coord_id(0x01),
+        );
+
+        assert!(matches!(result, Err(HandlerError::SigningError { .. })));
     }
 }

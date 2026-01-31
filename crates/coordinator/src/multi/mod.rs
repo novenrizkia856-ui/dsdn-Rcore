@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17, 14A.2B.2.18)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -58,6 +58,15 @@
 //! - **validate_receipt_proposal** - Validasi receipt proposal data
 //! - **create_vote_response** - Membuat vote response message
 //!
+//! ## Signing (14A.2B.2.18)
+//!
+//! - **SigningSession** - State machine untuk signing session
+//! - **SigningState** - State dalam signing session lifecycle
+//! - **SigningError** - Error type untuk signing failures
+//! - **handle_signing_commitment** - Handler untuk SigningCommitment message
+//! - **handle_partial_signature** - Handler untuk PartialSignature message
+//! - **initiate_signing_session** - Memulai signing session setelah voting threshold
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -108,6 +117,7 @@ mod message;
 mod network;
 mod consensus;
 mod handlers;
+mod signing;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -195,7 +205,29 @@ pub use handlers::{
     handle_vote_receipt,
     handle_message,
 
+    // Signing handlers (14A.2B.2.18)
+    handle_signing_commitment,
+    handle_partial_signature,
+    initiate_signing_session,
+
     // Helper functions
     validate_receipt_proposal,
     create_vote_response,
+};
+
+// Re-export all public types from signing module (14A.2B.2.18)
+pub use signing::{
+    // Session
+    SigningSession,
+
+    // State
+    SigningState,
+
+    // Error type
+    SigningError,
+
+    // Helper functions
+    derive_session_id,
+    validate_commitment,
+    validate_partial,
 };
