@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17, 14A.2B.2.18)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17, 14A.2B.2.18, 14A.2B.2.19)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -67,6 +67,12 @@
 //! - **handle_partial_signature** - Handler untuk PartialSignature message
 //! - **initiate_signing_session** - Memulai signing session setelah voting threshold
 //!
+//! ## Optimistic Receipt (14A.2B.2.19)
+//!
+//! - **OptimisticReceipt** - Low-latency receipt dengan single signature
+//! - **OptimisticReceiptError** - Error type untuk optimistic receipt operations
+//! - **create_placeholder_signature** - Helper untuk testing
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -118,6 +124,7 @@ mod network;
 mod consensus;
 mod handlers;
 mod signing;
+mod optimistic;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -230,4 +237,16 @@ pub use signing::{
     derive_session_id,
     validate_commitment,
     validate_partial,
+};
+
+// Re-export all public types from optimistic module (14A.2B.2.19)
+pub use optimistic::{
+    // Receipt
+    OptimisticReceipt,
+
+    // Error type
+    OptimisticReceiptError,
+
+    // Helper functions
+    create_placeholder_signature,
 };
