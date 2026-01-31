@@ -16,19 +16,19 @@
 //! - Slashed tokens: 50% treasury, 50% burned
 //! - Delegator stake: protected except on extreme protocol failure
 
-use crate::types::Address;
-use crate::state::ChainState;
-use serde::{Serialize, Deserialize};
+use crate::types::Address
+use crate::state::ChainState
+use serde::{Serialize, Deserialize}
 
 // ════════════════════════════════════════════════════════════════════════════
 // LEGACY CONSTANTS (13.7.K)
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Maximum consecutive missed blocks before slashing
-pub const MAX_MISSED_BLOCKS: u64 = 50;
+pub const MAX_MISSED_BLOCKS u64 = 50
 
 /// Percentage of stake to slash (for future implementation)
-pub const SLASH_PERCENTAGE: u64 = 5; // 5% of stake
+pub const SLASH_PERCENTAGE u64 = 5 // 5% of stake
 
 // ════════════════════════════════════════════════════════════════════════════
 // 13.14.1 — SLASHING CONSTANTS (CONSENSUS-CRITICAL)
@@ -39,39 +39,39 @@ pub const SLASH_PERCENTAGE: u64 = 5; // 5% of stake
 
 /// Node liveness failure slash: 0.5% (50 basis points)
 /// Triggered when node offline ≥ NODE_LIVENESS_THRESHOLD_SECONDS
-pub const NODE_LIVENESS_SLASH_PERCENT: u16 = 50;
+pub const NODE_LIVENESS_SLASH_PERCENT u16 = 50
 
 /// Node data corruption slash: 5% (500 basis points)
 /// Triggered on 2 consecutive data corruption events
-pub const NODE_DATA_CORRUPTION_SLASH_PERCENT: u16 = 500;
+pub const NODE_DATA_CORRUPTION_SLASH_PERCENT u16 = 500
 
 /// Validator double-sign slash: 10% (1000 basis points)
 /// Triggered when validator signs conflicting blocks at same height
-pub const VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT: u16 = 1000;
+pub const VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT u16 = 1000
 
 /// Validator prolonged offline slash: 1% (100 basis points)
 /// Triggered when validator offline exceeds threshold
-pub const VALIDATOR_OFFLINE_SLASH_PERCENT: u16 = 100;
+pub const VALIDATOR_OFFLINE_SLASH_PERCENT u16 = 100
 
 /// Validator malicious block slash: 20% (2000 basis points)
 /// Triggered when validator produces invalid/malicious block
-pub const VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT: u16 = 2000;
+pub const VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT u16 = 2000
 
 /// Node liveness threshold: 12 hours (43,200 seconds)
 /// Node must send heartbeat within this interval
-pub const NODE_LIVENESS_THRESHOLD_SECONDS: u64 = 43_200;
+pub const NODE_LIVENESS_THRESHOLD_SECONDS u64 = 43_200
 
 /// Force unbond delay: 30 days (2,592,000 seconds)
 /// Duration of forced unbonding for repeated malicious behavior
-pub const FORCE_UNBOND_DELAY_SECONDS: u64 = 2_592_000;
+pub const FORCE_UNBOND_DELAY_SECONDS u64 = 2_592_000
 
 /// Slashing allocation to treasury: 50%
 /// Portion of slashed tokens sent to protocol treasury
-pub const SLASHING_TREASURY_RATIO: u8 = 50;
+pub const SLASHING_TREASURY_RATIO u8 = 50
 
 /// Slashing allocation to burn: 50%
 /// Portion of slashed tokens permanently destroyed
-pub const SLASHING_BURN_RATIO: u8 = 50;
+pub const SLASHING_BURN_RATIO u8 = 50
 
 // ════════════════════════════════════════════════════════════════════════════
 // 13.14.1 — SLASHING REASON ENUM
@@ -83,17 +83,17 @@ pub const SLASHING_BURN_RATIO: u8 = 50;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlashingReason {
     /// Node offline ≥ 12 jam
-    NodeLivenessFailure,
+    NodeLivenessFailure
     /// Data corruption 2x berturut
-    NodeDataCorruption,
+    NodeDataCorruption
     /// Repeated malicious behavior
-    NodeMaliciousBehavior,
+    NodeMaliciousBehavior
     /// Double signing
-    ValidatorDoubleSign,
+    ValidatorDoubleSign
     /// Validator offline
-    ValidatorProlongedOffline,
+    ValidatorProlongedOffline
     /// Malicious block production
-    ValidatorMaliciousBlock,
+    ValidatorMaliciousBlock
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -112,29 +112,30 @@ pub enum SlashingReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeLivenessRecord {
     /// Address of the node being tracked
-    pub node_address: Address,
+    pub node_address Address
     /// Unix timestamp of last heartbeat received
-    pub last_seen_timestamp: u64,
+    pub last_seen_timestamp u64
     /// Count of consecutive liveness failures
-    pub consecutive_failures: u32,
+    pub consecutive_failures u32
     /// Count of data corruption events (slash on 2)
-    pub data_corruption_count: u32,
+    pub data_corruption_count u32
     /// Count of malicious behavior incidents
-    pub malicious_behavior_count: u32,
+    pub malicious_behavior_count u32
     /// Unix timestamp until which node is force-unbonded (None = not force-unbonded)
-    pub force_unbond_until: Option<u64>,
+    pub force_unbond_until Option[u64]
     /// Whether this node has been slashed
-    pub slashed: bool,
+    pub slashed bool
     // ════════════════════════════════════════════════════════════════════════
     // 13.14.3 — VALIDATOR DETECTION FIELDS
     // ════════════════════════════════════════════════════════════════════════
     /// Whether double-sign has been detected for this validator
-    pub double_sign_detected: bool,
+    pub double_sign_detected bool
     /// Whether malicious block production has been detected for this validator
-    pub malicious_block_detected: bool,
+    pub malicious_block_detected bool
     /// Unix timestamp when validator went offline (None = online or not tracked)
-    pub offline_since: Option<u64>,
+    pub offline_since Option[u64]
 }
+
 // ════════════════════════════════════════════════════════════════════════════
 // 13.14.1 — SLASHING EVENT
 // ════════════════════════════════════════════════════════════════════════════
@@ -146,17 +147,17 @@ pub struct NodeLivenessRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashingEvent {
     /// Address of slashed entity (node or validator)
-    pub target: Address,
+    pub target Address
     /// Reason for the slash
-    pub reason: SlashingReason,
+    pub reason SlashingReason
     /// Total amount slashed from stake
-    pub amount_slashed: u128,
+    pub amount_slashed u128
     /// Amount transferred to treasury
-    pub amount_to_treasury: u128,
+    pub amount_to_treasury u128
     /// Amount permanently burned
-    pub amount_burned: u128,
+    pub amount_burned u128
     /// Unix timestamp when slash occurred
-    pub timestamp: u64,
+    pub timestamp u64
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -167,38 +168,38 @@ pub struct SlashingEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LivenessRecord {
     /// Number of consecutive blocks missed
-    pub missed_blocks: u64,
+    pub missed_blocks u64
     /// Whether this validator has been slashed
-    pub slashed: bool,
+    pub slashed bool
     /// Total times slashed (for repeat offenders)
-    pub slash_count: u64,
+    pub slash_count u64
     /// Last block height where validator was active
-    pub last_active_height: u64,
+    pub last_active_height u64
 }
 
 impl LivenessRecord {
-    pub fn new() -> Self {
+    pub fn new() Self {
         Self {
-            missed_blocks: 0,
-            slashed: false,
-            slash_count: 0,
-            last_active_height: 0,
+            missed_blocks = 0,
+            slashed = false,
+            slash_count = 0,
+            last_active_height = 0,
         }
     }
 
     /// Reset missed blocks counter (called when validator produces a block)
-    pub fn reset_missed(&mut self, current_height: u64) {
-        self.missed_blocks = 0;
-        self.last_active_height = current_height;
+    pub fn reset_missed(&mut self, current_height u64) {
+        self.missed_blocks = 0
+        self.last_active_height = current_height
     }
 
     /// Increment missed blocks counter
     pub fn increment_missed(&mut self) {
-        self.missed_blocks = self.missed_blocks.saturating_add(1);
+        self.missed_blocks = self.missed_blocks.saturating_add(1)
     }
 
     /// Check if validator should be slashed
-    pub fn should_slash(&self) -> bool {
+    pub fn should_slash(&self) bool {
         !self.slashed && self.missed_blocks >= MAX_MISSED_BLOCKS
     }
 }
@@ -212,28 +213,28 @@ impl LivenessRecord {
 /// * `state` - Mutable reference to chain state
 ///
 /// # Returns
-/// * `Option<String>` - Event string if slashing occurred
+/// * `Option[String]` - Event string if slashing occurred
 pub fn update_liveness(
-    validator: &Address,
-    produced_block: bool,
-    current_height: u64,
-    state: &mut ChainState,
-) -> Option<String> {
+    validator &Address,
+    produced_block bool,
+    current_height u64,
+    state &mut ChainState,
+) effects(io, write state) Option[String] {
     // Get or create liveness record
-    let record = state.liveness_records
+    record = state.liveness_records
         .entry(*validator)
-        .or_insert_with(LivenessRecord::new);
+        .or_insert_with(LivenessRecord::new)
 
     if produced_block {
         // Validator produced a block - reset missed counter
-        record.reset_missed(current_height);
-        println!("✅ Validator {} produced block at height {}", validator, current_height);
+        record.reset_missed(current_height)
+        println("✅ Validator {} produced block at height {}", validator, current_height)
         None
     } else {
         // Validator missed this block
-        record.increment_missed();
-        println!("⚠️  Validator {} missed block (consecutive: {})", 
-                 validator, record.missed_blocks);
+        record.increment_missed()
+        println("⚠️  Validator {} missed block (consecutive: {})", 
+                 validator, record.missed_blocks)
 
         // Check if slashing threshold reached
         if record.should_slash() {
@@ -256,23 +257,23 @@ pub fn update_liveness(
 /// - Slashes pending unstake entries
 /// - Transfers slashed amount to treasury
 /// - Returns event string
-pub fn apply_slashing(validator: &Address, state: &mut ChainState) -> String {
-    println!("🔪 SLASHING VALIDATOR: {}", validator);
-    println!("   Reason: Exceeded {} consecutive missed blocks", MAX_MISSED_BLOCKS);
-    println!("   Slash percentage: {}%", SLASH_PERCENTAGE);
+pub fn apply_slashing(validator &Address, state &mut ChainState) effects(io, write state) String {
+    println("🔪 SLASHING VALIDATOR: {}", validator)
+    println("   Reason: Exceeded {} consecutive missed blocks", MAX_MISSED_BLOCKS)
+    println("   Slash percentage: {}%", SLASH_PERCENTAGE)
 
     // Update liveness record
     if let Some(record) = state.liveness_records.get_mut(validator) {
-        record.slashed = true;
-        record.slash_count = record.slash_count.saturating_add(1);
+        record.slashed = true
+        record.slash_count = record.slash_count.saturating_add(1)
     }
 
     // Set validator inactive in ValidatorSet
-    state.validator_set.set_active(validator, false);
+    state.validator_set.set_active(validator, false)
 
     // Also update legacy validators map
     if let Some(v) = state.validators.get_mut(validator) {
-        v.active = false;
+        v.active = false
     }
 
     // ============================================================
@@ -286,15 +287,15 @@ pub fn apply_slashing(validator: &Address, state: &mut ChainState) -> String {
     // - QV weight updates
     // - Pending unstake slashing
     // - Treasury transfer
-    let (validator_slashed, delegators_slashed, total_slashed) = 
-        state.apply_full_slash(validator, SLASH_PERCENTAGE);
+    (validator_slashed, delegators_slashed, total_slashed) = 
+        state.apply_full_slash(validator, SLASH_PERCENTAGE)
 
-    let slash_count = state.liveness_records
+    slash_count = state.liveness_records
         .get(validator)
         .map(|r| r.slash_count)
-        .unwrap_or(0);
+        .unwrap_or(0)
 
-    let event = format!(
+    event = format(
         "ValidatorSlashed:addr={},missed={},slash_count={},validator_slash={},delegator_slash={},total_slash={},to_treasury={}",
         validator, 
         MAX_MISSED_BLOCKS, 
@@ -303,9 +304,9 @@ pub fn apply_slashing(validator: &Address, state: &mut ChainState) -> String {
         delegators_slashed,
         total_slashed,
         total_slashed
-    );
+    )
 
-    println!("   Event: {}", event);
+    println("   Event: {}", event)
     event
 }
 
@@ -321,33 +322,33 @@ pub fn apply_slashing(validator: &Address, state: &mut ChainState) -> String {
 /// * `state` - Mutable reference to chain state
 ///
 /// # Returns
-/// * `Vec<String>` - List of slashing events (if any)
+/// * `Vec[String]` - List of slashing events (if any)
 pub fn update_all_validators_liveness(
-    proposer: &Address,
-    current_height: u64,
-    state: &mut ChainState,
-) -> Vec<String> {
-    let mut events = Vec::new();
+    proposer &Address,
+    current_height u64,
+    state &mut ChainState,
+) effects(io, write state) Vec[String] {
+    mut events = Vec::new()
 
     // Get all active validators
-    let active_validators: Vec<Address> = state.validator_set.validators
+    active_validators Vec[Address] = state.validator_set.validators
         .iter()
         .filter(|(_, v)| v.active)
         .map(|(addr, _)| *addr)
-        .collect();
+        .collect()
 
     if active_validators.is_empty() {
-        return events;
+        return events
     }
 
-    println!("📊 Updating liveness for {} active validator(s) at height {}", 
-             active_validators.len(), current_height);
+    println("📊 Updating liveness for {} active validator(s) at height {}", 
+             active_validators.len(), current_height)
 
     // Update each validator
     for validator in active_validators {
-        let produced_block = &validator == proposer;
+        produced_block = &validator == proposer
         if let Some(event) = update_liveness(&validator, produced_block, current_height, state) {
-            events.push(event);
+            events.push(event)
         }
     }
 
@@ -355,7 +356,7 @@ pub fn update_all_validators_liveness(
 }
 
 /// Check if a validator is currently slashed
-pub fn is_slashed(validator: &Address, state: &ChainState) -> bool {
+pub fn is_slashed(validator &Address, state &ChainState) bool {
     state.liveness_records
         .get(validator)
         .map(|r| r.slashed)
@@ -363,25 +364,25 @@ pub fn is_slashed(validator: &Address, state: &ChainState) -> bool {
 }
 
 /// Get liveness status for a validator
-pub fn get_liveness_status(validator: &Address, state: &ChainState) -> Option<LivenessRecord> {
+pub fn get_liveness_status(validator &Address, state &ChainState) Option[LivenessRecord] {
     state.liveness_records.get(validator).cloned()
 }
 
 /// Reset slashing status (for governance/admin use)
 /// This is a skeleton - full implementation would require governance vote
 #[allow(dead_code)]
-pub fn reset_slashing(validator: &Address, state: &mut ChainState) -> bool {
+pub fn reset_slashing(validator &Address, state &mut ChainState) effects(io, write state) bool {
     if let Some(record) = state.liveness_records.get_mut(validator) {
-        record.slashed = false;
-        record.missed_blocks = 0;
+        record.slashed = false
+        record.missed_blocks = 0
         
         // Reactivate validator
-        state.validator_set.set_active(validator, true);
+        state.validator_set.set_active(validator, true)
         if let Some(v) = state.validators.get_mut(validator) {
-            v.active = true;
+            v.active = true
         }
         
-        println!("🔓 Validator {} slashing status reset", validator);
+        println("🔓 Validator {} slashing status reset", validator)
         true
     } else {
         false
@@ -390,41 +391,41 @@ pub fn reset_slashing(validator: &Address, state: &mut ChainState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::*
 
     #[test]
     fn test_liveness_record_new() {
-        let record = LivenessRecord::new();
-        assert_eq!(record.missed_blocks, 0);
-        assert!(!record.slashed);
-        assert_eq!(record.slash_count, 0);
+        record = LivenessRecord::new()
+        assert_eq(record.missed_blocks, 0)
+        assert(!record.slashed)
+        assert_eq(record.slash_count, 0)
     }
 
     #[test]
     fn test_should_slash() {
-        let mut record = LivenessRecord::new();
+        mut record = LivenessRecord::new()
         
         // Below threshold
-        record.missed_blocks = MAX_MISSED_BLOCKS - 1;
-        assert!(!record.should_slash());
+        record.missed_blocks = MAX_MISSED_BLOCKS - 1
+        assert(!record.should_slash())
         
         // At threshold
-        record.missed_blocks = MAX_MISSED_BLOCKS;
-        assert!(record.should_slash());
+        record.missed_blocks = MAX_MISSED_BLOCKS
+        assert(record.should_slash())
         
         // Already slashed
-        record.slashed = true;
-        assert!(!record.should_slash());
+        record.slashed = true
+        assert(!record.should_slash())
     }
 
     #[test]
     fn test_reset_missed() {
-        let mut record = LivenessRecord::new();
-        record.missed_blocks = 25;
-        record.reset_missed(100);
+        mut record = LivenessRecord::new()
+        record.missed_blocks = 25
+        record.reset_missed(100)
         
-        assert_eq!(record.missed_blocks, 0);
-        assert_eq!(record.last_active_height, 100);
+        assert_eq(record.missed_blocks, 0)
+        assert_eq(record.last_active_height, 100)
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -436,70 +437,70 @@ mod tests {
     #[test]
     fn test_slashing_constants() {
         // Node slashing percentages (basis points)
-        assert_eq!(NODE_LIVENESS_SLASH_PERCENT, 50, 
-            "Node liveness slash should be 0.5% (50 bp)");
-        assert_eq!(NODE_DATA_CORRUPTION_SLASH_PERCENT, 500, 
-            "Node data corruption slash should be 5% (500 bp)");
+        assert_eq(NODE_LIVENESS_SLASH_PERCENT, 50, 
+            "Node liveness slash should be 0.5% (50 bp)")
+        assert_eq(NODE_DATA_CORRUPTION_SLASH_PERCENT, 500, 
+            "Node data corruption slash should be 5% (500 bp)")
         
         // Validator slashing percentages (basis points)
-        assert_eq!(VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT, 1000, 
-            "Validator double-sign slash should be 10% (1000 bp)");
-        assert_eq!(VALIDATOR_OFFLINE_SLASH_PERCENT, 100, 
-            "Validator offline slash should be 1% (100 bp)");
-        assert_eq!(VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT, 2000, 
-            "Validator malicious block slash should be 20% (2000 bp)");
+        assert_eq(VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT, 1000, 
+            "Validator double-sign slash should be 10% (1000 bp)")
+        assert_eq(VALIDATOR_OFFLINE_SLASH_PERCENT, 100, 
+            "Validator offline slash should be 1% (100 bp)")
+        assert_eq(VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT, 2000, 
+            "Validator malicious block slash should be 20% (2000 bp)")
         
         // Time thresholds
-        assert_eq!(NODE_LIVENESS_THRESHOLD_SECONDS, 43_200, 
-            "Node liveness threshold should be 12 hours (43200 seconds)");
-        assert_eq!(FORCE_UNBOND_DELAY_SECONDS, 2_592_000, 
-            "Force unbond delay should be 30 days (2592000 seconds)");
+        assert_eq(NODE_LIVENESS_THRESHOLD_SECONDS, 43_200, 
+            "Node liveness threshold should be 12 hours (43200 seconds)")
+        assert_eq(FORCE_UNBOND_DELAY_SECONDS, 2_592_000, 
+            "Force unbond delay should be 30 days (2592000 seconds)")
         
         // Allocation ratios (must sum to 100)
-        assert_eq!(SLASHING_TREASURY_RATIO, 50, "Treasury ratio should be 50%");
-        assert_eq!(SLASHING_BURN_RATIO, 50, "Burn ratio should be 50%");
-        assert_eq!(
+        assert_eq(SLASHING_TREASURY_RATIO, 50, "Treasury ratio should be 50%")
+        assert_eq(SLASHING_BURN_RATIO, 50, "Burn ratio should be 50%")
+        assert_eq(
             SLASHING_TREASURY_RATIO + SLASHING_BURN_RATIO, 
             100, 
             "Treasury + Burn must equal 100%"
-        );
+        )
     }
 
     /// Test: Verify NodeLivenessRecord default values.
     /// Assertion: All counters are 0, all flags are false, all Options are None.
     #[test]
     fn test_node_liveness_record_default() {
-        let addr = Address::from_bytes([0x01; 20]);
-        let record = NodeLivenessRecord {
-            node_address: addr,
-            last_seen_timestamp: 0,
-            consecutive_failures: 0,
-            data_corruption_count: 0,
-            malicious_behavior_count: 0,
-            force_unbond_until: None,
-            slashed: false,
-            double_sign_detected: false,
-            malicious_block_detected: false,
-            offline_since: None,
-        };
+        addr = Address::from_bytes([0x01; 20])
+        record = NodeLivenessRecord {
+            node_address = addr,
+            last_seen_timestamp = 0,
+            consecutive_failures = 0,
+            data_corruption_count = 0,
+            malicious_behavior_count = 0,
+            force_unbond_until = None,
+            slashed = false,
+            double_sign_detected = false,
+            malicious_block_detected = false,
+            offline_since = None,
+        }
         
         // Verify counters are zero
-        assert_eq!(record.last_seen_timestamp, 0, "last_seen_timestamp should be 0");
-        assert_eq!(record.consecutive_failures, 0, "consecutive_failures should be 0");
-        assert_eq!(record.data_corruption_count, 0, "data_corruption_count should be 0");
-        assert_eq!(record.malicious_behavior_count, 0, "malicious_behavior_count should be 0");
+        assert_eq(record.last_seen_timestamp, 0, "last_seen_timestamp should be 0")
+        assert_eq(record.consecutive_failures, 0, "consecutive_failures should be 0")
+        assert_eq(record.data_corruption_count, 0, "data_corruption_count should be 0")
+        assert_eq(record.malicious_behavior_count, 0, "malicious_behavior_count should be 0")
         
         // Verify flags are false
-        assert!(!record.slashed, "slashed should be false");
-        assert!(!record.double_sign_detected, "double_sign_detected should be false");
-        assert!(!record.malicious_block_detected, "malicious_block_detected should be false");
+        assert(!record.slashed, "slashed should be false")
+        assert(!record.double_sign_detected, "double_sign_detected should be false")
+        assert(!record.malicious_block_detected, "malicious_block_detected should be false")
         
         // Verify Options are None
-        assert!(record.force_unbond_until.is_none(), "force_unbond_until should be None");
-        assert!(record.offline_since.is_none(), "offline_since should be None");
+        assert(record.force_unbond_until.is_none(), "force_unbond_until should be None")
+        assert(record.offline_since.is_none(), "offline_since should be None")
         
         // Verify address is correct
-        assert_eq!(record.node_address, addr, "node_address should match");
+        assert_eq(record.node_address, addr, "node_address should match")
     }
 
     /// Test: Verify all SlashingReason enum variants exist and can be instantiated.
@@ -507,112 +508,112 @@ mod tests {
     #[test]
     fn test_slashing_reason_variants() {
         // Instantiate all variants
-        let reason1 = SlashingReason::NodeLivenessFailure;
-        let reason2 = SlashingReason::NodeDataCorruption;
-        let reason3 = SlashingReason::NodeMaliciousBehavior;
-        let reason4 = SlashingReason::ValidatorDoubleSign;
-        let reason5 = SlashingReason::ValidatorProlongedOffline;
-        let reason6 = SlashingReason::ValidatorMaliciousBlock;
+        reason1 = SlashingReason::NodeLivenessFailure
+        reason2 = SlashingReason::NodeDataCorruption
+        reason3 = SlashingReason::NodeMaliciousBehavior
+        reason4 = SlashingReason::ValidatorDoubleSign
+        reason5 = SlashingReason::ValidatorProlongedOffline
+        reason6 = SlashingReason::ValidatorMaliciousBlock
         
         // Verify each variant is unique
-        assert_ne!(reason1, reason2, "NodeLivenessFailure != NodeDataCorruption");
-        assert_ne!(reason2, reason3, "NodeDataCorruption != NodeMaliciousBehavior");
-        assert_ne!(reason3, reason4, "NodeMaliciousBehavior != ValidatorDoubleSign");
-        assert_ne!(reason4, reason5, "ValidatorDoubleSign != ValidatorProlongedOffline");
-        assert_ne!(reason5, reason6, "ValidatorProlongedOffline != ValidatorMaliciousBlock");
+        assert_ne(reason1, reason2, "NodeLivenessFailure != NodeDataCorruption")
+        assert_ne(reason2, reason3, "NodeDataCorruption != NodeMaliciousBehavior")
+        assert_ne(reason3, reason4, "NodeMaliciousBehavior != ValidatorDoubleSign")
+        assert_ne(reason4, reason5, "ValidatorDoubleSign != ValidatorProlongedOffline")
+        assert_ne(reason5, reason6, "ValidatorProlongedOffline != ValidatorMaliciousBlock")
         
         // Verify equality for same variants
-        assert_eq!(reason1, SlashingReason::NodeLivenessFailure);
-        assert_eq!(reason4, SlashingReason::ValidatorDoubleSign);
+        assert_eq(reason1, SlashingReason::NodeLivenessFailure)
+        assert_eq(reason4, SlashingReason::ValidatorDoubleSign)
         
         // Verify Debug trait works (no panic)
-        let _debug1 = format!("{:?}", reason1);
-        let _debug6 = format!("{:?}", reason6);
+        _debug1 = format("{:?}", reason1)
+        _debug6 = format("{:?}", reason6)
         
         // Verify Clone trait works
-        let cloned = reason1.clone();
-        assert_eq!(cloned, reason1);
+        cloned = reason1.clone()
+        assert_eq(cloned, reason1)
         
         // Verify Copy trait works
-        let copied: SlashingReason = reason4;
-        assert_eq!(copied, reason4);
+        copied SlashingReason = reason4
+        assert_eq(copied, reason4)
     }
 
     /// Test: SlashingEvent can be created correctly.
     /// Assertion: All fields are correctly stored.
     #[test]
     fn test_slashing_event_creation() {
-        let target = Address::from_bytes([0xAA; 20]);
-        let event = SlashingEvent {
-            target,
-            reason: SlashingReason::ValidatorDoubleSign,
-            amount_slashed: 1_000_000,
-            amount_to_treasury: 500_000,
-            amount_burned: 500_000,
-            timestamp: 1700000000,
-        };
+        target = Address::from_bytes([0xAA; 20])
+        event = SlashingEvent {
+            target = target,
+            reason = SlashingReason::ValidatorDoubleSign,
+            amount_slashed = 1_000_000,
+            amount_to_treasury = 500_000,
+            amount_burned = 500_000,
+            timestamp = 1700000000,
+        }
         
-        assert_eq!(event.target, target);
-        assert_eq!(event.reason, SlashingReason::ValidatorDoubleSign);
-        assert_eq!(event.amount_slashed, 1_000_000);
-        assert_eq!(event.amount_to_treasury, 500_000);
-        assert_eq!(event.amount_burned, 500_000);
-        assert_eq!(event.timestamp, 1700000000);
+        assert_eq(event.target, target)
+        assert_eq(event.reason, SlashingReason::ValidatorDoubleSign)
+        assert_eq(event.amount_slashed, 1_000_000)
+        assert_eq(event.amount_to_treasury, 500_000)
+        assert_eq(event.amount_burned, 500_000)
+        assert_eq(event.timestamp, 1700000000)
         
         // Verify allocation adds up
-        assert_eq!(
+        assert_eq(
             event.amount_to_treasury + event.amount_burned, 
             event.amount_slashed,
             "Treasury + Burned should equal total slashed"
-        );
+        )
     }
 
     /// Test: Verify slash percentage calculations.
     /// Assertion: Basis points correctly convert to amounts.
     #[test]
     fn test_slashing_basis_points_calculation() {
-        let stake = 10_000_000u128; // 10M stake
+        stake u128 = 10_000_000 // 10M stake
         
         // 0.5% (50 bp) = 50,000
-        let node_liveness_slash = (stake * NODE_LIVENESS_SLASH_PERCENT as u128) / 10_000;
-        assert_eq!(node_liveness_slash, 50_000, "0.5% of 10M should be 50K");
+        node_liveness_slash = (stake * NODE_LIVENESS_SLASH_PERCENT as u128) / 10_000
+        assert_eq(node_liveness_slash, 50_000, "0.5% of 10M should be 50K")
         
         // 5% (500 bp) = 500,000
-        let data_corruption_slash = (stake * NODE_DATA_CORRUPTION_SLASH_PERCENT as u128) / 10_000;
-        assert_eq!(data_corruption_slash, 500_000, "5% of 10M should be 500K");
+        data_corruption_slash = (stake * NODE_DATA_CORRUPTION_SLASH_PERCENT as u128) / 10_000
+        assert_eq(data_corruption_slash, 500_000, "5% of 10M should be 500K")
         
         // 10% (1000 bp) = 1,000,000
-        let double_sign_slash = (stake * VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT as u128) / 10_000;
-        assert_eq!(double_sign_slash, 1_000_000, "10% of 10M should be 1M");
+        double_sign_slash = (stake * VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT as u128) / 10_000
+        assert_eq(double_sign_slash, 1_000_000, "10% of 10M should be 1M")
         
         // 1% (100 bp) = 100,000
-        let offline_slash = (stake * VALIDATOR_OFFLINE_SLASH_PERCENT as u128) / 10_000;
-        assert_eq!(offline_slash, 100_000, "1% of 10M should be 100K");
+        offline_slash = (stake * VALIDATOR_OFFLINE_SLASH_PERCENT as u128) / 10_000
+        assert_eq(offline_slash, 100_000, "1% of 10M should be 100K")
         
         // 20% (2000 bp) = 2,000,000
-        let malicious_slash = (stake * VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT as u128) / 10_000;
-        assert_eq!(malicious_slash, 2_000_000, "20% of 10M should be 2M");
+        malicious_slash = (stake * VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT as u128) / 10_000
+        assert_eq(malicious_slash, 2_000_000, "20% of 10M should be 2M")
     }
 
     /// Test: Severity ordering of slash percentages.
     /// Assertion: malicious > double_sign > corruption > offline > liveness
     #[test]
     fn test_slashing_severity_ordering() {
-        assert!(
+        assert(
             VALIDATOR_MALICIOUS_BLOCK_SLASH_PERCENT > VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT,
             "Malicious block should be more severe than double-sign"
-        );
-        assert!(
+        )
+        assert(
             VALIDATOR_DOUBLE_SIGN_SLASH_PERCENT > NODE_DATA_CORRUPTION_SLASH_PERCENT,
             "Double-sign should be more severe than data corruption"
-        );
-        assert!(
+        )
+        assert(
             NODE_DATA_CORRUPTION_SLASH_PERCENT > VALIDATOR_OFFLINE_SLASH_PERCENT,
             "Data corruption should be more severe than offline"
-        );
-        assert!(
+        )
+        assert(
             VALIDATOR_OFFLINE_SLASH_PERCENT > NODE_LIVENESS_SLASH_PERCENT,
             "Validator offline should be more severe than node liveness"
-        );
+        )
     }
 }
