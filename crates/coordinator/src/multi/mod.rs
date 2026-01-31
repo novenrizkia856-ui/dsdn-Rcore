@@ -1,4 +1,4 @@
-//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16)
+//! Multi-Coordinator Module (14A.2B.2.11, 14A.2B.2.12, 14A.2B.2.13, 14A.2B.2.14, 14A.2B.2.15, 14A.2B.2.16, 14A.2B.2.17)
 //!
 //! Module ini menyediakan types dan utilities untuk sistem multi-coordinator
 //! dalam DSDN.
@@ -48,6 +48,16 @@
 //! - **TransitionTrigger** - Enum trigger yang menyebabkan transisi
 //! - **AddVoteResult** - Hasil dari operasi add_vote
 //!
+//! ## Handlers (14A.2B.2.17)
+//!
+//! - **MultiCoordinatorState** - State untuk multi-coordinator consensus
+//! - **HandlerError** - Error type untuk handler failures
+//! - **ValidationError** - Error type untuk validation failures
+//! - **handle_propose_receipt** - Handler untuk ProposeReceipt message
+//! - **handle_vote_receipt** - Handler untuk VoteReceipt message
+//! - **validate_receipt_proposal** - Validasi receipt proposal data
+//! - **create_vote_response** - Membuat vote response message
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -58,6 +68,7 @@
 //!     CoordinatorNetwork, NetworkError, MockNetwork,
 //!     ReceiptConsensus, ConsensusState, ConsensusError,
 //!     StateTransition, TransitionTrigger, AddVoteResult,
+//!     MultiCoordinatorState, HandlerError, handle_propose_receipt,
 //! };
 //!
 //! // Create coordinator identity
@@ -85,6 +96,10 @@
 //! let result = consensus.add_vote(voter_id, vote, now_ms);
 //! let transition = consensus.transition_to_signing(session_id)?;
 //! let transition = consensus.complete_signing(receipt)?;
+//!
+//! // Handle messages with handlers
+//! let mut state = MultiCoordinatorState::new(self_id, committee, 2, 30000);
+//! let response = handle_propose_receipt(&mut state, session_id, data, proposer, now_ms)?;
 //! ```
 
 mod types;
@@ -92,6 +107,7 @@ mod peer;
 mod message;
 mod network;
 mod consensus;
+mod handlers;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -163,4 +179,23 @@ pub use consensus::{
 
     // Add vote result (renamed from StateTransition enum)
     AddVoteResult,
+};
+
+// Re-export all public types from handlers module (14A.2B.2.17)
+pub use handlers::{
+    // State
+    MultiCoordinatorState,
+
+    // Error types
+    HandlerError,
+    ValidationError,
+
+    // Handler functions
+    handle_propose_receipt,
+    handle_vote_receipt,
+    handle_message,
+
+    // Helper functions
+    validate_receipt_proposal,
+    create_vote_response,
 };
