@@ -265,6 +265,9 @@ pub mod state_rebuild;
 pub mod event_publisher;
 pub mod reconciliation;
 
+// Multi-coordinator module (14A.2B.2.11)
+pub mod multi;
+
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
 pub use state_machine::{
