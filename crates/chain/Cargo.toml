@@ -1,8 +1,8 @@
 ﻿[package]
 name = "dsdn-chain"
 version = { workspace = true }
-edition = "2021"
-authors = ["INEVA / DSDN Team"]
+edition = { workspace = true }
+authors = { workspace = true }
 
 [features]
 default = ["dev_mode"]
