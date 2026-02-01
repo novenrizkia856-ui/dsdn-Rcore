@@ -1,9 +1,9 @@
 [package]
 name = "dsdn-tss"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-repository = "https://github.com/novenrizkia856-ui/dsdn"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
 description = "DSDN Threshold Signature Scheme - foundational types and cryptographic primitives"
 
 [dependencies]

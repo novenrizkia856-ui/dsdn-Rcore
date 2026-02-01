@@ -1,8 +1,8 @@
 ﻿[package]
 name = "dsdn-storage"
 version = "0.1.0"
-edition = "2021"
-authors = ["INEVA Team"]
+edition = { workspace = true }
+authors = { workspace = true }
 build = "build.rs"
 
 [dependencies]

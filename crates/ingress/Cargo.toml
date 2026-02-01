@@ -1,8 +1,8 @@
 ﻿[package]
 name = "dsdn-ingress"
-version = "0.1.0"
-edition = "2021"
-authors = ["INEVA team"]
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
 
 [dependencies]
 axum = "0.7"

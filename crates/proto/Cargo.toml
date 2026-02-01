@@ -1,8 +1,8 @@
 ﻿[package]
 name = "dsdn-proto"
-version = "0.1.0"
-edition = "2021"
-authors = ["INEVA Team"]
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
 build = "build.rs"
 
 [dependencies]
