@@ -39,6 +39,33 @@ impl std::fmt::Display for RotationError {
 impl std::error::Error for RotationError {}
 
 // ════════════════════════════════════════════════════════════════════════════════
+// HANDOFF ERROR (14A.2B.2.24)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error type untuk handoff period operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffError {
+    /// Tidak sedang dalam proses handoff.
+    NotInHandoff,
+    /// Handoff period belum selesai.
+    HandoffNotComplete,
+    /// New committee belum tersedia.
+    NewCommitteeNotReady,
+}
+
+impl std::fmt::Display for HandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInHandoff => write!(f, "not in handoff process"),
+            Self::HandoffNotComplete => write!(f, "handoff period not yet complete"),
+            Self::NewCommitteeNotReady => write!(f, "new committee not yet available"),
+        }
+    }
+}
+
+impl std::error::Error for HandoffError {}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // EPOCH MANAGER
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -234,6 +261,136 @@ impl EpochManager {
             return Err(RotationError::AlreadyRotating);
         }
         self.next_committee = Some(new_committee);
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // HANDOFF MANAGEMENT (14A.2B.2.24)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Compute handoff window boundaries.
+    ///
+    /// Returns `Some((handoff_start, handoff_end))` where:
+    /// - `handoff_end = epoch_start_height + epoch_duration_blocks`
+    /// - `handoff_start = handoff_end - handoff_duration_blocks`
+    ///
+    /// Returns `None` jika overflow terjadi.
+    fn handoff_window(&self) -> Option<(u64, u64)> {
+        let epoch_end = self.epoch_start_height.checked_add(self.config.epoch_duration_blocks)?;
+        let handoff_start = epoch_end.checked_sub(self.config.handoff_duration_blocks)?;
+        Some((handoff_start, epoch_end))
+    }
+
+    /// Cek apakah height berada dalam handoff period.
+    ///
+    /// Return `true` jika dan hanya jika:
+    /// `current_height >= handoff_start` DAN `current_height < handoff_end`
+    ///
+    /// Tidak mengubah state. Tidak panic.
+    pub fn is_in_handoff(&self, current_height: u64) -> bool {
+        match self.handoff_window() {
+            Some((start, end)) => current_height >= start && current_height < end,
+            None => false,
+        }
+    }
+
+    /// Return committee yang valid untuk signing pada height tertentu.
+    ///
+    /// - height < handoff_end → `&current_committee`
+    /// - height >= handoff_end → `&next_committee` (fallback ke current jika belum ada)
+    ///
+    /// Tidak allocate. Tidak clone. Tidak panic.
+    pub fn valid_committee_for_height(&self, height: u64) -> &CoordinatorCommittee {
+        match self.handoff_window() {
+            Some((_, end)) if height >= end => {
+                match &self.next_committee {
+                    Some(next) => next,
+                    None => &self.current_committee,
+                }
+            }
+            _ => &self.current_committee,
+        }
+    }
+
+    /// Return semua committee yang valid untuk height tertentu.
+    ///
+    /// - height < handoff_start → `[&current_committee]`
+    /// - height >= handoff_start DAN < handoff_end → `[&current_committee, &next_committee]`
+    /// - height >= handoff_end → `[&next_committee]`
+    ///
+    /// Urutan: OLD dulu, NEW setelahnya.
+    /// Jika next_committee belum tersedia saat dibutuhkan → fallback ke current saja.
+    pub fn valid_committees_for_height(&self, height: u64) -> Vec<&CoordinatorCommittee> {
+        match self.handoff_window() {
+            Some((start, end)) => {
+                if height < start {
+                    vec![&self.current_committee]
+                } else if height < end {
+                    match &self.next_committee {
+                        Some(next) => vec![&self.current_committee, next],
+                        None => vec![&self.current_committee],
+                    }
+                } else {
+                    match &self.next_committee {
+                        Some(next) => vec![next],
+                        None => vec![&self.current_committee],
+                    }
+                }
+            }
+            None => vec![&self.current_committee],
+        }
+    }
+
+    /// Complete handoff: finalisasi transisi committee.
+    ///
+    /// ## Preconditions
+    ///
+    /// - `current_height >= handoff_end`
+    /// - `next_committee` tersedia
+    /// - Ada pending transition
+    ///
+    /// ## State Effects
+    ///
+    /// - `current_committee = next_committee`
+    /// - `next_committee = None`
+    /// - `pending_transition = None`
+    /// - `epoch_start_height = handoff_end`
+    /// - `status = Active`
+    /// - `current_epoch += 1`
+    pub fn complete_handoff(
+        &mut self,
+        current_height: u64,
+    ) -> Result<(), HandoffError> {
+        // Guard: must have pending transition
+        if self.pending_transition.is_none() {
+            return Err(HandoffError::NotInHandoff);
+        }
+
+        // Compute handoff_end
+        let (_, handoff_end) = match self.handoff_window() {
+            Some(w) => w,
+            None => return Err(HandoffError::NotInHandoff),
+        };
+
+        // Must be past handoff_end
+        if current_height < handoff_end {
+            return Err(HandoffError::HandoffNotComplete);
+        }
+
+        // next_committee must be ready
+        let new_committee = match self.next_committee.take() {
+            Some(c) => c,
+            None => return Err(HandoffError::NewCommitteeNotReady),
+        };
+
+        // Atomic state transition
+        self.current_committee = new_committee;
+        // next_committee already None from take()
+        self.pending_transition = None;
+        self.epoch_start_height = handoff_end;
+        self.status = CommitteeStatus::Active;
+        self.current_epoch = self.current_epoch.saturating_add(1);
+
         Ok(())
     }
 }
@@ -754,5 +911,431 @@ mod tests {
         assert_ne!(RotationError::AlreadyRotating, RotationError::SelectionFailed);
         assert_ne!(RotationError::SelectionFailed, RotationError::DKGFailed);
         assert_ne!(RotationError::DKGFailed, RotationError::NotAtBoundary);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Handoff window helper (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+    //
+    // With valid_config: epoch_duration=100, handoff_duration=10
+    // epoch_start_height = 0
+    // epoch_end = 0 + 100 = 100
+    // handoff_start = 100 - 10 = 90
+    // handoff_end = 100
+
+    // ──────────────────────────────────────────────────────────
+    // is_in_handoff tests (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_in_handoff_before_start() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        assert!(!em.is_in_handoff(89));
+    }
+
+    #[test]
+    fn test_is_in_handoff_at_start() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        assert!(em.is_in_handoff(90));
+    }
+
+    #[test]
+    fn test_is_in_handoff_during() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        assert!(em.is_in_handoff(95));
+    }
+
+    #[test]
+    fn test_is_in_handoff_last_block() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        assert!(em.is_in_handoff(99));
+    }
+
+    #[test]
+    fn test_is_in_handoff_at_end() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        // handoff_end = 100, height 100 is NOT in handoff (>= end)
+        assert!(!em.is_in_handoff(100));
+    }
+
+    #[test]
+    fn test_is_in_handoff_after_end() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        assert!(!em.is_in_handoff(150));
+    }
+
+    #[test]
+    fn test_is_in_handoff_at_zero() {
+        let em = EpochManager::new(valid_config(), test_committee());
+        assert!(!em.is_in_handoff(0));
+    }
+
+    #[test]
+    fn test_is_in_handoff_zero_handoff_duration() {
+        let config = EpochConfig {
+            epoch_duration_blocks: 100,
+            handoff_duration_blocks: 0,
+            dkg_timeout_blocks: 0,
+        };
+        let em = EpochManager::new(config, test_committee());
+        // handoff_start = 100, handoff_end = 100 → empty window
+        assert!(!em.is_in_handoff(99));
+        assert!(!em.is_in_handoff(100));
+    }
+
+    #[test]
+    fn test_is_in_handoff_overflow() {
+        let config = EpochConfig {
+            epoch_duration_blocks: u64::MAX,
+            handoff_duration_blocks: 10,
+            dkg_timeout_blocks: 5,
+        };
+        let mut em = EpochManager::new(config, test_committee());
+        em.epoch_start_height = 1;
+        // 1 + u64::MAX → overflow → handoff_window returns None → false
+        assert!(!em.is_in_handoff(u64::MAX));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // valid_committee_for_height tests (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_valid_committee_before_handoff() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        assert_eq!(*em.valid_committee_for_height(50), committee);
+    }
+
+    #[test]
+    fn test_valid_committee_during_handoff() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        // During handoff (90-99): default is OLD committee
+        assert_eq!(*em.valid_committee_for_height(95), committee);
+    }
+
+    #[test]
+    fn test_valid_committee_after_handoff_with_next() {
+        let committee = test_committee();
+        let mut em = EpochManager::new(valid_config(), committee.clone());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        let new_committee = test_committee();
+        em.prepare_next_epoch(new_committee.clone()).unwrap();
+        // height >= handoff_end (100) → return next_committee
+        assert_eq!(*em.valid_committee_for_height(100), new_committee);
+    }
+
+    #[test]
+    fn test_valid_committee_after_handoff_without_next() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        // height >= handoff_end but next_committee is None → fallback to current
+        assert_eq!(*em.valid_committee_for_height(100), committee);
+    }
+
+    #[test]
+    fn test_valid_committee_at_handoff_start() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        // height 90 (handoff_start): still current_committee
+        assert_eq!(*em.valid_committee_for_height(90), committee);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // valid_committees_for_height tests (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_valid_committees_before_handoff() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        let result = em.valid_committees_for_height(50);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*result[0], committee);
+    }
+
+    #[test]
+    fn test_valid_committees_during_handoff_with_next() {
+        let committee = test_committee();
+        let mut em = EpochManager::new(valid_config(), committee.clone());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        let new_committee = test_committee();
+        em.prepare_next_epoch(new_committee.clone()).unwrap();
+        let result = em.valid_committees_for_height(95);
+        assert_eq!(result.len(), 2);
+        assert_eq!(*result[0], committee); // OLD first
+        assert_eq!(*result[1], new_committee); // NEW second
+    }
+
+    #[test]
+    fn test_valid_committees_during_handoff_without_next() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        // In handoff period but next_committee not set → only current
+        let result = em.valid_committees_for_height(95);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*result[0], committee);
+    }
+
+    #[test]
+    fn test_valid_committees_after_handoff_with_next() {
+        let committee = test_committee();
+        let mut em = EpochManager::new(valid_config(), committee.clone());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        let new_committee = test_committee();
+        em.prepare_next_epoch(new_committee.clone()).unwrap();
+        let result = em.valid_committees_for_height(100);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*result[0], new_committee); // only NEW
+    }
+
+    #[test]
+    fn test_valid_committees_after_handoff_without_next() {
+        let committee = test_committee();
+        let em = EpochManager::new(valid_config(), committee.clone());
+        // height >= handoff_end but no next → fallback to current
+        let result = em.valid_committees_for_height(100);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*result[0], committee);
+    }
+
+    #[test]
+    fn test_valid_committees_order_old_then_new() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        let result = em.valid_committees_for_height(95);
+        // Must have exactly 2, OLD first
+        assert_eq!(result.len(), 2);
+        assert!(std::ptr::eq(result[0], &em.current_committee));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // complete_handoff tests (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_complete_handoff_success() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        let result = em.complete_handoff(100);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_complete_handoff_state_current_committee() {
+        let committee = test_committee();
+        let mut em = EpochManager::new(valid_config(), committee.clone());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        let new_committee = test_committee();
+        em.prepare_next_epoch(new_committee.clone()).unwrap();
+        em.complete_handoff(100).unwrap();
+        assert_eq!(*em.current_committee(), new_committee);
+    }
+
+    #[test]
+    fn test_complete_handoff_state_next_committee_none() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        assert!(em.next_committee.is_none());
+    }
+
+    #[test]
+    fn test_complete_handoff_state_pending_transition_none() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        assert!(em.pending_transition.is_none());
+    }
+
+    #[test]
+    fn test_complete_handoff_state_epoch_start_height() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        // epoch_start_height = handoff_end = epoch_end = 0 + 100 = 100
+        assert_eq!(em.epoch_start_height, 100);
+    }
+
+    #[test]
+    fn test_complete_handoff_state_status_active() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        assert_eq!(em.current_status(), CommitteeStatus::Active);
+    }
+
+    #[test]
+    fn test_complete_handoff_state_epoch_incremented() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        assert_eq!(em.current_epoch(), 1);
+    }
+
+    #[test]
+    fn test_complete_handoff_err_not_in_handoff() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        // No trigger_rotation → no pending_transition
+        let result = em.complete_handoff(100);
+        assert_eq!(result, Err(HandoffError::NotInHandoff));
+    }
+
+    #[test]
+    fn test_complete_handoff_err_before_handoff_end() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        // handoff_end = 100, height 99 is before
+        let result = em.complete_handoff(99);
+        assert_eq!(result, Err(HandoffError::HandoffNotComplete));
+    }
+
+    #[test]
+    fn test_complete_handoff_err_new_committee_not_ready() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        // prepare_next_epoch NOT called → next_committee is None
+        let result = em.complete_handoff(100);
+        assert_eq!(result, Err(HandoffError::NewCommitteeNotReady));
+    }
+
+    #[test]
+    fn test_complete_handoff_double_complete() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        // Second complete → no pending_transition → NotInHandoff
+        let result = em.complete_handoff(200);
+        assert_eq!(result, Err(HandoffError::NotInHandoff));
+    }
+
+    #[test]
+    fn test_complete_handoff_state_untouched_on_error() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        // Don't set next_committee
+        let _ = em.complete_handoff(100);
+        // State should be unchanged (status still PendingRotation)
+        assert_eq!(em.current_status(), CommitteeStatus::PendingRotation);
+        assert_eq!(em.current_epoch(), 0);
+        assert_eq!(em.epoch_start_height, 0);
+    }
+
+    #[test]
+    fn test_complete_handoff_past_end_is_ok() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        // height 200 is well past handoff_end(100), should still succeed
+        let result = em.complete_handoff(200);
+        assert!(result.is_ok());
+        assert_eq!(em.epoch_start_height, 100); // handoff_end, not current_height
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Full lifecycle test (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_full_epoch_lifecycle() {
+        let committee = test_committee();
+        let mut em = EpochManager::new(valid_config(), committee.clone());
+
+        // Epoch 0: Active
+        assert_eq!(em.current_epoch(), 0);
+        assert_eq!(em.current_status(), CommitteeStatus::Active);
+        assert!(!em.is_in_handoff(50));
+        assert!(em.is_in_handoff(95));
+
+        // Trigger rotation at boundary
+        assert!(em.should_rotate(100));
+        let _ = em.trigger_rotation(100, test_da_seed());
+        assert_eq!(em.current_status(), CommitteeStatus::PendingRotation);
+
+        // Prepare new committee
+        let new_committee = test_committee();
+        em.prepare_next_epoch(new_committee.clone()).unwrap();
+
+        // Verify both committees valid during handoff
+        let committees = em.valid_committees_for_height(95);
+        assert_eq!(committees.len(), 2);
+
+        // Complete handoff
+        em.complete_handoff(100).unwrap();
+
+        // Epoch 1: Active with new committee
+        assert_eq!(em.current_epoch(), 1);
+        assert_eq!(em.current_status(), CommitteeStatus::Active);
+        assert_eq!(em.epoch_start_height, 100);
+        assert!(em.next_committee.is_none());
+        assert!(em.pending_transition.is_none());
+    }
+
+    #[test]
+    fn test_two_epoch_rotations() {
+        let mut em = EpochManager::new(valid_config(), test_committee());
+
+        // First rotation: epoch 0 → 1
+        let _ = em.trigger_rotation(100, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(100).unwrap();
+        assert_eq!(em.current_epoch(), 1);
+        assert_eq!(em.epoch_start_height, 100);
+
+        // Second rotation: epoch 1 → 2
+        // New boundary: 100 + 100 = 200
+        assert!(em.should_rotate(200));
+        let _ = em.trigger_rotation(200, test_da_seed());
+        em.prepare_next_epoch(test_committee()).unwrap();
+        em.complete_handoff(200).unwrap();
+        assert_eq!(em.current_epoch(), 2);
+        assert_eq!(em.epoch_start_height, 200);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // HandoffError tests (14A.2B.2.24)
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_handoff_error_display() {
+        assert!(!format!("{}", HandoffError::NotInHandoff).is_empty());
+        assert!(!format!("{}", HandoffError::HandoffNotComplete).is_empty());
+        assert!(!format!("{}", HandoffError::NewCommitteeNotReady).is_empty());
+    }
+
+    #[test]
+    fn test_handoff_error_debug() {
+        let debug = format!("{:?}", HandoffError::NotInHandoff);
+        assert!(debug.contains("NotInHandoff"));
+    }
+
+    #[test]
+    fn test_handoff_error_clone_eq() {
+        let e1 = HandoffError::HandoffNotComplete;
+        let e2 = e1.clone();
+        assert_eq!(e1, e2);
+    }
+
+    #[test]
+    fn test_handoff_error_is_std_error() {
+        let e: &dyn std::error::Error = &HandoffError::NewCommitteeNotReady;
+        assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_handoff_error_variants_distinct() {
+        assert_ne!(HandoffError::NotInHandoff, HandoffError::HandoffNotComplete);
+        assert_ne!(HandoffError::HandoffNotComplete, HandoffError::NewCommitteeNotReady);
+        assert_ne!(HandoffError::NewCommitteeNotReady, HandoffError::NotInHandoff);
     }
 }
