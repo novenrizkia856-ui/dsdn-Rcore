@@ -572,6 +572,7 @@ pub mod celestia;
 pub mod economic;
 pub mod wallet;
 pub mod encryption;
+pub mod coordinator;
 
 use crate::types::{Address, Hash};
 use std::str::FromStr;
