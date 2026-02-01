@@ -3,5 +3,7 @@
 //! Module struktur untuk integrasi coordinator ↔ chain layer.
 
 pub mod types;
+pub mod epoch;
 
 pub use types::{CommitteeStatus, CommitteeTransition, EpochConfig};
+pub use epoch::EpochManager;
