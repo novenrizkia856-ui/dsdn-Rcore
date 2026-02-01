@@ -20,6 +20,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
+version = "0.0.0-nan"
 repository = "https://github.com/novenrizkia856-ui/dsdn"
 description = "DSDN — Decentralized Storage & Data Network (infra-grade, deterministic, safety-first)"
 
