@@ -212,6 +212,8 @@ pub mod committee;
 pub mod receipt;
 pub mod transition;
 pub mod status;
+pub mod da_proof;         
+
 
 #[cfg(test)]
 mod tests;
@@ -222,3 +224,4 @@ pub use committee::{CoordinatorCommittee, CommitteeError};
 pub use receipt::{DecodeError, NodeId, ReceiptData, ReceiptVerificationError, ThresholdReceipt};
 pub use transition::{CommitteeTransition, TransitionError};
 pub use status::{CommitteeStatus, CommitteeStatusTransition, StatusTransitionError};
+pub use da_proof::DAMerkleProof;  
