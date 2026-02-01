@@ -13,3 +13,6 @@ pub use epoch::EpochManager;
 pub use dkg::{DKGError, EpochDKG, EpochDKGState};
 pub use disputes::*;
 pub use accountability::*;
+
+#[cfg(test)]
+mod tests;

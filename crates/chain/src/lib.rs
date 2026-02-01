@@ -550,6 +550,145 @@
 //! crates/chain/src/rpc.rs (RPC endpoints + response structs)
 //! crates/chain/src/cli.rs (CLI commands)
 //! ```
+//!
+//! ## Coordinator System (14A.2B.2)
+//!
+//! ### Overview
+//!
+//! Module `coordinator` mengimplementasikan integrasi coordinator committee system
+//! dengan chain layer. Coordinator committee bertanggung jawab atas threshold signing
+//! untuk resource receipts, beroperasi dalam epoch-based rotation dengan DKG
+//! (Distributed Key Generation) dan mekanisme handoff.
+//!
+//! ### Peran Coordinator
+//!
+//! Coordinator committee menjembatani antara compute/storage layer dan chain layer.
+//! Committee menandatangani receipts secara kolektif menggunakan threshold signatures
+//! (t-of-n) untuk membuktikan bahwa resource telah dieksekusi dengan benar.
+//!
+//! ### Hubungan dengan Chain & DA
+//!
+//! ```text
+//! ┌────────────┐     ┌────────────────────┐     ┌──────────────┐
+//! │  DA Layer  │────▶│  Coordinator Module │────▶│  Chain State │
+//! │ (Celestia) │     │  (epoch, dkg,       │     │  (validators,│
+//! │            │     │   disputes,          │     │   treasury)  │
+//! │            │     │   accountability)    │     │              │
+//! └────────────┘     └────────────────────┘     └──────────────┘
+//! ```
+//!
+//! DA layer menyediakan Merkle proofs untuk accountability dan dispute evidence.
+//! Coordinator module memverifikasi proofs dan mengelola epoch lifecycle secara
+//! deterministik. Chain state di-mutasi hanya oleh slashing operations.
+//!
+//! ### Deterministic & Verifiable Design
+//!
+//! Semua operasi coordinator bersifat deterministik. Setiap input menghasilkan
+//! output yang sama pada semua node. Tidak ada randomness, IO, atau state
+//! external yang memengaruhi hasil. Accountability proofs dapat diverifikasi
+//! secara independen tanpa akses ke state.
+//!
+//! ### EpochManager Usage
+//!
+//! `EpochManager` melacak epoch lifecycle dan committee rotation di chain layer.
+//!
+//! #### Epoch Lifecycle
+//!
+//! ```text
+//! Active ── should_rotate() ──▶ trigger_rotation() ──▶ PendingRotation
+//!                                                           │
+//!                                                    prepare_next_epoch()
+//!                                                           │
+//!                                                    complete_handoff()
+//!                                                           │
+//!                                                      Active (epoch+1)
+//! ```
+//!
+//! #### Rotation Trigger
+//!
+//! Rotation dipicu ketika `current_height >= epoch_start + epoch_duration_blocks`
+//! dan status adalah Active. DA seed non-zero diperlukan untuk committee selection.
+//!
+//! #### Handoff Semantics
+//!
+//! Selama handoff period (`handoff_start` sampai `handoff_end`), kedua committee
+//! (current dan next) dianggap valid. Ini memastikan continuity selama transisi.
+//! Setelah `complete_handoff()`, epoch bertambah dan new committee menjadi current.
+//!
+//! ### Dispute Types and Resolution
+//!
+//! #### Semua Jenis Dispute
+//!
+//! | Dispute | Deskripsi | Offenders |
+//! |---------|-----------|-----------|
+//! | InconsistentScheduling | Dua receipt berbeda untuk workload sama | Union signers kedua receipt |
+//! | InvalidSignature | Receipt gagal verifikasi signature | Semua signers di receipt |
+//! | MissingReceipt | Workload tidak mendapat receipt dalam waktu | Semua committee members |
+//! | UnauthorizedSigner | Receipt oleh non-member committee | Signer yang tidak authorized |
+//!
+//! #### Validation vs Resolution
+//!
+//! `validate_dispute()` melakukan pengecekan struktural ringan (pre-check).
+//! `resolve()` melakukan analisis logis deterministik untuk menentukan outcome.
+//! Keduanya PURE — tidak mengakses state dan tidak memiliki side effects.
+//!
+//! #### Slashing Model
+//!
+//! `apply_slashing()` menerima `DisputeResult::Valid` dan melakukan mutasi pada
+//! `ChainState`. Untuk setiap offender: deduct dari `locked`, deduct dari
+//! `validator_stakes`, tambahkan ke `treasury_balance`. Actual slash di-cap
+//! pada available stake — tidak pernah melebihi jumlah yang distake.
+//!
+//! ### Accountability System
+//!
+//! #### Logging Decisions
+//!
+//! `CoordinatorAccountability` mencatat setiap keputusan coordinator secara
+//! append-only. Insertion order dipertahankan untuk determinism.
+//! Duplicate workload_id diperbolehkan (audit log, bukan state container).
+//!
+//! #### Proof Generation
+//!
+//! `generate_proof()` menghasilkan `AccountabilityProof` deterministik.
+//! Proof hash dihitung via SHA3-256 dari coordinator_id, epoch, workload_id,
+//! receipt_data_hash, dan block_height. Jika ada multiple decisions untuk
+//! workload yang sama, yang paling awal (first inserted) dipilih.
+//!
+//! #### Audit & Dispute Evidence
+//!
+//! Accountability proofs dapat digunakan sebagai evidence dalam disputes.
+//! `verify_decision()` melakukan Merkle proof verification terhadap DA root.
+//! `get_decisions_in_range()` memfilter decisions berdasarkan block height
+//! tanpa cloning — mengembalikan references.
+//!
+//! ### Configuration Options
+//!
+//! #### EpochConfig
+//!
+//! | Field | Type | Deskripsi |
+//! |-------|------|-----------|
+//! | `epoch_duration_blocks` | u64 | Durasi epoch dalam blocks (harus > 0) |
+//! | `handoff_duration_blocks` | u64 | Durasi handoff (harus < epoch_duration) |
+//! | `dkg_timeout_blocks` | u64 | Timeout DKG (harus <= handoff_duration) |
+//!
+//! Jika config tidak valid, EpochManager dibuat dengan status Inactive.
+//!
+//! #### DisputeConfig
+//!
+//! | Field | Type | Deskripsi |
+//! |-------|------|-----------|
+//! | `slash_amount_inconsistent` | u128 | Slash untuk equivocation (NUSA base units) |
+//! | `slash_amount_invalid_sig` | u128 | Slash untuk signature invalid |
+//! | `slash_amount_missing` | u128 | Slash untuk missing receipt |
+//! | `slash_amount_unauthorized` | u128 | Slash untuk unauthorized signer |
+//! | `min_timeout_witnesses` | usize | Minimum witnesses untuk MissingReceipt |
+//!
+//! #### Timeout & Threshold Semantics
+//!
+//! DKG timeout diukur dalam blocks. `check_timeout(current_height)` men-transisi
+//! DKG ke Failed jika `current_height >= timeout_at` dan state belum terminal.
+//! Threshold untuk committee signing ditentukan saat DKG finalization sebagai
+//! majority: `(n / 2) + 1`.
 pub mod types;
 pub mod crypto;
 pub mod state; //direktori = /state/mod.rs
@@ -599,6 +738,27 @@ pub use economic::{
 // WALLET RE-EXPORTS (13.17)
 // ════════════════════════════════════════════════════════════════════════════
 pub use wallet::Wallet;
+
+// ════════════════════════════════════════════════════════════════════════════
+// COORDINATOR RE-EXPORTS (14A.2B.2)
+// ════════════════════════════════════════════════════════════════════════════
+pub use coordinator::{
+    // Types (14A.2B.2.21)
+    CommitteeStatus, CommitteeTransition, EpochConfig,
+    // Epoch (14A.2B.2.22-24)
+    EpochManager,
+    // Epoch errors (14A.2B.2.23-24)
+    epoch::RotationError, epoch::HandoffError,
+    // DKG (14A.2B.2.25-26)
+    DKGError, EpochDKG, EpochDKGState,
+    dkg::DKGProgress,
+    // Disputes (14A.2B.2.27-28)
+    CoordinatorDispute, DisputeConfig, DisputeEvidence,
+    DisputeResolver, DisputeResult, SlashingError, SlashingSummary,
+    TimeoutProof, SlashedEntry,
+    // Accountability (14A.2B.2.29)
+    AccountableDecision, AccountabilityProof, CoordinatorAccountability,
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // CHAIN ERROR (13.18.4)
