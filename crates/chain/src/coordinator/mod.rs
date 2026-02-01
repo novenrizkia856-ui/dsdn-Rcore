@@ -4,6 +4,8 @@
 
 pub mod types;
 pub mod epoch;
+pub mod dkg;
 
 pub use types::{CommitteeStatus, CommitteeTransition, EpochConfig};
 pub use epoch::EpochManager;
+pub use dkg::{DKGError, EpochDKG, EpochDKGState};
