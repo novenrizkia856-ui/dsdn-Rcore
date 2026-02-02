@@ -369,6 +369,32 @@
 //! based on caller-provided timestamps with no system clock access.
 //! A valid TLS certificate does NOT automatically make a node Active;
 //! it is one of several gating checks that must all pass.
+//!
+//! ### Gating Errors
+//!
+//! `GatingError` is the public error contract for all admission and
+//! gating operations. Each variant represents a specific, non-overlapping
+//! failure condition. Error messages are deterministic, operator-friendly,
+//! and suitable for logging and monitoring dashboards.
+//!
+//! Error categories:
+//!
+//! - **Stake errors**: `InsufficientStake` (non-zero but below minimum),
+//!   `ZeroStake` (exactly zero, always rejected first).
+//! - **Cooldown errors**: `SlashingCooldownActive` (node still in
+//!   cooldown after slashing, includes remaining seconds and reason).
+//! - **TLS errors**: `TLSInvalid` (wraps a `TLSValidationError` with
+//!   the specific certificate failure reason).
+//! - **Identity errors**: `IdentityMismatch` (node ID does not match
+//!   operator binding), `IdentityVerificationFailed` (signature or
+//!   other identity check failure with reason string).
+//! - **Status errors**: `NodeBanned` (banned until a specific timestamp),
+//!   `NodeQuarantined` (quarantined with reason), `NodeNotRegistered`.
+//! - **Class errors**: `InvalidNodeClass` (unrecognized class value).
+//!
+//! `GatingError` implements `Clone`, `Debug`, `PartialEq`, `Eq`,
+//! `Serialize`, `Deserialize`, `Display`, and `std::error::Error`.
+//! No `thiserror`, `anyhow`, or implicit error wrapping is used.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -422,12 +448,13 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.5)
+// Gating types (14B.1 — 14B.6)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};
 pub use gating::{CooldownPeriod, CooldownConfig, CooldownStatus};
 pub use gating::{TLSCertInfo, TLSValidationError};
+pub use gating::GatingError;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES

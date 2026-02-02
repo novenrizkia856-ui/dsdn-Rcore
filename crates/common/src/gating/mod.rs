@@ -8,7 +8,7 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1 — 14B.5)
+//! ## Current Components (14B.1 — 14B.6)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
@@ -24,11 +24,11 @@
 //! | `CooldownStatus` | `cooldown` | Cooldown state: NoCooldown, InCooldown, Expired |
 //! | `TLSCertInfo` | `tls` | TLS certificate metadata: fingerprint, validity, subject, issuer |
 //! | `TLSValidationError` | `tls` | Structured errors for TLS certificate validation |
+//! | `GatingError` | `error` | Comprehensive gating error types for admission control |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `GatingError` — Comprehensive gating error types (14B.6)
 //! - `GatingPolicy` — Combined gating policy configuration (14B.7)
 //! - `GatingDecision` — Approval/rejection decision with audit report (14B.8)
 //! - `NodeRegistryEntry` — Shared registry entry type (14B.9)
@@ -39,6 +39,7 @@ pub mod node_status;
 pub mod stake;
 pub mod cooldown;
 pub mod tls;
+pub mod error;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
@@ -49,3 +50,4 @@ pub use node_status::{NodeStatus, StatusTransition};
 pub use stake::{StakeRequirement, StakeError};
 pub use cooldown::{CooldownPeriod, CooldownConfig, CooldownStatus};
 pub use tls::{TLSCertInfo, TLSValidationError};
+pub use error::GatingError;
