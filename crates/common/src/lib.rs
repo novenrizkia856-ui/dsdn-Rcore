@@ -188,7 +188,71 @@
 //! | `cid` | Content addressing utilities |
 //! | `config` | Configuration management |
 //! | `consistent_hash` | Consistent hashing for placement |
-//! | `coordinator` | Multi-coordinator committee management dengan TSS | |
+//! | `coordinator` | Multi-coordinator committee management dengan TSS |
+//! | `gating` | Stake & identity gating system (14B) |
+//!
+//! ## Gating System (14B)
+//!
+//! The gating system ensures that only qualified, staked, and identity-verified
+//! nodes can participate in the DSDN network. Stake functions purely as a
+//! security gate — not as an economic signal or reward multiplier.
+//!
+//! ### NodeIdentity
+//!
+//! `NodeIdentity` is the cryptographic identity of a service node, binding three
+//! components:
+//!
+//! - `node_id` ([u8; 32]): Ed25519 public key uniquely identifying the node.
+//! - `operator_address` ([u8; 20]): Wallet address of the operator.
+//! - `tls_cert_fingerprint` ([u8; 32]): SHA-256 of the DER-encoded TLS certificate.
+//!
+//! Operator binding is verified via `verify_operator_binding()`, which checks an
+//! Ed25519 signature over a deterministic, domain-separated message:
+//!
+//! ```text
+//! message = b"DSDN:operator_binding:v1:" || node_id (32 bytes) || operator_address (20 bytes)
+//! ```
+//!
+//! Verification uses `verify_strict` which rejects weak keys and small-order point
+//! components. This prevents identity spoofing: an attacker cannot bind their
+//! operator address to a node they do not control.
+//!
+//! ### NodeClass
+//!
+//! `NodeClass` classifies a node's role and determines its minimum stake requirement:
+//!
+//! ```text
+//! Class      Min Stake    Role
+//! ────────── ───────────  ───────────────────────────────────────
+//! Storage    5000 NUSA    Persistent data storage and retrieval
+//! Compute     500 NUSA    Computation and processing tasks
+//! ```
+//!
+//! `NodeClass::min_stake()` returns the human-readable NUSA amount.
+//! On-chain smallest-unit conversion is handled by `StakeRequirement` (14B.3).
+//!
+//! ### Stake ↔ Capability Relationship
+//!
+//! Higher stake requirements for Storage nodes reflect greater data custody
+//! responsibility. A Storage node losing or withholding data causes more damage
+//! than a Compute node failing a task, hence the 10x stake difference.
+//!
+//! Stake at this stage does NOT:
+//! - Determine reward amounts (economic layer is separate)
+//! - Provide governance weight (governance uses quadratic voting)
+//! - Enable any capability beyond class membership
+//!
+//! ### Security Notes
+//!
+//! - **Operator binding**: Domain-separated, versioned signature prevents
+//!   cross-protocol replay attacks. The binding message is explicit and
+//!   deterministic with no implicit assumptions about wallet behavior.
+//! - **Spoofing resistance**: Node ID spoofing requires the corresponding
+//!   Ed25519 private key. Operator address spoofing requires a valid binding
+//!   signature from the node's key. TLS spoofing is detected by fingerprint
+//!   mismatch (validated in upper layers, 14B.5/14B.23).
+//! - **No silent failures**: All verification errors are structured and
+//!   propagated. No `panic!`, `unwrap()`, or `expect()` in production code.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -211,6 +275,9 @@ pub mod da_router;
 
 // Coordinator types (14A.2B.1.11)
 pub mod coordinator;
+
+// Gating system (14B)
+pub mod gating;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
@@ -238,6 +305,9 @@ pub use da_router::{
 
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
+
+// Gating types (14B.1)
+pub use gating::{NodeIdentity, NodeClass, IdentityError};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
