@@ -8,7 +8,7 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1 — 14B.3)
+//! ## Current Components (14B.1 — 14B.4)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
@@ -19,11 +19,13 @@
 //! | `StatusTransition` | `node_status` | Record of a status change event |
 //! | `StakeRequirement` | `stake` | Per-class minimum stake thresholds (18-decimal on-chain units) |
 //! | `StakeError` | `stake` | Structured errors for stake verification failures |
+//! | `CooldownPeriod` | `cooldown` | Cooldown period after slashing: start, duration, reason |
+//! | `CooldownConfig` | `cooldown` | Default (24h) and severe (7d) cooldown durations |
+//! | `CooldownStatus` | `cooldown` | Cooldown state: NoCooldown, InCooldown, Expired |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `SlashingCooldown` — Cooldown period tracking after slashing events (14B.4)
 //! - `TLSCertInfo` — TLS certificate validation types (14B.5)
 //! - `GatingError` — Comprehensive gating error types (14B.6)
 //! - `GatingPolicy` — Combined gating policy configuration (14B.7)
@@ -34,6 +36,7 @@
 pub mod identity;
 pub mod node_status;
 pub mod stake;
+pub mod cooldown;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
@@ -42,3 +45,4 @@ pub mod stake;
 pub use identity::{IdentityError, NodeClass, NodeIdentity};
 pub use node_status::{NodeStatus, StatusTransition};
 pub use stake::{StakeRequirement, StakeError};
+pub use cooldown::{CooldownPeriod, CooldownConfig, CooldownStatus};

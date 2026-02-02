@@ -314,6 +314,34 @@
 //! Both methods are pure functions — deterministic, no side effects, no
 //! external configuration. Stake verification does NOT automatically trigger
 //! status transitions; callers decide how to act on the result.
+//!
+//! ### Slashing Cooldown
+//!
+//! After a node is banned, a cooldown period prevents immediate re-registration.
+//! The cooldown duration depends on the severity of the offense:
+//!
+//! ```text
+//! Severity    Duration        Seconds
+//! ─────────── ─────────────── ────────
+//! Default     24 hours        86,400
+//! Severe      7 days          604,800
+//! ```
+//!
+//! `CooldownPeriod` tracks the start time, duration, and reason for each
+//! cooldown. All time queries (`is_active`, `remaining_secs`, `expires_at`)
+//! are pure functions that take a `current_timestamp` parameter — there is
+//! no system clock access or non-deterministic time source.
+//!
+//! `CooldownConfig` holds the default and severe durations, and provides
+//! `create_cooldown(severe, timestamp, reason)` to construct a new
+//! `CooldownPeriod` with the appropriate duration.
+//!
+//! `CooldownStatus` is a data enum with three states: `NoCooldown`,
+//! `InCooldown(CooldownPeriod)`, and `Expired(CooldownPeriod)`. It does
+//! NOT trigger status transitions — the caller must explicitly transition
+//! `Banned → Pending` after verifying that the cooldown has expired.
+//! Cooldown expiry does NOT mean automatic re-activation; the node must
+//! still pass all gating checks to become `Active`.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -349,6 +377,7 @@ pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream, DAConf
 
 // DA Layer implementations
 pub use celestia_da::CelestiaDA;
+
 pub use mock_da::MockDA;
 
 // DA Health Monitor types (14A.1A.11)
@@ -367,10 +396,11 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.3)
+// Gating types (14B.1 — 14B.4)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};
+pub use gating::{CooldownPeriod, CooldownConfig, CooldownStatus};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
