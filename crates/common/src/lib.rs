@@ -443,6 +443,28 @@
 //! and implement `Clone`, `Debug`, `PartialEq`, and `Eq`. No errors
 //! are filtered, merged, or reordered. Checks are stored in the
 //! order provided by the caller.
+//!
+//! ### Node Registry & Identity Challenge
+//!
+//! `NodeRegistryEntry` is the single source of truth for a node's
+//! current state in the gating system. It combines identity, class,
+//! status, stake, timestamps, cooldown, and TLS metadata into one
+//! record. The `is_eligible_for_scheduling(now)` method performs a
+//! deterministic eligibility check: the node must be `Active`, have
+//! stake at or above `NodeClass::min_stake()`, and have no active
+//! cooldown at the given timestamp. TLS and identity proof are NOT
+//! checked in this method — they are separate gating steps.
+//!
+//! `IdentityChallenge` represents a challenge nonce issued to a node
+//! to prove ownership of its Ed25519 private key. The challenger
+//! generates the nonce externally; this module never generates nonces.
+//!
+//! `IdentityProof` contains the challenge, the Ed25519 signature over
+//! the raw nonce bytes (no prefix, no suffix, no domain separator),
+//! and the node identity. The `verify()` method uses
+//! `ed25519_dalek::VerifyingKey::verify_strict` to perform cofactored
+//! verification that rejects weak keys and non-canonical signatures.
+//! All crypto failures return `false` — no panics.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -496,7 +518,7 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.8)
+// Gating types (14B.1 — 14B.9)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};
@@ -505,6 +527,8 @@ pub use gating::{TLSCertInfo, TLSValidationError};
 pub use gating::GatingError;
 pub use gating::GatingPolicy;
 pub use gating::{GatingDecision, CheckResult, GatingReport};
+pub use gating::NodeRegistryEntry;
+pub use gating::{IdentityChallenge, IdentityProof};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES

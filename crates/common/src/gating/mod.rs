@@ -8,7 +8,7 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1 — 14B.8)
+//! ## Current Components (14B.1 — 14B.9)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
@@ -29,11 +29,13 @@
 //! | `GatingDecision` | `decision` | Final gating output: Approved or Rejected with errors |
 //! | `CheckResult` | `decision` | Individual check outcome: name, passed, optional detail |
 //! | `GatingReport` | `decision` | Full audit report: identity, decision, checks, timestamp, evaluator |
+//! | `NodeRegistryEntry` | `registry_entry` | Single source of truth: identity, class, status, stake, cooldown, TLS |
+//! | `IdentityChallenge` | `challenge` | Challenge nonce for identity ownership verification |
+//! | `IdentityProof` | `challenge` | Ed25519 signature proof over raw challenge nonce |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `NodeRegistryEntry` — Shared registry entry type (14B.9)
 //! - Integration tests and final documentation (14B.10)
 
 pub mod identity;
@@ -44,6 +46,8 @@ pub mod tls;
 pub mod error;
 pub mod policy;
 pub mod decision;
+pub mod registry_entry;
+pub mod challenge;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
@@ -57,3 +61,5 @@ pub use tls::{TLSCertInfo, TLSValidationError};
 pub use error::GatingError;
 pub use policy::GatingPolicy;
 pub use decision::{GatingDecision, CheckResult, GatingReport};
+pub use registry_entry::NodeRegistryEntry;
+pub use challenge::{IdentityChallenge, IdentityProof};
