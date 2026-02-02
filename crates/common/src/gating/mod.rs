@@ -8,7 +8,7 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1 — 14B.2)
+//! ## Current Components (14B.1 — 14B.3)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
@@ -17,11 +17,12 @@
 //! | `IdentityError` | `identity` | Structured errors for identity verification operations |
 //! | `NodeStatus` | `node_status` | Lifecycle states: Pending, Active, Quarantined, Banned |
 //! | `StatusTransition` | `node_status` | Record of a status change event |
+//! | `StakeRequirement` | `stake` | Per-class minimum stake thresholds (18-decimal on-chain units) |
+//! | `StakeError` | `stake` | Structured errors for stake verification failures |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `StakeRequirement` — Per-class stake thresholds with on-chain precision (14B.3)
 //! - `SlashingCooldown` — Cooldown period tracking after slashing events (14B.4)
 //! - `TLSCertInfo` — TLS certificate validation types (14B.5)
 //! - `GatingError` — Comprehensive gating error types (14B.6)
@@ -32,6 +33,7 @@
 
 pub mod identity;
 pub mod node_status;
+pub mod stake;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
@@ -39,3 +41,4 @@ pub mod node_status;
 
 pub use identity::{IdentityError, NodeClass, NodeIdentity};
 pub use node_status::{NodeStatus, StatusTransition};
+pub use stake::{StakeRequirement, StakeError};

@@ -287,6 +287,33 @@
 //! All other transitions are rejected. Self-transitions (e.g., `Active → Active`)
 //! are forbidden. There are no implicit re-activation paths — a `Banned` node
 //! must always pass through `Pending` before becoming `Active` again.
+//!
+//! ### Stake Requirements & Class Gating
+//!
+//! Every service node must hold a minimum stake (in smallest on-chain units,
+//! 18 decimals) to participate. The required amount depends on the node's class:
+//!
+//! ```text
+//! Class       Human-Readable    On-Chain (18 decimals)
+//! ─────────── ───────────────── ──────────────────────────────
+//! Storage     5000 NUSA         5_000_000_000_000_000_000_000
+//! Compute      500 NUSA           500_000_000_000_000_000_000
+//! ```
+//!
+//! `StakeRequirement` holds these thresholds and provides two operations:
+//!
+//! - **`check(class, actual_stake)`**: Validates that a stake amount meets
+//!   the minimum for a specific class. Returns `Ok(())` or a structured
+//!   `StakeError`. Zero stake is always rejected (`StakeError::ZeroStake`),
+//!   even before checking class minimums.
+//!
+//! - **`classify_by_stake(stake)`**: Determines the highest class a stake
+//!   qualifies for. Storage is checked first (highest), then Compute. Zero
+//!   stake and amounts below all minimums return `None`.
+//!
+//! Both methods are pure functions — deterministic, no side effects, no
+//! external configuration. Stake verification does NOT automatically trigger
+//! status transitions; callers decide how to act on the result.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -340,9 +367,10 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.2)
+// Gating types (14B.1 — 14B.3)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
+pub use gating::{StakeRequirement, StakeError};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
