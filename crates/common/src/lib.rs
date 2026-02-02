@@ -395,6 +395,29 @@
 //! `GatingError` implements `Clone`, `Debug`, `PartialEq`, `Eq`,
 //! `Serialize`, `Deserialize`, `Display`, and `std::error::Error`.
 //! No `thiserror`, `anyhow`, or implicit error wrapping is used.
+//!
+//! ### Gating Policy
+//!
+//! `GatingPolicy` is the single source of truth for all gating
+//! configuration. It combines stake thresholds, cooldown durations,
+//! TLS requirements, identity proof requirements, and scheduling rules
+//! into one validated configuration object.
+//!
+//! Two presets are provided:
+//!
+//! - **`default()`** (production): All security checks enabled
+//!   (`require_tls = true`, `require_identity_proof = true`),
+//!   standard stake thresholds and cooldown durations, pending
+//!   scheduling disabled.
+//! - **`permissive()`** (testing only): All checks disabled, zero
+//!   stake thresholds, zero cooldown durations, pending scheduling
+//!   allowed.
+//!
+//! `validate()` must be called before using a policy in the admission
+//! engine. It detects internal contradictions such as inverted stake
+//! hierarchies (compute minimum exceeding storage minimum) and zero
+//! stake thresholds combined with enabled security checks. The policy
+//! affects both admission decisions and scheduling eligibility.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -448,13 +471,14 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.6)
+// Gating types (14B.1 — 14B.7)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};
 pub use gating::{CooldownPeriod, CooldownConfig, CooldownStatus};
 pub use gating::{TLSCertInfo, TLSValidationError};
 pub use gating::GatingError;
+pub use gating::GatingPolicy;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
