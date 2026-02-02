@@ -8,18 +8,19 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1)
+//! ## Current Components (14B.1 — 14B.2)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
 //! | `NodeIdentity` | `identity` | Cryptographic identity: Ed25519 key, operator wallet, TLS fingerprint |
 //! | `NodeClass` | `identity` | Node classification: Storage (5000 NUSA) or Compute (500 NUSA) |
 //! | `IdentityError` | `identity` | Structured errors for identity verification operations |
+//! | `NodeStatus` | `node_status` | Lifecycle states: Pending, Active, Quarantined, Banned |
+//! | `StatusTransition` | `node_status` | Record of a status change event |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `NodeStatus` — Lifecycle states: Pending, Active, Quarantined, Banned (14B.2)
 //! - `StakeRequirement` — Per-class stake thresholds with on-chain precision (14B.3)
 //! - `SlashingCooldown` — Cooldown period tracking after slashing events (14B.4)
 //! - `TLSCertInfo` — TLS certificate validation types (14B.5)
@@ -30,9 +31,11 @@
 //! - Integration tests and final documentation (14B.10)
 
 pub mod identity;
+pub mod node_status;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
 
 pub use identity::{IdentityError, NodeClass, NodeIdentity};
+pub use node_status::{NodeStatus, StatusTransition};

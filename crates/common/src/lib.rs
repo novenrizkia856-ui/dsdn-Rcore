@@ -253,6 +253,40 @@
 //!   mismatch (validated in upper layers, 14B.5/14B.23).
 //! - **No silent failures**: All verification errors are structured and
 //!   propagated. No `panic!`, `unwrap()`, or `expect()` in production code.
+//!
+//! ### Node Lifecycle & Status Transitions
+//!
+//! Every service node is in exactly one of four lifecycle states:
+//!
+//! - **`Pending`**: Newly registered on-chain, awaiting gating verification
+//!   (stake check, identity proof, TLS validation). Not schedulable.
+//! - **`Active`**: All gating checks have passed. This is the ONLY state
+//!   in which a node can be scheduled for workloads by the coordinator.
+//! - **`Quarantined`**: Suspended due to stake dropping below the class
+//!   minimum or a minor protocol violation. The node retains its registration
+//!   but cannot receive new workloads. Recovery to `Active` requires stake
+//!   restoration and re-verification — there is no automatic recovery.
+//! - **`Banned`**: Permanently removed from the active set due to identity
+//!   spoofing or severe slashing. The node must wait for its cooldown period
+//!   to expire, then re-register as `Pending`. There is no direct path from
+//!   `Banned` to `Active`.
+//!
+//! The allowed transitions form a **closed set** — only these 7 transitions
+//! are permitted:
+//!
+//! ```text
+//! Pending       → Active          (all gating checks pass)
+//! Pending       → Banned          (identity spoofing detected)
+//! Active        → Quarantined     (stake drop or minor violation)
+//! Active        → Banned          (severe slashing event)
+//! Quarantined   → Active          (stake restored + re-check pass)
+//! Quarantined   → Banned          (further violation while quarantined)
+//! Banned        → Pending         (cooldown expired, must re-register)
+//! ```
+//!
+//! All other transitions are rejected. Self-transitions (e.g., `Active → Active`)
+//! are forbidden. There are no implicit re-activation paths — a `Banned` node
+//! must always pass through `Pending` before becoming `Active` again.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -306,8 +340,9 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1)
+// Gating types (14B.1 — 14B.2)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
+pub use gating::{NodeStatus, StatusTransition};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
