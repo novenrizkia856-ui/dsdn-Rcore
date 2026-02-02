@@ -465,6 +465,106 @@
 //! `ed25519_dalek::VerifyingKey::verify_strict` to perform cofactored
 //! verification that rejects weak keys and non-canonical signatures.
 //! All crypto failures return `false` — no panics.
+//!
+//! ### Architecture Overview
+//!
+//! The gating system is a pipeline of deterministic checks. Each check
+//! is independent, stateless, and produces explicit pass/fail results.
+//! No check relies on the outcome of another. The evaluation flow is:
+//!
+//! ```text
+//!                ┌─────────────────┐
+//!                │  NodeIdentity   │  Ed25519 key + operator wallet + TLS fingerprint
+//!                └────────┬────────┘
+//!                         │
+//!                ┌────────▼────────┐
+//!                │NodeRegistryEntry│  class, status, stake, cooldown, tls_info
+//!                └────────┬────────┘
+//!                         │
+//!           ┌─────────────┼─────────────┐
+//!           │             │             │
+//!    ┌──────▼──────┐ ┌───▼───┐  ┌──────▼──────┐
+//!    │StakeRequire.│ │  TLS  │  │  Cooldown   │
+//!    │  .check()   │ │ valid │  │ .is_active()│
+//!    └──────┬──────┘ └───┬───┘  └──────┬──────┘
+//!           │            │             │
+//!           └─────────┬──┴─────────────┘
+//!                     │
+//!              ┌──────▼──────┐
+//!              │IdentityProof│  challenge–response (Ed25519 over raw nonce)
+//!              │  .verify()  │
+//!              └──────┬──────┘
+//!                     │
+//!              ┌──────▼──────┐
+//!              │GatingPolicy │  combined thresholds and feature flags
+//!              │ .validate() │
+//!              └──────┬──────┘
+//!                     │
+//!              ┌──────▼──────┐
+//!              │GatingDecision│  Approved │ Rejected(Vec<GatingError>)
+//!              └──────┬──────┘
+//!                     │
+//!              ┌──────▼──────┐
+//!              │ GatingReport │  audit trail: identity, decision, checks, timestamp
+//!              └─────────────┘
+//! ```
+//!
+//! ### Type Catalog (14B.1 — 14B.9)
+//!
+//! | Type | Module | Primary Invariant |
+//! |------|--------|-------------------|
+//! | `NodeIdentity` | identity | 32-byte Ed25519 key + 20-byte wallet + 32-byte TLS fingerprint |
+//! | `NodeClass` | identity | Storage (5000 NUSA) or Compute (500 NUSA); min_stake() is authoritative |
+//! | `IdentityError` | identity | Structured Ed25519 verification errors, no panic |
+//! | `NodeStatus` | node_status | Exactly one of: Pending, Active, Quarantined, Banned |
+//! | `StatusTransition` | node_status | Records from/to/timestamp; only 7 valid transitions |
+//! | `StakeRequirement` | stake | 18-decimal on-chain unit thresholds; check() returns ZeroStake or InsufficientStake |
+//! | `StakeError` | stake | ZeroStake always checked first; InsufficientStake includes required/actual/class |
+//! | `CooldownPeriod` | cooldown | start + duration → expires_at(); is_active(now) is authoritative |
+//! | `CooldownConfig` | cooldown | Default 24h, severe 7d; create_cooldown() is the only constructor |
+//! | `CooldownStatus` | cooldown | NoCooldown, InCooldown, Expired — no automatic transition |
+//! | `TLSCertInfo` | tls | SHA-256 fingerprint; is_valid_at() checks not_before ≤ t ≤ not_after |
+//! | `TLSValidationError` | tls | Structured TLS validation errors, no X.509 parsing |
+//! | `GatingError` | error | Non-overlapping error variants covering all gating failures |
+//! | `GatingPolicy` | policy | Combined config; validate() detects contradictions before use |
+//! | `GatingDecision` | decision | Approved or Rejected(errors); errors() returns &[] for Approved |
+//! | `CheckResult` | decision | check_name + passed + optional detail for each individual check |
+//! | `GatingReport` | decision | Full audit: identity, decision, ordered checks, timestamp, evaluator |
+//! | `NodeRegistryEntry` | registry_entry | Single source of truth; is_eligible checks status + stake + cooldown |
+//! | `IdentityChallenge` | challenge | Opaque 32-byte nonce + timestamp + challenger string |
+//! | `IdentityProof` | challenge | Ed25519 verify_strict over raw nonce; all failures return false |
+//!
+//! ### Usage Flow
+//!
+//! A typical gating evaluation follows these steps:
+//!
+//! 1. **Identity creation**: A node registers with an Ed25519 key,
+//!    operator wallet, and TLS certificate fingerprint, forming a
+//!    `NodeIdentity`.
+//!
+//! 2. **Registry entry**: The coordinator creates a `NodeRegistryEntry`
+//!    with the node's identity, class, initial status (`Pending`),
+//!    and on-chain stake amount.
+//!
+//! 3. **Policy evaluation**: A `GatingPolicy` defines the thresholds.
+//!    `validate()` is called to detect contradictions before use.
+//!
+//! 4. **Check execution**: Each check (stake, TLS, cooldown, identity
+//!    proof) runs independently and produces a `CheckResult`. Failed
+//!    checks produce `GatingError` values.
+//!
+//! 5. **Decision**: If all checks pass → `GatingDecision::Approved`.
+//!    If any fail → `GatingDecision::Rejected(errors)`. Errors are
+//!    never filtered or merged.
+//!
+//! 6. **Report**: A `GatingReport` captures the full evaluation:
+//!    identity, decision, ordered checks, caller-provided timestamp,
+//!    and evaluator string. `to_json()` serializes for audit.
+//!    `summary()` returns a single-line human-readable result.
+//!
+//! All steps are deterministic. No system clock is accessed internally.
+//! No implicit trust is granted. A valid identity proof only confirms
+//! private key possession — it does not bypass stake or TLS checks.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -518,7 +618,7 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.9)
+// Gating types (14B.1 — 14B.9, tested by 14B.10)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};

@@ -33,10 +33,11 @@
 //! | `IdentityChallenge` | `challenge` | Challenge nonce for identity ownership verification |
 //! | `IdentityProof` | `challenge` | Ed25519 signature proof over raw challenge nonce |
 //!
-//! ## Planned Components
+//! ## Test Coverage
 //!
-//! Future sub-stages will add:
-//! - Integration tests and final documentation (14B.10)
+//! The `tests` module (14B.10) provides comprehensive integration tests
+//! covering all gating types, transitions, eligibility, crypto verification,
+//! serialization roundtrips, and end-to-end flows.
 
 pub mod identity;
 pub mod node_status;
@@ -48,6 +49,9 @@ pub mod policy;
 pub mod decision;
 pub mod registry_entry;
 pub mod challenge;
+
+#[cfg(test)]
+mod tests;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
