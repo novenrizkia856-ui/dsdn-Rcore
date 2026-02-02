@@ -8,7 +8,7 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1 — 14B.7)
+//! ## Current Components (14B.1 — 14B.8)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
@@ -26,11 +26,13 @@
 //! | `TLSValidationError` | `tls` | Structured errors for TLS certificate validation |
 //! | `GatingError` | `error` | Comprehensive gating error types for admission control |
 //! | `GatingPolicy` | `policy` | Combined gating policy configuration: stake, cooldown, TLS, identity |
+//! | `GatingDecision` | `decision` | Final gating output: Approved or Rejected with errors |
+//! | `CheckResult` | `decision` | Individual check outcome: name, passed, optional detail |
+//! | `GatingReport` | `decision` | Full audit report: identity, decision, checks, timestamp, evaluator |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `GatingDecision` — Approval/rejection decision with audit report (14B.8)
 //! - `NodeRegistryEntry` — Shared registry entry type (14B.9)
 //! - Integration tests and final documentation (14B.10)
 
@@ -41,6 +43,7 @@ pub mod cooldown;
 pub mod tls;
 pub mod error;
 pub mod policy;
+pub mod decision;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
@@ -53,3 +56,4 @@ pub use cooldown::{CooldownPeriod, CooldownConfig, CooldownStatus};
 pub use tls::{TLSCertInfo, TLSValidationError};
 pub use error::GatingError;
 pub use policy::GatingPolicy;
+pub use decision::{GatingDecision, CheckResult, GatingReport};

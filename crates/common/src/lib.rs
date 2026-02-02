@@ -418,6 +418,31 @@
 //! hierarchies (compute minimum exceeding storage minimum) and zero
 //! stake thresholds combined with enabled security checks. The policy
 //! affects both admission decisions and scheduling eligibility.
+//!
+//! ### Gating Decision & Report
+//!
+//! `GatingDecision` is the final output of a gating evaluation:
+//! `Approved` if the node passed all checks, or `Rejected` with a
+//! `Vec<GatingError>` containing every failure reason in evaluation
+//! order. The `errors()` method returns a borrowed slice — no
+//! allocation occurs for `Approved` (returns `&[]`).
+//!
+//! `CheckResult` records the outcome of a single gating check:
+//! a descriptive name (e.g., `"stake_check"`, `"tls_validation"`),
+//! a `passed` flag, and an optional `detail` string for diagnostics.
+//!
+//! `GatingReport` is the full audit trail of an evaluation: the
+//! evaluated node's identity, the final decision, an ordered list
+//! of check results, the evaluation timestamp (caller-provided,
+//! not system clock), and the evaluator identifier (e.g.,
+//! `"coordinator"`, `"scheduler"`, `"cli"`). The `summary()` method
+//! returns a single-line human-readable string. The `to_json()`
+//! method serializes the entire report via `serde_json`.
+//!
+//! All decision and report types are deterministic, serializable,
+//! and implement `Clone`, `Debug`, `PartialEq`, and `Eq`. No errors
+//! are filtered, merged, or reordered. Checks are stored in the
+//! order provided by the caller.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -471,7 +496,7 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.7)
+// Gating types (14B.1 — 14B.8)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};
@@ -479,6 +504,7 @@ pub use gating::{CooldownPeriod, CooldownConfig, CooldownStatus};
 pub use gating::{TLSCertInfo, TLSValidationError};
 pub use gating::GatingError;
 pub use gating::GatingPolicy;
+pub use gating::{GatingDecision, CheckResult, GatingReport};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
