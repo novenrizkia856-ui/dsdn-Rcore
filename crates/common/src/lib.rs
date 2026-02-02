@@ -342,6 +342,33 @@
 //! `Banned → Pending` after verifying that the cooldown has expired.
 //! Cooldown expiry does NOT mean automatic re-activation; the node must
 //! still pass all gating checks to become `Active`.
+//!
+//! ### TLS Certificate Validation
+//!
+//! Each node's TLS certificate is bound to its [`NodeIdentity`] via the
+//! SHA-256 fingerprint of the DER-encoded certificate. This binding
+//! prevents MITM attacks and certificate spoofing — a node cannot
+//! impersonate another by presenting a different certificate.
+//!
+//! `TLSCertInfo` captures pre-extracted certificate metadata: the SHA-256
+//! fingerprint, subject Common Name, issuer, and the validity window
+//! (`not_before` / `not_after` as Unix timestamps). It provides:
+//!
+//! - **`is_valid_at(timestamp)`**: Returns `true` when
+//!   `not_before <= timestamp <= not_after` (both inclusive).
+//! - **`is_expired(timestamp)`**: Returns `true` when
+//!   `timestamp > not_after` (strictly past the end).
+//! - **`compute_fingerprint(der_bytes)`**: Computes SHA-256 over raw
+//!   DER certificate bytes. Pure function, deterministic.
+//! - **`matches_identity(identity)`**: Strict 32-byte comparison of
+//!   the certificate fingerprint against `NodeIdentity.tls_cert_fingerprint`.
+//!   No fallback to subject CN or issuer.
+//!
+//! This module does NOT perform full X.509 parsing or ASN.1 decoding —
+//! that is the transport layer's responsibility. All time checks are
+//! based on caller-provided timestamps with no system clock access.
+//! A valid TLS certificate does NOT automatically make a node Active;
+//! it is one of several gating checks that must all pass.
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -377,7 +404,6 @@ pub use da::{DALayer, DAError, DAHealthStatus, BlobRef, Blob, BlobStream, DAConf
 
 // DA Layer implementations
 pub use celestia_da::CelestiaDA;
-
 pub use mock_da::MockDA;
 
 // DA Health Monitor types (14A.1A.11)
@@ -396,11 +422,12 @@ pub use da_router::{
 // Coordinator types (14A.2B.1.11)
 pub use coordinator::*;
 
-// Gating types (14B.1 — 14B.4)
+// Gating types (14B.1 — 14B.5)
 pub use gating::{NodeIdentity, NodeClass, IdentityError};
 pub use gating::{NodeStatus, StatusTransition};
 pub use gating::{StakeRequirement, StakeError};
 pub use gating::{CooldownPeriod, CooldownConfig, CooldownStatus};
+pub use gating::{TLSCertInfo, TLSValidationError};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES

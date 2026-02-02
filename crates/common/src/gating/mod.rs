@@ -8,7 +8,7 @@
 //! nodes can participate in the DSDN network. It serves as a security gate —
 //! not an economic incentive mechanism.
 //!
-//! ## Current Components (14B.1 — 14B.4)
+//! ## Current Components (14B.1 — 14B.5)
 //!
 //! | Type | Module | Purpose |
 //! |------|--------|---------|
@@ -22,11 +22,12 @@
 //! | `CooldownPeriod` | `cooldown` | Cooldown period after slashing: start, duration, reason |
 //! | `CooldownConfig` | `cooldown` | Default (24h) and severe (7d) cooldown durations |
 //! | `CooldownStatus` | `cooldown` | Cooldown state: NoCooldown, InCooldown, Expired |
+//! | `TLSCertInfo` | `tls` | TLS certificate metadata: fingerprint, validity, subject, issuer |
+//! | `TLSValidationError` | `tls` | Structured errors for TLS certificate validation |
 //!
 //! ## Planned Components
 //!
 //! Future sub-stages will add:
-//! - `TLSCertInfo` — TLS certificate validation types (14B.5)
 //! - `GatingError` — Comprehensive gating error types (14B.6)
 //! - `GatingPolicy` — Combined gating policy configuration (14B.7)
 //! - `GatingDecision` — Approval/rejection decision with audit report (14B.8)
@@ -37,6 +38,7 @@ pub mod identity;
 pub mod node_status;
 pub mod stake;
 pub mod cooldown;
+pub mod tls;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RE-EXPORTS
@@ -46,3 +48,4 @@ pub use identity::{IdentityError, NodeClass, NodeIdentity};
 pub use node_status::{NodeStatus, StatusTransition};
 pub use stake::{StakeRequirement, StakeError};
 pub use cooldown::{CooldownPeriod, CooldownConfig, CooldownStatus};
+pub use tls::{TLSCertInfo, TLSValidationError};
