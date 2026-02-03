@@ -77,6 +77,7 @@ use dsdn_common::{CelestiaDA, DAConfig, DAError, DAHealthStatus, DALayer, MockDA
 use dsdn_common::da::DAMetricsSnapshot;
 use dsdn_coordinator::{Coordinator, NodeInfo, Workload, ReconciliationConfig};
 use parking_lot::RwLock;
+mod handlers;
 
 // ════════════════════════════════════════════════════════════════════════════
 // FALLBACK DA TYPES (14A.1A.35)
@@ -2183,6 +2184,7 @@ async fn main() {
         .route("/schedule", post(schedule_workload))
         .route("/health", get(health_check))
         .route("/ready", get(ready_check))
+        .merge(handlers::extended_routes())
         // Fallback HTTP endpoints (14A.1A.38)
         .route("/fallback/status", get(get_fallback_status))
         .route("/fallback/pending", get(get_pending_blobs))
