@@ -23,3 +23,7 @@ thiserror = "1.0"
 
 wat = "1.0"
 tonic = { version = "0.9", features = ["transport"] }
+
+[[bin]]
+name = "run_wasm_client"
+path = "src/bin/run_wasm_client.rs"

@@ -19,3 +19,7 @@ futures = "0.3"
 sha3 = "0.10"
 bincode = { version = "2.0.1", features = ["serde"] }
 async-trait = "0.1"
+
+[[bin]]
+name = "dsdn-coordinator"
+path = "src/main.rs"
