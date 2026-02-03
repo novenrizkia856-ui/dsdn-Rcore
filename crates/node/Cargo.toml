@@ -9,7 +9,7 @@ dsdn-storage = { path = "../storage" }
 dsdn-coordinator = { path = "../coordinator" }
 dsdn-runtime-wasm = { path = "../runtime_wasm" }
 
-tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "time", "signal"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -23,6 +23,10 @@ thiserror = "1.0"
 
 wat = "1.0"
 tonic = { version = "0.9", features = ["transport"] }
+
+[[bin]]
+name = "dsdn-node"
+path = "src/main.rs"
 
 [[bin]]
 name = "run_wasm_client"
