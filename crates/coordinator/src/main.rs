@@ -2,6 +2,14 @@
 //!
 //! Production coordinator with Celestia mainnet integration and DARouter fallback support.
 //!
+//! ## Environment File Loading
+//!
+//! The coordinator automatically loads configuration from environment files:
+//!
+//! 1. `DSDN_ENV_FILE` environment variable (custom path)
+//! 2. `.env.mainnet` (production default - **DSDN defaults to mainnet**)
+//! 3. `.env` (fallback for development)
+//!
 //! ## Configuration
 //!
 //! The coordinator loads configuration from environment variables for production:
@@ -10,7 +18,7 @@
 //! - `DA_RPC_URL`: Celestia light node RPC endpoint (required)
 //! - `DA_NAMESPACE`: 58-character hex namespace (required)
 //! - `DA_AUTH_TOKEN`: Authentication token (required for mainnet)
-//! - `DA_NETWORK`: Network identifier (mainnet, mocha, local)
+//! - `DA_NETWORK`: Network identifier (**default: mainnet**, options: mocha, local)
 //! - `DA_TIMEOUT_MS`: Operation timeout in milliseconds
 //! - `DA_RETRY_COUNT`: Number of retries for failed operations
 //! - `DA_RETRY_DELAY_MS`: Delay between retries
@@ -1259,6 +1267,14 @@ impl CoordinatorConfig {
     /// * `Ok(CoordinatorConfig)` - Configuration loaded successfully
     /// * `Err(String)` - Missing or invalid configuration
     pub fn from_env() -> Result<Self, String> {
+        // ─────────────────────────────────────────────────────────────────────
+        // Set default DA_NETWORK to mainnet if not specified
+        // DSDN defaults to mainnet for production-first approach
+        // ─────────────────────────────────────────────────────────────────────
+        if std::env::var("DA_NETWORK").is_err() {
+            std::env::set_var("DA_NETWORK", "mainnet");
+        }
+
         // Check if we should use mock DA
         let use_mock_da = std::env::var("USE_MOCK_DA")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1916,11 +1932,48 @@ fn initialize_emergency_da(config: &CoordinatorConfig) -> Option<Arc<dyn DALayer
 
 #[tokio::main]
 async fn main() {
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 0: Load environment from .env.mainnet (default) or custom env file
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    // Priority order for env file loading:
+    // 1. DSDN_ENV_FILE environment variable (custom path)
+    // 2. .env.mainnet (production default - DSDN defaults to mainnet)
+    // 3. .env (fallback for development)
+    let env_file = std::env::var("DSDN_ENV_FILE").unwrap_or_else(|_| {
+        if std::path::Path::new(".env.mainnet").exists() {
+            ".env.mainnet".to_string()
+        } else if std::path::Path::new(".env").exists() {
+            ".env".to_string()
+        } else {
+            ".env.mainnet".to_string() // Will fail gracefully if not exists
+        }
+    });
+    
+    match dotenvy::from_filename(&env_file) {
+        Ok(path) => {
+            // Will log after tracing is initialized
+            std::env::set_var("_DSDN_LOADED_ENV_FILE", path.display().to_string());
+        }
+        Err(e) => {
+            // Check if it's just file not found (acceptable) vs other errors
+            if !matches!(e, dotenvy::Error::Io(_)) {
+                eprintln!("⚠️  Warning: Failed to load {}: {}", env_file, e);
+            }
+            // Continue without env file - will use environment variables directly
+        }
+    }
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
+
+    // Log which env file was loaded (if any)
+    if let Ok(loaded_file) = std::env::var("_DSDN_LOADED_ENV_FILE") {
+        info!("📁 Loaded configuration from: {}", loaded_file);
+    }
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("              DSDN Coordinator (Mainnet Ready)                  ");
@@ -1942,9 +1995,12 @@ async fn main() {
             error!("  DA_AUTH_TOKEN    - Authentication token (required for mainnet)");
             error!("");
             error!("Optional (Primary DA):");
-            error!("  DA_NETWORK       - Network identifier (mainnet, mocha, local)");
+            error!("  DA_NETWORK       - Network identifier (default: mainnet, options: mocha, local)");
             error!("  DA_TIMEOUT_MS    - Operation timeout (default: 30000)");
             error!("  USE_MOCK_DA      - Use mock DA for development (default: false)");
+            error!("");
+            error!("Environment file loading (automatic):");
+            error!("  DSDN_ENV_FILE    - Custom env file path (default: .env.mainnet)");
             error!("");
             error!("Optional (Fallback DA):");
             error!("  ENABLE_FALLBACK  - Enable fallback DA (default: false)");

@@ -20,6 +20,7 @@ sha3 = "0.10"
 bincode = { version = "2.0.1", features = ["serde"] }
 async-trait = "0.1"
 hex = "0.4"
+dotenvy = "0.15"
 
 [[bin]]
 name = "dsdn-coordinator"
