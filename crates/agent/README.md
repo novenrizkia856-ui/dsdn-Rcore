@@ -9,7 +9,7 @@ The DSDN Agent provides a comprehensive CLI for interacting with the DSDN networ
 ## Installation
 
 ```bash
-cargo build --release -p dsdn-agent
+cargo rustsp build --release -p dsdn-agent
 ```
 
 ## Commands

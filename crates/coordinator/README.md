@@ -90,7 +90,7 @@ The Coordinator is the central orchestration component of DSDN (Decentralized St
 
 ```bash
 # Run coordinator with mock DA (no Celestia required)
-USE_MOCK_DA=true cargo run -p dsdn-coordinator
+USE_MOCK_DA=true cargo rustsp run -p dsdn-coordinator
 
 # Coordinator listens on http://127.0.0.1:8080
 ```
@@ -105,7 +105,7 @@ export DA_AUTH_TOKEN="your-auth-token"
 export DA_NETWORK="mainnet"
 
 # Run coordinator
-cargo run -p dsdn-coordinator --release
+cargo rustsp run -p dsdn-coordinator --release
 ```
 
 ### Quick Test
@@ -617,7 +617,7 @@ crates/coordinator/
 
 ### Unit Tests
 ```bash
-cargo test -p dsdn-coordinator
+cargo rustsp test -p dsdn-coordinator
 ```
 
 ### Integration Tests

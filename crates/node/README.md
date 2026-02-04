@@ -191,13 +191,13 @@ Ini berarti:
 ### Unit Tests
 
 ```bash
-cargo test -p dsdn-node
+cargo rustsp test -p dsdn-node
 ```
 
 ### Integration Tests
 
 ```bash
-cargo test -p dsdn-node --test da_integration
+cargo rustsp test -p dsdn-node --test da_integration
 ```
 
 ### Test Categories

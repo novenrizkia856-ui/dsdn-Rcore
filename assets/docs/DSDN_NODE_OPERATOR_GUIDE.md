@@ -252,7 +252,7 @@ git clone https://github.com/novenrizkia856-ui/dsdn
 cd dsdn
 
 # Build from source
-cargo build --release
+cargo rustsp build --release
 
 # Binary akan ada di ./target/release/
 ```

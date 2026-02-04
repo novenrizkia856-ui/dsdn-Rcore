@@ -485,13 +485,13 @@ Celestia provides Data Availability for control-plane state:
 
 ```bash
 # Build the crate
-cargo build --release
+cargo rustsp build --release
 
 # Run tests
-cargo test
+cargo rustsp test
 
 # Build documentation
-cargo doc --open
+cargo rustsp doc --open
 ```
 
 ## Dependencies

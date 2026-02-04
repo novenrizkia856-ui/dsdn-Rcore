@@ -104,7 +104,7 @@ check_binary() {
         log_warn "Binary not found: $target"
         log_info "Building release binary..."
         cd "$PROJECT_ROOT"
-        cargo build --release --bin "$binary"
+        cargo rustsp build --release --bin "$binary"
     fi
 }
 

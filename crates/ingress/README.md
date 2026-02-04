@@ -157,10 +157,10 @@ Semua komponen thread-safe:
 
 ```bash
 # Unit tests
-cargo test --package dsdn-ingress
+cargo rustsp test --package dsdn-ingress
 
 # Integration tests
-cargo test --package dsdn-ingress --test routing_test
+cargo rustsp test --package dsdn-ingress --test routing_test
 ```
 
 ## License
