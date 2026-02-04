@@ -43,8 +43,9 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tracing::{error, info, warn, Level};
@@ -53,6 +54,7 @@ use uuid::Uuid;
 use dsdn_common::{CelestiaDA, DAConfig, DAError, DAHealthStatus, DALayer, MockDA};
 use dsdn_node::{
     DAInfo, HealthResponse, HealthStorage, NodeDerivedState, NodeHealth,
+    NodeAppState, build_router,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -377,7 +379,46 @@ async fn startup_da_health_check(da: &dyn DALayer) -> Result<(), DAError> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// HTTP SERVER (HEALTH ENDPOINT)
+// HTTP SERVER (AXUM - NEW)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Start HTTP server using Axum with full observability endpoints.
+///
+/// Endpoints: /health /ready /info /status /state /state/fallback
+///            /state/assignments /da/status /metrics /metrics/prometheus
+///
+/// ALL endpoints are READ-ONLY (observability only).
+/// Node receives commands via DA events, NOT via HTTP.
+async fn start_axum_server(
+    addr: SocketAddr,
+    router: Router,
+    shutdown: Arc<Notify>,
+) {
+    info!("🌐 Starting HTTP server on http://{}", addr);
+    info!("   Endpoints: /health /ready /info /status /state /da/status /metrics");
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("Failed to bind HTTP server to {}: {}", addr, e);
+            return;
+        }
+    };
+
+    // Serve with graceful shutdown
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown.notified().await;
+            info!("HTTP server shutting down");
+        })
+        .await
+        .unwrap_or_else(|e| {
+            error!("HTTP server error: {}", e);
+        });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HTTP SERVER (HEALTH ENDPOINT) - LEGACY
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Start a minimal HTTP server for health endpoint.
@@ -577,7 +618,27 @@ async fn main() {
     // Step 6: Setup shutdown signal
     let shutdown = Arc::new(Notify::new());
 
-    // Step 7: Start HTTP server for health endpoint
+    // Step 7: Get start time for uptime tracking
+    let start_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Step 8: Build NodeAppState for Axum handlers
+    let app_state = Arc::new(NodeAppState {
+        node_id: config.node_id.clone(),
+        state: state.clone(),
+        da_info: da_info.clone(),
+        storage: storage.clone(),
+        start_time,
+        da_network: config.da_config.network.clone(),
+        da_endpoint: config.da_config.rpc_url.clone(),
+    });
+
+    // Step 9: Build Axum router
+    let router = build_router(app_state);
+
+    // Step 10: Start HTTP server (Axum)
     let http_addr: SocketAddr = format!("0.0.0.0:{}", config.http_port)
         .parse()
         .unwrap_or_else(|_| {
@@ -586,18 +647,13 @@ async fn main() {
         });
 
     let http_handle = {
-        let node_id = config.node_id.clone();
-        let da_info = da_info.clone();
-        let state = state.clone();
-        let storage = storage.clone();
         let shutdown = shutdown.clone();
-
         tokio::spawn(async move {
-            start_http_server(http_addr, node_id, da_info, state, storage, shutdown).await;
+            start_axum_server(http_addr, router, shutdown).await;
         })
     };
 
-    // Step 8: Start DA follower
+    // Step 11: Start DA follower
     info!("🚀 Starting DA follower...");
     info!("");
     info!("╔═══════════════════════════════════════════════════════════════╗");

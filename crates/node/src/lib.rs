@@ -220,6 +220,7 @@
 pub mod da_follower;
 pub mod delete_handler;
 pub mod event_processor;
+pub mod handlers;
 pub mod health;
 pub mod metrics;
 pub mod multi_da_source;
@@ -240,3 +241,6 @@ pub use metrics::NodeFallbackMetrics;
 pub use multi_da_source::{MultiDASource, MultiDAConfig, DASourceType};
 pub use placement_verifier::{PlacementVerifier, PlacementReport, PlacementDetail, PlacementStatus};
 pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
+
+// HTTP API handlers (Axum) - READ-ONLY observability endpoints
+pub use handlers::{NodeAppState, build_router};

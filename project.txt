@@ -6,3 +6,38 @@ cargo clippy --all-targets --all-features -- -W clippy::all
 test celestia:
 cargo rustsp test --test celestia_mainnet_integration -- --ignored --nocapture
 celestia light start --core.ip rpc.celestia.pops.one:26657 --p2p.network celestia
+
+# === PRIMARY DA ===
+
+$env:DA_RPC_URL = "http://localhost:26658"
+
+$env:DA_NAMESPACE=000000000000000000000000000000000000000064736e6e0000000000
+
+$env:DA_AUTH_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdLCJOb25jZSI6IlppRTZqTkdRQ3FoeVZSS0l4bWZHeVhYVGl5d1p0RWwyMVdwa2tqb1RZWmc9IiwiRXhwaXJlc0F0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoifQ.fCpwvLgJT5cMf23EJhQ-3cLhdMYGHFFhruxqeYGl4SY
+
+
+$env:DA_NETWORK = "mainnet"
+
+$env:DA_TIMEOUT_MS = "30000"
+
+# === FALLBACK DA (Quorum Mode) ===
+
+$env:ENABLE_FALLBACK = "true"
+
+$env:FALLBACK_DA_TYPE = "quorum"
+
+$env:QUORUM_VALIDATORS = "http://validator1:8080,http://validator2:8080,http://validator3:8080"
+
+$env:QUORUM_THRESHOLD = "67"  # 67% minimum
+
+# === RECONCILIATION CONFIG ===
+
+$env:RECONCILE_BATCH_SIZE = "10"
+
+$env:RECONCILE_MAX_RETRIES = "3"
+
+$env:RECONCILE_PARALLEL = "false"
+
+# Run
+
+cargo rustsp run -p dsdn-coordinator --release
