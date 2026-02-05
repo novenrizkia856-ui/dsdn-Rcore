@@ -117,18 +117,63 @@ impl NodeConfig {
         let da_endpoint = args[1].clone();
         let use_mock_da = da_endpoint == "mock";
 
-        // Build DA config for CLI mode
+        // Build DA config for CLI mode.
+        // CLI provides the RPC URL; auth_token, namespace, and other DA
+        // settings are picked up from environment (.env.mainnet already
+        // loaded by load_env_file() before we get here).
         let da_config = if use_mock_da {
             DAConfig::default()
         } else {
+            // --- namespace from env ---
+            let namespace = match env::var("DA_NAMESPACE") {
+                Ok(hex_str) => {
+                    let hex_str = hex_str.trim();
+                    if hex_str.len() == 58 {
+                        let mut ns = [0u8; 29];
+                        let mut valid = true;
+                        for i in 0..29 {
+                            match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
+                                Ok(b) => ns[i] = b,
+                                Err(_) => { valid = false; break; }
+                            }
+                        }
+                        if valid { ns } else {
+                            eprintln!("⚠️  Invalid DA_NAMESPACE hex, using zeroed namespace");
+                            [0u8; 29]
+                        }
+                    } else {
+                        eprintln!("⚠️  DA_NAMESPACE must be 58 hex chars (got {}), using zeroed namespace", hex_str.len());
+                        [0u8; 29]
+                    }
+                }
+                Err(_) => [0u8; 29],
+            };
+
+            // --- auth token from env ---
+            let auth_token = env::var("DA_AUTH_TOKEN").ok().filter(|s| !s.trim().is_empty());
+            if auth_token.is_none() {
+                eprintln!("⚠️  DA_AUTH_TOKEN not set — Celestia will reject requests that need 'read' permission");
+            }
+
+            // --- other DA settings from env with sane defaults ---
+            let network = env::var("DA_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+            let timeout_ms = env::var("DA_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30000u64);
+            let retry_count = env::var("DA_RETRY_COUNT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3u8);
+
             DAConfig {
                 rpc_url: da_endpoint,
-                namespace: [0u8; 29], // Default namespace for CLI mode
-                auth_token: None,
-                timeout_ms: 30000,
-                retry_count: 3,
+                namespace,
+                auth_token,
+                timeout_ms,
+                retry_count,
                 retry_delay_ms: 1000,
-                network: "local".to_string(),
+                network,
                 enable_pooling: true,
                 max_connections: 10,
                 idle_timeout_ms: 60000,
@@ -415,10 +460,11 @@ async fn start_axum_server(
     info!("🌐 Starting HTTP server on http://{}", addr);
     info!("   Endpoints: /health /ready /info /status /state /da/status /metrics");
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
+    let listener = match bind_with_reuse(addr).await {
         Ok(l) => l,
         Err(e) => {
-            error!("Failed to bind HTTP server to {}: {}", addr, e);
+            error!("❌ Failed to bind HTTP server to {}: {}", addr, e);
+            error!("   Hint: kill the previous node process, or use a different --port");
             return;
         }
     };
@@ -433,6 +479,60 @@ async fn start_axum_server(
         .unwrap_or_else(|e| {
             error!("HTTP server error: {}", e);
         });
+}
+
+/// Bind TCP listener with SO_REUSEADDR and retry.
+/// Handles Windows TIME_WAIT issue after rapid restart.
+async fn bind_with_reuse(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    let max_attempts = 5;
+
+    for attempt in 1..=max_attempts {
+        match try_bind_reuse(addr) {
+            Ok(listener) => {
+                if attempt > 1 {
+                    info!("✅ HTTP port {} bound on attempt {}", addr.port(), attempt);
+                }
+                return Ok(listener);
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    warn!(
+                        "Port {} busy (attempt {}/{}): {} — retrying in 2s...",
+                        addr.port(), attempt, max_attempts, e
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } else {
+                    return Err(format!(
+                        "port {} still busy after {} attempts: {}",
+                        addr.port(), max_attempts, e
+                    ));
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// Single bind attempt using socket2 for SO_REUSEADDR.
+fn try_bind_reuse(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(|e| format!("socket create: {}", e))?;
+
+    socket.set_reuse_address(true).map_err(|e| format!("SO_REUSEADDR: {}", e))?;
+    socket.set_nonblocking(true).map_err(|e| format!("nonblocking: {}", e))?;
+
+    let sock_addr: socket2::SockAddr = addr.into();
+    socket.bind(&sock_addr).map_err(|e| format!("bind: {}", e))?;
+    socket.listen(1024).map_err(|e| format!("listen: {}", e))?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener).map_err(|e| format!("tokio wrap: {}", e))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -636,6 +736,7 @@ async fn cmd_run(run_args: &[String]) {
     info!("Config Mode:  {}", config.config_source);
     info!("DA Network:   {}", config.da_config.network);
     info!("DA Endpoint:  {}", config.da_config.rpc_url);
+    info!("DA Auth:      {}", if config.da_config.auth_token.is_some() { "present ✅" } else { "MISSING ❌" });
     info!("Storage Path: {}", config.storage_path);
     info!("HTTP Port:    {}", config.http_port);
     info!("═══════════════════════════════════════════════════════════════");

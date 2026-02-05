@@ -33,7 +33,205 @@ Node adalah komponen penyimpanan dalam jaringan DSDN. Setiap node bertanggung ja
              └───────────────┘
 ```
 
-Node adalah **DA Follower** - node tidak menentukan state sendiri, melainkan mengikuti events dari Data Availability layer.
+Node adalah **DA Follower** — node tidak menentukan state sendiri, melainkan mengikuti events dari Data Availability layer.
+
+## Quick Start
+
+### 1. Siapkan `.env.mainnet`
+
+Buat file `.env.mainnet` di root directory project:
+
+```env
+# ── Node Identity ──
+NODE_ID=auto
+NODE_STORAGE_PATH=./data/node1
+NODE_HTTP_PORT=8080
+
+# ── DA Layer (Celestia) ──
+DA_RPC_URL=http://localhost:26658
+DA_NAMESPACE=0000000000000000000000000000000000000000000000000000000000
+DA_AUTH_TOKEN=your_celestia_auth_token_here
+DA_NETWORK=mainnet
+DA_TIMEOUT_MS=30000
+DA_RETRY_COUNT=3
+
+# ── Optional ──
+# USE_MOCK_DA=true          # Gunakan MockDA untuk development
+# DSDN_ENV_FILE=.env.custom # Custom env file path
+```
+
+### 2. Jalankan Node
+
+```bash
+# Cara paling simpel — otomatis baca .env.mainnet
+dsdn-node run
+
+# Atau eksplisit
+dsdn-node run env
+```
+
+### 3. Cek Status
+
+```bash
+dsdn-node health
+dsdn-node status
+```
+
+## CLI Reference
+
+### `dsdn-node run`
+
+Start node. Ini adalah command utama.
+
+```bash
+# Mode 1: Environment (Production) — DEFAULT
+# Baca config dari .env.mainnet secara otomatis
+dsdn-node run
+dsdn-node run env
+
+# Mode 2: CLI Arguments (Development)
+dsdn-node run <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>
+
+# Contoh:
+dsdn-node run node-1 http://localhost:26658 ./data/node1 8080
+dsdn-node run auto mock ./data/node1 8080
+```
+
+Kalau tidak ada subcommand, `dsdn-node` otomatis menjalankan `run` dalam env mode:
+
+```bash
+# Ini sama saja:
+dsdn-node
+dsdn-node run
+dsdn-node run env
+```
+
+### `dsdn-node status`
+
+Query status dari node yang sedang berjalan via HTTP `/status` endpoint.
+
+```bash
+dsdn-node status              # Default port dari NODE_HTTP_PORT atau 8080
+dsdn-node status --port 9090  # Custom port
+dsdn-node status -p 9090      # Shorthand
+```
+
+### `dsdn-node health`
+
+Query health dari node yang sedang berjalan via HTTP `/health` endpoint.
+
+```bash
+dsdn-node health              # Default port
+dsdn-node health --port 9090  # Custom port
+```
+
+### `dsdn-node info`
+
+Tampilkan build info dan konfigurasi environment saat ini. Berguna untuk debugging apakah `.env.mainnet` terbaca dengan benar.
+
+```bash
+dsdn-node info
+```
+
+Output contoh:
+
+```
+═══════════════════════════════════════════════════════════════
+                    DSDN Node Info
+═══════════════════════════════════════════════════════════════
+Version:        dsdn-node v0.1.0
+Env file:       /path/to/project/.env.mainnet
+
+── Current Configuration (from env) ──
+NODE_ID:            auto
+NODE_STORAGE_PATH:  ./data/node1
+NODE_HTTP_PORT:     8080
+DA_RPC_URL:         http://localhost:26658
+DA_NAMESPACE:       000000000000000000000000000000000000000000000000000000000
+DA_NETWORK:         mainnet
+DA_AUTH_TOKEN:      (set)
+USE_MOCK_DA:        false
+═══════════════════════════════════════════════════════════════
+```
+
+### `dsdn-node version`
+
+Tampilkan version string.
+
+```bash
+dsdn-node version
+dsdn-node --version
+dsdn-node -V
+```
+
+### `dsdn-node help`
+
+Tampilkan usage dan daftar command.
+
+```bash
+dsdn-node help
+dsdn-node --help
+dsdn-node -h
+```
+
+## Environment File Loading
+
+Node otomatis load environment variables dari file, dengan priority order yang sama dengan coordinator:
+
+| Priority | Source | Keterangan |
+|----------|--------|------------|
+| 1 | `DSDN_ENV_FILE` env var | Custom path, jika di-set |
+| 2 | `.env.mainnet` | Production default — **DSDN defaults to mainnet** |
+| 3 | `.env` | Fallback untuk development |
+
+Loading terjadi otomatis di awal sebelum apapun diproses. Jika file tidak ditemukan, node tetap jalan menggunakan environment variables yang sudah di-set secara manual.
+
+### Contoh Setup
+
+**Production (mainnet):**
+```bash
+# Cukup buat .env.mainnet, lalu:
+dsdn-node run
+```
+
+**Development (mock DA):**
+```bash
+# .env
+USE_MOCK_DA=true
+NODE_ID=dev-node
+NODE_STORAGE_PATH=./data/dev
+NODE_HTTP_PORT=8080
+
+dsdn-node run
+```
+
+**Custom env file:**
+```bash
+DSDN_ENV_FILE=.env.staging dsdn-node run
+```
+
+## Environment Variables
+
+### Required (env mode)
+
+| Variable | Deskripsi |
+|----------|-----------|
+| `NODE_ID` | Unique node identifier, atau `auto` untuk UUID otomatis |
+| `NODE_STORAGE_PATH` | Path directory untuk penyimpanan data |
+| `NODE_HTTP_PORT` | Port HTTP server untuk observability endpoints |
+| `DA_RPC_URL` | Celestia light node RPC endpoint |
+| `DA_NAMESPACE` | 58-character hex namespace |
+| `DA_AUTH_TOKEN` | Authentication token (wajib untuk mainnet) |
+
+### Optional
+
+| Variable | Default | Deskripsi |
+|----------|---------|-----------|
+| `DA_NETWORK` | `mainnet` | Network identifier: `mainnet`, `mocha`, `local` |
+| `DA_TIMEOUT_MS` | `30000` | Operation timeout dalam milliseconds |
+| `DA_RETRY_COUNT` | `3` | Jumlah retry untuk operasi DA yang gagal |
+| `USE_MOCK_DA` | `false` | Gunakan MockDA untuk development |
+| `DSDN_ENV_FILE` | — | Custom path ke env file |
 
 ## Architecture Summary
 
@@ -41,12 +239,15 @@ Node adalah **DA Follower** - node tidak menentukan state sendiri, melainkan men
 
 | Module | Deskripsi |
 |--------|-----------|
-| `da_follower` | DA subscription dan event processing |
-| `event_processor` | Event handling logic |
+| `da_follower` | DA subscription, event processing, source transitions |
+| `event_processor` | Event handling logic dengan fallback detection |
 | `placement_verifier` | Placement verification |
 | `delete_handler` | Delete request handling dengan grace period |
 | `state_sync` | State synchronization dengan DA |
-| `health` | Health reporting |
+| `health` | Health reporting dengan fallback awareness |
+| `multi_da_source` | Multi-DA source abstraction (Primary/Secondary/Emergency) |
+| `metrics` | Node fallback metrics untuk Prometheus export |
+| `handlers` | Axum HTTP API handlers (read-only observability) |
 
 ### State Model
 
@@ -62,48 +263,36 @@ NodeDerivedState
 
 Semua state dapat direkonstruksi dari DA dengan replay events.
 
-## Startup Flow
+### Multi-DA Source Architecture
 
-```
-1. Parse CLI arguments
-   └── node_id, da_endpoint, storage_path, http_port
+Node mendukung fault-tolerant Multi-DA source dengan tiga tier:
 
-2. Load configuration
-   └── Validate all inputs
+| Source | Priority | Role |
+|--------|----------|------|
+| Primary (Celestia) | 1 | Main DA source, selalu diutamakan |
+| Secondary (Backup) | 2 | Digunakan ketika Primary gagal |
+| Emergency | 3 | Last resort ketika keduanya gagal |
 
-3. Initialize DA layer
-   ├── Production: CelestiaDA
-   └── Testing: MockDA
+Transisi antar source bersifat atomic — berhasil sepenuhnya atau rollback sepenuhnya.
 
-4. Initialize storage
-   └── Create storage directory
+## HTTP Endpoints
 
-5. Initialize DA follower
-   └── Setup event subscription
+Semua endpoint bersifat **READ-ONLY** (observability only). Node menerima command hanya via DA events, bukan via HTTP.
 
-6. Start follower
-   └── Begin processing DA events
+| Endpoint | Method | Deskripsi |
+|----------|--------|-----------|
+| `/health` | GET | Health check (200 = healthy, 503 = unhealthy) |
+| `/ready` | GET | Readiness check (DA connected?) |
+| `/info` | GET | Node info (version, node_id, uptime) |
+| `/status` | GET | Status lengkap (state, DA, storage) |
+| `/state` | GET | Current NodeDerivedState |
+| `/state/fallback` | GET | Fallback state detail |
+| `/state/assignments` | GET | Chunk assignments |
+| `/da/status` | GET | DA layer status |
+| `/metrics` | GET | Metrics JSON |
+| `/metrics/prometheus` | GET | Metrics format Prometheus |
 
-7. Start HTTP server
-   └── Expose /health endpoint
-```
-
-### Usage
-
-```bash
-# Production dengan Celestia
-dsdn-node node-1 http://localhost:26658 ./data/node1 8080
-
-# Testing dengan MockDA
-dsdn-node node-1 mock ./data/node1 8080
-
-# Auto-generate node ID
-dsdn-node auto http://localhost:26658 ./data/node1 8080
-```
-
-## Health & Monitoring
-
-### Health Endpoint
+### Health Endpoint Detail
 
 ```
 GET /health
@@ -136,12 +325,59 @@ Node dianggap **healthy** jika dan hanya jika:
 | DA Lag | `da_behind_by < 100` |
 | Storage OK | `storage_used_gb <= storage_capacity_gb` |
 
-### HTTP Status Codes
+## Startup Flow
 
-| Code | Meaning |
-|------|---------|
-| 200 | Node healthy |
-| 503 | Node unhealthy |
+```
+1. Load .env.mainnet (atau custom env file)
+   └── Priority: DSDN_ENV_FILE > .env.mainnet > .env
+
+2. Parse subcommand
+   ├── run   → Start node
+   ├── status → Query running node
+   ├── health → Query running node health
+   ├── info   → Show config info
+   └── version → Show version
+
+3. [run] Parse configuration
+   ├── env mode  → Baca dari environment variables
+   └── CLI mode  → Baca dari arguments
+
+4. [run] Validate configuration
+   └── Production validation jika DA_NETWORK=mainnet
+
+5. [run] Initialize DA layer
+   ├── Production: CelestiaDA + startup health check
+   └── Testing: MockDA
+
+6. [run] Initialize storage
+   └── Buat storage directory jika belum ada
+
+7. [run] Initialize DA follower
+   └── Setup event subscription + health monitoring
+
+8. [run] Start HTTP server (Axum)
+   └── Expose observability endpoints
+
+9. [run] Wait for shutdown (Ctrl+C)
+   └── Graceful shutdown semua task
+```
+
+## Backward Compatibility
+
+Command lama tetap berjalan:
+
+```bash
+# Format lama (masih didukung):
+dsdn-node node-1 http://localhost:26658 ./data/node1 8080
+dsdn-node auto mock ./data/node1 8080
+dsdn-node env
+
+# Format baru (recommended):
+dsdn-node run node-1 http://localhost:26658 ./data/node1 8080
+dsdn-node run auto mock ./data/node1 8080
+dsdn-node run env
+dsdn-node run   # default env mode
+```
 
 ## Invariant Keamanan
 
@@ -154,10 +390,10 @@ Semua perintah datang via DA events.
 
 Ini berarti:
 
-1. **Tidak ada RPC mutation** - Node tidak menerima perintah langsung dari coordinator
-2. **DA sebagai sumber kebenaran** - Semua perubahan state berasal dari DA events
-3. **State dapat direkonstruksi** - Node state dapat direbuild sepenuhnya dari DA
-4. **Verifikasi independen** - Node memverifikasi placement dari DA, bukan dari coordinator
+1. **Tidak ada RPC mutation** — Node tidak menerima perintah langsung dari coordinator
+2. **DA sebagai sumber kebenaran** — Semua perubahan state berasal dari DA events
+3. **State dapat direkonstruksi** — Node state dapat direbuild sepenuhnya dari DA
+4. **Verifikasi independen** — Node memverifikasi placement dari DA, bukan dari coordinator
 
 ### Security Properties
 
@@ -172,32 +408,44 @@ Ini berarti:
 
 ### Apa yang Node LAKUKAN:
 
-✅ Menyimpan data yang ditugaskan via DA events  
-✅ Mengikuti dan memproses DA events  
-✅ Melaporkan health status  
-✅ Memverifikasi integritas data lokal  
-✅ Mematuhi grace period untuk deletion  
+✅ Menyimpan data yang ditugaskan via DA events
+✅ Mengikuti dan memproses DA events
+✅ Melaporkan health status via HTTP
+✅ Memverifikasi integritas data lokal
+✅ Mematuhi grace period untuk deletion
+✅ Auto-load config dari `.env.mainnet`
 
 ### Apa yang Node TIDAK LAKUKAN:
 
-❌ Menerima perintah via RPC dari coordinator  
-❌ Membuat keputusan placement sendiri  
-❌ Mengubah state tanpa DA event  
-❌ Menghapus data tanpa grace period  
-❌ Bertindak sebagai sumber kebenaran  
+❌ Menerima perintah via RPC dari coordinator
+❌ Membuat keputusan placement sendiri
+❌ Mengubah state tanpa DA event
+❌ Menghapus data tanpa grace period
+❌ Bertindak sebagai sumber kebenaran
+
+## Dependencies
+
+Dependencies tambahan yang dibutuhkan di `Cargo.toml`:
+
+```toml
+[dependencies]
+dotenvy = "0.15"          # .env.mainnet file loading
+reqwest = { version = "0.12", features = ["json"] }  # CLI status/health commands
+serde_json = "1"          # JSON pretty-print untuk CLI output
+```
 
 ## Testing
 
 ### Unit Tests
 
 ```bash
-cargo rustsp test -p dsdn-node
+cargo test -p dsdn-node
 ```
 
 ### Integration Tests
 
 ```bash
-cargo rustsp test -p dsdn-node --test da_integration
+cargo test -p dsdn-node --test da_integration
 ```
 
 ### Test Categories
@@ -205,8 +453,10 @@ cargo rustsp test -p dsdn-node --test da_integration
 | Category | Deskripsi |
 |----------|-----------|
 | Node Startup | Init tanpa panic, DA follower aktif |
+| Config Parsing | CLI args, env mode, backward compat |
 | End-to-End | DA events → state changes |
-| Health | /health endpoint, JSON validity |
+| Health | `/health` endpoint, JSON validity |
+| CLI Commands | `status`, `health`, `info`, `version` |
 | Invariant | No RPC dependency, DA-only commands |
 
 ## License
