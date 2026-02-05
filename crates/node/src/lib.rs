@@ -190,6 +190,14 @@
 //!    /metrics                 & Fallback Logic          /health endpoint
 //! ```
 //!
+//! # Environment File Loading
+//!
+//! The node uses the same env file loading pattern as the coordinator:
+//!
+//! 1. `DSDN_ENV_FILE` environment variable (custom path)
+//! 2. `.env.mainnet` (production default - DSDN defaults to mainnet)
+//! 3. `.env` (fallback for development)
+//!
 //! # Modules
 //!
 //! | Module              | Description                                          |

@@ -23,6 +23,7 @@ thiserror = "1.0"
 axum = "0.7"
 wat = "1.0"
 tonic = { version = "0.9", features = ["transport"] }
+dotenvy = "0.15"
 
 [[bin]]
 name = "dsdn-node"
