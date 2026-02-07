@@ -604,6 +604,12 @@ struct StorageHttpState {
     objects_dir: PathBuf,
 }
 
+/// Path parameter for hash-based routes.
+#[derive(Debug, serde::Deserialize)]
+struct HashParam {
+    hash: String,
+}
+
 /// Response for chunk operations.
 #[derive(Debug, Serialize)]
 struct ChunkResponse {
@@ -622,10 +628,10 @@ struct StorageStatsResponse {
 
 /// GET /storage/chunk/:hash — Retrieve a chunk by hash.
 async fn http_get_chunk(
+    AxumPath(params): AxumPath<HashParam>,
     AxumState(st): AxumState<Arc<StorageHttpState>>,
-    AxumPath(hash): AxumPath<String>,
 ) -> Result<Vec<u8>, StatusCode> {
-    match st.store.get_chunk(&hash) {
+    match st.store.get_chunk(&params.hash) {
         Ok(Some(data)) => Ok(data),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -634,11 +640,11 @@ async fn http_get_chunk(
 
 /// GET /storage/has/:hash — Check if a chunk exists.
 async fn http_has_chunk(
+    AxumPath(params): AxumPath<HashParam>,
     AxumState(st): AxumState<Arc<StorageHttpState>>,
-    AxumPath(hash): AxumPath<String>,
 ) -> Json<serde_json::Value> {
-    let exists = st.store.has_chunk(&hash).unwrap_or(false);
-    Json(serde_json::json!({ "hash": hash, "exists": exists }))
+    let exists = st.store.has_chunk(&params.hash).unwrap_or(false);
+    Json(serde_json::json!({ "hash": params.hash, "exists": exists }))
 }
 
 /// PUT /storage/chunk — Store a chunk (hash computed from data).
@@ -684,10 +690,15 @@ async fn http_storage_stats(
 /// Build storage HTTP router (data plane endpoints).
 fn build_storage_router(state: Arc<StorageHttpState>) -> Router {
     Router::new()
-        .route("/storage/chunk/{hash}", get(http_get_chunk))
-        .route("/storage/has/{hash}", get(http_has_chunk))
+        // Primary routes with /storage prefix
+        .route("/storage/chunk/:hash", get(http_get_chunk))
+        .route("/storage/has/:hash", get(http_has_chunk))
         .route("/storage/chunk", axum_put(http_put_chunk))
         .route("/storage/stats", get(http_storage_stats))
+        // Backward compatibility aliases without prefix
+        .route("/chunks/:hash", get(http_get_chunk))
+        .route("/has/:hash", get(http_has_chunk))
+        .route("/chunks", axum_put(http_put_chunk))
         .with_state(state)
 }
 
@@ -702,6 +713,8 @@ fn build_storage_router(state: Arc<StorageHttpState>) -> Router {
 ///                  /state/assignments /da/status /metrics /metrics/prometheus
 ///   Storage:       /storage/chunk/:hash (GET) /storage/chunk (PUT)
 ///                  /storage/has/:hash (GET) /storage/stats (GET)
+///                  /chunks/:hash (GET) /chunks (PUT) /has/:hash (GET)
+///                  (aliases for backward compatibility)
 ///
 /// Control plane commands come via DA events, NOT via HTTP.
 /// Storage endpoints are data plane operations.
@@ -713,6 +726,7 @@ async fn start_axum_server(
     info!("🌐 Starting HTTP server on http://{}", addr);
     info!("   Observability: /health /ready /info /status /state /da/status /metrics");
     info!("   Storage:       /storage/chunk/:hash /storage/chunk /storage/has/:hash /storage/stats");
+    info!("   Aliases:       /chunks/:hash /chunks /has/:hash (backward compatibility)");
 
     let listener = match bind_with_reuse(addr).await {
         Ok(l) => l,
@@ -1365,10 +1379,12 @@ async fn cmd_run(run_args: &[String]) {
     });
     let storage_router = build_storage_router(storage_http_state);
 
-    // Merge both routers — both already have .with_state() applied → Router<()>
-    let combined_router = Router::new()
-        .nest("/", observability_router)
-        .nest("/", storage_router);
+    // Merge routers directly (both already Router<()> after .with_state())
+    let combined_router = observability_router
+        .merge(storage_router)
+        .fallback(|| async {
+            (StatusCode::NOT_FOUND, "Route not found - check route registration")
+        });
 
 
     // Step 10: Start gRPC storage server
