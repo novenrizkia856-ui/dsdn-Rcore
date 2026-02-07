@@ -27,6 +27,8 @@
 //! | `economic` | Economic controller: deflation, burn rate, treasury | 13.15 |
 //! | `wallet` | Wallet management: keypair, signing, encryption | 13.17 |
 //! | `encryption` | Sistem enskripsi| 13.17 |
+//! | `coordinator` | Coordinator committee: epoch, DKG, disputes, accountability | 14A.2B.2 |
+//! | `gating` | Service node on-chain state: ServiceNodeRecord | 14B.11 |
 //!
 //! ## 13.9 — GAS MODEL & FEE SPLIT
 //!
@@ -426,6 +428,8 @@
 //! |       |   - 13.15.6: Block-Level Integration | ✅ IMPLEMENTED |
 //! |       |   - 13.15.7: LMDB Persistence | ✅ IMPLEMENTED |
 //! |       |   - 13.15.8: RPC & CLI Observability | ✅ IMPLEMENTED |
+//! | 14B   | Stake & Identity Gating (Chain State) | 🔧 IN PROGRESS |
+//! |       |   - 14B.11: ServiceNodeRecord & Service Node State | ✅ IMPLEMENTED |
 //! ```
 //!
 //! ## Chain Struct
@@ -712,6 +716,7 @@ pub mod economic;
 pub mod wallet;
 pub mod encryption;
 pub mod coordinator;
+pub mod gating;
 
 use crate::types::{Address, Hash};
 use std::str::FromStr;
@@ -759,6 +764,33 @@ pub use coordinator::{
     // Accountability (14A.2B.2.29)
     AccountableDecision, AccountabilityProof, CoordinatorAccountability,
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// GATING RE-EXPORTS (14B)
+// ════════════════════════════════════════════════════════════════════════════
+// ## 14B — Stake & Identity Gating
+//
+// Chain crate menyimpan `ServiceNodeRecord` sebagai ON-CHAIN SOURCE OF TRUTH
+// untuk setiap service node yang terdaftar di jaringan DSDN.
+//
+// Hubungan dengan `dsdn_common::gating`:
+// - `common` = validation logic (NodeClass, NodeStatus, CooldownPeriod,
+//   NodeIdentity, StakeRequirement, TLSCertInfo, IdentityProof).
+// - `chain` = state & enforcement (ServiceNodeRecord di ChainState,
+//   index dua arah operator_address ↔ node_id, query APIs).
+//
+// ServiceNodeRecord referensi types dari common:
+// - `NodeClass` (Storage / Compute) — role classification
+// - `NodeStatus` (Pending / Active / Quarantined / Banned) — lifecycle state
+// - `CooldownPeriod` — optional cooldown setelah slashing/ban
+//
+// Invariants (consensus-critical):
+// - Setiap entry di `service_nodes` HARUS punya entry di `service_node_index`.
+// - `service_node_index[node_id] == operator_address`.
+// - Tidak ada dua operator dengan node_id sama.
+// - Tidak ada dangling index.
+// ════════════════════════════════════════════════════════════════════════════
+pub use gating::ServiceNodeRecord;
 
 // ════════════════════════════════════════════════════════════════════════════
 // CHAIN ERROR (13.18.4)

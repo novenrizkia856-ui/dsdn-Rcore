@@ -4433,6 +4433,7 @@
 //! dsdn-chain test --module all
 //! ```
 use crate::types::{Address, Hash};
+use crate::gating::ServiceNodeRecord;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use crate::slashing::{
@@ -5092,6 +5093,35 @@ pub struct ChainState {
     /// - Index untuk query cepat kontrak per user
     /// - CONSENSUS-CRITICAL: termasuk dalam state_root
     pub user_contracts: HashMap<Address, Vec<Hash>>,
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE REGISTRY (14B.11)
+    // ════════════════════════════════════════════════════════════════════════════
+    // On-chain registry untuk service nodes (Storage / Compute).
+    // ServiceNodeRecord adalah SOURCE OF TRUTH untuk setiap service node.
+    //
+    // INVARIANTS (CONSENSUS-CRITICAL):
+    // 1. Setiap entry di service_nodes HARUS punya entry di service_node_index.
+    // 2. service_node_index[node_id] == operator_address.
+    // 3. Tidak boleh ada dua operator_address dengan node_id sama.
+    // 4. Tidak boleh ada dangling index (index tanpa record, atau record tanpa index).
+    //
+    // PERSISTENCE:
+    // - Dipersist ke LMDB bersama seluruh ChainState.
+    // - Termasuk dalam state_root computation.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Service node records keyed by operator address (14B.11)
+    /// - Primary store: operator_address → ServiceNodeRecord
+    /// - Source of truth untuk setiap service node on-chain
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root
+    pub service_nodes: HashMap<Address, ServiceNodeRecord>,
+
+    /// Reverse index: node_id → operator_address (14B.11)
+    /// - Enables O(1) lookup by node_id
+    /// - MUST be kept in sync with service_nodes at all times
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root
+    pub service_node_index: HashMap<[u8; 32], Address>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5190,6 +5220,10 @@ impl ChainState {
             // STORAGE PAYMENT (13.17.3)
             storage_contracts: HashMap::new(),
             user_contracts: HashMap::new(),
+
+            // SERVICE NODE REGISTRY (14B.11)
+            service_nodes: HashMap::new(),
+            service_node_index: HashMap::new(),
 
         }
     }
