@@ -15,19 +15,19 @@ fn print_usage_and_exit() {
     eprintln!("DSDN Storage CLI");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  storage-cli server <addr>                    Run gRPC server (e.g. 127.0.0.1:50051)");
-    eprintln!("  storage-cli put <file> [chunk_size]          Chunk file & store locally in ./data");
-    eprintln!("  storage-cli get <hash>                       Get chunk from local store");
-    eprintln!("  storage-cli has <hash>                       Check if chunk exists locally");
-    eprintln!("  storage-cli send <addr> <file>               Send file chunks to remote gRPC server");
-    eprintln!("  storage-cli fetch <addr> <hash> [output]     Fetch chunk from remote gRPC server");
+    eprintln!("  dsdn-storage server <addr>                    Run gRPC server (e.g. 127.0.0.1:50051)");
+    eprintln!("  dsdn-storage put <file> [chunk_size]          Chunk file & store locally in ./data");
+    eprintln!("  dsdn-storage get <hash>                       Get chunk from local store");
+    eprintln!("  dsdn-storage has <hash>                       Check if chunk exists locally");
+    eprintln!("  dsdn-storage send <addr> <file>               Send file chunks to remote gRPC server");
+    eprintln!("  dsdn-storage fetch <addr> <hash> [output]     Fetch chunk from remote gRPC server");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  storage-cli server 127.0.0.1:50051");
-    eprintln!("  storage-cli put myfile.dat 4194304");
-    eprintln!("  storage-cli get abc123def456...");
-    eprintln!("  storage-cli send 127.0.0.1:50051 myfile.dat");
-    eprintln!("  storage-cli fetch 127.0.0.1:50051 abc123def456... output.bin");
+    eprintln!("  dsdn-storage server 127.0.0.1:50051");
+    eprintln!("  dsdn-storage put myfile.dat 4194304");
+    eprintln!("  dsdn-storage get abc123def456...");
+    eprintln!("  dsdn-storage send 127.0.0.1:50051 myfile.dat");
+    eprintln!("  dsdn-storage fetch 127.0.0.1:50051 abc123def456... output.bin");
     std::process::exit(2);
 }
 
@@ -98,7 +98,7 @@ async fn main() {
 
         "get" => {
             if args.len() < 3 {
-                eprintln!("Usage: storage-cli get <hash> [output_file]");
+                eprintln!("Usage: dsdn-storage get <hash> [output_file]");
                 std::process::exit(2);
             }
 
@@ -139,7 +139,7 @@ async fn main() {
 
         "has" => {
             if args.len() < 3 {
-                eprintln!("Usage: storage-cli has <hash>");
+                eprintln!("Usage: dsdn-storage has <hash>");
                 std::process::exit(2);
             }
 
@@ -188,7 +188,7 @@ async fn main() {
 
         "fetch" => {
             if args.len() < 4 {
-                eprintln!("Usage: storage-cli fetch <addr> <hash> [output_file]");
+                eprintln!("Usage: dsdn-storage fetch <addr> <hash> [output_file]");
                 std::process::exit(2);
             }
 
