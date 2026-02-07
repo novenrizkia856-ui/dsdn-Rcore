@@ -12,10 +12,22 @@ use dsdn_storage::rpc;
 use dsdn_storage::store::Storage;
 
 fn print_usage_and_exit() {
+    eprintln!("DSDN Storage CLI");
+    eprintln!();
     eprintln!("Usage:");
-    eprintln!("  storage-cli server <addr>            # run gRPC server (e.g. 127.0.0.1:50051)");
-    eprintln!("  storage-cli put <file> [chunk_size]  # local put (same as before)");
-    eprintln!("  storage-cli send <addr> <file>       # send file chunks to remote gRPC server");
+    eprintln!("  storage-cli server <addr>                    Run gRPC server (e.g. 127.0.0.1:50051)");
+    eprintln!("  storage-cli put <file> [chunk_size]          Chunk file & store locally in ./data");
+    eprintln!("  storage-cli get <hash>                       Get chunk from local store");
+    eprintln!("  storage-cli has <hash>                       Check if chunk exists locally");
+    eprintln!("  storage-cli send <addr> <file>               Send file chunks to remote gRPC server");
+    eprintln!("  storage-cli fetch <addr> <hash> [output]     Fetch chunk from remote gRPC server");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  storage-cli server 127.0.0.1:50051");
+    eprintln!("  storage-cli put myfile.dat 4194304");
+    eprintln!("  storage-cli get abc123def456...");
+    eprintln!("  storage-cli send 127.0.0.1:50051 myfile.dat");
+    eprintln!("  storage-cli fetch 127.0.0.1:50051 abc123def456... output.bin");
     std::process::exit(2);
 }
 
@@ -61,14 +73,14 @@ async fn main() {
 
             let file = Path::new(&args[2]);
             if !file.exists() {
-                eprintln!("file not found: {:?}", file);
+                eprintln!("❌ file not found: {:?}", file);
                 std::process::exit(1);
             }
 
             let chunk_size = if args.len() >= 4 {
-                args[3].parse::<usize>().unwrap_or(16 * 1024 * 1024)
+                args[3].parse::<usize>().unwrap_or(chunker::DEFAULT_CHUNK_SIZE)
             } else {
-                16 * 1024 * 1024
+                chunker::DEFAULT_CHUNK_SIZE
             };
 
             let mut f = std::fs::File::open(file).expect("open file");
@@ -79,9 +91,72 @@ async fn main() {
             for (i, chunk) in chunks.into_iter().enumerate() {
                 let h = sha256_hex(&chunk);
                 store.put_chunk(&h, &chunk).expect("put chunk");
-                println!("chunk {:>4}: {} ({} bytes)", i, h, chunk.len());
+                println!("  chunk {:>4}: {} ({} bytes)", i, h, chunk.len());
             }
-            println!("✅ Done storing locally.");
+            println!("✅ Done storing locally in ./data");
+        }
+
+        "get" => {
+            if args.len() < 3 {
+                eprintln!("Usage: storage-cli get <hash> [output_file]");
+                std::process::exit(2);
+            }
+
+            let hash = &args[2];
+            let store = LocalFsStorage::new("./data").expect("create store at ./data");
+
+            match store.get_chunk(hash) {
+                Ok(Some(data)) => {
+                    if args.len() >= 4 {
+                        let output = &args[3];
+                        std::fs::write(output, &data).expect("write output");
+                        println!("✅ Chunk {} ({} bytes) → {}", hash, data.len(), output);
+                    } else {
+                        println!("✅ Chunk found: {} ({} bytes)", hash, data.len());
+                        if data.len() <= 1024 {
+                            if let Ok(text) = std::str::from_utf8(&data) {
+                                println!("Content: {}", text);
+                            } else {
+                                let hex: String = data.iter().take(64).map(|b| format!("{:02x}", b)).collect();
+                                println!("Content (hex): {}...", hex);
+                            }
+                        } else {
+                            let hex: String = data.iter().take(64).map(|b| format!("{:02x}", b)).collect();
+                            println!("Content (hex, first 64 bytes): {}...", hex);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("❌ Chunk not found: {}", hash);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("❌ Storage error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "has" => {
+            if args.len() < 3 {
+                eprintln!("Usage: storage-cli has <hash>");
+                std::process::exit(2);
+            }
+
+            let hash = &args[2];
+            let store = LocalFsStorage::new("./data").expect("create store at ./data");
+
+            match store.has_chunk(hash) {
+                Ok(true) => println!("✅ Chunk exists: {}", hash),
+                Ok(false) => {
+                    println!("❌ Chunk not found: {}", hash);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("❌ Storage error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
 
         "send" => {
@@ -92,24 +167,63 @@ async fn main() {
             let addr = args[2].clone(); // e.g. 127.0.0.1:50051
             let file = Path::new(&args[3]);
             if !file.exists() {
-                eprintln!("file not found: {:?}", file);
+                eprintln!("❌ file not found: {:?}", file);
                 std::process::exit(1);
             }
 
             let mut f = std::fs::File::open(file).expect("open file");
-            let chunks = chunker::chunk_reader(&mut f, 16 * 1024 * 1024).expect("chunk file");
+            let chunks = chunker::chunk_reader(&mut f, chunker::DEFAULT_CHUNK_SIZE).expect("chunk file");
 
             println!("📤 Sending {} chunks to {}", chunks.len(), addr);
 
             for (i, chunk) in chunks.into_iter().enumerate() {
                 let h = sha256_hex(&chunk);
                 match rpc::client_put(format!("http://{}", addr), h.clone(), chunk).await {
-                    Ok(returned) => println!("chunk {:>4}: sent, hash {}", i, returned),
+                    Ok(returned) => println!("  chunk {:>4}: sent → {}", i, returned),
                     Err(e) => eprintln!("❌ failed to send chunk {}: {}", i, e),
                 }
             }
             println!("✅ File transfer done.");
         }
+
+        "fetch" => {
+            if args.len() < 4 {
+                eprintln!("Usage: storage-cli fetch <addr> <hash> [output_file]");
+                std::process::exit(2);
+            }
+
+            let addr = args[2].clone();
+            let hash = args[3].clone();
+
+            println!("📥 Fetching chunk {} from {}", hash, addr);
+
+            match rpc::client_get(format!("http://{}", addr), hash.clone()).await {
+                Ok(Some(data)) => {
+                    if args.len() >= 5 {
+                        let output = &args[4];
+                        std::fs::write(output, &data).expect("write output");
+                        println!("✅ Fetched {} ({} bytes) → {}", hash, data.len(), output);
+                    } else {
+                        println!("✅ Fetched {} ({} bytes)", hash, data.len());
+                        if data.len() <= 1024 {
+                            if let Ok(text) = std::str::from_utf8(&data) {
+                                println!("Content: {}", text);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("❌ Chunk not found on remote: {}", hash);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("❌ gRPC error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "--help" | "-h" | "help" => print_usage_and_exit(),
 
         _ => print_usage_and_exit(),
     }
