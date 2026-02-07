@@ -1366,7 +1366,10 @@ async fn cmd_run(run_args: &[String]) {
     let storage_router = build_storage_router(storage_http_state);
 
     // Merge both routers — both already have .with_state() applied → Router<()>
-    let combined_router = observability_router.merge(storage_router);
+    let combined_router = Router::new()
+        .nest("/", observability_router)
+        .nest("/", storage_router);
+
 
     // Step 10: Start gRPC storage server
     let grpc_addr: SocketAddr = format!("0.0.0.0:{}", config.grpc_port)
