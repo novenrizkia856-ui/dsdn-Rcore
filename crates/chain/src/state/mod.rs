@@ -5494,6 +5494,97 @@ impl ChainState {
 
         (total_gas, node_multiplier as u32)
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE REGISTRY (14B.12)
+    // ════════════════════════════════════════════════════════════════════════════
+    // CRUD, query, and status management for service node registry.
+    // Logic implemented in crate::gating::registry.
+    // All methods preserve the bidirectional index invariant (14B.11).
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Register a new service node in the on-chain registry.
+    ///
+    /// Validates that operator_address and node_id are unique, and that
+    /// staked_amount > 0. Updates both `service_nodes` and `service_node_index`
+    /// atomically.
+    ///
+    /// ## Errors
+    /// - Operator address already registered
+    /// - Node ID already registered
+    /// - Staked amount is zero
+    #[inline]
+    pub fn register_service_node(
+        &mut self,
+        record: ServiceNodeRecord,
+    ) -> Result<(), String> {
+        crate::gating::registry::register_service_node(self, record)
+    }
+
+    /// Remove a service node from the on-chain registry.
+    ///
+    /// Removes from both `service_nodes` and `service_node_index`.
+    /// Returns the removed record.
+    ///
+    /// ## Errors
+    /// - Operator address not found
+    #[inline]
+    pub fn unregister_service_node(
+        &mut self,
+        operator: &Address,
+    ) -> Result<ServiceNodeRecord, String> {
+        crate::gating::registry::unregister_service_node(self, operator)
+    }
+
+    /// Look up a service node by operator address.
+    #[inline]
+    pub fn get_service_node(
+        &self,
+        operator: &Address,
+    ) -> Option<&ServiceNodeRecord> {
+        crate::gating::registry::get_service_node(self, operator)
+    }
+
+    /// Look up a service node by its 32-byte node ID.
+    #[inline]
+    pub fn get_service_node_by_node_id(
+        &self,
+        node_id: &[u8; 32],
+    ) -> Option<&ServiceNodeRecord> {
+        crate::gating::registry::get_service_node_by_node_id(self, node_id)
+    }
+
+    /// Update the status of a service node, enforcing valid state transitions.
+    ///
+    /// Uses `NodeStatus::can_transition_to()` to validate the transition.
+    /// Updates `status` and `last_status_change_height` atomically.
+    ///
+    /// ## Errors
+    /// - Operator address not found
+    /// - Invalid state transition
+    #[inline]
+    pub fn update_service_node_status(
+        &mut self,
+        operator: &Address,
+        new_status: dsdn_common::gating::NodeStatus,
+        height: u64,
+    ) -> Result<(), String> {
+        crate::gating::registry::update_service_node_status(self, operator, new_status, height)
+    }
+
+    /// Return references to all service node records.
+    ///
+    /// Order is non-deterministic (HashMap iteration).
+    #[inline]
+    pub fn list_service_nodes(&self) -> Vec<&ServiceNodeRecord> {
+        crate::gating::registry::list_service_nodes(self)
+    }
+
+    /// Count the number of service nodes with `NodeStatus::Active`.
+    #[inline]
+    pub fn count_active_service_nodes(&self) -> usize {
+        crate::gating::registry::count_active_service_nodes(self)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
