@@ -182,4 +182,4 @@ agent da status --json
 
 ## License
 
-Copyright INEVA. All rights reserved.
+Copyright BITEVA. All rights reserved.

@@ -2,7 +2,7 @@
 name = "dsdn-agent"
 version = "0.1.0"
 edition = "2021"
-authors = ["INEVA team"]
+authors = ["BIYEVA team"]
 
 [dependencies]
 anyhow = "1.0"

@@ -71,7 +71,7 @@ use dsdn_common::cid::sha256_hex;
 use dsdn_storage::rpc;
 
 #[derive(Parser)]
-#[command(author="INEVA", version, about="DSDN Agent CLI")]
+#[command(author="BITEVA", version, about="DSDN Agent CLI")]
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
