@@ -5616,14 +5616,64 @@ impl ChainState {
      /// Returns `ServiceNodeStakeInfo` with operator, staked_amount, class,
      /// and explicitly evaluated `meets_minimum` flag.
      /// Returns `None` if operator is not registered.
+     pub fn get_stake_info(
+          &self,
+          operator: &Address,
+      ) -> Option<crate::gating::query::ServiceNodeStakeInfo> {
+          crate::gating::query::get_stake_info(self, operator)
+      }
+
+     // ══════════════════════════════════════════════════════════════════════════
+     // SERVICE NODE CLASS, STATUS & SLASHING QUERIES (14B.15)
+     // ══════════════════════════════════════════════════════════════════════════
+     // Read-only query methods for node class, status, and slashing info.
+     // Logic implemented in crate::gating::query.
+     // All methods are &self — no mutation, no allocation, no side effects.
+     // ══════════════════════════════════════════════════════════════════════════
+
+     /// Get the `NodeClass` of a service node by operator address.
+     ///
+     /// Returns `Some(NodeClass)` if registered, `None` otherwise.
      #[inline]
-    pub fn get_stake_info(
+     pub fn get_service_node_class(&self, operator: &Address) -> Option<dsdn_common::gating::NodeClass> {
+         crate::gating::query::get_service_node_class(self, operator)
+     }
+
+     /// Get the `NodeStatus` of a service node by operator address.
+     ///
+     /// Returns `Some(NodeStatus)` if registered, `None` otherwise.
+     #[inline]
+     pub fn get_service_node_status(&self, operator: &Address) -> Option<dsdn_common::gating::NodeStatus> {
+         crate::gating::query::get_service_node_status(self, operator)
+     }
+
+     /// Get composite slashing and cooldown information for a service node.
+     ///
+     /// Evaluates cooldown against `current_timestamp`.
+     /// Returns `None` if operator is not registered.
+     #[inline]
+     pub fn get_service_node_slashing_status(
          &self,
          operator: &Address,
-     ) -> Option<crate::gating::query::ServiceNodeStakeInfo> {
-         crate::gating::query::get_stake_info(self, operator)
+         current_timestamp: u64,
+     ) -> Option<crate::gating::query::ServiceNodeSlashingInfo> {
+         crate::gating::query::get_service_node_slashing_status(self, operator, current_timestamp)
      }
-}
+
+     /// Check whether a service node is currently in an active cooldown period.
+     ///
+     /// Returns `true` only if registered AND cooldown active at `current_timestamp`.
+     /// Returns `false` for unregistered operators.
+     #[inline]
+     pub fn is_service_node_in_cooldown(
+         &self,
+         operator: &Address,
+         current_timestamp: u64,
+     ) -> bool {
+         crate::gating::query::is_service_node_in_cooldown(self, operator, current_timestamp)
+     }
+ }
+
 
 // ════════════════════════════════════════════════════════════════════════════
 // DEFAULT IMPLEMENTATION
