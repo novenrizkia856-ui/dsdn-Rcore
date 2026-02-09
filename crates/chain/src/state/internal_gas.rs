@@ -115,6 +115,7 @@ pub fn compute_gas_for_payload(
         TxPayload::StorageOperationPayment { .. } => BASE_OP_STORAGE_OP,
         TxPayload::ComputeExecutionPayment { .. } => BASE_OP_COMPUTE_OP,
         TxPayload::ValidatorRegistration { .. } => BASE_OP_TRANSFER,
+        TxPayload::RegisterServiceNode { .. } => BASE_OP_TRANSFER,
         TxPayload::GovernanceAction { .. } => BASE_OP_TRANSFER,
         TxPayload::Custom { .. } => BASE_OP_TRANSFER,
     };

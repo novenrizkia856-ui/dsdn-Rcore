@@ -12,8 +12,8 @@ use super::internal_governance::{
     GovernanceEvent, GovernanceEventType,
     ProposalStatus,
 };
-use dsdn_common::gating::{NodeClass, NodeStatus};
 use crate::gating::ServiceNodeRecord;
+use dsdn_common::gating::{NodeClass, NodeStatus};
 
 // Gas constants
 #[allow(dead_code)]
@@ -34,10 +34,18 @@ const FIXED_GAS_CUSTOM: u64 = 21000;
 const PRIVATE_TX_BASE_GAS: u64 = 21000;    // Base gas untuk private tx relay (13.7.F)
 #[allow(dead_code)]
 const MIN_DELEGATOR_STAKE: u128 = 100_000;
-const SERVICE_NODE_MIN_STAKE_REGULAR: u128 = 500;
-const SERVICE_NODE_MIN_STAKE_DATACENTER: u128 = 5_000;
-#[allow(dead_code)]
-const FIXED_GAS_SERVICE_NODE_REG: u64 = 50_000;
+
+// Service node min stake per NodeClass (14B.13)
+const MIN_SERVICE_NODE_STAKE_COMPUTE: u128 = 500;
+const MIN_SERVICE_NODE_STAKE_STORAGE: u128 = 5_000;
+
+/// Determine minimum stake requirement based on NodeClass
+fn min_stake_for_node_class(class: &NodeClass) -> u128 {
+    match class {
+        NodeClass::Storage => MIN_SERVICE_NODE_STAKE_STORAGE,
+        NodeClass::Compute => MIN_SERVICE_NODE_STAKE_COMPUTE,
+    }
+}
 
 impl ChainState {
     // ============================================================
@@ -56,8 +64,8 @@ impl ChainState {
             TxPayload::StorageOperationPayment { from, .. } => from,
             TxPayload::ComputeExecutionPayment { from, .. } => from,
             TxPayload::ValidatorRegistration { from, .. } => from,
-            TxPayload::GovernanceAction { from, .. } => from,
             TxPayload::RegisterServiceNode { from, .. } => from,
+            TxPayload::GovernanceAction { from, .. } => from,
             TxPayload::Custom { .. } => return false,
         };
 
@@ -137,8 +145,8 @@ impl ChainState {
                 TxPayload::StorageOperationPayment { from, .. } => *from,
                 TxPayload::ComputeExecutionPayment { from, .. } => *from,
                 TxPayload::ValidatorRegistration { from, .. } => *from,
-                TxPayload::GovernanceAction { from, .. } => *from,
                 TxPayload::RegisterServiceNode { from, .. } => *from,
+                TxPayload::GovernanceAction { from, .. } => *from,
                 _ => unreachable!(),
             }
         };
@@ -354,6 +362,81 @@ impl ChainState {
                 (0, None)
             }
 
+            TxPayload::RegisterServiceNode { from, node_id, class, tls_fingerprint, identity_proof_sig: _, .. } => {
+                // ════════════════════════════════════════════════════════════════
+                // SERVICE NODE REGISTRATION (14B.13 — CONSENSUS-CRITICAL)
+                // ════════════════════════════════════════════════════════════════
+                // Atomic: validate → lock stake → create record → insert registry
+                // ════════════════════════════════════════════════════════════════
+
+                // 1. Determine required stake based on NodeClass
+                let required_stake = min_stake_for_node_class(class);
+
+                // 2. Check sender balance >= required stake
+                let sender_balance = self.get_balance(from);
+                if sender_balance < required_stake {
+                    anyhow::bail!(
+                        "insufficient balance for service node registration: need {}, have {}",
+                        required_stake,
+                        sender_balance
+                    );
+                }
+
+                // 3. Check not already registered as service node
+                if self.service_nodes.contains_key(from) {
+                    anyhow::bail!("address already registered as service node");
+                }
+
+                // 4. Validate and convert node_id to [u8; 32]
+                if node_id.len() != 32 {
+                    anyhow::bail!("node_id must be exactly 32 bytes, got {}", node_id.len());
+                }
+                let mut nid = [0u8; 32];
+                nid.copy_from_slice(node_id);
+
+                // 5. Check node_id not already used by another operator
+                if self.service_node_index.contains_key(&nid) {
+                    anyhow::bail!("node_id already registered by another operator");
+                }
+
+                // 6. Lock stake: deduct from liquid balance, add to locked
+                let sender_bal = self.balances.entry(*from).or_insert(0);
+                *sender_bal -= required_stake;
+                *self.locked.entry(*from).or_insert(0) += required_stake;
+
+                // 7. Build ServiceNodeRecord
+                let record = ServiceNodeRecord {
+                    operator_address: *from,
+                    node_id: nid,
+                    class: *class,
+                    status: NodeStatus::Pending,
+                    staked_amount: required_stake,
+                    registered_height: 0,
+                    last_status_change_height: 0,
+                    cooldown: None,
+                    tls_fingerprint: if tls_fingerprint.is_empty() {
+                        None
+                    } else if tls_fingerprint.len() == 32 {
+                        let mut fp = [0u8; 32];
+                        fp.copy_from_slice(tls_fingerprint);
+                        Some(fp)
+                    } else {
+                        anyhow::bail!(
+                            "tls_fingerprint must be exactly 32 bytes or empty, got {}",
+                            tls_fingerprint.len()
+                        );
+                    },
+                    metadata: HashMap::new(),
+                };
+
+                // 8. Insert into registry (atomic: service_nodes + service_node_index)
+                self.register_service_node(record)
+                    .map_err(|e| anyhow::anyhow!("service node registration failed: {}", e))?;
+
+                println!("✅ Service node registered: {} class={:?} stake={}", from, class, required_stake);
+                (0, None)
+            }
+
             TxPayload::GovernanceAction { from, action, fee: _, nonce: _, gas_limit: _ } => {
                 // ════════════════════════════════════════════════════════════════════════════
                 // GOVERNANCE ACTION EXECUTION (13.13.7 — Integration)
@@ -554,89 +637,6 @@ impl ChainState {
 
                 (0, None)
             }
-
-            // ─────────────────────────────────────────────────────────────
-            // REGISTER SERVICE NODE (14B.13)
-            // ─────────────────────────────────────────────────────────────
-            // Atomic sequence:
-            // 1. Compute min_stake from class
-            // 2. Validate balance >= min_stake
-            // 3. Validate not already registered
-            // 4. Lock stake (deduct from balance)
-            // 5. Create ServiceNodeRecord (status = Pending)
-            // 6. Insert into registry via register_service_node
-            //
-            // If ANY step fails, no state is modified (all validations
-            // before mutations, register_service_node validates before insert).
-            //
-            // NOTE: registered_height and last_status_change_height are set to 0
-            // because ChainState does not track current block height.
-            // This matches ValidatorRegistration which also lacks height context.
-            // Height will be set when block processing pipeline provides it.
-            // ─────────────────────────────────────────────────────────────
-            TxPayload::RegisterServiceNode {
-                from, node_id, class, tls_fingerprint, identity_proof_sig: _, ..
-            } => {
-                // 1. Compute min_stake from class
-                let min_stake: u128 = match class {
-                    NodeClass::DataCenter => SERVICE_NODE_MIN_STAKE_DATACENTER,
-                    _ => SERVICE_NODE_MIN_STAKE_REGULAR,
-                };
-
-                // 2. Validate balance >= min_stake
-                let sender_balance = self.get_balance(from);
-                if sender_balance < min_stake {
-                    anyhow::bail!(
-                        "insufficient balance for service node registration: need {}, have {}",
-                        min_stake, sender_balance
-                    );
-                }
-
-                // 3. Validate not already registered as service node
-                if self.service_nodes.contains_key(from) {
-                    anyhow::bail!("address already registered as service node");
-                }
-
-                // 4. Lock stake: deduct min_stake from sender balance
-                //    This MUST happen before register_service_node to ensure
-                //    balance consistency. If register fails after this point,
-                //    the bail! will propagate and apply_payload returns Err,
-                //    meaning this transaction is rejected entirely (no state persisted).
-                let sender_bal = self.balances.entry(*from).or_insert(0);
-                if *sender_bal < min_stake {
-                    anyhow::bail!("insufficient balance to lock service node stake");
-                }
-                *sender_bal -= min_stake;
-
-                // Track locked stake
-                *self.locked.entry(*from).or_insert(0) += min_stake;
-
-                // 5. Create ServiceNodeRecord
-                let record = ServiceNodeRecord {
-                    operator_address: *from,
-                    node_id: *node_id,
-                    class: class.clone(),
-                    status: NodeStatus::Pending,
-                    staked_amount: min_stake,
-                    registered_height: 0,
-                    last_status_change_height: 0,
-                    cooldown: None,
-                    tls_fingerprint: Some(*tls_fingerprint),
-                    metadata: HashMap::new(),
-                };
-
-                // 6. Register in service node registry (validates uniqueness atomically)
-                self.register_service_node(record)
-                    .map_err(|e| anyhow::anyhow!("service node registration failed: {}", e))?;
-
-                println!(
-                    "✅ Service node registered: operator={} node_id={} class={:?} stake={}",
-                    from, hex::encode(node_id), class, min_stake
-                );
-
-                (0, None)
-            }
-
             TxPayload::Custom { .. } => (0, None),
         };
 
@@ -669,8 +669,8 @@ impl ChainState {
             TxPayload::StorageOperationPayment { fee, .. } => *fee,
             TxPayload::ComputeExecutionPayment { fee, .. } => *fee,
             TxPayload::ValidatorRegistration { fee, .. } => *fee,
-            TxPayload::GovernanceAction { fee, .. } => *fee,
             TxPayload::RegisterServiceNode { fee, .. } => *fee,
+            TxPayload::GovernanceAction { fee, .. } => *fee,
             TxPayload::Custom { fee, .. } => *fee,
         };
 

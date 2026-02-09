@@ -167,6 +167,7 @@ impl Mempool {
             | TxPayload::StorageOperationPayment { fee, .. }
             | TxPayload::ComputeExecutionPayment { fee, .. }
             | TxPayload::ValidatorRegistration { fee, .. }
+            | TxPayload::RegisterServiceNode { fee, .. }
             | TxPayload::GovernanceAction { fee, .. }
             | TxPayload::Custom { fee, .. } { *fee }
         }
@@ -271,6 +272,7 @@ impl Mempool {
             | TxPayload::StorageOperationPayment { fee, .. }
             | TxPayload::ComputeExecutionPayment { fee, .. }
             | TxPayload::ValidatorRegistration { fee, .. }
+            | TxPayload::RegisterServiceNode { fee, .. }
             | TxPayload::GovernanceAction { fee, .. }
             | TxPayload::Custom { fee, .. } { *fee }
         }

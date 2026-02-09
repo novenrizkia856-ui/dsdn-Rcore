@@ -97,6 +97,7 @@ impl Miner {
                 | TxPayload::StorageOperationPayment { nonce, .. }
                 | TxPayload::ComputeExecutionPayment { nonce, .. }
                 | TxPayload::ValidatorRegistration { nonce, .. }
+                | TxPayload::RegisterServiceNode { nonce, .. }
                 | TxPayload::GovernanceAction { nonce, .. }
                 => *nonce,
 
