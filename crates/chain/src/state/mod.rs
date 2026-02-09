@@ -5580,11 +5580,49 @@ impl ChainState {
         crate::gating::registry::list_service_nodes(self)
     }
 
-    /// Count the number of service nodes with `NodeStatus::Active`.
-    #[inline]
-    pub fn count_active_service_nodes(&self) -> usize {
-        crate::gating::registry::count_active_service_nodes(self)
-    }
+     /// Count the number of service nodes with `NodeStatus::Active`.
+     #[inline]
+     pub fn count_active_service_nodes(&self) -> usize {
+         crate::gating::registry::count_active_service_nodes(self)
+     }
+
+     // ══════════════════════════════════════════════════════════════════════════
+     // SERVICE NODE STAKE QUERIES (14B.14)
+     // ══════════════════════════════════════════════════════════════════════════
+     // Read-only query methods for service node stake information.
+     // Logic implemented in crate::gating::query.
+     // All methods are &self — no mutation, no allocation, no side effects.
+     // ══════════════════════════════════════════════════════════════════════════
+
+     /// Get staked amount for a service node by operator address.
+     ///
+     /// Returns `Some(staked_amount)` if registered, `None` otherwise.
+     #[inline]
+     pub fn get_service_node_stake(&self, operator: &Address) -> Option<u128> {
+         crate::gating::query::get_service_node_stake(self, operator)
+     }
+
+     /// Get staked amount for a service node by its 32-byte node ID.
+     ///
+     /// Lookup path: `service_node_index[node_id]` → `service_nodes[operator]`.
+     /// Returns `Some(staked_amount)` if found, `None` otherwise.
+     #[inline]
+     pub fn get_service_node_stake_by_node_id(&self, node_id: &[u8; 32]) -> Option<u128> {
+         crate::gating::query::get_service_node_stake_by_node_id(self, node_id)
+     }
+
+     /// Get composite stake information for a service node.
+     ///
+     /// Returns `ServiceNodeStakeInfo` with operator, staked_amount, class,
+     /// and explicitly evaluated `meets_minimum` flag.
+     /// Returns `None` if operator is not registered.
+     #[inline]
+    pub fn get_stake_info(
+         &self,
+         operator: &Address,
+     ) -> Option<crate::gating::query::ServiceNodeStakeInfo> {
+         crate::gating::query::get_stake_info(self, operator)
+     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
