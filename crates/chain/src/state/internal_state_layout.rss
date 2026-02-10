@@ -146,6 +146,9 @@ impl ChainState {
         proposal_votes HashMap[u64, HashMap[Address, super::Vote]],
         governance_config Option[super::GovernanceConfig],
         proposal_count u64,
+        // Service node data (14B.17)
+        service_nodes HashMap[Address, crate::gating::service_node::ServiceNodeRecord],
+        service_node_index HashMap[[u8; 32], Address],
     ) effects(io, write self) {
         // ✅ RESET STATE YANG TERKAIT VALIDATOR
         self.validator_set.validators.clear()
@@ -223,7 +226,11 @@ impl ChainState {
             self.governance_config = config
         }
 
-        println("📦 State loaded from new layout — VALIDATORS & GOVERNANCE SYNCED ✅")
+        // ✅ LOAD SERVICE NODE DATA (14B.17)
+        self.service_nodes = service_nodes
+        self.service_node_index = service_node_index
+
+        println("📦 State loaded from new layout — VALIDATORS, GOVERNANCE & SERVICE NODES SYNCED ✅")
     }
 
     /// Export state to new layout format (for snapshot/debugging)
@@ -239,6 +246,9 @@ impl ChainState {
         HashMap[u64, HashMap[Address, super::Vote]],
         super::GovernanceConfig,
         u64, // proposal_count
+        // Service node data (14B.17)
+        HashMap[Address, crate::gating::service_node::ServiceNodeRecord],
+        HashMap[[u8; 32], Address],
     ) {
         // ✅ convert state::ValidatorInfo → db::ValidatorInfo
         validators = self
@@ -304,8 +314,13 @@ impl ChainState {
         governance_config = self.governance_config.clone()
         proposal_count = self.proposal_count
 
+        // Export service node data (14B.17)
+        service_nodes = self.service_nodes.clone()
+        service_node_index = self.service_node_index.clone()
+
         (validators, stakes, delegators, qv_data, node_cost_data, claimed_receipts,
-         proposals, proposal_votes, governance_config, proposal_count)
+         proposals, proposal_votes, governance_config, proposal_count,
+         service_nodes, service_node_index)
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -566,6 +581,84 @@ impl ChainState {
             )
         }
         
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE PERSISTENCE (14B.17)
+    // ════════════════════════════════════════════════════════════════════════════
+    //
+    // Persistence for:
+    // - service_nodes (HashMap[Address, ServiceNodeRecord])
+    // - service_node_index (HashMap[[u8; 32], Address])
+    //
+    // CONSENSUS-CRITICAL:
+    // - Format tidak boleh berubah tanpa hard fork
+    // - Roundtrip harus valid: export → load → state identik
+    // - Index HARUS konsisten: service_node_index[record.node_id] == operator
+    //
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Export service node records and index to LMDB
+    ///
+    /// Persists all service node data:
+    /// - service_nodes: operator_address → ServiceNodeRecord
+    /// - service_node_index: node_id → operator_address
+    ///
+    /// # Arguments
+    /// * `db` - Reference to ChainDb
+    ///
+    /// # Returns
+    /// * `Ok(())` - All data exported successfully
+    /// * `Err` - LMDB or serialization error
+    pub fn export_service_nodes_to_layout(&self, db &crate::db::ChainDb) effects(io, panic) Result[()] {
+        mut count = 0
+
+        for (_operator, record) in &self.service_nodes {
+            db.put_service_node(record)?
+            outer count += 1
+        }
+
+        if count > 0 {
+            println("📦 Exported {} service node record(s) to LMDB", count)
+        }
+
+        Ok(())
+    }
+
+    /// Load service node records and index from LMDB
+    ///
+    /// Clears existing service_nodes and service_node_index, then loads
+    /// all records and index entries from LMDB.
+    /// Guarantees roundtrip validity: export → restart → load → state identik.
+    ///
+    /// # Arguments
+    /// * `db` - Reference to ChainDb
+    ///
+    /// # Returns
+    /// * `Ok(())` - All data loaded successfully
+    /// * `Err` - LMDB or deserialization error
+    pub fn load_service_nodes_from_layout(&mut self, db &crate::db::ChainDb) effects(io, panic, write self) Result[()] {
+        // Clear existing state before loading
+        self.service_nodes.clear()
+        self.service_node_index.clear()
+
+        // Load all from LMDB (returns both maps from single read txn)
+        (records, index) = db.load_all_service_nodes()?
+        record_count = records.len()
+        index_count = index.len()
+
+        // Populate state
+        self.service_nodes = records
+        self.service_node_index = index
+
+        if record_count > 0 || index_count > 0 {
+            println(
+                "📦 Loaded {} service node record(s) and {} index entries from LMDB",
+                record_count, index_count
+            )
+        }
+
         Ok(())
     }
 }

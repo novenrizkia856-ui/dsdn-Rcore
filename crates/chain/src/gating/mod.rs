@@ -14,6 +14,8 @@
 //! - `slashing`: Slashing enforcement & cooldown management (14B.16)
 //!   - `slash_service_node`, `check_and_clear_expired_cooldowns`, `activate_service_node`
 //!   - `ServiceNodeSlashEvent`
+//! - `persistence`: Persistence validation & tests (14B.17)
+//!   - `validate_service_node_consistency`
 //!
 //! ## Relationship with `dsdn_common::gating`
 //!
@@ -24,8 +26,10 @@ pub mod service_node;
 pub mod registry;
 pub mod query;
 pub mod slashing;
+pub mod persistence;
 
 pub use service_node::ServiceNodeRecord;
 pub use query::ServiceNodeStakeInfo;
 pub use query::ServiceNodeSlashingInfo;
 pub use slashing::ServiceNodeSlashEvent;
+pub use persistence::validate_service_node_consistency;

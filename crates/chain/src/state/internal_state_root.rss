@@ -319,6 +319,34 @@ impl ChainState {
             accum.extend_from_slice(&contract_bytes)
         }
 
+        // ════════════════════════════════════════════════════════════════════════════
+        // SERVICE NODE STATE (14B.17) — CONSENSUS-CRITICAL
+        // ════════════════════════════════════════════════════════════════════════════
+        // Position #36-#37 in state_root ordering
+        // Format is CONSENSUS-CRITICAL. Changes require HARD FORK.
+        // ════════════════════════════════════════════════════════════════════════════
+
+        // #36 — service_nodes
+        // Sort by operator_address ascending
+        // Format: [operator_address (20 bytes)] + [bincode serialized ServiceNodeRecord]
+        mut sn_vec Vec[(&crate::types::Address, &crate::gating::service_node::ServiceNodeRecord)] = self.service_nodes.iter().collect()
+        sn_vec.sort_by_key(|&(addr, _)| addr)
+        for (addr, record) in sn_vec {
+            accum.extend_from_slice(addr.as_bytes())
+            sn_record_bytes = bincode::serialize(record).expect("ServiceNodeRecord serialization must not fail")
+            accum.extend_from_slice(&sn_record_bytes)
+        }
+
+        // #37 — service_node_index
+        // Sort by node_id ascending (raw bytes comparison)
+        // Format: [node_id (32 bytes)] + [operator_address (20 bytes)]
+        mut sni_vec Vec[(&[u8; 32], &crate::types::Address)] = self.service_node_index.iter().collect()
+        sni_vec.sort_by_key(|&(node_id, _)| *node_id)
+        for (node_id, operator) in sni_vec {
+            accum.extend_from_slice(node_id)
+            accum.extend_from_slice(operator.as_bytes())
+        }
+
         // Hash the accumulated bytes
         Ok(Hash::from_bytes(sha3_512_bytes(&accum)))
     }

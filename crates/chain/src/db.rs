@@ -160,6 +160,22 @@ pub const BUCKET_STORAGE_CONTRACTS: &str = "storage_contracts";
 /// Value: bincode serialized Vec<Hash> (list of contract_ids)
 pub const BUCKET_USER_CONTRACTS: &str = "user_contracts";
 
+// ════════════════════════════════════════════════════════════════════════════
+// SERVICE NODE BUCKET CONSTANTS (14B.17)
+// ════════════════════════════════════════════════════════════════════════════
+// Key formats are CONSENSUS-CRITICAL. Do not modify without hard fork.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Service node records bucket
+/// Key: operator_address (20 bytes)
+/// Value: bincode serialized ServiceNodeRecord
+pub const BUCKET_SERVICE_NODES: &str = "service_nodes";
+
+/// Service node index bucket (node_id → operator_address)
+/// Key: node_id (32 bytes, Ed25519 public key)
+/// Value: operator_address (20 bytes raw, NOT bincode)
+pub const BUCKET_SERVICE_NODE_INDEX: &str = "service_node_index";
+
 /// Account object persisted in DB
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
@@ -390,6 +406,10 @@ pub struct ChainDb {
     // STORAGE PAYMENT (13.17.7)
     db_storage_contracts: Database,      // storage_contracts/{contract_id}
     db_user_contracts: Database,         // user_contracts/{address}
+    
+    // SERVICE NODE REGISTRY (14B.17)
+    db_service_nodes: Database,          // service_nodes/{operator_address}
+    db_service_node_index: Database,     // service_node_index/{node_id}
 }
 impl ChainDb {
     /// Open LMDB environment at path, create named DBs
@@ -398,7 +418,7 @@ impl ChainDb {
         std::fs::create_dir_all(p)?;
 
     let env = Environment::new()
-            .set_max_dbs(33) // increased for storage payment buckets (13.17.7)
+            .set_max_dbs(35) // increased for service node buckets (14B.17)
             .set_map_size(1_000_000_000usize)
             .open(p)?;
 
@@ -444,6 +464,10 @@ impl ChainDb {
         let db_storage_contracts = env.create_db(Some(BUCKET_STORAGE_CONTRACTS), DatabaseFlags::empty())?;
         let db_user_contracts = env.create_db(Some(BUCKET_USER_CONTRACTS), DatabaseFlags::empty())?;
 
+        // Service node buckets (14B.17)
+        let db_service_nodes = env.create_db(Some(BUCKET_SERVICE_NODES), DatabaseFlags::empty())?;
+        let db_service_node_index = env.create_db(Some(BUCKET_SERVICE_NODE_INDEX), DatabaseFlags::empty())?;
+
         Ok(Self {
             env: Arc::new(env),
             env_path: p.to_path_buf(),
@@ -474,6 +498,8 @@ impl ChainDb {
             db_deflation_config,
             db_storage_contracts,
             db_user_contracts,
+            db_service_nodes,
+            db_service_node_index,
         })
     }
 
@@ -1109,6 +1135,13 @@ impl ChainDb {
         state.set_pending_unstakes(pending_unstakes);
         println!("   ✓ Loaded {} addresses with pending unstakes", state.pending_unstakes.len());
 
+        // Load service nodes (14B.17)
+        let (service_nodes, service_node_index) = self.load_all_service_nodes()?;
+        state.service_nodes = service_nodes;
+        state.service_node_index = service_node_index;
+        println!("   ✓ Loaded {} service nodes, {} index entries",
+                 state.service_nodes.len(), state.service_node_index.len());
+
         // Total supply: sum semua balance (tetap akurat)
         state.total_supply = state.balances.values().cloned().sum::<u128>();
 
@@ -1491,6 +1524,39 @@ impl ChainDb {
                  state_snapshot.node_cost_index.len());
 
 
+
+        // ─────────────────────────────────────────────────────────
+        // 5d) PERSIST SERVICE NODE REGISTRY (14B.17)
+        // ─────────────────────────────────────────────────────────
+        // Clear existing service_nodes entries
+        {
+            let mut cursor = wtxn.open_rw_cursor(self.db_service_nodes)?;
+            let mut del_keys = Vec::new();
+            for (key, _) in cursor.iter() { del_keys.push(key.to_vec()); }
+            drop(cursor);
+            for key in del_keys { wtxn.del(self.db_service_nodes, &key, None)?; }
+        }
+        // Clear existing service_node_index entries
+        {
+            let mut cursor = wtxn.open_rw_cursor(self.db_service_node_index)?;
+            let mut del_keys = Vec::new();
+            for (key, _) in cursor.iter() { del_keys.push(key.to_vec()); }
+            drop(cursor);
+            for key in del_keys { wtxn.del(self.db_service_node_index, &key, None)?; }
+        }
+        // Write current service nodes
+        for (addr, record) in &state_snapshot.service_nodes {
+            let key = addr.as_bytes();
+            let blob = bincode::serialize(record)?;
+            wtxn.put(self.db_service_nodes, key, &blob, WriteFlags::empty())?;
+        }
+        // Write current service node index
+        for (node_id, operator) in &state_snapshot.service_node_index {
+            wtxn.put(self.db_service_node_index, node_id, operator.as_bytes(), WriteFlags::empty())?;
+        }
+        println!("   ✓ Service nodes persisted: {} records, {} index entries",
+                 state_snapshot.service_nodes.len(),
+                 state_snapshot.service_node_index.len());
 
         // ─────────────────────────────────────────────────────────
         // 6) SET TIP (height + hash)
@@ -2424,6 +2490,188 @@ Ok(headers)
     }
 
     // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE OPERATIONS (14B.17)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Bucket: service_nodes/{operator_address}
+    //   Key: operator_address (20 bytes)
+    //   Value: bincode serialized ServiceNodeRecord
+    //
+    // Index: service_node_index/{node_id}
+    //   Key: node_id (32 bytes)
+    //   Value: operator_address (20 bytes raw)
+    //
+    // Key formats are CONSENSUS-CRITICAL. Do not modify without hard fork.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Store a service node record and its index entry atomically.
+    ///
+    /// # Arguments
+    /// * `record` - ServiceNodeRecord to persist
+    ///
+    /// # Key Format
+    /// * service_nodes: operator_address (20 bytes) → bincode(ServiceNodeRecord)
+    /// * service_node_index: node_id (32 bytes) → operator_address (20 bytes raw)
+    pub fn put_service_node(
+        &self,
+        record: &crate::gating::service_node::ServiceNodeRecord,
+    ) -> Result<()> {
+        let key = record.operator_address.as_bytes();
+        let blob = bincode::serialize(record)?;
+        let mut wtxn = self.env.begin_rw_txn()?;
+        wtxn.put(self.db_service_nodes, key, &blob, WriteFlags::empty())?;
+        wtxn.put(
+            self.db_service_node_index,
+            &record.node_id,
+            record.operator_address.as_bytes(),
+            WriteFlags::empty(),
+        )?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Get a service node record by operator address.
+    ///
+    /// # Arguments
+    /// * `operator` - Operator address to lookup
+    ///
+    /// # Returns
+    /// * `Ok(Some(record))` - Found
+    /// * `Ok(None)` - Not found
+    /// * `Err` - LMDB or deserialization error
+    pub fn get_service_node(
+        &self,
+        operator: &Address,
+    ) -> Result<Option<crate::gating::service_node::ServiceNodeRecord>> {
+        let rtxn = self.env.begin_ro_txn()?;
+        let key = operator.as_bytes();
+        match rtxn.get(self.db_service_nodes, key) {
+            Ok(val) => {
+                let record: crate::gating::service_node::ServiceNodeRecord =
+                    bincode::deserialize(val)?;
+                Ok(Some(record))
+            }
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Lookup operator address by node_id.
+    ///
+    /// # Arguments
+    /// * `node_id` - 32-byte Ed25519 public key
+    ///
+    /// # Returns
+    /// * `Ok(Some(operator_address))` - Found
+    /// * `Ok(None)` - Not found
+    pub fn get_service_node_by_node_id(
+        &self,
+        node_id: &[u8; 32],
+    ) -> Result<Option<Address>> {
+        let rtxn = self.env.begin_ro_txn()?;
+        match rtxn.get(self.db_service_node_index, node_id) {
+            Ok(val) => {
+                if val.len() == 20 {
+                    let addr_bytes: [u8; 20] = val.try_into().map_err(|_| {
+                        anyhow::anyhow!("invalid operator address length in service_node_index")
+                    })?;
+                    Ok(Some(Address::from_bytes(addr_bytes)))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "invalid operator address length in service_node_index: expected 20, got {}",
+                        val.len()
+                    ))
+                }
+            }
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete a service node record and its index entry atomically.
+    ///
+    /// # Arguments
+    /// * `operator` - Operator address of the record to delete
+    /// * `node_id` - Node ID for index cleanup
+    ///
+    /// # Returns
+    /// * `Ok(())` - Success (even if not found)
+    /// * `Err` - LMDB error
+    pub fn delete_service_node(
+        &self,
+        operator: &Address,
+        node_id: &[u8; 32],
+    ) -> Result<()> {
+        let mut wtxn = self.env.begin_rw_txn()?;
+        match wtxn.del(self.db_service_nodes, operator.as_bytes(), None) {
+            Ok(_) => {}
+            Err(lmdb::Error::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match wtxn.del(self.db_service_node_index, node_id, None) {
+            Ok(_) => {}
+            Err(lmdb::Error::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Load all service node records and index from LMDB.
+    ///
+    /// Returns both maps needed for ChainState restoration:
+    /// - service_nodes: HashMap<Address, ServiceNodeRecord>
+    /// - service_node_index: HashMap<[u8; 32], Address>
+    ///
+    /// # Returns
+    /// * `Ok((records, index))` - Both maps
+    /// * `Err` - LMDB or deserialization error
+    pub fn load_all_service_nodes(
+        &self,
+    ) -> Result<(
+        std::collections::HashMap<Address, crate::gating::service_node::ServiceNodeRecord>,
+        std::collections::HashMap<[u8; 32], Address>,
+    )> {
+        let rtxn = self.env.begin_ro_txn()?;
+        let mut records = std::collections::HashMap::new();
+        let mut index = std::collections::HashMap::new();
+
+        // Load service_nodes bucket
+        {
+            let mut cursor = rtxn.open_ro_cursor(self.db_service_nodes)?;
+            for (key, val) in cursor.iter() {
+                if key.len() == 20 {
+                    let addr_bytes: [u8; 20] = key.try_into().map_err(|_| {
+                        anyhow::anyhow!("invalid operator address key length")
+                    })?;
+                    let operator = Address::from_bytes(addr_bytes);
+                    let record: crate::gating::service_node::ServiceNodeRecord =
+                        bincode::deserialize(val)?;
+                    records.insert(operator, record);
+                }
+            }
+        }
+
+        // Load service_node_index bucket
+        {
+            let mut cursor = rtxn.open_ro_cursor(self.db_service_node_index)?;
+            for (key, val) in cursor.iter() {
+                if key.len() == 32 && val.len() == 20 {
+                    let node_id: [u8; 32] = key.try_into().map_err(|_| {
+                        anyhow::anyhow!("invalid node_id key length")
+                    })?;
+                    let addr_bytes: [u8; 20] = val.try_into().map_err(|_| {
+                        anyhow::anyhow!("invalid operator address value length")
+                    })?;
+                    let operator = Address::from_bytes(addr_bytes);
+                    index.insert(node_id, operator);
+                }
+            }
+        }
+
+        Ok((records, index))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
     // SNAPSHOT OPERATIONS (13.18.2)
     // ════════════════════════════════════════════════════════════════════════════
     // Methods untuk membuat snapshot LMDB dan menulis metadata.
@@ -2676,7 +2924,7 @@ Ok(headers)
         // 3. Open LMDB environment (read-only is default for snapshots)
         // We open with same settings as normal but snapshot is immutable
         let env = Environment::new()
-            .set_max_dbs(33)
+            .set_max_dbs(35) // increased for service node buckets (14B.17)
             .set_map_size(1_000_000_000usize)
             .open(snapshot_path)
             .map_err(|e| DbError::SnapshotOpenFailed(format!(
@@ -2738,6 +2986,10 @@ Ok(headers)
             .map_err(|e| DbError::SnapshotOpenFailed(format!("storage_contracts: {}", e)))?;
         let db_user_contracts = env.open_db(Some(BUCKET_USER_CONTRACTS))
             .map_err(|e| DbError::SnapshotOpenFailed(format!("user_contracts: {}", e)))?;
+        let db_service_nodes = env.open_db(Some(BUCKET_SERVICE_NODES))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("service_nodes: {}", e)))?;
+        let db_service_node_index = env.open_db(Some(BUCKET_SERVICE_NODE_INDEX))
+            .map_err(|e| DbError::SnapshotOpenFailed(format!("service_node_index: {}", e)))?;
 
         Ok(Self {
             env: Arc::new(env),
@@ -2769,6 +3021,8 @@ Ok(headers)
             db_deflation_config,
             db_storage_contracts,
             db_user_contracts,
+            db_service_nodes,
+            db_service_node_index,
         })
     }
 
