@@ -28,7 +28,7 @@
 //! | `wallet` | Wallet management: keypair, signing, encryption | 13.17 |
 //! | `encryption` | Sistem enskripsi| 13.17 |
 //! | `coordinator` | Coordinator committee: epoch, DKG, disputes, accountability | 14A.2B.2 |
-//! | `gating` | Service node on-chain state: ServiceNodeRecord | 14B.11 |
+//! | `gating` | Service node on-chain state: ServiceNodeRecord, query API, RPC endpoints | 14B.11, 14B.18 |
 //!
 //! ## 13.9 — GAS MODEL & FEE SPLIT
 //!
@@ -430,6 +430,7 @@
 //! |       |   - 13.15.8: RPC & CLI Observability | ✅ IMPLEMENTED |
 //! | 14B   | Stake & Identity Gating (Chain State) | 🔧 IN PROGRESS |
 //! |       |   - 14B.11: ServiceNodeRecord & Service Node State | ✅ IMPLEMENTED |
+//! |       |   - 14B.18: RPC Gating Endpoints (read-only query) | ✅ IMPLEMENTED |
 //! ```
 //!
 //! ## Chain Struct

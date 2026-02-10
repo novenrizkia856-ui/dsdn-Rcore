@@ -740,6 +740,72 @@ pub struct NodeCostIndexRes {
     pub message: String,
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// SERVICE NODE GATING RPC RESPONSE TYPES (14B.18)
+// ════════════════════════════════════════════════════════════════════════════
+// READ-ONLY structs for service node gating observability.
+// No state mutation. Safe for monitoring, dashboards, and wallets.
+// All u128 values are represented as String to avoid JSON overflow.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Response for service node stake query
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServiceNodeStakeRes {
+    /// Operator address (hex string with 0x prefix)
+    pub operator: String,
+    /// Staked amount (u128 as string, smallest unit)
+    pub staked_amount: String,
+    /// Node class ("Storage" or "Compute")
+    pub class: String,
+    /// Whether staked_amount meets the minimum for this class
+    pub meets_minimum: bool,
+}
+
+/// Response for service node class query
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServiceNodeClassRes {
+    /// Operator address (hex string with 0x prefix)
+    pub operator: String,
+    /// Node class ("Storage" or "Compute")
+    pub class: String,
+    /// Minimum stake required for this class (u128 as string)
+    pub min_stake_required: String,
+}
+
+/// Response for service node slashing status query
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServiceNodeSlashingRes {
+    /// Operator address (hex string with 0x prefix)
+    pub operator: String,
+    /// Whether the node is currently slashed
+    pub is_slashed: bool,
+    /// Whether a cooldown period is currently active
+    pub cooldown_active: bool,
+    /// Seconds remaining in cooldown (None if not in cooldown)
+    pub cooldown_remaining_secs: Option<u64>,
+    /// Total count of slashing-related events
+    pub slash_count: u64,
+}
+
+/// Response for service node info query
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServiceNodeInfoRes {
+    /// Operator address (hex string with 0x prefix)
+    pub operator: String,
+    /// Node ID as lowercase hex string (64 chars, no prefix)
+    pub node_id_hex: String,
+    /// Node class ("Storage" or "Compute")
+    pub class: String,
+    /// Node lifecycle status ("Pending", "Active", "Quarantined", "Banned")
+    pub status: String,
+    /// Staked amount (u128 as string, smallest unit)
+    pub staked_amount: String,
+    /// Block height at which the node was first registered
+    pub registered_height: u64,
+    /// TLS certificate fingerprint as lowercase hex (None if not set)
+    pub tls_fingerprint_hex: Option<String>,
+}
+
 /// RPC handler for public full node operations
 pub struct FullNodeRpc {
     chain: Chain,
@@ -3267,7 +3333,246 @@ SyncRequest::GetChainTip => {
             ),
         })
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE GATING RPC METHODS (14B.18)
+    // ════════════════════════════════════════════════════════════════════════════
+    // READ-ONLY endpoints for service node gating observability.
+    // All methods acquire a read lock on ChainState, never a write lock.
+    // No state mutation. No consensus impact.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Query stake information for a registered service node.
+    ///
+    /// # Arguments
+    /// * `operator_hex` - Operator address as hex string (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// * `ServiceNodeStakeRes` with stake amount, class, and minimum check
+    ///
+    /// # Errors
+    /// * -32600: Invalid address format
+    /// * -32100: Service node not found
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Delegates to `crate::gating::query::get_stake_info`
+    pub fn get_service_node_stake(&self, operator_hex: String) -> Result<ServiceNodeStakeRes, RpcError> {
+        let addr = operator_hex.trim_start_matches("0x");
+        let parsed_addr = Address::from_hex(addr).map_err(|e| RpcError {
+            code: -32600,
+            message: format!("invalid address format: {}", e),
+        })?;
+
+        let state = self.chain.state.read();
+        let info = crate::gating::query::get_stake_info(&state, &parsed_addr)
+            .ok_or_else(|| RpcError {
+                code: -32100,
+                message: format!("service node not found for operator 0x{}", addr),
+            })?;
+
+        Ok(ServiceNodeStakeRes {
+            operator: format!("0x{}", parsed_addr.to_hex()),
+            staked_amount: info.staked_amount.to_string(),
+            class: node_class_to_string(info.class),
+            meets_minimum: info.meets_minimum,
+        })
+    }
+
+    /// Query class and minimum stake requirement for a registered service node.
+    ///
+    /// # Arguments
+    /// * `operator_hex` - Operator address as hex string (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// * `ServiceNodeClassRes` with class and minimum stake required
+    ///
+    /// # Errors
+    /// * -32600: Invalid address format
+    /// * -32100: Service node not found
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Delegates to `crate::gating::query::get_service_node_class`
+    pub fn get_service_node_class(&self, operator_hex: String) -> Result<ServiceNodeClassRes, RpcError> {
+        let addr = operator_hex.trim_start_matches("0x");
+        let parsed_addr = Address::from_hex(addr).map_err(|e| RpcError {
+            code: -32600,
+            message: format!("invalid address format: {}", e),
+        })?;
+
+        let state = self.chain.state.read();
+        let class = crate::gating::query::get_service_node_class(&state, &parsed_addr)
+            .ok_or_else(|| RpcError {
+                code: -32100,
+                message: format!("service node not found for operator 0x{}", addr),
+            })?;
+
+        Ok(ServiceNodeClassRes {
+            operator: format!("0x{}", parsed_addr.to_hex()),
+            class: node_class_to_string(class),
+            min_stake_required: min_stake_display(class).to_string(),
+        })
+    }
+
+    /// Query slashing and cooldown status for a registered service node.
+    ///
+    /// # Arguments
+    /// * `operator_hex` - Operator address as hex string (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// * `ServiceNodeSlashingRes` with slashing and cooldown information
+    ///
+    /// # Errors
+    /// * -32600: Invalid address format
+    /// * -32100: Service node not found
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Delegates to `crate::gating::query::get_service_node_slashing_status`
+    /// - Uses current system time for cooldown evaluation
+    pub fn get_service_node_slashing_status(&self, operator_hex: String) -> Result<ServiceNodeSlashingRes, RpcError> {
+        let addr = operator_hex.trim_start_matches("0x");
+        let parsed_addr = Address::from_hex(addr).map_err(|e| RpcError {
+            code: -32600,
+            message: format!("invalid address format: {}", e),
+        })?;
+
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let state = self.chain.state.read();
+        let info = crate::gating::query::get_service_node_slashing_status(
+            &state, &parsed_addr, current_timestamp,
+        ).ok_or_else(|| RpcError {
+            code: -32100,
+            message: format!("service node not found for operator 0x{}", addr),
+        })?;
+
+        Ok(ServiceNodeSlashingRes {
+            operator: format!("0x{}", parsed_addr.to_hex()),
+            is_slashed: info.is_slashed,
+            cooldown_active: info.cooldown_active,
+            cooldown_remaining_secs: info.cooldown_remaining_secs,
+            slash_count: info.slash_count,
+        })
+    }
+
+    /// Query full information for a registered service node.
+    ///
+    /// # Arguments
+    /// * `operator_hex` - Operator address as hex string (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// * `ServiceNodeInfoRes` with complete node information
+    ///
+    /// # Errors
+    /// * -32600: Invalid address format
+    /// * -32100: Service node not found
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Direct lookup in `state.service_nodes`
+    pub fn get_service_node_info(&self, operator_hex: String) -> Result<ServiceNodeInfoRes, RpcError> {
+        let addr = operator_hex.trim_start_matches("0x");
+        let parsed_addr = Address::from_hex(addr).map_err(|e| RpcError {
+            code: -32600,
+            message: format!("invalid address format: {}", e),
+        })?;
+
+        let state = self.chain.state.read();
+        let record = state.service_nodes.get(&parsed_addr)
+            .ok_or_else(|| RpcError {
+                code: -32100,
+                message: format!("service node not found for operator 0x{}", addr),
+            })?;
+
+        Ok(record_to_info_res(record))
+    }
+
+    /// List all active service nodes.
+    ///
+    /// # Returns
+    /// * `Vec<ServiceNodeInfoRes>` — all nodes with `status == Active`,
+    ///   sorted by operator address ascending (deterministic ordering)
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Filters `state.service_nodes` for `NodeStatus::Active`
+    /// - Sorting by operator address bytes guarantees deterministic response
+    pub fn list_active_service_nodes(&self) -> Vec<ServiceNodeInfoRes> {
+        let state = self.chain.state.read();
+
+        let mut active: Vec<_> = state.service_nodes
+            .values()
+            .filter(|record| record.status == dsdn_common::gating::NodeStatus::Active)
+            .collect();
+
+        // Deterministic ordering: sort by operator address bytes ascending
+        active.sort_by(|a, b| a.operator_address.as_bytes().cmp(b.operator_address.as_bytes()));
+
+        active.iter().map(|record| record_to_info_res(record)).collect()
+    }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// SERVICE NODE RPC HELPERS (14B.18)
+// ════════════════════════════════════════════════════════════════════════════
+// Display-only helpers for service node RPC response formatting.
+// These do NOT implement consensus logic — they format existing data for
+// JSON-RPC consumers (wallets, explorers, dashboards).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Convert `NodeClass` to display string.
+///
+/// Explicit match — no wildcard — adding a new variant forces a compile error.
+fn node_class_to_string(class: dsdn_common::gating::NodeClass) -> String {
+    match class {
+        dsdn_common::gating::NodeClass::Storage => "Storage".to_string(),
+        dsdn_common::gating::NodeClass::Compute => "Compute".to_string(),
+    }
+}
+
+/// Convert `NodeStatus` to display string.
+///
+/// Explicit match — no wildcard — adding a new variant forces a compile error.
+fn node_status_to_string(status: dsdn_common::gating::NodeStatus) -> String {
+    match status {
+        dsdn_common::gating::NodeStatus::Pending => "Pending".to_string(),
+        dsdn_common::gating::NodeStatus::Active => "Active".to_string(),
+        dsdn_common::gating::NodeStatus::Quarantined => "Quarantined".to_string(),
+        dsdn_common::gating::NodeStatus::Banned => "Banned".to_string(),
+    }
+}
+
+/// Return minimum stake for a NodeClass (display only, not consensus).
+///
+/// Values MUST be kept in sync with `crate::gating::query` constants.
+/// These are protocol constants, not state-derived values.
+fn min_stake_display(class: dsdn_common::gating::NodeClass) -> u128 {
+    match class {
+        dsdn_common::gating::NodeClass::Storage => 5_000,
+        dsdn_common::gating::NodeClass::Compute => 500,
+    }
+}
+
+/// Convert a `ServiceNodeRecord` reference to `ServiceNodeInfoRes`.
+///
+/// Pure function. No allocation beyond response struct construction.
+fn record_to_info_res(record: &crate::gating::ServiceNodeRecord) -> ServiceNodeInfoRes {
+    ServiceNodeInfoRes {
+        operator: format!("0x{}", record.operator_address.to_hex()),
+        node_id_hex: hex::encode(record.node_id),
+        class: node_class_to_string(record.class),
+        status: node_status_to_string(record.status),
+        staked_amount: record.staked_amount.to_string(),
+        registered_height: record.registered_height,
+        tls_fingerprint_hex: record.tls_fingerprint.map(hex::encode),
+    }
+}
+
 // ============================================================
 // HELPER FUNCTIONS FOR NETWORK SYNC
 // ============================================================
