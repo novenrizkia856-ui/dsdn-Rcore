@@ -15,6 +15,7 @@ use crate::Chain;
 use hex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use dsdn_common::gating::{NodeClass, NodeStatus};
 
 // ------------------- WALLET HELPERS -------------------
 
@@ -388,6 +389,17 @@ pub enum Commands {
     },
 
     // ═══════════════════════════════════════════════════════════
+    // SERVICE NODE GATING (14B.19)
+    // ═══════════════════════════════════════════════════════════
+
+    /// Service node gating commands
+    /// Register, query info/stake/status, and list active service nodes
+    ServiceNode {
+        #[command(subcommand)]
+        command: ServiceNodeCommand,
+    },
+
+    // ═══════════════════════════════════════════════════════════
     // FULL INTEGRATION TESTING (13.19)
     // ═══════════════════════════════════════════════════════════
 
@@ -409,6 +421,63 @@ pub enum TestCommand {
     /// Executes all 9 integration tests sequentially
     /// Reports: SYSTEM OK / SYSTEM DEGRADED / SYSTEM INVALID
     Full,
+}
+
+/// Service node gating commands (14B.19)
+///
+/// Commands for operator/admin to register service nodes and query
+/// gating state. READ commands (info, stake, status, list) do NOT
+/// modify state. Only `register` submits a transaction.
+///
+/// ## Subcommands
+///
+/// - `register`: Submit RegisterServiceNode transaction
+/// - `info`: Show detailed service node record
+/// - `stake`: Show stake info for a service node
+/// - `status`: Show status for a service node
+/// - `list`: List all active service nodes
+#[derive(Subcommand)]
+pub enum ServiceNodeCommand {
+    /// Register a new service node on-chain
+    /// Submits a RegisterServiceNode transaction
+    Register {
+        #[arg(long, help = "Node ID — Ed25519 public key (hex, 64 chars / 32 bytes)")]
+        node_id: String,
+        #[arg(long, help = "Node class: storage or compute")]
+        class: String,
+        #[arg(long, help = "TLS certificate SHA-256 fingerprint (hex, 64 chars / 32 bytes)")]
+        tls_fingerprint: String,
+        #[arg(long, default_value = "10")]
+        fee: String,
+        #[arg(long, default_value = "80000")]
+        gas_limit: u64,
+    },
+    /// Show detailed service node info by operator address (READ-ONLY)
+    Info {
+        #[arg(long, help = "Operator address (hex)")]
+        address: String,
+        #[arg(long, action = clap::ArgAction::SetTrue, help = "Output as JSON")]
+        json: bool,
+    },
+    /// Show stake info for a service node (READ-ONLY)
+    Stake {
+        #[arg(long, help = "Operator address (hex)")]
+        address: String,
+        #[arg(long, action = clap::ArgAction::SetTrue, help = "Output as JSON")]
+        json: bool,
+    },
+    /// Show status for a service node (READ-ONLY)
+    Status {
+        #[arg(long, help = "Operator address (hex)")]
+        address: String,
+        #[arg(long, action = clap::ArgAction::SetTrue, help = "Output as JSON")]
+        json: bool,
+    },
+    /// List all active service nodes (READ-ONLY)
+    List {
+        #[arg(long, action = clap::ArgAction::SetTrue, help = "Output as JSON")]
+        json: bool,
+    },
 }
 
 /// Wallet commands (13.17.8)
@@ -1171,6 +1240,356 @@ pub fn run_cli() -> Result<()> {
                     println!("Result:      ❌ INVALID - Blob does NOT match commitment");
                 }
                 println!("═══════════════════════════════════════════════════════════");
+                Ok(())
+            }
+        };
+    }
+
+    // === Handle ServiceNode commands (14B.19) ===
+    if let Commands::ServiceNode { command } = &cli.cmd {
+        return match command {
+            ServiceNodeCommand::Register { node_id, class, tls_fingerprint, fee, gas_limit } => {
+                // Parse node_id hex (must be exactly 32 bytes / 64 hex chars)
+                let node_id_str = node_id.trim_start_matches("0x");
+                let node_id_bytes = hex::decode(node_id_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid node_id hex: {}", e))?;
+                if node_id_bytes.len() != 32 {
+                    anyhow::bail!(
+                        "node_id must be exactly 32 bytes (64 hex chars), got {} bytes",
+                        node_id_bytes.len()
+                    );
+                }
+
+                // Parse class
+                let node_class = match class.to_lowercase().as_str() {
+                    "storage" => NodeClass::Storage,
+                    "compute" => NodeClass::Compute,
+                    other => anyhow::bail!(
+                        "Invalid node class '{}'. Must be 'storage' or 'compute'.",
+                        other
+                    ),
+                };
+
+                // Parse tls_fingerprint hex (must be exactly 32 bytes / 64 hex chars)
+                let tls_str = tls_fingerprint.trim_start_matches("0x");
+                let tls_bytes = hex::decode(tls_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid tls_fingerprint hex: {}", e))?;
+                if tls_bytes.len() != 32 {
+                    anyhow::bail!(
+                        "tls_fingerprint must be exactly 32 bytes (64 hex chars), got {} bytes",
+                        tls_bytes.len()
+                    );
+                }
+
+                // Parse fee
+                let fee_parsed = parse_nusa_amount(fee)?;
+
+                // Load wallet (register submits a transaction)
+                let w = load_wallet()?;
+
+                // Generate identity proof: sign node_id with wallet private key
+                let identity_proof_sig = sign_ed25519(&w.priv_key, &node_id_bytes)?;
+
+                let nonce = chain.state.read().get_nonce(&w.address) + 1;
+
+                let payload = TxPayload::RegisterServiceNode {
+                    from: w.address,
+                    node_id: node_id_bytes,
+                    class: node_class,
+                    tls_fingerprint: tls_bytes,
+                    identity_proof_sig,
+                    fee: fee_parsed,
+                    nonce,
+                    gas_limit: *gas_limit,
+                };
+
+                let env = sign_payload(payload, &w.priv_key)?;
+                chain.submit_tx(env)?;
+
+                let class_str = match node_class {
+                    NodeClass::Storage => "Storage",
+                    NodeClass::Compute => "Compute",
+                };
+                println!("═══════════════════════════════════════════════════════════");
+                println!("✅ SERVICE NODE REGISTRATION SUBMITTED (14B.19)");
+                println!("═══════════════════════════════════════════════════════════");
+                println!("   Operator:        {}", w.address);
+                println!("   Node ID:         {}", node_id_str);
+                println!("   Class:           {}", class_str);
+                println!("   TLS Fingerprint: {}", tls_str);
+                println!("   Fee:             {}", format_nusa(fee_parsed));
+                println!("   Nonce:           {}", nonce);
+                println!("═══════════════════════════════════════════════════════════");
+                Ok(())
+            }
+
+            ServiceNodeCommand::Info { address, json } => {
+                let addr_str = address.trim_start_matches("0x");
+                let addr = Address::from_hex(addr_str)
+                    .map_err(|_| anyhow::anyhow!("Invalid address hex format"))?;
+
+                let state = chain.state.read();
+                match state.get_service_node(&addr) {
+                    Some(record) => {
+                        if *json {
+                            let class_str = match record.class {
+                                NodeClass::Storage => "Storage",
+                                NodeClass::Compute => "Compute",
+                            };
+                            let status_str = match record.status {
+                                NodeStatus::Pending => "Pending",
+                                NodeStatus::Active => "Active",
+                                NodeStatus::Quarantined => "Quarantined",
+                                NodeStatus::Banned => "Banned",
+                            };
+                            let tls_hex = record.tls_fingerprint
+                                .as_ref()
+                                .map(|fp| hex::encode(fp))
+                                .unwrap_or_default();
+                            let json_val = serde_json::json!({
+                                "operator_address": format!("0x{}", hex::encode(record.operator_address.as_bytes())),
+                                "node_id": hex::encode(record.node_id),
+                                "class": class_str,
+                                "status": status_str,
+                                "staked_amount": record.staked_amount.to_string(),
+                                "registered_height": record.registered_height,
+                                "last_status_change_height": record.last_status_change_height,
+                                "tls_fingerprint": tls_hex,
+                                "metadata": record.metadata,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&json_val)
+                                .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                        } else {
+                            let class_str = match record.class {
+                                NodeClass::Storage => "Storage",
+                                NodeClass::Compute => "Compute",
+                            };
+                            let status_str = match record.status {
+                                NodeStatus::Pending => "Pending ⏳",
+                                NodeStatus::Active => "Active ✅",
+                                NodeStatus::Quarantined => "Quarantined ⚠️",
+                                NodeStatus::Banned => "Banned 🚫",
+                            };
+                            let tls_display = record.tls_fingerprint
+                                .as_ref()
+                                .map(|fp| hex::encode(fp))
+                                .unwrap_or_else(|| "(none)".to_string());
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("🔍 SERVICE NODE INFO (14B.19)");
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("   Operator:        0x{}", hex::encode(record.operator_address.as_bytes()));
+                            println!("   Node ID:         {}", hex::encode(record.node_id));
+                            println!("   Class:           {}", class_str);
+                            println!("   Status:          {}", status_str);
+                            println!("   Staked:          {}", format_nusa(record.staked_amount));
+                            println!("   Registered At:   height {}", record.registered_height);
+                            println!("   Last Status Chg: height {}", record.last_status_change_height);
+                            println!("   TLS Fingerprint: {}", tls_display);
+                            if !record.metadata.is_empty() {
+                                println!("   Metadata:");
+                                let mut keys: Vec<&String> = record.metadata.keys().collect();
+                                keys.sort();
+                                for key in keys {
+                                    if let Some(val) = record.metadata.get(key) {
+                                        println!("      {}: {}", key, val);
+                                    }
+                                }
+                            }
+                            println!("═══════════════════════════════════════════════════════════");
+                        }
+                    }
+                    None => {
+                        if *json {
+                            let json_val = serde_json::json!({
+                                "error": "Service node not found",
+                                "address": format!("0x{}", addr_str),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&json_val)
+                                .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                        } else {
+                            println!("❌ Service node not found for address: 0x{}", addr_str);
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            ServiceNodeCommand::Stake { address, json } => {
+                let addr_str = address.trim_start_matches("0x");
+                let addr = Address::from_hex(addr_str)
+                    .map_err(|_| anyhow::anyhow!("Invalid address hex format"))?;
+
+                let state = chain.state.read();
+                match state.get_stake_info(&addr) {
+                    Some(info) => {
+                        let class_str = match info.class {
+                            NodeClass::Storage => "Storage",
+                            NodeClass::Compute => "Compute",
+                        };
+                        if *json {
+                            let json_val = serde_json::json!({
+                                "operator": format!("0x{}", hex::encode(info.operator.as_bytes())),
+                                "staked_amount": info.staked_amount.to_string(),
+                                "class": class_str,
+                                "meets_minimum": info.meets_minimum,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&json_val)
+                                .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                        } else {
+                            let meets_str = if info.meets_minimum { "Yes ✅" } else { "No ❌" };
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("💰 SERVICE NODE STAKE (14B.19)");
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("   Operator:      0x{}", hex::encode(info.operator.as_bytes()));
+                            println!("   Staked:        {}", format_nusa(info.staked_amount));
+                            println!("   Class:         {}", class_str);
+                            println!("   Meets Minimum: {}", meets_str);
+                            println!("═══════════════════════════════════════════════════════════");
+                        }
+                    }
+                    None => {
+                        if *json {
+                            let json_val = serde_json::json!({
+                                "error": "Service node not found",
+                                "address": format!("0x{}", addr_str),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&json_val)
+                                .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                        } else {
+                            println!("❌ Service node not found for address: 0x{}", addr_str);
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            ServiceNodeCommand::Status { address, json } => {
+                let addr_str = address.trim_start_matches("0x");
+                let addr = Address::from_hex(addr_str)
+                    .map_err(|_| anyhow::anyhow!("Invalid address hex format"))?;
+
+                let state = chain.state.read();
+                match state.get_service_node(&addr) {
+                    Some(record) => {
+                        let status_str = match record.status {
+                            NodeStatus::Pending => "Pending",
+                            NodeStatus::Active => "Active",
+                            NodeStatus::Quarantined => "Quarantined",
+                            NodeStatus::Banned => "Banned",
+                        };
+                        let class_str = match record.class {
+                            NodeClass::Storage => "Storage",
+                            NodeClass::Compute => "Compute",
+                        };
+                        if *json {
+                            let json_val = serde_json::json!({
+                                "operator_address": format!("0x{}", hex::encode(record.operator_address.as_bytes())),
+                                "status": status_str,
+                                "class": class_str,
+                                "last_status_change_height": record.last_status_change_height,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&json_val)
+                                .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                        } else {
+                            let status_display = match record.status {
+                                NodeStatus::Pending => "Pending ⏳",
+                                NodeStatus::Active => "Active ✅",
+                                NodeStatus::Quarantined => "Quarantined ⚠️",
+                                NodeStatus::Banned => "Banned 🚫",
+                            };
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("📊 SERVICE NODE STATUS (14B.19)");
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("   Operator:        0x{}", hex::encode(record.operator_address.as_bytes()));
+                            println!("   Status:          {}", status_display);
+                            println!("   Class:           {}", class_str);
+                            println!("   Last Status Chg: height {}", record.last_status_change_height);
+                            println!("═══════════════════════════════════════════════════════════");
+                        }
+                    }
+                    None => {
+                        if *json {
+                            let json_val = serde_json::json!({
+                                "error": "Service node not found",
+                                "address": format!("0x{}", addr_str),
+                            });
+                            println!("{}", serde_json::to_string_pretty(&json_val)
+                                .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                        } else {
+                            println!("❌ Service node not found for address: 0x{}", addr_str);
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            ServiceNodeCommand::List { json } => {
+                let state = chain.state.read();
+                let all_nodes = state.list_service_nodes();
+
+                // Filter: ONLY Active nodes
+                let mut active_nodes: Vec<_> = all_nodes.into_iter()
+                    .filter(|r| r.status == NodeStatus::Active)
+                    .collect();
+
+                // Sort deterministically by operator_address bytes
+                active_nodes.sort_by(|a, b| {
+                    a.operator_address.as_bytes().cmp(b.operator_address.as_bytes())
+                });
+
+                if *json {
+                    let json_nodes: Vec<serde_json::Value> = active_nodes.iter().map(|r| {
+                        let class_str = match r.class {
+                            NodeClass::Storage => "Storage",
+                            NodeClass::Compute => "Compute",
+                        };
+                        let tls_hex = r.tls_fingerprint
+                            .as_ref()
+                            .map(|fp| hex::encode(fp))
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "operator_address": format!("0x{}", hex::encode(r.operator_address.as_bytes())),
+                            "node_id": hex::encode(r.node_id),
+                            "class": class_str,
+                            "status": "Active",
+                            "staked_amount": r.staked_amount.to_string(),
+                            "registered_height": r.registered_height,
+                            "tls_fingerprint": tls_hex,
+                        })
+                    }).collect();
+                    println!("{}", serde_json::to_string_pretty(&json_nodes)
+                        .map_err(|e| anyhow::anyhow!("JSON serialization error: {}", e))?);
+                } else {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("📋 ACTIVE SERVICE NODES (14B.19)");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    if active_nodes.is_empty() {
+                        println!("   No active service nodes found.");
+                    } else {
+                        println!("{:<5} {:<44} {:<10} {:>15} {:<18}",
+                                 "#", "Operator", "Class", "Staked", "Node ID (prefix)");
+                        println!("{}", "─".repeat(95));
+
+                        for (i, r) in active_nodes.iter().enumerate() {
+                            let class_str = match r.class {
+                                NodeClass::Storage => "Storage",
+                                NodeClass::Compute => "Compute",
+                            };
+                            let node_id_prefix = &hex::encode(r.node_id)[..16];
+                            println!("{:<5} 0x{:<42} {:<10} {:>15} {}...",
+                                    i + 1,
+                                    hex::encode(r.operator_address.as_bytes()),
+                                    class_str,
+                                    format_nusa(r.staked_amount),
+                                    node_id_prefix);
+                        }
+                    }
+
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("Total active: {}", active_nodes.len());
+                    println!("═══════════════════════════════════════════════════════════");
+                }
                 Ok(())
             }
         };
@@ -2800,6 +3219,9 @@ println!("   Bootstrap Mode: {}", if config.bootstrap_mode { "YES ⚠️" } else
         }
         Commands::Da { .. } => {
             // Already handled above, this is unreachable
+        }
+        Commands::ServiceNode { .. } => {
+            // Already handled above via if-let block, this is unreachable
         }
 
         // ═══════════════════════════════════════════════════════════

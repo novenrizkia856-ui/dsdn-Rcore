@@ -14,7 +14,7 @@
 //! | `mempool` | Transaction pool management | Core |
 //! | `miner` | Block production: Miner, proposer selection | 13.7.D |
 //! | `rpc` | JSON-RPC endpoints: FullNodeRpc, BroadcastManager, SyncRpc | 13.7.N, 13.11.7 |
-//! | `cli` | Command line interface: Commands, sync subcommands | 13.9, 13.11.7 |
+//! | `cli` | Command line interface: Commands, sync subcommands, service node gating | 13.9, 13.11.7, 14B.19 |
 //! | `qv` | Quadratic Voting: sqrt weight, 80/20 formula | 13.8.C/D |
 //! | `proposer` | Stake-weighted proposer selection | 13.7.D |
 //! | `tokenomics` | Fee distribution: 70/20/10 split, caps | 13.8.E, 13.9 |
@@ -431,6 +431,7 @@
 //! | 14B   | Stake & Identity Gating (Chain State) | 🔧 IN PROGRESS |
 //! |       |   - 14B.11: ServiceNodeRecord & Service Node State | ✅ IMPLEMENTED |
 //! |       |   - 14B.18: RPC Gating Endpoints (read-only query) | ✅ IMPLEMENTED |
+//! |       |   - 14B.19: CLI Gating Commands (register, info, stake, status, list) | ✅ IMPLEMENTED |
 //! ```
 //!
 //! ## Chain Struct
