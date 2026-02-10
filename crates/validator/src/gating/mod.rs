@@ -5,6 +5,7 @@
 //! ## Modules
 //!
 //! - `stake_verifier`: Validates stake meets minimum per [`NodeClass`](dsdn_common::gating::NodeClass) (14B.21)
+//! - `identity_verifier`: Verifies Ed25519 identity proofs and operator bindings (14B.22)
 //!
 //! ## Design Principles
 //!
@@ -19,5 +20,7 @@
 //! or trigger status transitions.
 
 pub mod stake_verifier;
+pub mod identity_verifier;
 
 pub use stake_verifier::StakeVerifier;
+pub use identity_verifier::IdentityVerifier;
