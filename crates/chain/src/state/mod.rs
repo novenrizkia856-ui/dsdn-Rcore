@@ -5664,15 +5664,72 @@ impl ChainState {
      ///
      /// Returns `true` only if registered AND cooldown active at `current_timestamp`.
      /// Returns `false` for unregistered operators.
-     #[inline]
-     pub fn is_service_node_in_cooldown(
-         &self,
-         operator: &Address,
-         current_timestamp: u64,
-     ) -> bool {
-         crate::gating::query::is_service_node_in_cooldown(self, operator, current_timestamp)
-     }
- }
+    pub fn is_service_node_in_cooldown(
+          &self,
+          operator: &Address,
+          current_timestamp: u64,
+      ) -> bool {
+          crate::gating::query::is_service_node_in_cooldown(self, operator, current_timestamp)
+      }
+
+      // ══════════════════════════════════════════════════════════════════════════
+      // SERVICE NODE SLASHING & COOLDOWN ENFORCEMENT (14B.16)
+      // ══════════════════════════════════════════════════════════════════════════
+      // Slashing, cooldown expiry, and activation methods.
+      // Logic implemented in crate::gating::slashing.
+      // ══════════════════════════════════════════════════════════════════════════
+
+      /// Slash a registered service node.
+      ///
+      /// Deducts `amount` from stake, evaluates status (Quarantined if below
+      /// minimum, Banned + cooldown if severe), and reduces locked balance.
+      /// Returns `ServiceNodeSlashEvent` with FINAL state.
+      ///
+      /// ## Errors
+      /// - Operator not registered
+      /// - Amount is zero
+      /// - Reason is empty
+      /// - Insufficient staked amount
+      #[inline]
+      pub fn slash_service_node(
+          &mut self,
+          operator: &Address,
+          amount: u128,
+          reason: String,
+          height: u64,
+          timestamp: u64,
+          severe: bool,
+      ) -> Result<crate::gating::slashing::ServiceNodeSlashEvent, String> {
+          crate::gating::slashing::slash_service_node(
+              self, operator, amount, reason, height, timestamp, severe,
+          )
+      }
+
+      /// Clear expired cooldowns and transition Banned → Pending.
+      ///
+      /// Iterates all service nodes. For each expired cooldown:
+      /// cooldown set to None, and if Banned → Pending.
+      #[inline]
+      pub fn check_and_clear_expired_cooldowns(&mut self, current_timestamp: u64) {
+          crate::gating::slashing::check_and_clear_expired_cooldowns(self, current_timestamp)
+      }
+
+      /// Activate a service node: Pending → Active.
+      ///
+      /// All gating checks must have already passed.
+      ///
+      /// ## Errors
+      /// - Operator not registered
+      /// - Status is not Pending
+      #[inline]
+      pub fn activate_service_node(
+          &mut self,
+          operator: &Address,
+          height: u64,
+      ) -> Result<(), String> {
+          crate::gating::slashing::activate_service_node(self, operator, height)
+      }
+  }
 
 
 // ════════════════════════════════════════════════════════════════════════════

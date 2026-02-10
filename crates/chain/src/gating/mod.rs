@@ -10,7 +10,10 @@
 //! - `query`: Read-only query API (14B.14, 14B.15)
 //!   - Stake queries: `get_service_node_stake`, `get_stake_info`, `ServiceNodeStakeInfo`
 //!   - Class/status: `get_service_node_class`, `get_service_node_status`
-//!   - Slashing: `get_service_node_slashing_status`, `is_service_node_in_cooldown`, `ServiceNodeSlashingInfo`
+//!   - Slashing queries: `get_service_node_slashing_status`, `is_service_node_in_cooldown`, `ServiceNodeSlashingInfo`
+//! - `slashing`: Slashing enforcement & cooldown management (14B.16)
+//!   - `slash_service_node`, `check_and_clear_expired_cooldowns`, `activate_service_node`
+//!   - `ServiceNodeSlashEvent`
 //!
 //! ## Relationship with `dsdn_common::gating`
 //!
@@ -20,7 +23,9 @@
 pub mod service_node;
 pub mod registry;
 pub mod query;
+pub mod slashing;
 
 pub use service_node::ServiceNodeRecord;
 pub use query::ServiceNodeStakeInfo;
 pub use query::ServiceNodeSlashingInfo;
+pub use slashing::ServiceNodeSlashEvent;
