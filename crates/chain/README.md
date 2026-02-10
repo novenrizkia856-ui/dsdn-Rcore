@@ -133,84 +133,97 @@ export DSDN_DB_PATH="./chaindb"
 dsdn-chain --db-path ./chaindb <command>
 ```
 
-### Wallet Management
+### Chain Management
 
 ```bash
-# Create new wallet
-dsdn-chain wallet create
+# Initialize genesis block with initial account
+dsdn-chain init --genesis-account 0x... --amount 300000000
 
-# Import existing wallet
-dsdn-chain wallet import --privkey <hex>
-
-# Show wallet status
-dsdn-chain wallet status
-
-# Encrypt a file
-dsdn-chain wallet encrypt --file input.txt --output encrypted.bin
-
-# Decrypt a file
-dsdn-chain wallet decrypt --file encrypted.bin --output output.txt
-```
-
-### Chain Status & Queries
-
-```bash
 # Show chain status (height, tip hash)
 dsdn-chain status
 
-# Show balance
+# Show balance (uses wallet address if --address not specified)
 dsdn-chain balance
 dsdn-chain balance --address 0x...
+```
 
-# List validators
-dsdn-chain validators
+### Wallet Management
 
-# Show validator details
-dsdn-chain validator-info --address 0x...
+```bash
+# Create new wallet (generates keypair, saves to wallet.dat)
+dsdn-chain wallet create
 
-# Show staking info for current wallet
-dsdn-chain staking-info
+# Import existing wallet from private key
+dsdn-chain wallet import --privkey <hex>
 
-# Show epoch and network info
-dsdn-chain epoch-info
+# Show wallet status (address only)
+dsdn-chain wallet status
 
-# Show treasury and pool balances
-dsdn-chain pool-info
+# Sign a transaction with secret key
+dsdn-chain wallet sign --tx <unsigned-tx-hex> --secret <secret-key-hex>
+
+# Encrypt a file using wallet encryption
+dsdn-chain wallet encrypt --file input.txt --output encrypted.bin
+
+# Decrypt a file using wallet encryption
+dsdn-chain wallet decrypt --file encrypted.bin --output output.txt
 ```
 
 ### Transactions
 
 ```bash
 # Transfer NUSA
-dsdn-chain submit-transfer --to 0x... --amount 100 --fee 10
+dsdn-chain submit-transfer --to 0x... --amount 100 --fee 10 --gas-limit 21000
 
 # Storage operation payment
-dsdn-chain submit-storage-op --to-node 0x... --amount 50 --operation-id "op123"
+dsdn-chain submit-storage-op --to-node 0x... --amount 50 --operation-id "op123" --fee 10 --gas-limit 25000
 
 # Compute execution payment
-dsdn-chain submit-compute-exec --to-node 0x... --amount 30 --execution-id "exec456"
+dsdn-chain submit-compute-exec --to-node 0x... --amount 30 --execution-id "exec456" --fee 10 --gas-limit 40000
 ```
 
 ### Staking & Delegation
 
 ```bash
-# Register as validator (requires 50,000 NUSA)
-dsdn-chain submit-validator-reg --pubkey <hex> --min-stake 50000
+# Register as validator (requires min 50,000 NUSA stake)
+dsdn-chain submit-validator-reg --pubkey <hex> --min-stake 50000 --fee 10 --gas-limit 80000
 
 # Stake to validator
-dsdn-chain submit-stake --validator 0x... --amount 1000
+dsdn-chain submit-stake --validator 0x... --amount 1000 --fee 10 --gas-limit 50000
 
-# Delegate to validator (with --bond flag)
-dsdn-chain submit-stake --validator 0x... --amount 1000 --bond
+# Stake with delegation bond (--bond flag)
+dsdn-chain submit-stake --validator 0x... --amount 1000 --bond --fee 10 --gas-limit 50000
 
-# Delegator stake (min 100,000 NUSA)
-dsdn-chain submit-delegator-stake --validator 0x... --amount 100000
+# Delegate stake shortcut (equivalent to submit-stake --bond)
+dsdn-chain delegate --validator 0x... --amount 1000 --fee 10
+
+# Delegator stake (min 100,000 NUSA, explicit delegator staking)
+dsdn-chain submit-delegator-stake --validator 0x... --amount 100000 --fee 10 --gas-limit 50000
 
 # Unstake (7-day delay applies)
-dsdn-chain submit-unstake --validator 0x... --amount 500
+dsdn-chain submit-unstake --validator 0x... --amount 500 --fee 10 --gas-limit 50000
 
 # Withdraw delegator stake
-dsdn-chain withdraw-delegator-stake --validator 0x... --amount 50000
+dsdn-chain withdraw-delegator-stake --validator 0x... --amount 50000 --fee 10 --gas-limit 50000
+```
+
+### Query Commands
+
+```bash
+# List all validators with stake and voting power
+dsdn-chain validators
+
+# Show detailed validator info including delegations
+dsdn-chain validator-info --address 0x...
+
+# Show staking info for current wallet
+dsdn-chain staking-info
+
+# Show current epoch and network info
+dsdn-chain epoch-info
+
+# Show treasury, reward pool, and delegator pool balances
+dsdn-chain pool-info
 ```
 
 ### Governance
@@ -220,33 +233,40 @@ dsdn-chain withdraw-delegator-stake --validator 0x... --amount 50000
 dsdn-chain governance propose \
   --type update-fee \
   --title "Reduce storage fee" \
-  --description "Proposal to reduce storage fees by 10%"
+  --description "Proposal to reduce storage fees by 10%" \
+  --fee 10 --gas-limit 100000
 
-# Vote on proposal
-dsdn-chain governance vote --proposal 1 --vote yes
+# Vote on proposal (yes, no, abstain)
+dsdn-chain governance vote --proposal 1 --vote yes --fee 10 --gas-limit 50000
 
 # Finalize proposal after voting period
-dsdn-chain governance finalize --proposal 1
+dsdn-chain governance finalize --proposal 1 --fee 10 --gas-limit 75000
+
+# Foundation veto a proposal (Bootstrap Mode only)
+dsdn-chain governance foundation-veto --proposal 1 --fee 10 --gas-limit 50000
 
 # List active proposals
 dsdn-chain governance list-active
 
-# List all proposals
+# List all proposals (all statuses)
 dsdn-chain governance list-all
 
 # Show proposal details
 dsdn-chain governance show --proposal 1
 
-# Show my votes
+# Show my votes on all proposals
 dsdn-chain governance my-votes
 
-# Preview proposal changes (READ-ONLY)
+# Show current governance configuration
+dsdn-chain governance config
+
+# Preview proposal changes (READ-ONLY, does NOT execute)
 dsdn-chain governance preview --proposal 1
 
 # Check bootstrap mode status
 dsdn-chain governance bootstrap-status
 
-# View governance events
+# View recent governance events
 dsdn-chain governance events --count 20
 ```
 
@@ -263,28 +283,57 @@ dsdn-chain governance events --count 20
 
 ```bash
 # Claim reward from Coordinator receipt
-dsdn-chain submit-claim-reward --receipt-file receipt.json
+dsdn-chain submit-claim-reward --receipt-file receipt.json --fee 10 --gas-limit 30000
 
 # Or use receipt subcommand
-dsdn-chain receipt claim --file receipt.json
+dsdn-chain receipt claim --file receipt.json --fee 10 --gas-limit 30000
 
-# Check receipt status
+# Check receipt status (claimed or not)
 dsdn-chain receipt status --id 0x...
 
-# View node earnings
+# View accumulated node earnings
 dsdn-chain receipt earnings --address 0x...
 ```
+
+### Service Node Gating
+
+```bash
+# Register a new service node on-chain
+dsdn-chain service-node register \
+  --node-id <ed25519-pubkey-hex> \
+  --class storage \
+  --tls-fingerprint <sha256-hex> \
+  --fee 10 --gas-limit 80000
+
+# Show detailed service node info (READ-ONLY)
+dsdn-chain service-node info --address 0x...
+dsdn-chain service-node info --address 0x... --json
+
+# Show stake info for a service node (READ-ONLY)
+dsdn-chain service-node stake --address 0x...
+dsdn-chain service-node stake --address 0x... --json
+
+# Show service node status (READ-ONLY)
+dsdn-chain service-node status --address 0x...
+dsdn-chain service-node status --address 0x... --json
+
+# List all active service nodes (READ-ONLY)
+dsdn-chain service-node list
+dsdn-chain service-node list --json
+```
+
+**Node Classes:** `storage`, `compute`
 
 ### Economic Observability
 
 ```bash
-# Show economic status (mode, treasury, supply, burn rate)
+# Show economic status (mode, replication factor, treasury, supply, burn rate)
 dsdn-chain economic status
 
-# Show deflation configuration
+# Show deflation configuration and state
 dsdn-chain economic deflation
 
-# Show burn history
+# Show burn event history
 dsdn-chain economic burn-history --count 20
 ```
 
@@ -297,7 +346,7 @@ dsdn-chain slashing node-status --address 0x...
 # Show validator slash status
 dsdn-chain slashing validator-status --address 0x...
 
-# Show slashing events
+# Show recent slashing events
 dsdn-chain slashing events --count 10
 ```
 
@@ -307,42 +356,42 @@ dsdn-chain slashing events --count 10
 # Start sync to network tip
 dsdn-chain sync start
 
-# Stop sync
+# Stop ongoing sync process
 dsdn-chain sync stop
 
-# Show sync status
+# Show current sync status
 dsdn-chain sync status
 
-# Show sync progress with ETA
+# Show sync progress with progress bar and ETA
 dsdn-chain sync progress
 
-# Reset sync state
+# Reset sync state (clear metadata, restart from genesis)
 dsdn-chain sync reset
 
-# Fast sync from snapshot
+# Fast sync from a snapshot
 dsdn-chain sync fast --from-snapshot 10000
 ```
 
 ### Snapshots
 
 ```bash
-# List available snapshots
+# List all available snapshots
 dsdn-chain snapshot list
 
 # Create snapshot at current height
 dsdn-chain snapshot create
 
-# Show snapshot details
+# Show detailed snapshot info (height, timestamp, state_root)
 dsdn-chain snapshot info --height 10000
 ```
 
 ### Storage Contracts
 
 ```bash
-# List contracts for address
+# List all contracts for an address
 dsdn-chain storage list --address 0x...
 
-# Show contract details
+# Show detailed contract info
 dsdn-chain storage info --contract 0x...
 ```
 
@@ -356,10 +405,10 @@ dsdn-chain da verify --blob <hex> --commitment <hex>
 ### Node Cost Index (Admin)
 
 ```bash
-# Set node cost multiplier
+# Set node cost multiplier (basis 100 = 1.0x)
 dsdn-chain node-cost set --address 0x... --multiplier 150
 
-# Get node cost index
+# Get current node cost index
 dsdn-chain node-cost get --address 0x...
 
 # List all node cost indexes
@@ -372,10 +421,10 @@ dsdn-chain node-cost remove --address 0x...
 ### Mining (Development)
 
 ```bash
-# Mine a new block
+# Mine a new block (proposer selected by stake-weight if validators exist)
 dsdn-chain mine
 
-# Mine with specific proposer (fallback)
+# Mine with specific proposer address (fallback)
 dsdn-chain mine --miner-addr 0x...
 ```
 
@@ -385,7 +434,9 @@ dsdn-chain mine --miner-addr 0x...
 # Run E2E integration tests
 dsdn-chain test-e2e --module all --verbose
 
-# Run full integration test suite
+# Available modules: proposer, stake, qv, block, mempool, epoch, fullnode, all
+
+# Run full integration test suite (13.19)
 dsdn-chain test full
 ```
 

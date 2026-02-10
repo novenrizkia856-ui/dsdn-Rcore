@@ -17,6 +17,17 @@
 //!
 //! Complete validator-based Data Availability implementation.
 //!
+//! ## Gating Verifiers (14B)
+//!
+//! Stateless verifiers for service node admission gating.
+//!
+//! | Verifier | Module | Description |
+//! |----------|--------|-------------|
+//! | `StakeVerifier` | `gating::stake_verifier` | Validates stake meets minimum per NodeClass (14B.21) |
+//!
+//! All verifiers are stateless, deterministic, and produce `CheckResult`
+//! or `GatingError` without accessing chain state.
+//!
 //! # QuorumDA Architecture
 //!
 //! ## Peran dalam Sistem DSDN
@@ -437,6 +448,9 @@ pub mod metrics_tracking
 // Coordinator Selection (14A.2B.2)
 pub mod coordinator_selection
 
+// Gating Verifiers (14B)
+pub mod gating
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
 // ════════════════════════════════════════════════════════════════════════════════
@@ -515,6 +529,13 @@ pub use coordinator_selection::{
     verify_committee_selection
     verify_member_eligibility
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - Gating Verifiers (14B)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// StakeVerifier for service node stake validation.
+pub use gating::StakeVerifier
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MANIFEST VALIDATION TYPES
