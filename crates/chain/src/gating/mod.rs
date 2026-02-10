@@ -33,3 +33,6 @@ pub use query::ServiceNodeStakeInfo;
 pub use query::ServiceNodeSlashingInfo;
 pub use slashing::ServiceNodeSlashEvent;
 pub use persistence::validate_service_node_consistency;
+
+#[cfg(test)]
+mod tests;

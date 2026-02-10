@@ -28,7 +28,70 @@
 //! | `wallet` | Wallet management: keypair, signing, encryption | 13.17 |
 //! | `encryption` | Sistem enskripsi| 13.17 |
 //! | `coordinator` | Coordinator committee: epoch, DKG, disputes, accountability | 14A.2B.2 |
-//! | `gating` | Service node on-chain state: ServiceNodeRecord, query API, RPC endpoints | 14B.11, 14B.18 |
+//! | `gating` | Service node on-chain state: ServiceNodeRecord, query API, RPC, CLI, tests | 14B.11–14B.20 |
+//!
+//! ## 14B — Stake & Identity Gating
+//!
+//! ### Overview
+//!
+//! The gating system manages on-chain registration, querying, slashing, and
+//! lifecycle management of DSDN service nodes (Storage / Compute).
+//!
+//! ### ChainState API Methods
+//!
+//! | Method | Mutates | Description |
+//! |--------|---------|-------------|
+//! | `register_service_node(record)` | Yes | Register new node (validates uniqueness + stake > 0) |
+//! | `unregister_service_node(operator)` | Yes | Remove node and clean index |
+//! | `get_service_node(operator)` | No | Lookup by operator address |
+//! | `get_service_node_by_node_id(node_id)` | No | Lookup by 32-byte node ID |
+//! | `list_service_nodes()` | No | List all registered nodes |
+//! | `count_active_service_nodes()` | No | Count nodes with Active status |
+//! | `get_service_node_stake(operator)` | No | Query staked amount |
+//! | `get_service_node_stake_by_node_id(node_id)` | No | Query stake via node ID |
+//! | `get_stake_info(operator)` | No | Composite: stake + class + meets_minimum |
+//! | `get_service_node_class(operator)` | No | Query NodeClass (Storage/Compute) |
+//! | `get_service_node_status(operator)` | No | Query NodeStatus |
+//! | `get_service_node_slashing_status(operator, ts)` | No | Slashing + cooldown info |
+//! | `is_service_node_in_cooldown(operator, ts)` | No | Cooldown active check |
+//! | `slash_service_node(operator, amount, ...)` | Yes | Deduct stake, evaluate status |
+//! | `check_and_clear_expired_cooldowns(ts)` | Yes | Batch clear expired cooldowns |
+//! | `activate_service_node(operator, height)` | Yes | Pending → Active transition |
+//! | `update_service_node_status(operator, status, h)` | Yes | Validated status transition |
+//!
+//! ### RPC Endpoints (14B.18)
+//!
+//! | Method | Description |
+//! |--------|-------------|
+//! | `get_service_node(address)` | Query service node record |
+//! | `get_service_node_stake(address)` | Query staked amount |
+//! | `get_service_node_status(address)` | Query lifecycle status |
+//! | `list_active_service_nodes()` | List all Active nodes |
+//!
+//! ### CLI Commands (14B.19)
+//!
+//! | Command | Type | Description |
+//! |---------|------|-------------|
+//! | `service-node register --node-id --class --tls-fingerprint` | Write | Submit RegisterServiceNode TX |
+//! | `service-node info --address [--json]` | Read | Show full node record |
+//! | `service-node stake --address [--json]` | Read | Show stake info |
+//! | `service-node status --address [--json]` | Read | Show status info |
+//! | `service-node list [--json]` | Read | List Active nodes (sorted, deterministic) |
+//!
+//! ### State Fields & Invariants
+//!
+//! ```text
+//! Fields:
+//!   service_nodes: HashMap<Address, ServiceNodeRecord>  — primary store
+//!   service_node_index: HashMap<[u8; 32], Address>      — node_id → operator
+//!
+//! Invariants (consensus-critical):
+//!   1. service_nodes.len() == service_node_index.len()
+//!   2. For every record: service_node_index[record.node_id] == record.operator_address
+//!   3. No two operators share the same node_id
+//!   4. No dangling index entries
+//!   5. Both maps included in state_root computation (#36, #37)
+//! ```
 //!
 //! ## 13.9 — GAS MODEL & FEE SPLIT
 //!
@@ -428,10 +491,11 @@
 //! |       |   - 13.15.6: Block-Level Integration | ✅ IMPLEMENTED |
 //! |       |   - 13.15.7: LMDB Persistence | ✅ IMPLEMENTED |
 //! |       |   - 13.15.8: RPC & CLI Observability | ✅ IMPLEMENTED |
-//! | 14B   | Stake & Identity Gating (Chain State) | 🔧 IN PROGRESS |
+//! | 14B   | Stake & Identity Gating (Chain State) | ✅ IMPLEMENTED |
 //! |       |   - 14B.11: ServiceNodeRecord & Service Node State | ✅ IMPLEMENTED |
 //! |       |   - 14B.18: RPC Gating Endpoints (read-only query) | ✅ IMPLEMENTED |
 //! |       |   - 14B.19: CLI Gating Commands (register, info, stake, status, list) | ✅ IMPLEMENTED |
+//! |       |   - 14B.20: Chain Gating Tests & Final Documentation | ✅ IMPLEMENTED |
 //! ```
 //!
 //! ## Chain Struct
