@@ -11,6 +11,7 @@
 //! - `class_verifier`: Validates node class claim is supported by actual stake (14B.25)
 //! - `engine`: Orchestrator that runs all verifiers and produces a final `GatingDecision` (14B.26)
 //! - `admission`: Tunable admission policy configuration with time-based rules (14B.27)
+//! - `report`: Stateless audit report generator with deterministic table and JSON output (14B.28)
 //!
 //! ## Design Principles
 //!
@@ -31,6 +32,7 @@ pub mod cooldown_verifier;
 pub mod class_verifier;
 pub mod engine;
 pub mod admission;
+pub mod report;
 
 pub use stake_verifier::StakeVerifier;
 pub use identity_verifier::IdentityVerifier;
@@ -39,3 +41,4 @@ pub use cooldown_verifier::CooldownVerifier;
 pub use class_verifier::ClassVerifier;
 pub use engine::GatingEngine;
 pub use admission::AdmissionPolicy;
+pub use report::ReportGenerator;
