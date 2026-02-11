@@ -42,3 +42,6 @@ pub use class_verifier::ClassVerifier;
 pub use engine::GatingEngine;
 pub use admission::AdmissionPolicy;
 pub use report::ReportGenerator;
+
+#[cfg(test)]
+mod tests;
