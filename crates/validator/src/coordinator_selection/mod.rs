@@ -62,6 +62,16 @@ use rand_chacha::ChaCha20Rng;
 // SHA3-256 untuk epoch seed derivation (14A.2B.2.5)
 use sha3::{Digest, Sha3_256};
 
+// Gating types for integration hook (14B.29)
+use dsdn_common::gating::{
+    CooldownPeriod,
+    IdentityProof,
+    NodeClass,
+    NodeIdentity,
+    TLSCertInfo,
+};
+use crate::gating::GatingEngine;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // ValidatorCandidate
 // ════════════════════════════════════════════════════════════════════════════════
@@ -79,10 +89,37 @@ pub struct ValidatorCandidate {
     pub pubkey: [u8; 32],
 
     /// Staked amount dalam smallest unit
-    pub stake: u64,
+    pub stake: u128,
 
     /// Geographic/logical zone identifier
     pub zone: String,
+
+    // ── Gating fields (14B.29) ──────────────────────────────────
+    // All Optional for backward compatibility.
+    // Used by `select_committee_with_gating()` to evaluate candidates
+    // against the gating engine before selection.
+
+    /// Node identity for gating evaluation.
+    /// Required by `GatingEngine::evaluate()`.
+    /// If `None`, candidate cannot be evaluated and is excluded from gating.
+    pub node_identity: Option<NodeIdentity>,
+
+    /// TLS certificate info for gating evaluation.
+    /// Passed as `Option<&TLSCertInfo>` to `GatingEngine::evaluate()`.
+    pub tls_info: Option<TLSCertInfo>,
+
+    /// Node class for gating evaluation.
+    /// Required by `GatingEngine::evaluate()`.
+    /// If `None`, candidate cannot be evaluated and is excluded from gating.
+    pub node_class: Option<NodeClass>,
+
+    /// Active cooldown period for gating evaluation.
+    /// Passed as `Option<&CooldownPeriod>` to `GatingEngine::evaluate()`.
+    pub cooldown: Option<CooldownPeriod>,
+
+    /// Identity proof for gating evaluation.
+    /// Passed as `Option<&IdentityProof>` to `GatingEngine::evaluate()`.
+    pub identity_proof: Option<IdentityProof>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -99,10 +136,10 @@ pub struct SelectionWeight {
     pub validator_id: [u8; 32],
 
     /// Individual weight (biasanya = stake)
-    pub weight: u64,
+    pub weight: u128,
 
     /// Cumulative weight sampai validator ini (inclusive)
-    pub cumulative: u64,
+    pub cumulative: u128,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -125,7 +162,7 @@ pub struct CoordinatorMember {
     pub pubkey: [u8; 32],
 
     /// Stake yang di-commit oleh member
-    pub stake: u64,
+    pub stake: u128,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -270,7 +307,7 @@ pub struct SelectionConfig {
     pub threshold: u8,
 
     /// Minimum stake required untuk eligible sebagai candidate
-    pub min_stake: u64,
+    pub min_stake: u128,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -395,6 +432,11 @@ impl std::fmt::Display for SelectionError {
 
 impl std::error::Error for SelectionError {}
 
+/// Type alias for committee selection result (14B.29).
+///
+/// Used by both `select_committee` and `select_committee_with_gating`.
+pub type CommitteeResult = Result<CoordinatorCommittee, SelectionError>;
+
 /// Stateless coordinator selection engine.
 ///
 /// CoordinatorSelector adalah pure computation engine tanpa side effects.
@@ -480,7 +522,7 @@ impl CoordinatorSelector {
     pub fn compute_eligible_validators(
         &self,
         validators: &[ValidatorCandidate],
-        min_stake: u64,
+        min_stake: u128,
     ) -> Vec<ValidatorCandidate> {
         validators
             .iter()
@@ -493,8 +535,8 @@ impl CoordinatorSelector {
     ///
     /// # Overflow Handling
     ///
-    /// Menggunakan saturating addition. Jika total melebihi u64::MAX,
-    /// result akan saturate ke u64::MAX tanpa panic atau wrap-around.
+    /// Menggunakan saturating addition. Jika total melebihi u128::MAX,
+    /// result akan saturate ke u128::MAX tanpa panic atau wrap-around.
     ///
     /// # Arguments
     ///
@@ -503,10 +545,10 @@ impl CoordinatorSelector {
     /// # Returns
     ///
     /// Total stake (saturating sum).
-    pub fn total_stake(&self, validators: &[ValidatorCandidate]) -> u64 {
+    pub fn total_stake(&self, validators: &[ValidatorCandidate]) -> u128 {
         validators
             .iter()
-            .fold(0u64, |acc, v| acc.saturating_add(v.stake))
+            .fold(0u128, |acc, v| acc.saturating_add(v.stake))
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -517,7 +559,7 @@ impl CoordinatorSelector {
     ///
     /// # Formula
     ///
-    /// - `weight[i] = stake[i]` (tanpa normalisasi, u64)
+    /// - `weight[i] = stake[i]` (tanpa normalisasi, u128)
     /// - `cumulative[i] = sum(stake[0..=i])` (inclusive)
     ///
     /// # Behavior
@@ -552,7 +594,7 @@ impl CoordinatorSelector {
             return Vec::new();
         }
 
-        let mut cumulative: u64 = 0;
+        let mut cumulative: u128 = 0;
         let mut weights = Vec::with_capacity(validators.len());
 
         for validator in validators {
@@ -603,7 +645,7 @@ impl CoordinatorSelector {
     pub fn select_by_weight(
         &self,
         weights: &[SelectionWeight],
-        random_value: u64,
+        random_value: u128,
     ) -> Option<usize> {
         if weights.is_empty() {
             return None;
@@ -920,6 +962,122 @@ impl CoordinatorSelector {
             }
         })
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Committee Selection with Gating Filter (14B.29)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Select committee with gating filter applied BEFORE selection.
+    ///
+    /// Applies gating checks to each candidate before running the
+    /// existing selection algorithm. Candidates that fail gating are
+    /// excluded from the selection pool.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Iterate candidates in INPUT ORDER (deterministic)
+    /// 2. For each candidate:
+    ///    a. If `node_identity` is `None` → exclude (cannot call evaluate)
+    ///    b. If `node_class` is `None` → exclude (cannot call evaluate)
+    ///    c. Call `gating_engine.evaluate()` with all available fields
+    ///    d. If `Approved` → keep in filtered list
+    ///    e. If `Rejected` → exclude
+    /// 3. Delegate to `select_committee()` with filtered candidates
+    ///
+    /// # Determinism
+    ///
+    /// - Filtering preserves input order (no hash iteration)
+    /// - Same inputs → same filtered list → same committee
+    /// - No randomness in filtering step
+    ///
+    /// # Backward Compatibility
+    ///
+    /// `select_committee()` is NOT affected by this method.
+    /// It continues to work independently without gating.
+    ///
+    /// # Selection Algorithm Integrity
+    ///
+    /// This method does NOT modify:
+    /// - Stake weighting
+    /// - Sorting logic
+    /// - Randomness source
+    /// - Zone diversity rules
+    /// - Threshold computation
+    ///
+    /// It ONLY filters the candidate list before delegation.
+    ///
+    /// # Edge Cases
+    ///
+    /// - All candidates fail gating → `SelectionError::InsufficientValidators`
+    ///   (from `select_committee`)
+    /// - Candidate with `node_identity: None` → excluded silently
+    ///   (cannot construct evaluate parameters)
+    /// - Candidate with `node_class: None` → excluded silently
+    ///   (cannot construct evaluate parameters)
+    /// - `cooldown`, `tls_info`, `identity_proof` as `None` →
+    ///   passed to evaluate as `None`; engine handles per policy
+    ///
+    /// # Arguments
+    ///
+    /// * `candidates` - Slice of validator candidates (unfiltered)
+    /// * `epoch` - Epoch number for committee selection
+    /// * `seed` - 32-byte deterministic seed (from `derive_epoch_seed`)
+    /// * `gating_engine` - Gating engine with policy and timestamp
+    ///
+    /// # Returns
+    ///
+    /// `Ok(CoordinatorCommittee)` if selection succeeds after gating filter.
+    /// `Err(SelectionError)` if not enough candidates pass gating or selection fails.
+    pub fn select_committee_with_gating(
+        &self,
+        candidates: &[ValidatorCandidate],
+        epoch: u64,
+        seed: &[u8; 32],
+        gating_engine: &GatingEngine,
+    ) -> CommitteeResult {
+        // Step 1: Filter candidates through gating engine.
+        // Iteration follows input order — deterministic.
+        let filtered: Vec<ValidatorCandidate> = candidates
+            .iter()
+            .filter(|candidate| {
+                // node_identity is required for evaluate() — non-optional parameter.
+                // If absent, candidate cannot be evaluated → exclude.
+                let identity = match &candidate.node_identity {
+                    Some(id) => id,
+                    None => return false,
+                };
+
+                // node_class is required for evaluate() — non-optional parameter.
+                // If absent, candidate cannot be evaluated → exclude.
+                let class = match &candidate.node_class {
+                    Some(c) => c,
+                    None => return false,
+                };
+
+                // Remaining fields are Option in evaluate() signature:
+                // cooldown: Option<&CooldownPeriod>
+                // tls: Option<&TLSCertInfo>
+                // proof: Option<&IdentityProof>
+                // Pass as-is; gating engine handles None per policy.
+                let decision = gating_engine.evaluate(
+                    identity,
+                    class,
+                    candidate.stake,
+                    candidate.cooldown.as_ref(),
+                    candidate.tls_info.as_ref(),
+                    candidate.identity_proof.as_ref(),
+                );
+
+                decision.is_approved()
+            })
+            .cloned()
+            .collect();
+
+        // Step 2: Delegate to existing selection algorithm (unchanged).
+        // All selection logic (shuffle, zone diversity, fallback, sorting)
+        // runs on the filtered list exactly as before.
+        self.select_committee(&filtered, epoch, seed)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1149,8 +1307,13 @@ mod tests {
         ValidatorCandidate {
             id,
             pubkey,
-            stake: (seed as u64 + 1) * 1000,
+            stake: (seed as u128 + 1) * 1000,
             zone: format!("zone-{}", seed % 3),
+            node_identity: None,
+            tls_info: None,
+            node_class: None,
+            cooldown: None,
+            identity_proof: None,
         }
     }
 
@@ -1171,7 +1334,7 @@ mod tests {
             id,
             validator_id,
             pubkey,
-            stake: (seed as u64 + 1) * 1000,
+            stake: (seed as u128 + 1) * 1000,
         }
     }
 
@@ -1671,7 +1834,7 @@ mod tests {
         let validators: Vec<ValidatorCandidate> = (0..10)
             .map(|i| {
                 let mut v = make_validator_candidate(i as u8);
-                v.stake = 1000 + (i as u64 * 100);
+                v.stake = 1000 + (i as u128 * 100);
                 v
             })
             .collect();
@@ -1681,7 +1844,7 @@ mod tests {
         // All should be eligible and order preserved
         assert_eq!(eligible.len(), 10);
         for (i, v) in eligible.iter().enumerate() {
-            assert_eq!(v.stake, 1000 + (i as u64 * 100));
+            assert_eq!(v.stake, 1000 + (i as u128 * 100));
         }
     }
 
@@ -1752,15 +1915,15 @@ mod tests {
         let selector = CoordinatorSelector::new(config).expect("valid config");
 
         let mut v1 = make_validator_candidate(1);
-        v1.stake = u64::MAX;
+        v1.stake = u128::MAX;
         let mut v2 = make_validator_candidate(2);
         v2.stake = 1000;
 
         let validators = vec![v1, v2];
         let total = selector.total_stake(&validators);
 
-        // Should saturate to u64::MAX, not overflow/panic
-        assert_eq!(total, u64::MAX);
+        // Should saturate to u128::MAX, not overflow/panic
+        assert_eq!(total, u128::MAX);
     }
 
     #[test]
@@ -1774,15 +1937,15 @@ mod tests {
 
         // Large but not overflowing
         let mut v1 = make_validator_candidate(1);
-        v1.stake = u64::MAX / 2;
+        v1.stake = u128::MAX / 2;
         let mut v2 = make_validator_candidate(2);
-        v2.stake = u64::MAX / 2;
+        v2.stake = u128::MAX / 2;
 
         let validators = vec![v1, v2];
         let total = selector.total_stake(&validators);
 
         // (MAX/2) + (MAX/2) = MAX - 1 (due to integer division)
-        assert_eq!(total, (u64::MAX / 2) + (u64::MAX / 2));
+        assert_eq!(total, (u128::MAX / 2) + (u128::MAX / 2));
     }
 
     #[test]
@@ -1918,7 +2081,7 @@ mod tests {
         let selector = CoordinatorSelector::new(config).expect("valid config");
 
         // Various stakes including 0
-        let stakes = [0u64, 100, 50, 200, 0, 1000, 500];
+        let stakes = [0u128, 100, 50, 200, 0, 1000, 500];
         let validators: Vec<ValidatorCandidate> = stakes
             .iter()
             .enumerate()
@@ -1934,7 +2097,7 @@ mod tests {
         assert_eq!(weights.len(), 7);
 
         // Verify monotonically increasing (non-decreasing since some stakes are 0)
-        let mut prev_cumulative = 0u64;
+        let mut prev_cumulative = 0u128;
         for (i, w) in weights.iter().enumerate() {
             assert!(
                 w.cumulative >= prev_cumulative,
@@ -1947,7 +2110,7 @@ mod tests {
         }
 
         // Verify total
-        let expected_total: u64 = stakes.iter().sum();
+        let expected_total: u128 = stakes.iter().sum();
         assert_eq!(weights.last().map(|w| w.cumulative), Some(expected_total));
     }
 
@@ -1979,7 +2142,7 @@ mod tests {
         let validators: Vec<ValidatorCandidate> = (0..5)
             .map(|i| {
                 let mut v = make_validator_candidate(i as u8);
-                v.stake = ((5 - i) * 1000) as u64; // 5000, 4000, 3000, 2000, 1000
+                v.stake = ((5 - i) * 1000) as u128; // 5000, 4000, 3000, 2000, 1000
                 v
             })
             .collect();
@@ -2008,7 +2171,7 @@ mod tests {
         let selector = CoordinatorSelector::new(config).expect("valid config");
 
         let mut v1 = make_validator_candidate(1);
-        v1.stake = u64::MAX;
+        v1.stake = u128::MAX;
         let mut v2 = make_validator_candidate(2);
         v2.stake = 1000;
 
@@ -2016,9 +2179,9 @@ mod tests {
         let weights = selector.compute_selection_weights(&validators);
 
         assert_eq!(weights.len(), 2);
-        assert_eq!(weights[0].cumulative, u64::MAX);
+        assert_eq!(weights[0].cumulative, u128::MAX);
         // Saturating: MAX + 1000 = MAX
-        assert_eq!(weights[1].cumulative, u64::MAX);
+        assert_eq!(weights[1].cumulative, u128::MAX);
     }
 
     #[test]
@@ -2100,7 +2263,7 @@ mod tests {
 
         // random_value > cumulative[-1] should return None
         assert_eq!(selector.select_by_weight(&weights, 5000), None);
-        assert_eq!(selector.select_by_weight(&weights, u64::MAX), None);
+        assert_eq!(selector.select_by_weight(&weights, u128::MAX), None);
     }
 
     #[test]
@@ -2116,7 +2279,7 @@ mod tests {
 
         assert_eq!(selector.select_by_weight(&weights, 0), None);
         assert_eq!(selector.select_by_weight(&weights, 1000), None);
-        assert_eq!(selector.select_by_weight(&weights, u64::MAX), None);
+        assert_eq!(selector.select_by_weight(&weights, u128::MAX), None);
     }
 
     #[test]
@@ -2878,7 +3041,7 @@ mod tests {
     // Committee Selection Tests (14A.2B.2.7)
     // ════════════════════════════════════════════════════════════════════════════
 
-    fn make_validator_with_zone(seed: u8, zone: &str, stake: u64) -> ValidatorCandidate {
+    fn make_validator_with_zone(seed: u8, zone: &str, stake: u128) -> ValidatorCandidate {
         let mut id = [0u8; 32];
         id[0] = seed;
         id[31] = seed.wrapping_add(1);
@@ -2892,6 +3055,11 @@ mod tests {
             pubkey,
             stake,
             zone: zone.to_string(),
+            node_identity: None,
+            tls_info: None,
+            node_class: None,
+            cooldown: None,
+            identity_proof: None,
         }
     }
 
@@ -2968,7 +3136,7 @@ mod tests {
         let selector = CoordinatorSelector::new(config).expect("valid config");
 
         let validators: Vec<ValidatorCandidate> = (0..10)
-            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000 + (i as u64 * 100)))
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000 + (i as u128 * 100)))
             .collect();
 
         let seed = [0x42u8; 32];
@@ -2998,7 +3166,7 @@ mod tests {
         let selector = CoordinatorSelector::new(config).expect("valid config");
 
         let validators: Vec<ValidatorCandidate> = (0..10)
-            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000 + (i as u64 * 100)))
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 3), 1000 + (i as u128 * 100)))
             .collect();
 
         let seed1 = [0x11u8; 32];
@@ -3046,7 +3214,7 @@ mod tests {
         let selector = CoordinatorSelector::new(config).expect("valid config");
 
         let validators: Vec<ValidatorCandidate> = (0..10)
-            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 5), 100 + (i as u64 * 500)))
+            .map(|i| make_validator_with_zone(i, &format!("zone-{}", i % 5), 100 + (i as u128 * 500)))
             .collect();
 
         let seed = [0x44u8; 32];
@@ -3185,7 +3353,7 @@ mod tests {
         // Create 10 validators: 7 in zone-a, 3 in other zones
         let mut validators = Vec::new();
         for i in 0..7 {
-            validators.push(make_validator_with_zone(i, "zone-a", 1000 + (i as u64 * 100)));
+            validators.push(make_validator_with_zone(i, "zone-a", 1000 + (i as u128 * 100)));
         }
         for i in 7..10 {
             validators.push(make_validator_with_zone(i, &format!("zone-{}", i), 1000));

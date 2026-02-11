@@ -17,7 +17,7 @@ use super::*;
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Create deterministic validator for testing.
-fn create_test_validator(seed: u8, zone: &str, stake: u64) -> ValidatorCandidate {
+fn create_test_validator(seed: u8, zone: &str, stake: u128) -> ValidatorCandidate {
     let mut id = [0u8; 32];
     id[0] = seed;
     id[31] = seed.wrapping_add(1);
@@ -31,18 +31,23 @@ fn create_test_validator(seed: u8, zone: &str, stake: u64) -> ValidatorCandidate
         pubkey,
         stake,
         zone: zone.to_string(),
+        node_identity: None,
+        tls_info: None,
+        node_class: None,
+        cooldown: None,
+        identity_proof: None,
     }
 }
 
 /// Create deterministic validator set.
-fn create_validator_set(count: u8, base_stake: u64) -> Vec<ValidatorCandidate> {
+fn create_validator_set(count: u8, base_stake: u128) -> Vec<ValidatorCandidate> {
     (0..count)
-        .map(|i| create_test_validator(i, &format!("zone-{}", i % 3), base_stake + (i as u64 * 100)))
+        .map(|i| create_test_validator(i, &format!("zone-{}", i % 3), base_stake + (i as u128 * 100)))
         .collect()
 }
 
 /// Create config for testing.
-fn create_test_config(committee_size: u8, threshold: u8, min_stake: u64) -> SelectionConfig {
+fn create_test_config(committee_size: u8, threshold: u8, min_stake: u128) -> SelectionConfig {
     SelectionConfig {
         committee_size,
         threshold,
@@ -166,7 +171,7 @@ fn test_selection_zone_diversity() {
     let mut validators = Vec::new();
     for i in 0..30 {
         let zone = format!("zone-{}", i % 5); // 5 different zones
-        validators.push(create_test_validator(i, &zone, 1000 + (i as u64 * 10)));
+        validators.push(create_test_validator(i, &zone, 1000 + (i as u128 * 10)));
     }
 
     let seed = [0x55u8; 32];

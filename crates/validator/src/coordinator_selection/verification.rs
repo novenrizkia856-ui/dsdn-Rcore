@@ -372,9 +372,9 @@ pub enum VerificationError {
         /// Validator ID
         validator_id: [u8; 32],
         /// Stake di member
-        member_stake: u64,
+        member_stake: u128,
         /// Stake di validator
-        validator_stake: u64,
+        validator_stake: u128,
     },
 
     /// Pubkey tidak cocok dengan validator source
@@ -1153,7 +1153,7 @@ mod tests {
     // Committee Verification Tests (14A.2B.2.8)
     // ════════════════════════════════════════════════════════════════════════════
 
-    fn make_validator_for_verification(seed: u8, zone: &str, stake: u64) -> ValidatorCandidate {
+    fn make_validator_for_verification(seed: u8, zone: &str, stake: u128) -> ValidatorCandidate {
         let mut id = [0u8; 32];
         id[0] = seed;
         id[31] = seed.wrapping_add(1);
@@ -1167,6 +1167,11 @@ mod tests {
             pubkey,
             stake,
             zone: zone.to_string(),
+            node_identity: None,
+            tls_info: None,
+            node_class: None,
+            cooldown: None,
+            identity_proof: None,
         }
     }
 
@@ -1248,7 +1253,7 @@ mod tests {
         };
 
         let validators: Vec<ValidatorCandidate> = (0..10)
-            .map(|i| make_validator_for_verification(i, &format!("zone-{}", i % 3), 1000 + (i as u64 * 100)))
+            .map(|i| make_validator_for_verification(i, &format!("zone-{}", i % 3), 1000 + (i as u128 * 100)))
             .collect();
 
         let seed = [0x42u8; 32];

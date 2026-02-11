@@ -32,11 +32,19 @@
 //! | `AdmissionPolicy` | `gating::admission` | Tunable admission policy with time-based pending/quarantine rules (14B.27) |
 //! | `ReportGenerator` | `gating::report` | Stateless audit report generator with deterministic table and JSON output (14B.28) |
 //!
+//! ### Integration
+//!
+//! | Hook | Module | Description |
+//! |------|--------|-------------|
+//! | `select_committee_with_gating` | `coordinator_selection` | Pre-selection gating filter via `GatingEngine` without modifying selection algorithm (14B.29) |
+//!
 //! All verifiers are stateless, deterministic, and produce `CheckResult`
 //! or `GatingError` without accessing chain state. `GatingEngine` orchestrates
 //! all verifiers in a fixed consensus-critical order and produces the final
 //! `GatingDecision`. `ReportGenerator` renders the evaluation result as a
 //! deterministic human-readable table or machine-readable JSON for audit.
+//! `select_committee_with_gating` applies gating as a pre-filter before
+//! the existing deterministic selection algorithm runs unchanged.
 //!
 //! # QuorumDA Architecture
 //!
