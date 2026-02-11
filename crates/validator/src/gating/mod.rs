@@ -9,6 +9,7 @@
 //! - `tls_verifier`: Validates TLS certificate time, fingerprint, and subject CN (14B.23)
 //! - `cooldown_verifier`: Verifies node is not in active slashing cooldown (14B.24)
 //! - `class_verifier`: Validates node class claim is supported by actual stake (14B.25)
+//! - `engine`: Orchestrator that runs all verifiers and produces a final `GatingDecision` (14B.26)
 //!
 //! ## Design Principles
 //!
@@ -27,9 +28,11 @@ pub mod identity_verifier;
 pub mod tls_verifier;
 pub mod cooldown_verifier;
 pub mod class_verifier;
+pub mod engine;
 
 pub use stake_verifier::StakeVerifier;
 pub use identity_verifier::IdentityVerifier;
 pub use tls_verifier::TLSVerifier;
 pub use cooldown_verifier::CooldownVerifier;
 pub use class_verifier::ClassVerifier;
+pub use engine::GatingEngine;
