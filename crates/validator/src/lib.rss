@@ -27,6 +27,7 @@
 //! | `IdentityVerifier` | `gating::identity_verifier` | Verifies Ed25519 identity proofs and operator bindings (14B.22) |
 //! | `TLSVerifier` | `gating::tls_verifier` | Validates TLS certificate time, fingerprint, and subject CN (14B.23) |
 //! | `CooldownVerifier` | `gating::cooldown_verifier` | Verifies node is not in active slashing cooldown (14B.24) |
+//! | `ClassVerifier` | `gating::class_verifier` | Validates node class claim is supported by actual stake (14B.25) |
 //!
 //! All verifiers are stateless, deterministic, and produce `CheckResult`
 //! or `GatingError` without accessing chain state.
@@ -537,11 +538,12 @@ pub use coordinator_selection::{
 // PUBLIC EXPORTS - Gating Verifiers (14B)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// StakeVerifier, IdentityVerifier, TLSVerifier, and CooldownVerifier for service node gating.
+/// StakeVerifier, IdentityVerifier, TLSVerifier, CooldownVerifier, and ClassVerifier for service node gating.
 pub use gating::StakeVerifier
 pub use gating::IdentityVerifier
 pub use gating::TLSVerifier
 pub use gating::CooldownVerifier
+pub use gating::ClassVerifier
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MANIFEST VALIDATION TYPES
