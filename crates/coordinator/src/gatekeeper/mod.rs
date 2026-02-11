@@ -1,14 +1,19 @@
-//! # GateKeeper Module (14B.31)
+//! # GateKeeper Module (14B.31–32)
 //!
-//! Provides the [`GateKeeper`] struct and [`GateKeeperConfig`] for service
-//! node admission gating within the coordinator crate.
+//! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], and node
+//! admission filtering for service node gating within the coordinator crate.
 //!
-//! ## Scope — Setup Only
+//! ## Modules
 //!
-//! This module defines the foundational types and construction logic.
-//! It does **not** contain enforcement logic, RPC calls, scheduler hooks,
-//! background tasks, or any side effects. Those will be added in subsequent
-//! stages (14B.32+).
+//! - **admission** (14B.32): [`AdmissionRequest`], [`AdmissionResponse`],
+//!   and [`GateKeeper::process_admission`] for evaluating node join requests.
+//!
+//! ## Scope
+//!
+//! This module provides foundational types, construction logic, and
+//! admission filtering. It does **not** contain periodic re-checks,
+//! RPC calls, scheduler hooks, or background tasks. Those will be
+//! added in subsequent stages (14B.33+).
 //!
 //! ## Relationship with Validator Gating Engine
 //!
@@ -36,6 +41,10 @@ use std::collections::HashMap;
 use dsdn_common::gating::{GatingPolicy, NodeRegistryEntry};
 use dsdn_validator::gating::GatingEngine;
 
+// Admission filter (14B.32)
+pub mod admission;
+pub use admission::{AdmissionRequest, AdmissionResponse};
+
 // ════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -53,6 +62,7 @@ use dsdn_validator::gating::GatingEngine;
 /// | `chain_rpc_endpoint` | `""` (empty — must be configured before use) |
 /// | `check_interval_secs` | `60` |
 /// | `enable_gating` | `true` |
+/// | `auto_activate_on_pass` | `false` |
 #[derive(Clone, Debug)]
 pub struct GateKeeperConfig {
     /// The gating policy that defines stake requirements, security checks,
@@ -65,12 +75,19 @@ pub struct GateKeeperConfig {
     pub chain_rpc_endpoint: String,
 
     /// Interval in seconds between periodic re-checks of registered nodes.
-    /// Used by future enforcement logic (14B.32+). Default: 60.
+    /// Used by future enforcement logic (14B.33+). Default: 60.
     pub check_interval_secs: u64,
 
     /// Global toggle for gating enforcement. When `false`, the GateKeeper
     /// is constructed but performs no admission checks. Default: `true`.
     pub enable_gating: bool,
+
+    /// When `true`, nodes that pass admission are assigned `NodeStatus::Active`
+    /// immediately instead of `NodeStatus::Pending`. Default: `false`.
+    ///
+    /// Corresponds to `AdmissionPolicy::auto_activate_on_pass` from
+    /// the validator crate's admission module.
+    pub auto_activate_on_pass: bool,
 }
 
 impl Default for GateKeeperConfig {
@@ -80,6 +97,7 @@ impl Default for GateKeeperConfig {
             chain_rpc_endpoint: String::new(),
             check_interval_secs: 60,
             enable_gating: true,
+            auto_activate_on_pass: false,
         }
     }
 }
@@ -97,15 +115,19 @@ impl Default for GateKeeperConfig {
 ///
 /// [`GateKeeper::new`] performs deterministic, side-effect-free initialization.
 /// The internal [`GatingEngine`] is constructed with timestamp `0` as a
-/// placeholder. Actual evaluations (added in 14B.32+) must supply the
-/// current timestamp at call time.
+/// placeholder. [`process_admission`](GateKeeper::process_admission) rebuilds
+/// the engine with the caller-provided timestamp before each evaluation.
+///
+/// ## Admission (14B.32)
+///
+/// [`GateKeeper::process_admission`] runs the full gating evaluation pipeline
+/// and returns an [`AdmissionResponse`] with the decision, assigned status,
+/// and audit report. Approved nodes are inserted into the local registry.
 ///
 /// ## Registry
 ///
-/// The `registry` field is an in-memory cache of node records. It starts
-/// empty and will be populated by future admission and sync logic.
-/// Keys are node ID strings matching [`NodeRegistryEntry::identity::node_id`]
-/// hex representation.
+/// The `registry` field is an in-memory cache of node records. Keys are
+/// lowercase hex strings of the 32-byte `identity.node_id` (64 characters).
 #[derive(Debug)]
 pub struct GateKeeper {
     /// Configuration for this GateKeeper instance.
@@ -133,9 +155,9 @@ impl GateKeeper {
     /// ## Engine Timestamp
     ///
     /// The internal [`GatingEngine`] is initialized with timestamp `0`.
-    /// This is intentional — no evaluations are performed at construction
-    /// time. Future evaluation methods (14B.32+) will supply the actual
-    /// current timestamp when invoking the engine.
+    /// [`process_admission`](GateKeeper::process_admission) rebuilds the
+    /// engine with the caller-provided `current_timestamp` before each
+    /// evaluation, ensuring time-sensitive checks use the correct time.
     pub fn new(config: GateKeeperConfig) -> Self {
         let gating_engine = GatingEngine::new(config.policy.clone(), 0);
         Self {
