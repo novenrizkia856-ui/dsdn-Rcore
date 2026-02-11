@@ -25,6 +25,7 @@
 //! |----------|--------|-------------|
 //! | `StakeVerifier` | `gating::stake_verifier` | Validates stake meets minimum per NodeClass (14B.21) |
 //! | `IdentityVerifier` | `gating::identity_verifier` | Verifies Ed25519 identity proofs and operator bindings (14B.22) |
+//! | `TLSVerifier` | `gating::tls_verifier` | Validates TLS certificate time, fingerprint, and subject CN (14B.23) |
 //!
 //! All verifiers are stateless, deterministic, and produce `CheckResult`
 //! or `GatingError` without accessing chain state.
@@ -535,9 +536,10 @@ pub use coordinator_selection::{
 // PUBLIC EXPORTS - Gating Verifiers (14B)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// StakeVerifier and IdentityVerifier for service node gating.
+/// StakeVerifier, IdentityVerifier, and TLSVerifier for service node gating.
 pub use gating::StakeVerifier
 pub use gating::IdentityVerifier
+pub use gating::TLSVerifier
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MANIFEST VALIDATION TYPES
