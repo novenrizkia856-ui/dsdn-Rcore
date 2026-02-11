@@ -313,6 +313,55 @@
 //! - **Committee immutability**: Committee is fixed for the entire epoch
 //! - **Network tolerance**: Broadcast failure does not cancel local consensus
 //!
+//! ## GateKeeper System (14B)
+//!
+//! The coordinator includes a [`gatekeeper::GateKeeper`] module that enforces
+//! service node admission gating. The GateKeeper wraps the [`GatingEngine`]
+//! from the `dsdn_validator` crate and maintains a local cache of
+//! [`NodeRegistryEntry`] records from `dsdn_common`.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────────────┐
+//! │                          GATEKEEPER (14B)                                │
+//! │                                                                          │
+//! │  ┌────────────────────────────────────────────────────────────────────┐ │
+//! │  │                      GateKeeper                                    │ │
+//! │  │                                                                    │ │
+//! │  │  ┌──────────────────┐  ┌─────────────────────────────────────┐   │ │
+//! │  │  │ GateKeeperConfig │  │  GatingEngine (dsdn_validator)      │   │ │
+//! │  │  │  - policy        │  │  - Stateless evaluation             │   │ │
+//! │  │  │  - chain_rpc     │  │  - Stake/Identity/TLS/Cooldown/     │   │ │
+//! │  │  │  - interval      │  │    Class verification               │   │ │
+//! │  │  │  - enable_gating │  └─────────────────────────────────────┘   │ │
+//! │  │  └──────────────────┘                                            │ │
+//! │  │                                                                    │ │
+//! │  │  ┌──────────────────────────────────────────────────────────┐    │ │
+//! │  │  │  registry: HashMap<String, NodeRegistryEntry>            │    │ │
+//! │  │  │  (local cache, populated by future admission logic)      │    │ │
+//! │  │  └──────────────────────────────────────────────────────────┘    │ │
+//! │  └────────────────────────────────────────────────────────────────────┘ │
+//! │                                                                          │
+//! │  Chain RPC (future): Query on-chain stake, slashing, node records       │
+//! │  Status: Setup only (14B.31) — no enforcement logic yet                 │
+//! └──────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### GateKeeper Components
+//!
+//! | Component | Source | Role |
+//! |-----------|--------|------|
+//! | `GateKeeperConfig` | `gatekeeper` | Policy, RPC endpoint, interval, toggle |
+//! | `GateKeeper` | `gatekeeper` | Coordinator-side admission control wrapper |
+//! | `GatingEngine` | `dsdn_validator` | Stateless service node evaluation |
+//! | `GatingPolicy` | `dsdn_common` | Combined gating configuration |
+//! | `NodeRegistryEntry` | `dsdn_common` | Per-node registry record |
+//!
+//! ### Current Status (14B.31)
+//!
+//! This stage provides struct definitions and deterministic construction only.
+//! No enforcement logic, RPC connections, background tasks, or scheduler
+//! hooks are implemented. Those are planned for 14B.32–14B.40.
+//!
 //! ## Modules
 //!
 //! - **scheduler**: Node scoring and workload-aware scheduling
@@ -322,6 +371,7 @@
 //! - **event_publisher**: Event batching and publishing to DA
 //! - **reconciliation**: Fallback blob reconciliation to Celestia (14A.1A.31-34)
 //! - **multi**: Multi-coordinator consensus with threshold signing (14A.2B.2.11–20)
+//! - **gatekeeper**: Service node admission gating (14B.31+)
 //!
 //! ## Key Invariant
 //!
@@ -363,6 +413,9 @@ pub mod reconciliation;
 // Multi-coordinator module (14A.2B.2.11–20)
 pub mod multi;
 
+// GateKeeper module (14B.31)
+pub mod gatekeeper;
+
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
 pub use state_machine::{
@@ -381,6 +434,9 @@ pub use reconciliation::{
     ConsistencyReport,
     PendingBlobInfo,
 };
+
+// GateKeeper exports (14B.31)
+pub use gatekeeper::{GateKeeperConfig, GateKeeper};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
