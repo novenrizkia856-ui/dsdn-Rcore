@@ -1,19 +1,22 @@
-//! # GateKeeper Module (14B.31–32)
+//! # GateKeeper Module (14B.31–33)
 //!
-//! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], and node
-//! admission filtering for service node gating within the coordinator crate.
+//! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], node
+//! admission filtering, and stake validation hooks for service node
+//! gating within the coordinator crate.
 //!
 //! ## Modules
 //!
 //! - **admission** (14B.32): [`AdmissionRequest`], [`AdmissionResponse`],
 //!   and [`GateKeeper::process_admission`] for evaluating node join requests.
+//! - **stake_check** (14B.33): [`StakeCheckHook`] for pure stake validation
+//!   before scheduling and admission operations.
 //!
 //! ## Scope
 //!
-//! This module provides foundational types, construction logic, and
-//! admission filtering. It does **not** contain periodic re-checks,
-//! RPC calls, scheduler hooks, or background tasks. Those will be
-//! added in subsequent stages (14B.33+).
+//! This module provides foundational types, construction logic, admission
+//! filtering, and stake validation hooks. It does **not** contain periodic
+//! re-checks, RPC calls, or background tasks. Those will be added in
+//! subsequent stages (14B.34+).
 //!
 //! ## Relationship with Validator Gating Engine
 //!
@@ -45,6 +48,10 @@ use dsdn_validator::gating::GatingEngine;
 pub mod admission;
 pub use admission::{AdmissionRequest, AdmissionResponse};
 
+// Stake check hook (14B.33)
+pub mod stake_check;
+pub use stake_check::StakeCheckHook;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -75,7 +82,7 @@ pub struct GateKeeperConfig {
     pub chain_rpc_endpoint: String,
 
     /// Interval in seconds between periodic re-checks of registered nodes.
-    /// Used by future enforcement logic (14B.33+). Default: 60.
+    /// Used by future enforcement logic (14B.34+). Default: 60.
     pub check_interval_secs: u64,
 
     /// Global toggle for gating enforcement. When `false`, the GateKeeper
