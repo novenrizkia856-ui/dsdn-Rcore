@@ -1,9 +1,9 @@
-//! # GateKeeper Module (14B.31–36)
+//! # GateKeeper Module (14B.31–37)
 //!
 //! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], node
 //! admission filtering, stake validation hooks, identity validation
-//! hooks, and quarantine management for service node gating within
-//! the coordinator crate.
+//! hooks, quarantine management, and ban enforcement for service node
+//! gating within the coordinator crate.
 //!
 //! ## Modules
 //!
@@ -15,14 +15,16 @@
 //!   verification, TLS matching, and node ID spoof detection.
 //! - **quarantine** (14B.36): [`QuarantineManager`] and [`QuarantineRecord`]
 //!   for tracking quarantined nodes and escalation checks.
+//! - **ban** (14B.37): [`BanEnforcer`] and [`BanRecord`] for tracking
+//!   banned nodes with cooldown-based expiry.
 //!
 //! ## Scope
 //!
 //! This module provides foundational types, construction logic, admission
-//! filtering, stake validation hooks, identity validation hooks, and
-//! quarantine management. It does **not** contain periodic re-checks,
-//! RPC calls, or background tasks. Those will be added in subsequent
-//! stages (14B.37+).
+//! filtering, stake validation hooks, identity validation hooks,
+//! quarantine management, and ban enforcement. It does **not** contain
+//! periodic re-checks, RPC calls, or background tasks. Those will be
+//! added in subsequent stages (14B.38+).
 //!
 //! ## Relationship with Validator Gating Engine
 //!
@@ -66,6 +68,10 @@ pub use identity_check::IdentityCheckHook;
 pub mod quarantine;
 pub use quarantine::{QuarantineManager, QuarantineRecord};
 
+// Ban enforcer (14B.37)
+pub mod ban;
+pub use ban::{BanEnforcer, BanRecord};
+
 // ════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -96,7 +102,7 @@ pub struct GateKeeperConfig {
     pub chain_rpc_endpoint: String,
 
     /// Interval in seconds between periodic re-checks of registered nodes.
-    /// Used by future enforcement logic (14B.37+). Default: 60.
+    /// Used by future enforcement logic (14B.38+). Default: 60.
     pub check_interval_secs: u64,
 
     /// Global toggle for gating enforcement. When `false`, the GateKeeper
