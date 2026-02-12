@@ -9,6 +9,10 @@ dsdn-storage = { path = "../storage" }
 dsdn-coordinator = { path = "../coordinator" }
 dsdn-runtime-wasm = { path = "../runtime_wasm" }
 
+# Crypto: Ed25519 keypair for node identity (14B.41)
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+rand = "0.8.5"
+
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "time", "signal"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -25,6 +29,7 @@ wat = "1.0"
 tonic = { version = "0.9", features = ["transport"] }
 dotenvy = "0.15"
 socket2 = "0.5"
+tempfile = "3.10"
 
 [[bin]]
 name = "dsdn-node"

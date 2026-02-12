@@ -210,6 +210,68 @@
 //! | `health`            | Health reporting with fallback awareness             |
 //! | `multi_da_source`   | Multi-DA source abstraction (Primary/Secondary/Emergency) |
 //! | `metrics`           | Node fallback metrics for Prometheus export          |
+//! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
+//!
+//! # Node Identity & Gating (14B)
+//!
+//! ## NodeIdentityManager (14B.41)
+//!
+//! `NodeIdentityManager` encapsulates the node's Ed25519 keypair and provides
+//! the cryptographic operations needed for coordinator admission gating.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │              NodeIdentityManager                      │
+//! │  ┌──────────────┐    ┌───────────────────────────┐   │
+//! │  │  SigningKey   │───▶│      NodeIdentity         │   │
+//! │  │  (PRIVATE)    │    │  - node_id  [u8; 32]     │   │
+//! │  │  Never exposed│    │  - operator  [u8; 20]    │   │
+//! │  └──────────────┘    │  - tls_fp   [u8; 32]     │   │
+//! │         │             └───────────────────────────┘   │
+//! │         ▼                                             │
+//! │  sign_challenge(nonce) ──▶ [u8; 64] signature        │
+//! │  create_identity_proof(challenge) ──▶ IdentityProof  │
+//! └──────────────────────────────────────────────────────┘
+//!                          │
+//!                          ▼
+//! ┌──────────────────────────────────────────────────────┐
+//! │          Coordinator GateKeeper (14B.31–40)           │
+//! │  IdentityVerifier::verify_proof(proof, ts, max_age)  │
+//! │  IdentityProof::verify() → verify_strict(nonce, sig) │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Relation to GateKeeper
+//!
+//! The coordinator's `GateKeeper` (14B.31–40) evaluates admission requests
+//! that include an `IdentityProof`. The node constructs this proof using
+//! `NodeIdentityManager::create_identity_proof`, which signs the coordinator-
+//! issued challenge nonce. The coordinator verifies the proof via
+//! `IdentityVerifier::verify_proof` (14B.22).
+//!
+//! ### Relation to IdentityVerifier
+//!
+//! `IdentityVerifier` (14B.22) is a stateless verifier on the coordinator
+//! side. It calls `IdentityProof::verify()` which uses
+//! `ed25519_dalek::VerifyingKey::verify_strict(&challenge.nonce, &signature)`.
+//! The signing convention in `NodeIdentityManager::sign_challenge` matches
+//! this exactly: raw nonce bytes, no prefix, no domain separator.
+//!
+//! ### Security
+//!
+//! - The Ed25519 `SigningKey` is never exposed via any public method.
+//! - `Debug` output redacts the signing key (`[REDACTED]`).
+//! - No `Clone` derived on the struct (prevents accidental key duplication).
+//! - No `Serialize` derived (prevents key serialization to untrusted sinks).
+//! - The struct is `Send + Sync` (no interior mutability).
+//!
+//! ### Determinism
+//!
+//! - `from_keypair(secret)`: Fully deterministic — same secret always
+//!   produces identical `node_id`, `operator_address`, and signatures.
+//! - `sign_challenge(nonce)`: Deterministic per RFC 8032 (Ed25519).
+//! - `generate()`: Uses OS entropy (`OsRng`); subsequent operations
+//!   are deterministic for the generated key.
 //!
 //! # Key Invariants
 //!
@@ -230,6 +292,7 @@ pub mod delete_handler;
 pub mod event_processor;
 pub mod handlers;
 pub mod health;
+pub mod identity_manager;
 pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
@@ -252,3 +315,4 @@ pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
 
 // HTTP API handlers (Axum) - READ-ONLY observability endpoints
 pub use handlers::{NodeAppState, build_router};
+pub use identity_manager::{NodeIdentityManager, IdentityError};
