@@ -356,11 +356,13 @@
 //! | `GatingPolicy` | `dsdn_common` | Combined gating configuration |
 //! | `NodeRegistryEntry` | `dsdn_common` | Per-node registry record |
 //!
-//! ### Current Status (14B.31)
+//! ### Current Status (14B.35)
 //!
-//! This stage provides struct definitions and deterministic construction only.
-//! No enforcement logic, RPC connections, background tasks, or scheduler
-//! hooks are implemented. Those are planned for 14B.32–14B.40.
+//! The gatekeeper provides struct definitions, deterministic construction,
+//! node admission filtering (14B.32), stake validation hooks (14B.33),
+//! identity validation hooks (14B.34), and scheduler gate integration (14B.35).
+//! Remaining stages (14B.36–40) will add periodic re-checks, RPC connections,
+//! and background enforcement tasks.
 //!
 //! ## Modules
 //!
@@ -402,6 +404,7 @@ use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 
 use dsdn_common::consistent_hash::NodeDesc;
+use dsdn_common::gating::NodeStatus;
 
 pub mod scheduler;
 pub mod da_consumer;
@@ -413,7 +416,7 @@ pub mod reconciliation;
 // Multi-coordinator module (14A.2B.2.11–20)
 pub mod multi;
 
-// GateKeeper module (14B.31)
+// GateKeeper module (14B.31–35)
 pub mod gatekeeper;
 
 pub use scheduler::{NodeStats, Workload, Scheduler};
@@ -435,8 +438,12 @@ pub use reconciliation::{
     PendingBlobInfo,
 };
 
-// GateKeeper exports (14B.31)
-pub use gatekeeper::{GateKeeperConfig, GateKeeper};
+// GateKeeper exports (14B.31–35)
+pub use gatekeeper::{
+    GateKeeperConfig, GateKeeper,
+    AdmissionRequest, AdmissionResponse,
+    StakeCheckHook, IdentityCheckHook,
+};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -551,7 +558,22 @@ impl Coordinator {
 
     /// Scheduling: pick best node id for given workload.
     /// Returns None if no node meets soft requirements.
-    pub fn schedule(&self, workload: &Workload) -> Option<String> {
+    ///
+    /// ## Gating Integration (14B.35)
+    ///
+    /// When `gatekeeper` is `Some`, delegates to [`schedule_with_gating`](Self::schedule_with_gating)
+    /// which filters nodes through the gating registry before scoring.
+    /// When `gatekeeper` is `None`, runs the original scoring logic unchanged.
+    ///
+    /// ## Backward Compatibility
+    ///
+    /// Passing `None` for `gatekeeper` produces identical behavior to the
+    /// pre-14B.35 version. No scoring algorithm, tie-breaking, or requirement
+    /// checking logic is modified.
+    pub fn schedule(&self, workload: &Workload, gatekeeper: Option<&GateKeeper>) -> Option<String> {
+        if let Some(gk) = gatekeeper {
+            return self.schedule_with_gating(workload, gk);
+        }
         let nodes = self.list_nodes();
         if nodes.is_empty() { return None; }
         let stats_map = self.node_stats.read();
@@ -559,6 +581,84 @@ impl Coordinator {
         // iterate nodes, compute score only for nodes that meet requirements
         let mut best: Option<(String, f64)> = None;
         for n in nodes {
+            let stats = stats_map.get(&n.id).cloned().unwrap_or_default();
+            if !scheduler.meets(&stats, workload) {
+                continue;
+            }
+            let score = scheduler.score(&stats);
+            match &best {
+                None => best = Some((n.id.clone(), score)),
+                Some((best_id, best_score)) => {
+                    if score > *best_score {
+                        best = Some((n.id.clone(), score));
+                    } else if (score - *best_score).abs() < 1e-9 {
+                        // tie-breaker deterministic: pick lexicographically smaller id
+                        if n.id < *best_id {
+                            best = Some((n.id.clone(), score));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Scheduling with gating: pick best node id for given workload,
+    /// filtering through the GateKeeper registry.
+    ///
+    /// ## Flow
+    ///
+    /// 1. Retrieve list of registered coordinator nodes.
+    /// 2. **Gating filter** (before scoring): For each node, verify:
+    ///    - The node exists in `gatekeeper.registry` (by coordinator node ID).
+    ///    - The node's `NodeRegistryEntry.status == NodeStatus::Active`.
+    ///    Nodes that fail either check are skipped with a warning log.
+    /// 3. Run existing scoring logic (requirement check + weighted score)
+    ///    **without modification** on the filtered set.
+    /// 4. Return the best-scoring node, or `None` if no eligible nodes remain.
+    ///
+    /// ## Determinism
+    ///
+    /// Same `(workload, gatekeeper.registry, coordinator nodes, stats)` always
+    /// produces the same result. Logging does not affect return value.
+    ///
+    /// ## Immutability
+    ///
+    /// This method takes `&self` and `&GateKeeper` — no mutation of
+    /// coordinator state, gatekeeper registry, or workload.
+    pub fn schedule_with_gating(
+        &self,
+        workload: &Workload,
+        gatekeeper: &GateKeeper,
+    ) -> Option<String> {
+        let nodes = self.list_nodes();
+        if nodes.is_empty() { return None; }
+        let stats_map = self.node_stats.read();
+        let scheduler = self.scheduler.read().clone();
+
+        let mut best: Option<(String, f64)> = None;
+        for n in nodes {
+            // Gating filter: node must exist in registry with Active status.
+            match gatekeeper.registry.get(&n.id) {
+                None => {
+                    eprintln!(
+                        "[gatekeeper] schedule: skipping node '{}': not found in gating registry",
+                        n.id,
+                    );
+                    continue;
+                }
+                Some(entry) => {
+                    if entry.status != NodeStatus::Active {
+                        eprintln!(
+                            "[gatekeeper] schedule: skipping node '{}': status {:?} != Active",
+                            n.id, entry.status,
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Scoring logic: identical to schedule() — no modification.
             let stats = stats_map.get(&n.id).cloned().unwrap_or_default();
             if !scheduler.meets(&stats, workload) {
                 continue;
@@ -648,7 +748,7 @@ mod tests {
         c.update_node_stats("c", NodeStats { cpu_free: 0.5, ram_free_mb: 1000.0, gpu_free: 0.0, latency_ms: 20.0, io_pressure: 0.1 });
 
         let wl = Workload { cpu_req: Some(0.1), ram_req_mb: Some(512.0), gpu_req: None, max_latency_ms: None, io_tolerance: None };
-        let chosen = c.schedule(&wl).expect("should pick a node");
+        let chosen = c.schedule(&wl, None).expect("should pick a node");
         assert_eq!(chosen, "b");
     }
 
@@ -663,7 +763,7 @@ mod tests {
 
         // workload requires at least 512 MB - only n1 qualifies
         let wl = Workload { cpu_req: None, ram_req_mb: Some(512.0), gpu_req: None, max_latency_ms: None, io_tolerance: None };
-        let chosen = c.schedule(&wl).expect("should pick n1");
+        let chosen = c.schedule(&wl, None).expect("should pick n1");
         assert_eq!(chosen, "n1");
     }
 
