@@ -1,9 +1,10 @@
-//! # GateKeeper Module (14B.31–38)
+//! # GateKeeper Module (14B.31–39)
 //!
 //! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], node
 //! admission filtering, stake validation hooks, identity validation
-//! hooks, quarantine management, ban enforcement, and node lifecycle
-//! management for service node gating within the coordinator crate.
+//! hooks, quarantine management, ban enforcement, node lifecycle
+//! management, and DA event publishing for service node gating
+//! within the coordinator crate.
 //!
 //! ## Modules
 //!
@@ -19,14 +20,17 @@
 //!   banned nodes with cooldown-based expiry.
 //! - **lifecycle** (14B.38): [`NodeLifecycleManager`] and [`StatusTransition`]
 //!   for orchestrating node status transitions across gating subsystems.
+//! - **events** (14B.39): [`GatingEvent`] and [`GatingEventPublisher`]
+//!   for publishing gating events to the DA layer.
 //!
 //! ## Scope
 //!
 //! This module provides foundational types, construction logic, admission
 //! filtering, stake validation hooks, identity validation hooks,
-//! quarantine management, ban enforcement, and node lifecycle management.
-//! It does **not** contain RPC calls or background tasks. Those will be
-//! added in subsequent stages (14B.39+).
+//! quarantine management, ban enforcement, node lifecycle management,
+//! and DA event publishing for gating auditability. It does **not**
+//! contain RPC calls or background tasks. Those will be added in
+//! subsequent stages (14B.40+).
 //!
 //! ## Relationship with Validator Gating Engine
 //!
@@ -78,6 +82,10 @@ pub use ban::{BanEnforcer, BanRecord};
 pub mod lifecycle;
 pub use lifecycle::{NodeLifecycleManager, StatusTransition};
 
+// Gating DA events (14B.39)
+pub mod events;
+pub use events::{GatingEvent, GatingEventPublisher};
+
 // ════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -108,7 +116,7 @@ pub struct GateKeeperConfig {
     pub chain_rpc_endpoint: String,
 
     /// Interval in seconds between periodic re-checks of registered nodes.
-    /// Used by future enforcement logic (14B.39+). Default: 60.
+    /// Used by future enforcement logic (14B.40+). Default: 60.
     pub check_interval_secs: u64,
 
     /// Global toggle for gating enforcement. When `false`, the GateKeeper
@@ -161,6 +169,14 @@ impl Default for GateKeeperConfig {
 ///
 /// The `registry` field is an in-memory cache of node records. Keys are
 /// lowercase hex strings of the 32-byte `identity.node_id` (64 characters).
+///
+/// ### Gating DA Events (14B.39)
+///
+/// All gating state changes (admissions, rejections, quarantines, bans,
+/// activations, ban expirations) can be published to the DA layer via
+/// [`GatingEventPublisher`] for auditability and deterministic state
+/// rebuilding. Events are encoded deterministically and tagged with
+/// the `"dsdn-gating"` namespace.
 #[derive(Debug)]
 pub struct GateKeeper {
     /// Configuration for this GateKeeper instance.
