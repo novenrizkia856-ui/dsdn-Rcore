@@ -1,8 +1,8 @@
-//! # GateKeeper Module (14B.31–33)
+//! # GateKeeper Module (14B.31–34)
 //!
 //! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], node
-//! admission filtering, and stake validation hooks for service node
-//! gating within the coordinator crate.
+//! admission filtering, stake validation hooks, and identity validation
+//! hooks for service node gating within the coordinator crate.
 //!
 //! ## Modules
 //!
@@ -10,13 +10,15 @@
 //!   and [`GateKeeper::process_admission`] for evaluating node join requests.
 //! - **stake_check** (14B.33): [`StakeCheckHook`] for pure stake validation
 //!   before scheduling and admission operations.
+//! - **identity_check** (14B.34): [`IdentityCheckHook`] for identity proof
+//!   verification, TLS matching, and node ID spoof detection.
 //!
 //! ## Scope
 //!
 //! This module provides foundational types, construction logic, admission
-//! filtering, and stake validation hooks. It does **not** contain periodic
-//! re-checks, RPC calls, or background tasks. Those will be added in
-//! subsequent stages (14B.34+).
+//! filtering, stake validation hooks, and identity validation hooks. It
+//! does **not** contain periodic re-checks, RPC calls, or background
+//! tasks. Those will be added in subsequent stages (14B.35+).
 //!
 //! ## Relationship with Validator Gating Engine
 //!
@@ -52,6 +54,10 @@ pub use admission::{AdmissionRequest, AdmissionResponse};
 pub mod stake_check;
 pub use stake_check::StakeCheckHook;
 
+// Identity check hook (14B.34)
+pub mod identity_check;
+pub use identity_check::IdentityCheckHook;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -82,7 +88,7 @@ pub struct GateKeeperConfig {
     pub chain_rpc_endpoint: String,
 
     /// Interval in seconds between periodic re-checks of registered nodes.
-    /// Used by future enforcement logic (14B.34+). Default: 60.
+    /// Used by future enforcement logic (14B.35+). Default: 60.
     pub check_interval_secs: u64,
 
     /// Global toggle for gating enforcement. When `false`, the GateKeeper
