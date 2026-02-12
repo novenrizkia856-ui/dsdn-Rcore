@@ -315,54 +315,165 @@
 //!
 //! ## GateKeeper System (14B)
 //!
-//! The coordinator includes a [`gatekeeper::GateKeeper`] module that enforces
-//! service node admission gating. The GateKeeper wraps the [`GatingEngine`]
-//! from the `dsdn_validator` crate and maintains a local cache of
-//! [`NodeRegistryEntry`] records from `dsdn_common`.
+//! The coordinator includes a comprehensive service node admission gating
+//! system implemented across stages 14B.31–14B.40. The system enforces
+//! stake requirements, cryptographic identity verification, TLS certificate
+//! validation, cooldown periods, and lifecycle state transitions for all
+//! service nodes participating in the DSDN network.
+//!
+//! ### Architecture (14B.31–40)
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────────────┐
-//! │                          GATEKEEPER (14B)                                │
+//! │                        GATEKEEPER SYSTEM (14B)                           │
 //! │                                                                          │
-//! │  ┌────────────────────────────────────────────────────────────────────┐ │
-//! │  │                      GateKeeper                                    │ │
-//! │  │                                                                    │ │
-//! │  │  ┌──────────────────┐  ┌─────────────────────────────────────┐   │ │
-//! │  │  │ GateKeeperConfig │  │  GatingEngine (dsdn_validator)      │   │ │
-//! │  │  │  - policy        │  │  - Stateless evaluation             │   │ │
-//! │  │  │  - chain_rpc     │  │  - Stake/Identity/TLS/Cooldown/     │   │ │
-//! │  │  │  - interval      │  │    Class verification               │   │ │
-//! │  │  │  - enable_gating │  └─────────────────────────────────────┘   │ │
-//! │  │  └──────────────────┘                                            │ │
-//! │  │                                                                    │ │
-//! │  │  ┌──────────────────────────────────────────────────────────┐    │ │
-//! │  │  │  registry: HashMap<String, NodeRegistryEntry>            │    │ │
-//! │  │  │  (local cache, populated by future admission logic)      │    │ │
-//! │  │  └──────────────────────────────────────────────────────────┘    │ │
-//! │  └────────────────────────────────────────────────────────────────────┘ │
+//! │  ┌──────────────────────────────────────────────────────────────────┐   │
+//! │  │                   NodeLifecycleManager (14B.38)                   │   │
+//! │  │  Owns and orchestrates all gating subsystems:                    │   │
+//! │  │                                                                   │   │
+//! │  │  ┌──────────────────────────────────────────────────────────┐   │   │
+//! │  │  │                  GateKeeper (14B.31)                      │   │   │
+//! │  │  │  ┌──────────────┐  ┌──────────────────────────────┐     │   │   │
+//! │  │  │  │ GateKeeper   │  │  GatingEngine                │     │   │   │
+//! │  │  │  │ Config       │  │  (dsdn_validator, stateless) │     │   │   │
+//! │  │  │  │  - policy    │  │  Order: Stake → Class →      │     │   │   │
+//! │  │  │  │  - chain_rpc │  │  Identity → TLS → Cooldown   │     │   │   │
+//! │  │  │  └──────────────┘  └──────────────────────────────┘     │   │   │
+//! │  │  │  ┌──────────────────────────────────────────────────┐   │   │   │
+//! │  │  │  │  registry: HashMap<String, NodeRegistryEntry>    │   │   │   │
+//! │  │  │  └──────────────────────────────────────────────────┘   │   │   │
+//! │  │  └──────────────────────────────────────────────────────────┘   │   │
+//! │  │                                                                │   │
+//! │  │  ┌─────────────────────┐  ┌─────────────────────┐            │   │
+//! │  │  │ QuarantineManager   │  │   BanEnforcer        │            │   │
+//! │  │  │ (14B.36)            │  │   (14B.37)           │            │   │
+//! │  │  │  - quarantine_node  │  │  - ban_node          │            │   │
+//! │  │  │  - release_node     │  │  - is_banned         │            │   │
+//! │  │  │  - check_escalation │  │  - check_expired     │            │   │
+//! │  │  └─────────────────────┘  └─────────────────────┘            │   │
+//! │  └──────────────────────────────────────────────────────────────────┘   │
 //! │                                                                          │
-//! │  Chain RPC (future): Query on-chain stake, slashing, node records       │
-//! │  Status: Setup only (14B.31) — no enforcement logic yet                 │
+//! │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐      │
+//! │  │ AdmissionFilter  │  │ StakeCheckHook   │  │ IdentityCheck    │      │
+//! │  │ (14B.32)         │  │ (14B.33)         │  │ Hook (14B.34)    │      │
+//! │  │ process_admission│  │ check_schedule   │  │ check_on_join    │      │
+//! │  │ is_node_register │  │ check_admission  │  │ check_tls_match  │      │
+//! │  └──────────────────┘  └──────────────────┘  │ check_spoof      │      │
+//! │                                               └──────────────────┘      │
+//! │  ┌──────────────────────────────────────────────────────────────────┐   │
+//! │  │           GatingEventPublisher (14B.39)                          │   │
+//! │  │  Deterministic binary encoding → DA layer ("dsdn-gating")       │   │
+//! │  └──────────────────────────────────────────────────────────────────┘   │
 //! └──────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ### GateKeeper Components
+//! ### Node Lifecycle (14B.2 / 14B.38)
 //!
-//! | Component | Source | Role |
-//! |-----------|--------|------|
-//! | `GateKeeperConfig` | `gatekeeper` | Policy, RPC endpoint, interval, toggle |
-//! | `GateKeeper` | `gatekeeper` | Coordinator-side admission control wrapper |
-//! | `GatingEngine` | `dsdn_validator` | Stateless service node evaluation |
-//! | `GatingPolicy` | `dsdn_common` | Combined gating configuration |
-//! | `NodeRegistryEntry` | `dsdn_common` | Per-node registry record |
+//! ```text
+//!                    ┌─────────┐
+//!        Admission   │ Pending │  Ban expired
+//!       ──────────▶  │         │ ◀──────────
+//!                    └────┬────┘
+//!                         │ All checks pass
+//!                         ▼
+//!                    ┌─────────┐
+//!    Stake restored  │ Active  │  Stake restored
+//!   ┌───────────────▶│         │◀─ ─ ─ ─ ─ ─ ─
+//!   │                └────┬────┘              │
+//!   │           Stake drop│     Severe slash  │
+//!   │           or minor  │     ──────────┐   │
+//!   │           slash     ▼               │   │
+//!   │  ┌──────────────────────┐           │   │
+//!   └──│    Quarantined       │           │   │
+//!      │                      │           │   │
+//!      └──────────┬───────────┘           │   │
+//!                 │ Escalation             │   │
+//!                 │ (max duration)         │   │
+//!                 ▼                        ▼   │
+//!            ┌─────────┐                      │
+//!            │ Banned   │──────────────────────┘
+//!            │          │  Cooldown expired → Pending
+//!            └──────────┘
+//! ```
 //!
-//! ### Current Status (14B.35)
+//! Valid transitions (closed set, 7 total):
+//! Pending → Active, Pending → Banned,
+//! Active → Quarantined, Active → Banned,
+//! Quarantined → Active, Quarantined → Banned,
+//! Banned → Pending.
 //!
-//! The gatekeeper provides struct definitions, deterministic construction,
-//! node admission filtering (14B.32), stake validation hooks (14B.33),
-//! identity validation hooks (14B.34), and scheduler gate integration (14B.35).
-//! Remaining stages (14B.36–40) will add periodic re-checks, RPC connections,
-//! and background enforcement tasks.
+//! ### Event Catalog (14B.39)
+//!
+//! All gating state changes are published to the DA layer as `GatingEvent`
+//! values with deterministic binary encoding under the `"dsdn-gating"` namespace.
+//!
+//! | Event | Trigger | Fields |
+//! |-------|---------|--------|
+//! | `NodeAdmitted` | Admission approved | node_id, operator, class, timestamp |
+//! | `NodeRejected` | Admission denied | node_id, operator, reasons (Vec), timestamp |
+//! | `NodeQuarantined` | Stake drop / minor slash | node_id, reason, timestamp |
+//! | `NodeBanned` | Severe slash / escalation | node_id, reason, cooldown_until, timestamp |
+//! | `NodeActivated` | Stake restored / checks pass | node_id, timestamp |
+//! | `NodeBanExpired` | Cooldown period ended | node_id, timestamp |
+//!
+//! ### Interaction with Validator Crate
+//!
+//! The `dsdn_validator::gating::GatingEngine` is the stateless evaluation
+//! core. It runs 5 verifiers in consensus-critical order (Stake → Class →
+//! Identity → TLS → Cooldown) and returns a `GatingDecision`. The
+//! coordinator's `GateKeeper` wraps this engine, providing:
+//! registry management, timestamp injection, report generation, and
+//! admission response construction. The engine is reconstructed with
+//! a fresh timestamp before each evaluation to ensure time-sensitive
+//! checks (TLS validity, cooldown, identity proof freshness) use
+//! the caller-provided time.
+//!
+//! ### Interaction with DA Layer
+//!
+//! `GatingEventPublisher` (14B.39) wraps the coordinator's `EventPublisher`
+//! to post gating events to the Data Availability layer. Events are encoded
+//! using a deterministic binary format with length-prefixed strings,
+//! fixed-width big-endian integers, and explicit discriminant bytes.
+//! The encoding ensures identical serialized bytes for identical events,
+//! enabling deterministic state rebuilding from the DA event log.
+//!
+//! ### Determinism Guarantee
+//!
+//! Every component in the gating system is deterministic:
+//! same `(inputs, timestamp)` always produce identical outputs. No system
+//! clock access, no randomness, no `HashMap` iteration-order dependence
+//! in consensus-affecting paths. All sorted outputs use lexicographic
+//! ordering. All timestamp arithmetic uses `saturating_add` / `checked_add`
+//! for overflow safety. Event serialization produces identical bytes for
+//! identical inputs.
+//!
+//! ### Consensus Safety
+//!
+//! The gating system does not directly modify consensus state. It operates
+//! as a pre-filter: nodes must pass gating checks before the coordinator
+//! schedules workloads to them. Gating events are published to the DA
+//! layer for auditability but do not participate in block production or
+//! validator set rotation. The `GatingEngine` evaluation order is
+//! consensus-critical and must not be reordered across coordinator
+//! implementations.
+//!
+//! ### Components (14B.31–40)
+//!
+//! | Component | Module | Stage | Role |
+//! |-----------|--------|-------|------|
+//! | `GateKeeperConfig` | `gatekeeper` | 14B.31 | Policy, RPC endpoint, interval, toggle |
+//! | `GateKeeper` | `gatekeeper` | 14B.31 | Coordinator-side admission control wrapper |
+//! | `AdmissionRequest/Response` | `gatekeeper::admission` | 14B.32 | Node join request evaluation |
+//! | `StakeCheckHook` | `gatekeeper::stake_check` | 14B.33 | Pre-schedule/admission stake validation |
+//! | `IdentityCheckHook` | `gatekeeper::identity_check` | 14B.34 | Identity proof, TLS, spoof detection |
+//! | `QuarantineManager` | `gatekeeper::quarantine` | 14B.36 | Quarantine tracking and escalation |
+//! | `BanEnforcer` | `gatekeeper::ban` | 14B.37 | Ban tracking with cooldown expiry |
+//! | `NodeLifecycleManager` | `gatekeeper::lifecycle` | 14B.38 | Full lifecycle state machine |
+//! | `GatingEvent/Publisher` | `gatekeeper::events` | 14B.39 | DA event publishing |
+//! | `tests` | `gatekeeper::tests` | 14B.40 | Comprehensive test suite |
+//! | `GatingEngine` | `dsdn_validator` | 14B.26 | Stateless evaluation engine |
+//! | `GatingPolicy` | `dsdn_common` | 14B.7 | Combined gating configuration |
+//! | `NodeRegistryEntry` | `dsdn_common` | 14B.9 | Per-node registry record |
 //!
 //! ## Modules
 //!
@@ -373,7 +484,7 @@
 //! - **event_publisher**: Event batching and publishing to DA
 //! - **reconciliation**: Fallback blob reconciliation to Celestia (14A.1A.31-34)
 //! - **multi**: Multi-coordinator consensus with threshold signing (14A.2B.2.11–20)
-//! - **gatekeeper**: Service node admission gating (14B.31+)
+//! - **gatekeeper**: Service node admission gating (14B.31–40)
 //!
 //! ## Key Invariant
 //!
@@ -404,7 +515,6 @@ use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 
 use dsdn_common::consistent_hash::NodeDesc;
-use dsdn_common::gating::NodeStatus;
 
 pub mod scheduler;
 pub mod da_consumer;
@@ -416,7 +526,7 @@ pub mod reconciliation;
 // Multi-coordinator module (14A.2B.2.11–20)
 pub mod multi;
 
-// GateKeeper module (14B.31–35)
+// GateKeeper module (14B.31–40)
 pub mod gatekeeper;
 
 pub use scheduler::{NodeStats, Workload, Scheduler};
@@ -438,12 +548,14 @@ pub use reconciliation::{
     PendingBlobInfo,
 };
 
-// GateKeeper exports (14B.31–35)
-pub use gatekeeper::{
-    GateKeeperConfig, GateKeeper,
-    AdmissionRequest, AdmissionResponse,
-    StakeCheckHook, IdentityCheckHook,
-};
+// GateKeeper exports (14B.31–40)
+pub use gatekeeper::{GateKeeperConfig, GateKeeper};
+pub use gatekeeper::{AdmissionRequest, AdmissionResponse};
+pub use gatekeeper::{StakeCheckHook, IdentityCheckHook};
+pub use gatekeeper::{QuarantineManager, QuarantineRecord};
+pub use gatekeeper::{BanEnforcer, BanRecord};
+pub use gatekeeper::{NodeLifecycleManager, StatusTransition};
+pub use gatekeeper::{GatingEvent, GatingEventPublisher};
 
 /// Node info stored in coordinator
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -558,22 +670,7 @@ impl Coordinator {
 
     /// Scheduling: pick best node id for given workload.
     /// Returns None if no node meets soft requirements.
-    ///
-    /// ## Gating Integration (14B.35)
-    ///
-    /// When `gatekeeper` is `Some`, delegates to [`schedule_with_gating`](Self::schedule_with_gating)
-    /// which filters nodes through the gating registry before scoring.
-    /// When `gatekeeper` is `None`, runs the original scoring logic unchanged.
-    ///
-    /// ## Backward Compatibility
-    ///
-    /// Passing `None` for `gatekeeper` produces identical behavior to the
-    /// pre-14B.35 version. No scoring algorithm, tie-breaking, or requirement
-    /// checking logic is modified.
-    pub fn schedule(&self, workload: &Workload, gatekeeper: Option<&GateKeeper>) -> Option<String> {
-        if let Some(gk) = gatekeeper {
-            return self.schedule_with_gating(workload, gk);
-        }
+    pub fn schedule(&self, workload: &Workload) -> Option<String> {
         let nodes = self.list_nodes();
         if nodes.is_empty() { return None; }
         let stats_map = self.node_stats.read();
@@ -581,84 +678,6 @@ impl Coordinator {
         // iterate nodes, compute score only for nodes that meet requirements
         let mut best: Option<(String, f64)> = None;
         for n in nodes {
-            let stats = stats_map.get(&n.id).cloned().unwrap_or_default();
-            if !scheduler.meets(&stats, workload) {
-                continue;
-            }
-            let score = scheduler.score(&stats);
-            match &best {
-                None => best = Some((n.id.clone(), score)),
-                Some((best_id, best_score)) => {
-                    if score > *best_score {
-                        best = Some((n.id.clone(), score));
-                    } else if (score - *best_score).abs() < 1e-9 {
-                        // tie-breaker deterministic: pick lexicographically smaller id
-                        if n.id < *best_id {
-                            best = Some((n.id.clone(), score));
-                        }
-                    }
-                }
-            }
-        }
-        best.map(|(id, _)| id)
-    }
-
-    /// Scheduling with gating: pick best node id for given workload,
-    /// filtering through the GateKeeper registry.
-    ///
-    /// ## Flow
-    ///
-    /// 1. Retrieve list of registered coordinator nodes.
-    /// 2. **Gating filter** (before scoring): For each node, verify:
-    ///    - The node exists in `gatekeeper.registry` (by coordinator node ID).
-    ///    - The node's `NodeRegistryEntry.status == NodeStatus::Active`.
-    ///    Nodes that fail either check are skipped with a warning log.
-    /// 3. Run existing scoring logic (requirement check + weighted score)
-    ///    **without modification** on the filtered set.
-    /// 4. Return the best-scoring node, or `None` if no eligible nodes remain.
-    ///
-    /// ## Determinism
-    ///
-    /// Same `(workload, gatekeeper.registry, coordinator nodes, stats)` always
-    /// produces the same result. Logging does not affect return value.
-    ///
-    /// ## Immutability
-    ///
-    /// This method takes `&self` and `&GateKeeper` — no mutation of
-    /// coordinator state, gatekeeper registry, or workload.
-    pub fn schedule_with_gating(
-        &self,
-        workload: &Workload,
-        gatekeeper: &GateKeeper,
-    ) -> Option<String> {
-        let nodes = self.list_nodes();
-        if nodes.is_empty() { return None; }
-        let stats_map = self.node_stats.read();
-        let scheduler = self.scheduler.read().clone();
-
-        let mut best: Option<(String, f64)> = None;
-        for n in nodes {
-            // Gating filter: node must exist in registry with Active status.
-            match gatekeeper.registry.get(&n.id) {
-                None => {
-                    eprintln!(
-                        "[gatekeeper] schedule: skipping node '{}': not found in gating registry",
-                        n.id,
-                    );
-                    continue;
-                }
-                Some(entry) => {
-                    if entry.status != NodeStatus::Active {
-                        eprintln!(
-                            "[gatekeeper] schedule: skipping node '{}': status {:?} != Active",
-                            n.id, entry.status,
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // Scoring logic: identical to schedule() — no modification.
             let stats = stats_map.get(&n.id).cloned().unwrap_or_default();
             if !scheduler.meets(&stats, workload) {
                 continue;
@@ -748,7 +767,7 @@ mod tests {
         c.update_node_stats("c", NodeStats { cpu_free: 0.5, ram_free_mb: 1000.0, gpu_free: 0.0, latency_ms: 20.0, io_pressure: 0.1 });
 
         let wl = Workload { cpu_req: Some(0.1), ram_req_mb: Some(512.0), gpu_req: None, max_latency_ms: None, io_tolerance: None };
-        let chosen = c.schedule(&wl, None).expect("should pick a node");
+        let chosen = c.schedule(&wl).expect("should pick a node");
         assert_eq!(chosen, "b");
     }
 
@@ -763,7 +782,7 @@ mod tests {
 
         // workload requires at least 512 MB - only n1 qualifies
         let wl = Workload { cpu_req: None, ram_req_mb: Some(512.0), gpu_req: None, max_latency_ms: None, io_tolerance: None };
-        let chosen = c.schedule(&wl, None).expect("should pick n1");
+        let chosen = c.schedule(&wl).expect("should pick n1");
         assert_eq!(chosen, "n1");
     }
 

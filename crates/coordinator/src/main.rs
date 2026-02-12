@@ -1688,7 +1688,7 @@ async fn schedule_workload(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Workload>,
 ) -> (StatusCode, Json<Value>) {
-    match state.coordinator.schedule(&payload, None) {
+    match state.coordinator.schedule(&payload) {
         Some(node_id) => (StatusCode::OK, Json(json!({ "node_id": node_id }))),
         None => (StatusCode::NOT_FOUND, Json(json!({ "error": "no suitable node" }))),
     }

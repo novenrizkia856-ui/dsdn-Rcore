@@ -1,10 +1,10 @@
-//! # GateKeeper Module (14B.31–39)
+//! # GateKeeper Module (14B.31–40)
 //!
 //! Provides the [`GateKeeper`] struct, [`GateKeeperConfig`], node
 //! admission filtering, stake validation hooks, identity validation
 //! hooks, quarantine management, ban enforcement, node lifecycle
-//! management, and DA event publishing for service node gating
-//! within the coordinator crate.
+//! management, DA event publishing, and comprehensive tests for
+//! service node gating within the coordinator crate.
 //!
 //! ## Modules
 //!
@@ -22,15 +22,18 @@
 //!   for orchestrating node status transitions across gating subsystems.
 //! - **events** (14B.39): [`GatingEvent`] and [`GatingEventPublisher`]
 //!   for publishing gating events to the DA layer.
+//! - **tests** (14B.40): Comprehensive test suite validating all gating
+//!   components (admission, stake, identity, quarantine, ban, lifecycle,
+//!   events).
 //!
 //! ## Scope
 //!
 //! This module provides foundational types, construction logic, admission
 //! filtering, stake validation hooks, identity validation hooks,
 //! quarantine management, ban enforcement, node lifecycle management,
-//! and DA event publishing for gating auditability. It does **not**
-//! contain RPC calls or background tasks. Those will be added in
-//! subsequent stages (14B.40+).
+//! DA event publishing, and comprehensive tests for the gating subsystem.
+//! It does **not** contain RPC calls or background tasks. Those will be
+//! added in subsequent stages (14B.41+).
 //!
 //! ## Relationship with Validator Gating Engine
 //!
@@ -86,6 +89,10 @@ pub use lifecycle::{NodeLifecycleManager, StatusTransition};
 pub mod events;
 pub use events::{GatingEvent, GatingEventPublisher};
 
+// Comprehensive test suite (14B.40)
+#[cfg(test)]
+mod tests;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -116,7 +123,7 @@ pub struct GateKeeperConfig {
     pub chain_rpc_endpoint: String,
 
     /// Interval in seconds between periodic re-checks of registered nodes.
-    /// Used by future enforcement logic (14B.40+). Default: 60.
+    /// Used by future enforcement logic (14B.41+). Default: 60.
     pub check_interval_secs: u64,
 
     /// Global toggle for gating enforcement. When `false`, the GateKeeper
@@ -177,6 +184,14 @@ impl Default for GateKeeperConfig {
 /// [`GatingEventPublisher`] for auditability and deterministic state
 /// rebuilding. Events are encoded deterministically and tagged with
 /// the `"dsdn-gating"` namespace.
+///
+/// ### Tests (14B.40)
+///
+/// The `tests` module provides comprehensive coverage of all gating
+/// components: admission filter, stake check hook, identity check hook,
+/// scheduler gate, quarantine manager, ban enforcer, node lifecycle
+/// manager, and gating event serialization. All tests are deterministic
+/// and use explicit timestamps.
 #[derive(Debug)]
 pub struct GateKeeper {
     /// Configuration for this GateKeeper instance.
