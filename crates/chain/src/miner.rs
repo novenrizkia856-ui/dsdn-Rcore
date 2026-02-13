@@ -1,17 +1,18 @@
 // crates/chain/src/miner.rs
 //! Simple miner / block producer (PoS mode with signing)
 //! NONCE-SAFE VERSION (sorted pending tx by nonce)
-//! 
+//!
 //! 13.8.E Fee Distribution:
 //! - Transfer:   Validator (proposer) receives 100%
 //! - Governance: Validator 50%, Treasury 50%
 //! - Storage:    Storage Node 100% (proposer gets NOTHING)
 //! - Compute:    Compute Node 100% (proposer gets NOTHING)
 use crate::block::{Block, Receipt};
-use crate::tx::{TxEnvelope, TxPayload};
+use crate::crypto::public_key_from_secret_key;
 use crate::state::ChainState;
-use crate::types::{Hash, Address};
-use anyhow::{Result, anyhow};
+use crate::tx::{TxEnvelope, TxPayload};
+use crate::types::{Address, Hash};
+use anyhow::{anyhow, Result};
 
 /// Optional: uncomment these if you want derive public key from private key
 /// and add ed25519-dalek to Cargo.toml:
@@ -21,8 +22,8 @@ use anyhow::{Result, anyhow};
 
 pub struct Miner {
     proposer: Address,
-    private_key: Vec<u8>,  // Ed25519 secret key (32 bytes)
-    public_key: Vec<u8>,   // Ed25519 public key (32 bytes)
+    private_key: Vec<u8>, // Ed25519 secret key (32 bytes)
+    public_key: Vec<u8>,  // Ed25519 public key (32 bytes)
 }
 
 impl Miner {
@@ -41,7 +42,11 @@ impl Miner {
     /// Explicit constructor accepting both private & public keys.
     /// Use this when you actually have the public key (validator/proposer).
     pub fn with_keys(proposer: Address, private_key: Vec<u8>, public_key: Vec<u8>) -> Self {
-        Miner { proposer, private_key, public_key }
+        Miner {
+            proposer,
+            private_key,
+            public_key,
+        }
     }
 
     /// Alternative constructor: derive public key from private key (requires ed25519-dalek)
@@ -49,21 +54,17 @@ impl Miner {
     /// To enable this, add `ed25519-dalek = "1.0.1"` to Cargo.toml.
     #[allow(dead_code)]
     pub fn from_private(proposer: Address, private_key: Vec<u8>) -> Result<Self> {
-        // If you don't want to use ed25519-dalek, remove this function.
-        // Make sure to add `ed25519-dalek = "1.0.1"` to Cargo.toml if using.
-        use ed25519_dalek::SecretKey;
-
         if private_key.len() != 32 {
-            return Err(anyhow!("private key must be 32 bytes (seed) to derive public key"));
+            return Err(anyhow!(
+                "private key must be 32 bytes (seed) to derive public key"
+            ));
         }
 
-        let secret = SecretKey::from_bytes(&private_key)
-            .map_err(|e| anyhow!("invalid secret key bytes: {}", e))?;
-        let public = ed25519_dalek::PublicKey::from(&secret);
+        let public_key = public_key_from_secret_key(&private_key)?;
         Ok(Miner {
             proposer,
             private_key,
-            public_key: public.as_bytes().to_vec(),
+            public_key,
         })
     }
 
@@ -88,21 +89,18 @@ impl Miner {
         // 1) SORT TX BY NONCE (absolutely required!)
         // -------------------------------------------------------------
         let mut txs_sorted = txs.clone();
-        txs_sorted.sort_by_key(|tx| {
-            match &tx.payload {
-                TxPayload::Transfer { nonce, .. }
-                | TxPayload::Stake { nonce, .. }
-                | TxPayload::Unstake { nonce, .. }
-                | TxPayload::ClaimReward { nonce, .. }
-                | TxPayload::StorageOperationPayment { nonce, .. }
-                | TxPayload::ComputeExecutionPayment { nonce, .. }
-                | TxPayload::ValidatorRegistration { nonce, .. }
-                | TxPayload::RegisterServiceNode { nonce, .. }
-                | TxPayload::GovernanceAction { nonce, .. }
-                => *nonce,
+        txs_sorted.sort_by_key(|tx| match &tx.payload {
+            TxPayload::Transfer { nonce, .. }
+            | TxPayload::Stake { nonce, .. }
+            | TxPayload::Unstake { nonce, .. }
+            | TxPayload::ClaimReward { nonce, .. }
+            | TxPayload::StorageOperationPayment { nonce, .. }
+            | TxPayload::ComputeExecutionPayment { nonce, .. }
+            | TxPayload::ValidatorRegistration { nonce, .. }
+            | TxPayload::RegisterServiceNode { nonce, .. }
+            | TxPayload::GovernanceAction { nonce, .. } => *nonce,
 
-                TxPayload::Custom { nonce, .. } => *nonce,
-            }
+            TxPayload::Custom { nonce, .. } => *nonce,
         });
 
         // -------------------------------------------------------------
@@ -110,7 +108,7 @@ impl Miner {
         // -------------------------------------------------------------
         for tx in &txs_sorted {
             let tx_hash = tx.compute_txid()?;
-            
+
             // === ANTI SELF-DEALING CHECK (13.7.E) - RECIPIENT ONLY ===
             // Only check recipient-based self-dealing (Storage/Compute payments)
             // Sender-based self-dealing is handled in apply_payload with fee → treasury
@@ -136,7 +134,6 @@ impl Miner {
                 });
                 continue;
             }
-
 
             // === EXECUTE TRANSACTION ===
             match state.apply_payload(tx, &self.proposer) {
@@ -168,15 +165,19 @@ impl Miner {
         // Block producer HARUS menjalankan slashing di titik yang sama
         // dengan full node untuk menjaga determinisme
         // -------------------------------------------------------------
-        let slashing_events = state.process_automatic_slashing(height, std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0));
-        
+        let slashing_events = state.process_automatic_slashing(
+            height,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+
         if !slashing_events.is_empty() {
             println!("⚔️ SLASHING EXECUTED IN BLOCK:");
             for event in &slashing_events {
-                println!("   └─ {:?}: {} slashed {} (treasury={}, burned={})",
+                println!(
+                    "   └─ {:?}: {} slashed {} (treasury={}, burned={})",
                     event.reason,
                     event.target,
                     event.amount_slashed,
@@ -198,11 +199,13 @@ impl Miner {
         let failed_txs = receipts.iter().filter(|r| !r.success).count();
         let total_txs = receipts.len();
         let state_root_display = format!("{}", state_root);
-        
+
         println!("═══════════════════════════════════════════════════════════");
         println!("✅ BLOCK PRODUCTION COMPLETE - Height: {}", height);
-        println!("   Total TXs: {} (Success: {}, Failed: {})", 
-                 total_txs, successful_txs, failed_txs);
+        println!(
+            "   Total TXs: {} (Success: {}, Failed: {})",
+            total_txs, successful_txs, failed_txs
+        );
         println!("   Total Gas Used: {}", total_gas_used);
         println!("   State Root: {}", state_root_display);
         println!("───────────────────────────────────────────────────────────");
@@ -214,7 +217,6 @@ impl Miner {
         println!("   Delegator Pool: {}", state.get_delegator_pool());
         println!("═══════════════════════════════════════════════════════════");
 
-
         // -------------------------------------------------------------
         // 5) Build block
         // -------------------------------------------------------------
@@ -222,7 +224,7 @@ impl Miner {
         let mut block = Block::new(
             height,
             parent_hash,
-            txs_sorted,   // <- always put sorted txs into block!
+            txs_sorted, // <- always put sorted txs into block!
             state_root,
             self.proposer,
             self.public_key.clone(), // proposer_pubkey for verification (13.7.J)

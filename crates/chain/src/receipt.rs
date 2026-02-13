@@ -20,9 +20,9 @@
 //! - 20% → validator
 //! - 10% → treasury
 
-use crate::types::{Address, Hash};
 use crate::crypto;
-use serde::{Serialize, Deserialize};
+use crate::types::{Address, Hash};
+use serde::{Deserialize, Serialize};
 
 // ════════════════════════════════════════════════════════════════════════════
 // COORDINATOR PUBKEY (CONSENSUS-CRITICAL)
@@ -32,6 +32,8 @@ use serde::{Serialize, Deserialize};
 /// Placeholder: harus diganti dengan pubkey production sebelum mainnet.
 /// Perubahan nilai ini memerlukan hard-fork.
 pub const COORDINATOR_PUBKEY: [u8; 32] = [0u8; 32];
+pub const COORDINATOR_SIG_SCHEME: crate::crypto::CryptoSchemeId =
+    crate::crypto::CryptoSchemeId::Ed25519;
 // ════════════════════════════════════════════════════════════════════════════
 // ENUMS
 // ════════════════════════════════════════════════════════════════════════════
@@ -77,12 +79,22 @@ pub struct MeasuredUsage {
 impl MeasuredUsage {
     /// Membuat MeasuredUsage baru dengan nilai eksplisit.
     pub fn new(cpu: u64, ram: u64, chunk_count: u64, bw: u64) -> Self {
-        Self { cpu, ram, chunk_count, bw }
+        Self {
+            cpu,
+            ram,
+            chunk_count,
+            bw,
+        }
     }
 
     /// Membuat MeasuredUsage dengan semua nilai nol.
     pub fn zero() -> Self {
-        Self { cpu: 0, ram: 0, chunk_count: 0, bw: 0 }
+        Self {
+            cpu: 0,
+            ram: 0,
+            chunk_count: 0,
+            bw: 0,
+        }
     }
 
     /// Serialize ke bytes untuk hashing (deterministic order).
@@ -182,37 +194,37 @@ impl ResourceReceipt {
     /// Total: 79 bytes sebelum hashing.
     pub fn compute_receipt_id(&self) -> Hash {
         let mut data = Vec::with_capacity(79);
-        
+
         // 1. node_address (20 bytes)
         data.extend_from_slice(self.node_address.as_bytes());
-        
+
         // 2. node_class (1 byte)
         let node_class_byte: u8 = match self.node_class {
             NodeClass::Regular => 0,
             NodeClass::Datacenter => 1,
         };
         data.push(node_class_byte);
-        
+
         // 3. resource_type (1 byte)
         let resource_type_byte: u8 = match self.resource_type {
             ResourceType::Storage => 0,
             ResourceType::Compute => 1,
         };
         data.push(resource_type_byte);
-        
+
         // 4. measured_usage (32 bytes)
         data.extend_from_slice(&self.measured_usage.to_bytes());
-        
+
         // 5. reward_base (16 bytes BE)
         data.extend_from_slice(&self.reward_base.to_be_bytes());
-        
+
         // 6. anti_self_dealing_flag (1 byte)
         let flag_byte: u8 = if self.anti_self_dealing_flag { 1 } else { 0 };
         data.push(flag_byte);
-        
+
         // 7. timestamp (8 bytes BE)
         data.extend_from_slice(&self.timestamp.to_be_bytes());
-        
+
         // Hash dengan SHA3-512
         crypto::sha3_512(&data)
     }
@@ -227,13 +239,22 @@ impl ResourceReceipt {
         if self.coordinator_signature.is_empty() {
             return false;
         }
-        
-        // Verifikasi Ed25519 signature atas receipt_id bytes
-        crypto::ed25519_verify(
+
+        let decoded = match crypto::decode_signature(&self.coordinator_signature) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
+
+        if decoded.scheme != COORDINATOR_SIG_SCHEME {
+            return false;
+        }
+
+        crypto::verify_signature(
             &COORDINATOR_PUBKEY,
             self.receipt_id.as_bytes(),
             &self.coordinator_signature,
         )
+        .unwrap_or(false)
     }
 
     /// Menetapkan coordinator_signature setelah receipt dibuat.

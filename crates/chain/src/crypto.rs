@@ -1,10 +1,57 @@
-//! crypto helpers for dsdn-chain: sha3-512, ed25519 sign/verify, address derivation
-use sha3::{Digest, Sha3_512};
+//! crypto helpers for dsdn-chain: hashing + pluggable signature schemes
+use anyhow::{anyhow, Result};
 use hex::encode as hex_encode;
-use ed25519_dalek::{Keypair, Signature, Signer, Verifier, PublicKey, SecretKey};
-use rand_core::OsRng;
-use anyhow::Result;
+use sha3::{Digest, Sha3_512};
+
 use crate::types::{Address, Hash};
+
+#[path = "crypto/dilithium_backend.rs"]
+mod dilithium_backend;
+#[path = "crypto/ed25519_backend.rs"]
+mod ed25519_backend;
+#[path = "crypto/schemes.rs"]
+mod schemes;
+
+pub use ed25519_backend::Ed25519PrivateKey;
+pub use schemes::{CryptoSchemeId, SignatureScheme};
+
+use dilithium_backend::DilithiumBackend;
+use ed25519_backend::Ed25519Backend;
+
+const SIGNATURE_FORMAT_V1: u8 = 1;
+const DEFAULT_SCHEME: CryptoSchemeId = CryptoSchemeId::Ed25519;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSignature {
+    pub scheme: CryptoSchemeId,
+    pub signature: Vec<u8>,
+    pub is_legacy: bool,
+}
+
+pub fn encode_signature(scheme: CryptoSchemeId, signature: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + signature.len());
+    out.push(SIGNATURE_FORMAT_V1);
+    out.push(scheme as u8);
+    out.extend_from_slice(signature);
+    out
+}
+
+pub fn decode_signature(signature: &[u8]) -> Result<DecodedSignature> {
+    if signature.len() >= 2 && signature[0] == SIGNATURE_FORMAT_V1 {
+        let scheme = CryptoSchemeId::try_from(signature[1])?;
+        return Ok(DecodedSignature {
+            scheme,
+            signature: signature[2..].to_vec(),
+            is_legacy: false,
+        });
+    }
+
+    Ok(DecodedSignature {
+        scheme: DEFAULT_SCHEME,
+        signature: signature.to_vec(),
+        is_legacy: true,
+    })
+}
 
 /// compute sha3-512 hex string of bytes
 pub fn sha3_512_hex(data: &[u8]) -> String {
@@ -24,121 +71,80 @@ pub fn sha3_512_bytes(data: &[u8]) -> [u8; 64] {
 
 /// compute sha3-512 and return as Hash type
 pub fn sha3_512(data: &[u8]) -> Hash {
-    let bytes = sha3_512_bytes(data);
-    Hash::from_bytes(bytes)
+    Hash::from_bytes(sha3_512_bytes(data))
 }
 
-/// Generate Ed25519 keypair and return (public_bytes, keypair_bytes).
-/// - public_bytes: 32 bytes
-/// - keypair_bytes: 64 bytes (secret(32) || public(32))
-pub fn generate_ed25519_keypair_bytes() -> (Vec<u8>, Vec<u8>) {
-    let mut csprng = OsRng{};
-    let kp: Keypair = Keypair::generate(&mut csprng);
-    let pk_bytes = kp.public.to_bytes().to_vec();
-    let kp_bytes = kp.to_bytes().to_vec(); // 64 bytes
-    (pk_bytes, kp_bytes)
-}
-
-/// Sign message with secret key bytes (32 bytes). Derives public key internally. Returns signature bytes (64).
-pub fn sign_with_secret_key(secret: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-    let secret_key = SecretKey::from_bytes(secret)
-        .map_err(|e| anyhow::anyhow!("invalid secret key: {}", e))?;
-    let public_key: PublicKey = (&secret_key).into();
-    let kp = Keypair { secret: secret_key, public: public_key };
-    let sig: Signature = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
-}
-
-/// Sign message with keypair bytes (64 bytes). Returns signature bytes (64).
-pub fn sign_message_with_keypair_bytes(keypair_bytes: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-    let kp = Keypair::from_bytes(keypair_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid keypair bytes: {}", e))?;
-    let sig: Signature = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
-}
-
-/// Verify signature given public key bytes (32), message and signature bytes (64)
-pub fn verify_signature(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<bool> {
-    let pk = PublicKey::from_bytes(pubkey_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid public key: {}", e))?;
-    let sig = Signature::from_bytes(sig_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid signature: {}", e))?;
-    match pk.verify(msg, &sig) {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-/// Verify Ed25519 signature (returns bool, no Result).
-/// Returns false for any invalid input (pubkey length, signature length, verification failure).
-pub fn ed25519_verify(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> bool {
-    if pubkey_bytes.len() != 32 || sig_bytes.len() != 64 {
-        return false;
-    }
-    let pk = match PublicKey::from_bytes(pubkey_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let sig = match Signature::from_bytes(sig_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    pk.verify(msg, &sig).is_ok()
-}
-/// Ed25519 private key wrapper that stores raw 32 bytes (secret)
-#[derive(Clone)]
-pub struct Ed25519PrivateKey {
-    raw: [u8; 32],
-}
-
-impl Ed25519PrivateKey {
-    pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        if b.len() != 32 {
-            return Err(anyhow::anyhow!("private key must be 32 bytes"));
+fn dispatch_verify(
+    scheme: CryptoSchemeId,
+    pubkey_bytes: &[u8],
+    msg: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    match scheme {
+        CryptoSchemeId::Ed25519 => Ed25519Backend::verify_signature(pubkey_bytes, msg, sig_bytes),
+        CryptoSchemeId::Dilithium => {
+            DilithiumBackend::verify_signature(pubkey_bytes, msg, sig_bytes)
         }
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(b);
-        Ok(Self { raw })
     }
+}
 
-    pub fn to_secret(&self) -> Result<SecretKey> {
-        SecretKey::from_bytes(&self.raw)
-            .map_err(|e| anyhow::anyhow!("invalid secret key: {}", e))
-    }
+/// Default keypair generation using active default scheme.
+pub fn generate_ed25519_keypair_bytes() -> (Vec<u8>, Vec<u8>) {
+    Ed25519Backend::generate_keypair_bytes().expect("ed25519 generation must be available")
+}
 
-    pub fn public_key(&self) -> PublicKey {
-        let sk = SecretKey::from_bytes(&self.raw).unwrap();
-        PublicKey::from(&sk)
-    }
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.raw
-    }
+pub fn public_key_from_secret_key(secret: &[u8]) -> Result<Vec<u8>> {
+    Ed25519Backend::public_key_from_secret(secret)
+}
 
-    /// Generate random private key (ed25519-dalek style)
-    pub fn generate() -> Self {
-        let mut rng = OsRng;
-        let secret = ed25519_dalek::SecretKey::generate(&mut rng);
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(secret.as_bytes());
-        Self { raw }
-    }
+/// Sign message with secret key bytes; returns encoded signature bytes (scheme-aware format).
+pub fn sign_with_secret_key(secret: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+    let raw = Ed25519Backend::sign_with_secret_key(secret, msg)?;
+    Ok(encode_signature(CryptoSchemeId::Ed25519, &raw))
+}
+
+/// Sign message with keypair bytes; returns encoded signature bytes (scheme-aware format).
+pub fn sign_message_with_keypair_bytes(keypair_bytes: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+    let raw = Ed25519Backend::sign_with_keypair_bytes(keypair_bytes, msg)?;
+    Ok(encode_signature(CryptoSchemeId::Ed25519, &raw))
+}
+
+/// Verify signature given public key bytes, message, and signature bytes.
+/// Accepts both legacy signatures (raw bytes) and scheme-aware format v1.
+pub fn verify_signature(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<bool> {
+    let decoded = decode_signature(sig_bytes)?;
+    dispatch_verify(decoded.scheme, pubkey_bytes, msg, &decoded.signature)
+}
+
+pub fn ed25519_verify(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> bool {
+    verify_signature(pubkey_bytes, msg, sig_bytes).unwrap_or(false)
 }
 
 pub fn sign_ed25519(pk: &Ed25519PrivateKey, msg: &[u8]) -> Result<Vec<u8>> {
-    let sk = pk.to_secret()?;
-    let pk2 = PublicKey::from(&sk);
-    let kp = Keypair { secret: sk, public: pk2 };
-    let sig = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
+    sign_with_secret_key(pk.as_bytes(), msg)
 }
-
 
 /// Derive Address from raw public key bytes: addr = SHA3-512(pubkey)[:20]
 pub fn address_from_pubkey_bytes(pubkey_bytes: &[u8]) -> Result<Address> {
     let hash = sha3_512_bytes(pubkey_bytes);
-    let mut arr = [0u8;20];
+    let mut arr = [0u8; 20];
     arr.copy_from_slice(&hash[0..20]);
     Ok(Address::from_bytes(arr))
+}
+
+pub fn decode_signature_required_scheme(
+    sig_bytes: &[u8],
+    required: CryptoSchemeId,
+) -> Result<Vec<u8>> {
+    let decoded = decode_signature(sig_bytes)?;
+    if decoded.scheme != required {
+        return Err(anyhow!(
+            "signature scheme mismatch: expected {:?}, got {:?}",
+            required,
+            decoded.scheme
+        ));
+    }
+    Ok(decoded.signature)
 }
 
 #[cfg(test)]
@@ -153,12 +159,17 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_sign_verify() {
+    fn signature_format_supports_legacy_and_v1() {
         let (pk, kp_bytes) = generate_ed25519_keypair_bytes();
         let msg = b"hello dsdn";
-        let sig = sign_message_with_keypair_bytes(&kp_bytes, msg).expect("sign");
-        let ok = verify_signature(&pk, msg, &sig).expect("verify");
-        assert!(ok, "signature must verify");
+        let sig_v1 = sign_message_with_keypair_bytes(&kp_bytes, msg).expect("sign");
+        assert!(verify_signature(&pk, msg, &sig_v1).expect("verify v1"));
+
+        let decoded = decode_signature(&sig_v1).expect("decode");
+        assert_eq!(decoded.scheme, CryptoSchemeId::Ed25519);
+        assert!(!decoded.is_legacy);
+
+        assert!(verify_signature(&pk, msg, &decoded.signature).expect("verify legacy"));
     }
 
     #[test]
