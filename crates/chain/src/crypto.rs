@@ -1,10 +1,64 @@
-//! crypto helpers for dsdn-chain: sha3-512, ed25519 sign/verify, address derivation
+//! Crypto helpers for dsdn-chain: hashing, signature abstraction, and address derivation.
 use sha3::{Digest, Sha3_512};
 use hex::encode as hex_encode;
 use ed25519_dalek::{Keypair, Signature, Signer, Verifier, PublicKey, SecretKey};
 use rand_core::OsRng;
 use anyhow::Result;
 use crate::types::{Address, Hash};
+
+/// Signature scheme variants supported by the chain crypto layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignatureAlgorithm {
+    Ed25519,
+}
+
+/// Generic signature algorithm interface.
+pub trait SignatureScheme {
+    fn algorithm(&self) -> SignatureAlgorithm;
+    fn generate_keypair_bytes(&self) -> Result<(Vec<u8>, Vec<u8>)>;
+    fn sign_with_keypair_bytes(&self, keypair_bytes: &[u8], msg: &[u8]) -> Result<Vec<u8>>;
+    fn verify(&self, pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<bool>;
+}
+
+/// Ed25519 implementation of [`SignatureScheme`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ed25519Scheme;
+
+impl SignatureScheme for Ed25519Scheme {
+    fn algorithm(&self) -> SignatureAlgorithm {
+        SignatureAlgorithm::Ed25519
+    }
+
+    fn generate_keypair_bytes(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut csprng = OsRng{};
+        let kp: Keypair = Keypair::generate(&mut csprng);
+        let pk_bytes = kp.public.to_bytes().to_vec();
+        let kp_bytes = kp.to_bytes().to_vec(); // 64 bytes
+        Ok((pk_bytes, kp_bytes))
+    }
+
+    fn sign_with_keypair_bytes(&self, keypair_bytes: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+        let kp = Keypair::from_bytes(keypair_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid keypair bytes: {}", e))?;
+        let sig: Signature = kp.sign(msg);
+        Ok(sig.to_bytes().to_vec())
+    }
+
+    fn verify(&self, pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<bool> {
+        let pk = PublicKey::from_bytes(pubkey_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid public key: {}", e))?;
+        let sig = Signature::from_bytes(sig_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid signature: {}", e))?;
+        match pk.verify(msg, &sig) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+pub fn default_signature_scheme() -> Ed25519Scheme {
+    Ed25519Scheme
+}
 
 /// compute sha3-512 hex string of bytes
 pub fn sha3_512_hex(data: &[u8]) -> String {
@@ -32,11 +86,9 @@ pub fn sha3_512(data: &[u8]) -> Hash {
 /// - public_bytes: 32 bytes
 /// - keypair_bytes: 64 bytes (secret(32) || public(32))
 pub fn generate_ed25519_keypair_bytes() -> (Vec<u8>, Vec<u8>) {
-    let mut csprng = OsRng{};
-    let kp: Keypair = Keypair::generate(&mut csprng);
-    let pk_bytes = kp.public.to_bytes().to_vec();
-    let kp_bytes = kp.to_bytes().to_vec(); // 64 bytes
-    (pk_bytes, kp_bytes)
+    default_signature_scheme()
+        .generate_keypair_bytes()
+        .expect("ed25519 keypair generation should not fail")
 }
 
 /// Sign message with secret key bytes (32 bytes). Derives public key internally. Returns signature bytes (64).
@@ -51,22 +103,12 @@ pub fn sign_with_secret_key(secret: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
 
 /// Sign message with keypair bytes (64 bytes). Returns signature bytes (64).
 pub fn sign_message_with_keypair_bytes(keypair_bytes: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-    let kp = Keypair::from_bytes(keypair_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid keypair bytes: {}", e))?;
-    let sig: Signature = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
+    default_signature_scheme().sign_with_keypair_bytes(keypair_bytes, msg)
 }
 
 /// Verify signature given public key bytes (32), message and signature bytes (64)
 pub fn verify_signature(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<bool> {
-    let pk = PublicKey::from_bytes(pubkey_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid public key: {}", e))?;
-    let sig = Signature::from_bytes(sig_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid signature: {}", e))?;
-    match pk.verify(msg, &sig) {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    default_signature_scheme().verify(pubkey_bytes, msg, sig_bytes)
 }
 
 /// Verify Ed25519 signature (returns bool, no Result).
@@ -167,5 +209,17 @@ mod tests {
         let addr = address_from_pubkey_bytes(&pk).expect("addr");
         assert_eq!(addr.to_hex().len(), 40);
         assert_eq!(addr.as_bytes().len(), 20);
+    }
+
+    #[test]
+    fn signature_scheme_abstraction_roundtrip() {
+        let scheme = default_signature_scheme();
+        assert_eq!(scheme.algorithm(), SignatureAlgorithm::Ed25519);
+
+        let (pk, kp) = scheme.generate_keypair_bytes().expect("generate");
+        let msg = b"abstraction-layer";
+        let sig = scheme.sign_with_keypair_bytes(&kp, msg).expect("sign");
+        let ok = scheme.verify(&pk, msg, &sig).expect("verify");
+        assert!(ok, "signature scheme abstraction should verify");
     }
 }
