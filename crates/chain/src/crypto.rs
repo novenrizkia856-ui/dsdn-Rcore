@@ -1,10 +1,68 @@
-//! crypto helpers for dsdn-chain: sha3-512, ed25519 sign/verify, address derivation
+//! crypto helpers for dsdn-chain: sha3-512, pluggable signature schemes, address derivation
 use sha3::{Digest, Sha3_512};
 use hex::encode as hex_encode;
-use ed25519_dalek::{Keypair, Signature, Signer, Verifier, PublicKey, SecretKey};
-use rand_core::OsRng;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use crate::types::{Address, Hash};
+use ed25519_dalek::PublicKey as EcdsaPublicKey;
+
+pub mod ecdsa;
+pub mod dilithium;
+
+/// Supported signature algorithms for on-chain payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CryptoAlgorithm {
+    Ecdsa,
+    Dilithium,
+}
+
+impl Default for CryptoAlgorithm {
+    fn default() -> Self {
+        Self::Ecdsa
+    }
+}
+
+/// Serialized signature with explicit algorithm identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlgorithmSignature {
+    pub algorithm: CryptoAlgorithm,
+    pub signature: Vec<u8>,
+}
+
+/// Serialized public key with explicit algorithm identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlgorithmPublicKey {
+    pub algorithm: CryptoAlgorithm,
+    pub public_key: Vec<u8>,
+}
+
+pub trait CryptoScheme {
+    type PublicKey;
+    type PrivateKey;
+    type Signature;
+
+    fn generate_keypair() -> (Self::PublicKey, Self::PrivateKey);
+    fn sign(private: &Self::PrivateKey, message: &[u8]) -> Self::Signature;
+    fn verify(public: &Self::PublicKey, message: &[u8], signature: &Self::Signature) -> bool;
+}
+
+pub struct CryptoEngine<A: CryptoScheme> {
+    marker: std::marker::PhantomData<A>,
+}
+
+impl<A: CryptoScheme> CryptoEngine<A> {
+    pub fn generate_keypair() -> (A::PublicKey, A::PrivateKey) {
+        A::generate_keypair()
+    }
+
+    pub fn sign(private: &A::PrivateKey, message: &[u8]) -> A::Signature {
+        A::sign(private, message)
+    }
+
+    pub fn verify(public: &A::PublicKey, message: &[u8], signature: &A::Signature) -> bool {
+        A::verify(public, message, signature)
+    }
+}
 
 /// compute sha3-512 hex string of bytes
 pub fn sha3_512_hex(data: &[u8]) -> String {
@@ -28,64 +86,45 @@ pub fn sha3_512(data: &[u8]) -> Hash {
     Hash::from_bytes(bytes)
 }
 
-/// Generate Ed25519 keypair and return (public_bytes, keypair_bytes).
-/// - public_bytes: 32 bytes
-/// - keypair_bytes: 64 bytes (secret(32) || public(32))
+/// Default key generation. Kept for backward compatibility.
 pub fn generate_ed25519_keypair_bytes() -> (Vec<u8>, Vec<u8>) {
-    let mut csprng = OsRng{};
-    let kp: Keypair = Keypair::generate(&mut csprng);
-    let pk_bytes = kp.public.to_bytes().to_vec();
-    let kp_bytes = kp.to_bytes().to_vec(); // 64 bytes
-    (pk_bytes, kp_bytes)
+    CryptoEngine::<ecdsa::EcdsaImpl>::generate_keypair()
 }
 
-/// Sign message with secret key bytes (32 bytes). Derives public key internally. Returns signature bytes (64).
-pub fn sign_with_secret_key(secret: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-    let secret_key = SecretKey::from_bytes(secret)
-        .map_err(|e| anyhow::anyhow!("invalid secret key: {}", e))?;
-    let public_key: PublicKey = (&secret_key).into();
-    let kp = Keypair { secret: secret_key, public: public_key };
-    let sig: Signature = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
-}
-
-/// Sign message with keypair bytes (64 bytes). Returns signature bytes (64).
+/// Default signing API. Kept for backward compatibility.
 pub fn sign_message_with_keypair_bytes(keypair_bytes: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-    let kp = Keypair::from_bytes(keypair_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid keypair bytes: {}", e))?;
-    let sig: Signature = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
+    ecdsa::sign_message_with_keypair_bytes(keypair_bytes, msg)
 }
 
-/// Verify signature given public key bytes (32), message and signature bytes (64)
+/// Default signing API from 32-byte secret key.
+pub fn sign_with_secret_key(secret: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+    ecdsa::sign_with_secret_key(secret, msg)
+}
+
+/// Verify signature using explicit algorithm.
+pub fn verify_signature_with_algorithm(
+    algorithm: CryptoAlgorithm,
+    pubkey_bytes: &[u8],
+    msg: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool> {
+    match algorithm {
+        CryptoAlgorithm::Ecdsa => ecdsa::verify_signature(pubkey_bytes, msg, sig_bytes),
+        CryptoAlgorithm::Dilithium => Ok(dilithium::verify_signature(pubkey_bytes, msg, sig_bytes)),
+    }
+}
+
+/// Default signature verification (Ecdsa) for compatibility.
 pub fn verify_signature(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<bool> {
-    let pk = PublicKey::from_bytes(pubkey_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid public key: {}", e))?;
-    let sig = Signature::from_bytes(sig_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid signature: {}", e))?;
-    match pk.verify(msg, &sig) {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    verify_signature_with_algorithm(CryptoAlgorithm::Ecdsa, pubkey_bytes, msg, sig_bytes)
 }
 
-/// Verify Ed25519 signature (returns bool, no Result).
-/// Returns false for any invalid input (pubkey length, signature length, verification failure).
+/// Legacy helper name retained.
 pub fn ed25519_verify(pubkey_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> bool {
-    if pubkey_bytes.len() != 32 || sig_bytes.len() != 64 {
-        return false;
-    }
-    let pk = match PublicKey::from_bytes(pubkey_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let sig = match Signature::from_bytes(sig_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    pk.verify(msg, &sig).is_ok()
+    verify_signature(pubkey_bytes, msg, sig_bytes).unwrap_or(false)
 }
-/// Ed25519 private key wrapper that stores raw 32 bytes (secret)
+
+/// Backward-compatible key wrapper for callers that store 32-byte private key material.
 #[derive(Clone)]
 pub struct Ed25519PrivateKey {
     raw: [u8; 32],
@@ -101,37 +140,25 @@ impl Ed25519PrivateKey {
         Ok(Self { raw })
     }
 
-    pub fn to_secret(&self) -> Result<SecretKey> {
-        SecretKey::from_bytes(&self.raw)
-            .map_err(|e| anyhow::anyhow!("invalid secret key: {}", e))
+    pub fn public_key(&self) -> EcdsaPublicKey {
+        ecdsa::public_key_from_secret_key(&self.raw).expect("private key was validated at construction")
     }
 
-    pub fn public_key(&self) -> PublicKey {
-        let sk = SecretKey::from_bytes(&self.raw).unwrap();
-        PublicKey::from(&sk)
-    }
     pub fn as_bytes(&self) -> &[u8] {
         &self.raw
     }
 
-    /// Generate random private key (ed25519-dalek style)
     pub fn generate() -> Self {
-        let mut rng = OsRng;
-        let secret = ed25519_dalek::SecretKey::generate(&mut rng);
+        let (_pub, keypair) = generate_ed25519_keypair_bytes();
         let mut raw = [0u8; 32];
-        raw.copy_from_slice(secret.as_bytes());
+        raw.copy_from_slice(&keypair[..32]);
         Self { raw }
     }
 }
 
 pub fn sign_ed25519(pk: &Ed25519PrivateKey, msg: &[u8]) -> Result<Vec<u8>> {
-    let sk = pk.to_secret()?;
-    let pk2 = PublicKey::from(&sk);
-    let kp = Keypair { secret: sk, public: pk2 };
-    let sig = kp.sign(msg);
-    Ok(sig.to_bytes().to_vec())
+    sign_with_secret_key(pk.as_bytes(), msg)
 }
-
 
 /// Derive Address from raw public key bytes: addr = SHA3-512(pubkey)[:20]
 pub fn address_from_pubkey_bytes(pubkey_bytes: &[u8]) -> Result<Address> {
@@ -153,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_sign_verify() {
+    fn ecdsa_default_sign_verify() {
         let (pk, kp_bytes) = generate_ed25519_keypair_bytes();
         let msg = b"hello dsdn";
         let sig = sign_message_with_keypair_bytes(&kp_bytes, msg).expect("sign");
