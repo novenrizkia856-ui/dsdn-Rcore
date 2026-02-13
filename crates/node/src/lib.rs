@@ -207,7 +207,7 @@
 //! | `placement_verifier`| Placement verification                               |
 //! | `delete_handler`    | Delete request handling                              |
 //! | `state_sync`        | State synchronization                                |
-//! | `health`            | Health reporting with fallback awareness             |
+//! | `health`            | Health reporting with fallback awareness and identity extension (14B.48) |
 //! | `multi_da_source`   | Multi-DA source abstraction (Primary/Secondary/Emergency) |
 //! | `metrics`           | Node fallback metrics for Prometheus export          |
 //! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
@@ -569,6 +569,33 @@
 //! is reconstructed on every restart. Same secret → same `node_id`,
 //! same `operator_address`, same signing behavior.
 //!
+//! ## Health Reporting Extension (14B.48)
+//!
+//! `NodeHealth` is extended with 7 optional identity/gating fields:
+//! `node_id_hex`, `operator_address_hex`, `node_class`, `gating_status`,
+//! `tls_valid`, `tls_expires_at`, `staked_amount`.
+//!
+//! ### Backward Compatibility
+//!
+//! All new fields are `Option<T>` with `#[serde(default, skip_serializing_if)]`.
+//! When absent, they are omitted from JSON. Old consumers that parse the
+//! response are unaffected. Old JSON without these fields deserializes
+//! correctly (fields default to `None`).
+//!
+//! ### Identity Visibility
+//!
+//! `health_endpoint_extended` accepts optional `NodeIdentityManager`,
+//! `TLSCertManager`, `NodeStatus`, `NodeClass`, and stake amount.
+//! Only public identity information is exposed (Ed25519 public key,
+//! operator address). Secret key material is never accessed.
+//!
+//! ### Security Consideration
+//!
+//! The `node_id_hex` field exposes the Ed25519 public key. This is
+//! intentional — the public key is already transmitted during admission
+//! and is not sensitive. The secret key is never exposed via any
+//! health reporting path.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -608,6 +635,7 @@ pub use delete_handler::{DeleteHandler, DeleteError, DeleteRequestedEvent, Pendi
 pub use event_processor::{NodeEventProcessor, NodeAction, ProcessError};
 pub use health::{
     NodeHealth, HealthStorage, DAInfo, HealthResponse, health_endpoint,
+    health_endpoint_extended,
     DA_LAG_THRESHOLD, FALLBACK_DEGRADATION_THRESHOLD_MS,
 };
 pub use metrics::NodeFallbackMetrics;

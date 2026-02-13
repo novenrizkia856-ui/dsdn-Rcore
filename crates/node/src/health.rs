@@ -27,12 +27,27 @@
 //! - No chunks are missing
 //! - DA lag is within acceptable threshold
 //! - Storage is not overflowing
+//!
+//! ## Identity Extension (14B.48)
+//!
+//! `NodeHealth` carries optional identity/gating fields populated by
+//! [`health_endpoint_extended`]. These fields (`node_id_hex`,
+//! `operator_address_hex`, `node_class`, `gating_status`, `tls_valid`,
+//! `tls_expires_at`, `staked_amount`) are all `Option<T>` with
+//! `#[serde(skip_serializing_if)]`, so they are omitted from JSON
+//! when absent. This preserves backward compatibility: old consumers
+//! see no unknown fields, and old JSON without these fields still
+//! deserializes correctly via `#[serde(default)]`.
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dsdn_common::gating::{NodeClass, NodeStatus};
+
 use crate::da_follower::{NodeDerivedState, ReplicaStatus};
+use crate::identity_manager::NodeIdentityManager;
 use crate::multi_da_source::DASourceType;
+use crate::tls_manager::TLSCertManager;
 
 // ════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -161,6 +176,41 @@ pub struct NodeHealth {
     /// last_primary_contact = fallback_since (when we left primary).
     /// If fallback is not active, last_primary_contact = last_check (now).
     pub last_primary_contact: Option<u64>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // IDENTITY EXTENSION FIELDS (14B.48)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Ed25519 public key as 64-character lowercase hex string.
+    /// Populated by [`set_identity_context`] when a [`NodeIdentityManager`]
+    /// is available. No `0x` prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id_hex: Option<String>,
+
+    /// Operator address as 40-character lowercase hex string.
+    /// Derived from `node_id[12..32]`. No `0x` prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_address_hex: Option<String>,
+
+    /// Node class: "Storage" or "Compute".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_class: Option<String>,
+
+    /// Gating status: "Active", "Pending", "Quarantined", or "Banned".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gating_status: Option<String>,
+
+    /// Whether the TLS certificate is valid at the check timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_valid: Option<bool>,
+
+    /// TLS certificate expiry timestamp (seconds since Unix epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_expires_at: Option<u64>,
+
+    /// Staked amount as a decimal string (u128 via `to_string()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staked_amount: Option<String>,
 }
 
 impl NodeHealth {
@@ -262,6 +312,14 @@ impl NodeHealth {
             da_source,
             events_from_fallback,
             last_primary_contact,
+            // Identity extension fields (14B.48) — None until set_identity_context
+            node_id_hex: None,
+            operator_address_hex: None,
+            node_class: None,
+            gating_status: None,
+            tls_valid: None,
+            tls_expires_at: None,
+            staked_amount: None,
         }
     }
 
@@ -273,6 +331,58 @@ impl NodeHealth {
             DASourceType::Primary => "Primary".to_string(),
             DASourceType::Secondary => "Secondary".to_string(),
             DASourceType::Emergency => "Emergency".to_string(),
+        }
+    }
+
+    /// Populates identity, gating, TLS, and stake fields from optional context.
+    ///
+    /// Called after `check()` to enrich the health report with identity
+    /// information. All parameters are optional — `None` inputs leave
+    /// the corresponding fields as `None`.
+    ///
+    /// ## Parameters
+    ///
+    /// - `identity`: Populates `node_id_hex` (64-char hex) and
+    ///   `operator_address_hex` (40-char hex).
+    /// - `tls`: Populates `tls_valid` and `tls_expires_at`.
+    /// - `gating_status`: Populates `gating_status` as exact string.
+    /// - `node_class`: Populates `node_class` as exact string.
+    /// - `staked_amount`: Populates `staked_amount` as decimal string.
+    /// - `tls_check_timestamp`: Unix timestamp (seconds) for TLS validity.
+    ///
+    /// ## Security
+    ///
+    /// Only public identity information is exposed (public key, operator
+    /// address). Secret key material is never accessed or stored.
+    pub fn set_identity_context(
+        &mut self,
+        identity: Option<&NodeIdentityManager>,
+        tls: Option<&TLSCertManager>,
+        gating_status: Option<NodeStatus>,
+        node_class: Option<NodeClass>,
+        staked_amount: Option<u128>,
+        tls_check_timestamp: u64,
+    ) {
+        if let Some(mgr) = identity {
+            self.node_id_hex = Some(bytes_to_lower_hex(mgr.node_id()));
+            self.operator_address_hex = Some(bytes_to_lower_hex(mgr.operator_address()));
+        }
+
+        if let Some(tls_mgr) = tls {
+            self.tls_valid = Some(tls_mgr.is_valid(tls_check_timestamp));
+            self.tls_expires_at = Some(tls_mgr.cert_info().not_after);
+        }
+
+        if let Some(status) = gating_status {
+            self.gating_status = Some(node_status_to_string(status));
+        }
+
+        if let Some(class) = node_class {
+            self.node_class = Some(node_class_to_string(class));
+        }
+
+        if let Some(stake) = staked_amount {
+            self.staked_amount = Some(stake.to_string());
         }
     }
 
@@ -402,6 +512,10 @@ impl NodeHealth {
     }
 
     /// Manual JSON serialization fallback.
+    ///
+    /// Covers core fields only. Identity extension fields (14B.48) are
+    /// omitted in this fallback path since serde_json is the primary
+    /// serializer and this path is only reached on serialization failure.
     fn to_json_manual(&self) -> String {
         // Handle Option<u64> for last_primary_contact
         let last_primary_str = match self.last_primary_contact {
@@ -498,6 +612,14 @@ impl Default for NodeHealth {
             da_source: "Primary".to_string(),
             events_from_fallback: 0,
             last_primary_contact: None,
+            // Identity extension fields (14B.48)
+            node_id_hex: None,
+            operator_address_hex: None,
+            node_class: None,
+            gating_status: None,
+            tls_valid: None,
+            tls_expires_at: None,
+            staked_amount: None,
         }
     }
 }
@@ -563,6 +685,84 @@ pub fn health_endpoint(
     HealthResponse::from_health(&health)
 }
 
+/// Extended health endpoint with identity, gating, TLS, and stake context.
+///
+/// Performs a standard health check via [`NodeHealth::check`], then enriches
+/// the result with optional identity-related information via
+/// [`NodeHealth::set_identity_context`].
+///
+/// # Backward Compatibility
+///
+/// All identity fields are `Option<T>` with `skip_serializing_if`.
+/// When all optional parameters are `None`, the JSON output is identical
+/// to [`health_endpoint`]. Old consumers are unaffected.
+///
+/// # Guarantees
+///
+/// - Read-only (does not modify any input)
+/// - Never panics
+/// - Deterministic: same inputs → same JSON
+pub fn health_endpoint_extended(
+    node_id: &str,
+    da: &dyn DAInfo,
+    state: &NodeDerivedState,
+    storage: &dyn HealthStorage,
+    identity: Option<&NodeIdentityManager>,
+    tls: Option<&TLSCertManager>,
+    gating_status: Option<NodeStatus>,
+    node_class: Option<NodeClass>,
+    staked_amount: Option<u128>,
+    tls_check_timestamp: u64,
+) -> HealthResponse {
+    let mut health = NodeHealth::check(node_id, da, state, storage);
+    health.set_identity_context(
+        identity,
+        tls,
+        gating_status,
+        node_class,
+        staked_amount,
+        tls_check_timestamp,
+    );
+    HealthResponse::from_health(&health)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS — IDENTITY EXTENSION (14B.48)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Lowercase hex digit lookup table.
+const HEX_CHARS: [u8; 16] = *b"0123456789abcdef";
+
+/// Converts a byte slice to a lowercase hex string.
+///
+/// No `0x` prefix. No separators. Deterministic.
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        hex.push(HEX_CHARS[(b >> 4) as usize] as char);
+        hex.push(HEX_CHARS[(b & 0x0F) as usize] as char);
+    }
+    hex
+}
+
+/// Converts a `NodeStatus` to its exact string representation.
+fn node_status_to_string(status: NodeStatus) -> String {
+    match status {
+        NodeStatus::Active => "Active".to_string(),
+        NodeStatus::Pending => "Pending".to_string(),
+        NodeStatus::Quarantined => "Quarantined".to_string(),
+        NodeStatus::Banned => "Banned".to_string(),
+    }
+}
+
+/// Converts a `NodeClass` to its exact string representation.
+fn node_class_to_string(class: NodeClass) -> String {
+    match class {
+        NodeClass::Storage => "Storage".to_string(),
+        NodeClass::Compute => "Compute".to_string(),
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // UNIT TESTS
 // ════════════════════════════════════════════════════════════════════════════
@@ -573,6 +773,20 @@ mod tests {
     use crate::da_follower::ChunkAssignment;
 
     const TEST_NODE: &str = "test-node-1";
+
+    const TEST_SEED: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+    ];
+
+    /// Helper: build a default NodeHealth, then apply overrides.
+    fn base_health(overrides: impl FnOnce(&mut NodeHealth)) -> NodeHealth {
+        let mut h = NodeHealth::default();
+        overrides(&mut h);
+        h
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     // MOCK DA INFO
@@ -933,19 +1147,24 @@ mod tests {
         let parsed: Result<serde_json::Value, _> = serde_json::from_str(&json);
         assert!(parsed.is_ok());
 
-        let value = parsed.unwrap();
-        assert_eq!(value["node_id"], TEST_NODE);
-        assert_eq!(value["da_connected"], true);
-        assert_eq!(value["chunks_stored"], 10);
-        assert_eq!(value["chunks_pending"], 2);
-        assert_eq!(value["chunks_missing"], 1);
+        if let Ok(value) = parsed {
+            assert_eq!(value["node_id"], TEST_NODE);
+            assert_eq!(value["da_connected"], true);
+            assert_eq!(value["chunks_stored"], 10);
+            assert_eq!(value["chunks_pending"], 2);
+            assert_eq!(value["chunks_missing"], 1);
+            // Identity fields absent when None (14B.48)
+            assert!(value.get("node_id_hex").is_none());
+            assert!(value.get("gating_status").is_none());
+        }
     }
 
     #[test]
     fn test_to_json_all_fields_present() {
         let health = NodeHealth::default();
         let json = health.to_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("test: parse JSON");
 
         // All fields must be present
         assert!(parsed.get("node_id").is_some());
@@ -1125,6 +1344,15 @@ mod tests {
         assert_eq!(health.events_from_fallback, 0);
         assert!(health.last_primary_contact.is_none());
 
+        // Identity extension fields (14B.48)
+        assert!(health.node_id_hex.is_none());
+        assert!(health.operator_address_hex.is_none());
+        assert!(health.node_class.is_none());
+        assert!(health.gating_status.is_none());
+        assert!(health.tls_valid.is_none());
+        assert!(health.tls_expires_at.is_none());
+        assert!(health.staked_amount.is_none());
+
         // Default is unhealthy (DA not connected)
         assert!(!health.is_healthy());
     }
@@ -1179,23 +1407,16 @@ mod tests {
 
     #[test]
     fn test_health_response_from_health() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            last_check: 12345,
-            // Fallback fields (14A.1A.47)
-            fallback_active: false,
-            da_source: "Primary".to_string(),
-            events_from_fallback: 0,
-            last_primary_contact: Some(12345),
-        };
+        let health = base_health(|h| {
+            h.node_id = TEST_NODE.to_string();
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 12345;
+            h.last_primary_contact = Some(12345);
+        });
 
         let response = HealthResponse::from_health(&health);
 
@@ -1264,22 +1485,20 @@ mod tests {
 
     #[test]
     fn test_health_serialization_includes_fallback_fields() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 5,
-            chunks_pending: 2,
-            chunks_missing: 0,
-            storage_used_gb: 10.0,
-            storage_capacity_gb: 100.0,
-            last_check: 50000,
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 42,
-            last_primary_contact: Some(10000),
-        };
+        let health = base_health(|h| {
+            h.node_id = TEST_NODE.to_string();
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 5;
+            h.chunks_pending = 2;
+            h.storage_used_gb = 10.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 50000;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 42;
+            h.last_primary_contact = Some(10000);
+        });
 
         let json = health.to_json();
 
@@ -1291,22 +1510,13 @@ mod tests {
 
     #[test]
     fn test_health_serialization_null_last_primary_contact() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 0,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 0.0,
-            storage_capacity_gb: 100.0,
-            last_check: 50000,
-            fallback_active: false,
-            da_source: "Primary".to_string(),
-            events_from_fallback: 0,
-            last_primary_contact: None,
-        };
+        let health = base_health(|h| {
+            h.node_id = TEST_NODE.to_string();
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 50000;
+        });
 
         let json = health.to_json();
 
@@ -1319,22 +1529,15 @@ mod tests {
 
     #[test]
     fn test_not_degraded_when_not_in_fallback() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            last_check: 1_000_000,
-            fallback_active: false,
-            da_source: "Primary".to_string(),
-            events_from_fallback: 0,
-            last_primary_contact: Some(1_000_000),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 1_000_000;
+            h.last_primary_contact = Some(1_000_000);
+        });
 
         assert!(!health.is_fallback_degraded());
         assert!(health.is_healthy());
@@ -1342,24 +1545,18 @@ mod tests {
 
     #[test]
     fn test_not_degraded_when_fallback_short_duration() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            // last_check = 60 seconds after fallback started
-            last_check: 60_000,
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 10,
-            // Fallback started at timestamp 0
-            last_primary_contact: Some(0),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 60_000;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 10;
+            h.last_primary_contact = Some(0);
+        });
 
         // 60 seconds < 5 minutes threshold
         assert!(!health.is_fallback_degraded());
@@ -1368,24 +1565,18 @@ mod tests {
 
     #[test]
     fn test_degraded_when_fallback_exceeds_threshold() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            // last_check = 6 minutes after fallback started (360,000 ms)
-            last_check: 360_000,
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 100,
-            // Fallback started at timestamp 0
-            last_primary_contact: Some(0),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 360_000;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 100;
+            h.last_primary_contact = Some(0);
+        });
 
         // 6 minutes > 5 minutes threshold
         assert!(health.is_fallback_degraded());
@@ -1394,24 +1585,18 @@ mod tests {
 
     #[test]
     fn test_degraded_exactly_at_threshold() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            // last_check = exactly 5 minutes after fallback started (300,000 ms)
-            last_check: FALLBACK_DEGRADATION_THRESHOLD_MS,
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 50,
-            // Fallback started at timestamp 0
-            last_primary_contact: Some(0),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = FALLBACK_DEGRADATION_THRESHOLD_MS;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 50;
+            h.last_primary_contact = Some(0);
+        });
 
         // Exactly at threshold = degraded (>=)
         assert!(health.is_fallback_degraded());
@@ -1420,22 +1605,18 @@ mod tests {
 
     #[test]
     fn test_degraded_with_emergency_source() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            last_check: 600_000, // 10 minutes
-            fallback_active: true,
-            da_source: "Emergency".to_string(),
-            events_from_fallback: 200,
-            last_primary_contact: Some(0),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 600_000;
+            h.fallback_active = true;
+            h.da_source = "Emergency".to_string();
+            h.events_from_fallback = 200;
+            h.last_primary_contact = Some(0);
+        });
 
         assert!(health.is_fallback_degraded());
         assert!(!health.is_healthy());
@@ -1443,22 +1624,18 @@ mod tests {
 
     #[test]
     fn test_health_issues_includes_extended_fallback() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            last_check: 600_000, // 10 minutes
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 100,
-            last_primary_contact: Some(0),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 600_000;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 100;
+            h.last_primary_contact = Some(0);
+        });
 
         let issues = health.health_issues();
 
@@ -1469,22 +1646,18 @@ mod tests {
 
     #[test]
     fn test_health_issues_no_fallback_issue_when_short() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            last_check: 60_000, // 1 minute
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 10,
-            last_primary_contact: Some(0),
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 60_000;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 10;
+            h.last_primary_contact = Some(0);
+        });
 
         let issues = health.health_issues();
 
@@ -1494,23 +1667,17 @@ mod tests {
 
     #[test]
     fn test_fallback_degraded_no_last_primary_contact() {
-        let health = NodeHealth {
-            node_id: TEST_NODE.to_string(),
-            da_connected: true,
-            da_last_sequence: 100,
-            da_behind_by: 0,
-            chunks_stored: 10,
-            chunks_pending: 0,
-            chunks_missing: 0,
-            storage_used_gb: 50.0,
-            storage_capacity_gb: 100.0,
-            last_check: 1_000_000,
-            fallback_active: true,
-            da_source: "Secondary".to_string(),
-            events_from_fallback: 50,
-            // No last_primary_contact available
-            last_primary_contact: None,
-        };
+        let health = base_health(|h| {
+            h.da_connected = true;
+            h.da_last_sequence = 100;
+            h.chunks_stored = 10;
+            h.storage_used_gb = 50.0;
+            h.storage_capacity_gb = 100.0;
+            h.last_check = 1_000_000;
+            h.fallback_active = true;
+            h.da_source = "Secondary".to_string();
+            h.events_from_fallback = 50;
+        });
 
         // Cannot determine duration, so not degraded
         assert!(!health.is_fallback_degraded());
@@ -1542,5 +1709,285 @@ mod tests {
         // da_behind_by = 0, so should be healthy
         assert_eq!(health.da_behind_by, 0);
         assert!(health.is_healthy());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // R. IDENTITY EXTENSION TESTS (14B.48)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_set_identity_context_full() {
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup: from_keypair");
+        let tls_mgr = TLSCertManager::generate_self_signed("test.dsdn.local", 365)
+            .expect("test setup: TLS");
+
+        let mut health = NodeHealth::default();
+        health.set_identity_context(
+            Some(&id_mgr),
+            Some(&tls_mgr),
+            Some(NodeStatus::Active),
+            Some(NodeClass::Storage),
+            Some(1_000_000_000_000_000_000),
+            1_700_000_000,
+        );
+
+        // node_id_hex: 64 lowercase hex chars
+        assert!(health.node_id_hex.is_some());
+        if let Some(ref hex) = health.node_id_hex {
+            assert_eq!(hex.len(), 64);
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_eq!(hex, &hex.to_lowercase());
+        }
+
+        // operator_address_hex: 40 lowercase hex chars
+        assert!(health.operator_address_hex.is_some());
+        if let Some(ref hex) = health.operator_address_hex {
+            assert_eq!(hex.len(), 40);
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        assert_eq!(health.gating_status, Some("Active".to_string()));
+        assert_eq!(health.node_class, Some("Storage".to_string()));
+        assert_eq!(health.staked_amount, Some("1000000000000000000".to_string()));
+        assert!(health.tls_valid.is_some());
+        assert!(health.tls_expires_at.is_some());
+    }
+
+    #[test]
+    fn test_set_identity_context_none_inputs() {
+        let mut health = NodeHealth::default();
+        health.set_identity_context(None, None, None, None, None, 0);
+
+        assert!(health.node_id_hex.is_none());
+        assert!(health.operator_address_hex.is_none());
+        assert!(health.gating_status.is_none());
+        assert!(health.node_class.is_none());
+        assert!(health.tls_valid.is_none());
+        assert!(health.tls_expires_at.is_none());
+        assert!(health.staked_amount.is_none());
+    }
+
+    #[test]
+    fn test_set_identity_context_partial() {
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup");
+
+        let mut health = NodeHealth::default();
+        health.set_identity_context(
+            Some(&id_mgr), None, Some(NodeStatus::Quarantined), None, None, 0,
+        );
+
+        assert!(health.node_id_hex.is_some());
+        assert!(health.operator_address_hex.is_some());
+        assert_eq!(health.gating_status, Some("Quarantined".to_string()));
+        assert!(health.node_class.is_none());
+        assert!(health.tls_valid.is_none());
+        assert!(health.staked_amount.is_none());
+    }
+
+    #[test]
+    fn test_gating_status_mapping_all_variants() {
+        let cases = [
+            (NodeStatus::Active, "Active"),
+            (NodeStatus::Pending, "Pending"),
+            (NodeStatus::Quarantined, "Quarantined"),
+            (NodeStatus::Banned, "Banned"),
+        ];
+        for (status, expected) in cases {
+            let mut h = NodeHealth::default();
+            h.set_identity_context(None, None, Some(status), None, None, 0);
+            assert_eq!(h.gating_status, Some(expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_node_class_mapping_all_variants() {
+        let mut h1 = NodeHealth::default();
+        h1.set_identity_context(None, None, None, Some(NodeClass::Storage), None, 0);
+        assert_eq!(h1.node_class, Some("Storage".to_string()));
+
+        let mut h2 = NodeHealth::default();
+        h2.set_identity_context(None, None, None, Some(NodeClass::Compute), None, 0);
+        assert_eq!(h2.node_class, Some("Compute".to_string()));
+    }
+
+    #[test]
+    fn test_staked_amount_format() {
+        let mut h1 = NodeHealth::default();
+        h1.set_identity_context(None, None, None, None, Some(0), 0);
+        assert_eq!(h1.staked_amount, Some("0".to_string()));
+
+        let mut h2 = NodeHealth::default();
+        h2.set_identity_context(None, None, None, None, Some(u128::MAX), 0);
+        assert_eq!(h2.staked_amount, Some(u128::MAX.to_string()));
+    }
+
+    #[test]
+    fn test_identity_fields_in_json_when_set() {
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup");
+        let mut health = NodeHealth::default();
+        health.set_identity_context(
+            Some(&id_mgr), None, Some(NodeStatus::Active),
+            Some(NodeClass::Storage), Some(42), 0,
+        );
+
+        let json = health.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("test: parse JSON");
+
+        assert!(parsed.get("node_id_hex").is_some());
+        assert!(parsed.get("operator_address_hex").is_some());
+        assert_eq!(parsed["gating_status"], "Active");
+        assert_eq!(parsed["node_class"], "Storage");
+        assert_eq!(parsed["staked_amount"], "42");
+        // TLS not set → absent
+        assert!(parsed.get("tls_valid").is_none());
+        assert!(parsed.get("tls_expires_at").is_none());
+    }
+
+    #[test]
+    fn test_identity_fields_absent_from_json_when_none() {
+        let health = NodeHealth::default();
+        let json = health.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("test: parse JSON");
+
+        assert!(parsed.get("node_id_hex").is_none());
+        assert!(parsed.get("operator_address_hex").is_none());
+        assert!(parsed.get("node_class").is_none());
+        assert!(parsed.get("gating_status").is_none());
+        assert!(parsed.get("tls_valid").is_none());
+        assert!(parsed.get("tls_expires_at").is_none());
+        assert!(parsed.get("staked_amount").is_none());
+    }
+
+    #[test]
+    fn test_backward_compat_deserialization() {
+        // Old JSON without identity fields should still deserialize
+        let old_json = r#"{
+            "node_id":"test","da_connected":true,"da_last_sequence":100,
+            "da_behind_by":0,"chunks_stored":5,"chunks_pending":0,
+            "chunks_missing":0,"storage_used_gb":50.0,"storage_capacity_gb":100.0,
+            "last_check":12345,"fallback_active":false,"da_source":"Primary",
+            "events_from_fallback":0,"last_primary_contact":12345
+        }"#;
+
+        let parsed: Result<NodeHealth, _> = serde_json::from_str(old_json);
+        assert!(parsed.is_ok());
+        if let Ok(h) = parsed {
+            assert_eq!(h.node_id, "test");
+            assert!(h.da_connected);
+            assert!(h.node_id_hex.is_none());
+            assert!(h.gating_status.is_none());
+        }
+    }
+
+    #[test]
+    fn test_health_endpoint_extended_with_identity() {
+        let da = MockDAInfo::new(true, 100);
+        let state = make_state_with_replicas(100, 10, 0, 0);
+        let storage = MockHealthStorage::new(GB_50, GB_100);
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup");
+
+        let response = health_endpoint_extended(
+            TEST_NODE, &da, &state, &storage,
+            Some(&id_mgr), None,
+            Some(NodeStatus::Active), Some(NodeClass::Storage),
+            Some(1000), 1_700_000_000,
+        );
+
+        assert_eq!(response.status_code, 200);
+        assert!(response.body.contains("node_id_hex"));
+        assert!(response.body.contains("Active"));
+        assert!(response.body.contains("Storage"));
+    }
+
+    #[test]
+    fn test_health_endpoint_extended_no_identity() {
+        let da = MockDAInfo::new(true, 100);
+        let state = make_state_with_replicas(100, 10, 0, 0);
+        let storage = MockHealthStorage::new(GB_50, GB_100);
+
+        let response = health_endpoint_extended(
+            TEST_NODE, &da, &state, &storage,
+            None, None, None, None, None, 0,
+        );
+
+        assert_eq!(response.status_code, 200);
+        // Identity fields absent
+        assert!(!response.body.contains("node_id_hex"));
+        assert!(!response.body.contains("gating_status"));
+    }
+
+    #[test]
+    fn test_hex_encoding_correctness() {
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup");
+        let hex = bytes_to_lower_hex(id_mgr.node_id());
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!hex.starts_with("0x"));
+        assert_eq!(hex, hex.to_lowercase());
+
+        let op_hex = bytes_to_lower_hex(id_mgr.operator_address());
+        assert_eq!(op_hex.len(), 40);
+    }
+
+    #[test]
+    fn test_set_identity_context_deterministic() {
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup");
+
+        let mut h1 = NodeHealth::default();
+        h1.set_identity_context(
+            Some(&id_mgr), None, Some(NodeStatus::Active),
+            Some(NodeClass::Storage), Some(42), 1000,
+        );
+
+        let mut h2 = NodeHealth::default();
+        h2.set_identity_context(
+            Some(&id_mgr), None, Some(NodeStatus::Active),
+            Some(NodeClass::Storage), Some(42), 1000,
+        );
+
+        assert_eq!(h1.node_id_hex, h2.node_id_hex);
+        assert_eq!(h1.operator_address_hex, h2.operator_address_hex);
+        assert_eq!(h1.gating_status, h2.gating_status);
+        assert_eq!(h1.node_class, h2.node_class);
+        assert_eq!(h1.staked_amount, h2.staked_amount);
+    }
+
+    #[test]
+    fn test_node_id_hex_matches_identity_bytes() {
+        let id_mgr = NodeIdentityManager::from_keypair(TEST_SEED)
+            .expect("test setup");
+        let mut health = NodeHealth::default();
+        health.set_identity_context(Some(&id_mgr), None, None, None, None, 0);
+
+        let expected = bytes_to_lower_hex(id_mgr.node_id());
+        assert_eq!(health.node_id_hex, Some(expected));
+
+        let expected_op = bytes_to_lower_hex(id_mgr.operator_address());
+        assert_eq!(health.operator_address_hex, Some(expected_op));
+    }
+
+    #[test]
+    fn test_check_leaves_identity_fields_none() {
+        let da = MockDAInfo::new(true, 100);
+        let state = make_state_with_replicas(100, 10, 0, 0);
+        let storage = MockHealthStorage::new(GB_50, GB_100);
+
+        let health = NodeHealth::check(TEST_NODE, &da, &state, &storage);
+
+        assert!(health.node_id_hex.is_none());
+        assert!(health.operator_address_hex.is_none());
+        assert!(health.gating_status.is_none());
+        assert!(health.node_class.is_none());
+        assert!(health.tls_valid.is_none());
+        assert!(health.tls_expires_at.is_none());
+        assert!(health.staked_amount.is_none());
     }
 }
