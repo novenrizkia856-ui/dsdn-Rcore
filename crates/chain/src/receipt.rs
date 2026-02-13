@@ -21,7 +21,7 @@
 //! - 10% → treasury
 
 use crate::types::{Address, Hash};
-use crate::crypto;
+use crate::crypto::{self, CryptoAlgorithm};
 use serde::{Serialize, Deserialize};
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -32,6 +32,8 @@ use serde::{Serialize, Deserialize};
 /// Placeholder: harus diganti dengan pubkey production sebelum mainnet.
 /// Perubahan nilai ini memerlukan hard-fork.
 pub const COORDINATOR_PUBKEY: [u8; 32] = [0u8; 32];
+/// Algorithm used to verify coordinator signatures.
+pub const COORDINATOR_ALGORITHM: CryptoAlgorithm = CryptoAlgorithm::Ecdsa;
 // ════════════════════════════════════════════════════════════════════════════
 // ENUMS
 // ════════════════════════════════════════════════════════════════════════════
@@ -134,8 +136,11 @@ pub struct ResourceReceipt {
     pub anti_self_dealing_flag: bool,
     /// Unix timestamp pembuatan receipt
     pub timestamp: u64,
-    /// Ed25519 signature dari Coordinator atas receipt_id
+    /// Signature dari Coordinator atas receipt_id
     pub coordinator_signature: Vec<u8>,
+    /// Algorithm identifier for coordinator_signature (default Ecdsa for backward compatibility)
+    #[serde(default)]
+    pub coordinator_signature_algorithm: CryptoAlgorithm,
 }
 
 impl ResourceReceipt {
@@ -163,6 +168,7 @@ impl ResourceReceipt {
             anti_self_dealing_flag,
             timestamp,
             coordinator_signature: Vec::new(),
+            coordinator_signature_algorithm: COORDINATOR_ALGORITHM,
         };
         receipt.receipt_id = receipt.compute_receipt_id();
         receipt
@@ -228,12 +234,12 @@ impl ResourceReceipt {
             return false;
         }
         
-        // Verifikasi Ed25519 signature atas receipt_id bytes
-        crypto::ed25519_verify(
+        crypto::verify_signature_with_algorithm(
+            self.coordinator_signature_algorithm,
             &COORDINATOR_PUBKEY,
             self.receipt_id.as_bytes(),
             &self.coordinator_signature,
-        )
+        ).unwrap_or(false)
     }
 
     /// Menetapkan coordinator_signature setelah receipt dibuat.

@@ -51,19 +51,17 @@ impl Miner {
     pub fn from_private(proposer: Address, private_key: Vec<u8>) -> Result<Self> {
         // If you don't want to use ed25519-dalek, remove this function.
         // Make sure to add `ed25519-dalek = "1.0.1"` to Cargo.toml if using.
-        use ed25519_dalek::SecretKey;
-
         if private_key.len() != 32 {
             return Err(anyhow!("private key must be 32 bytes (seed) to derive public key"));
         }
 
-        let secret = SecretKey::from_bytes(&private_key)
-            .map_err(|e| anyhow!("invalid secret key bytes: {}", e))?;
-        let public = ed25519_dalek::PublicKey::from(&secret);
+        let mut secret_arr = [0u8; 32];
+        secret_arr.copy_from_slice(&private_key);
+        let public = crate::crypto::ecdsa::public_key_from_secret(&secret_arr);
         Ok(Miner {
             proposer,
             private_key,
-            public_key: public.as_bytes().to_vec(),
+            public_key: public.to_vec(),
         })
     }
 

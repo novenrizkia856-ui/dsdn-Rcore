@@ -49,7 +49,7 @@
 //! - RPC/CLI integration → 13.17.8
 
 use crate::types::Address;
-use crate::crypto::{generate_ed25519_keypair_bytes, address_from_pubkey_bytes, sign_message_with_keypair_bytes};
+use crate::crypto::{generate_ed25519_keypair_bytes, address_from_pubkey_bytes, sign_message_with_keypair_bytes, verify_signature};
 use crate::tx::TxEnvelope;
 use crate::encryption::EncryptedFile;
 use crate::celestia::BlobCommitment;
@@ -218,13 +218,7 @@ impl Wallet {
     /// - Public key konsisten dengan Ed25519 derivation
     /// - Tidak panic
     pub fn from_secret_key(secret: &[u8; 32]) -> Self {
-        use ed25519_dalek::{SecretKey, PublicKey};
-
-        let secret_key = SecretKey::from_bytes(secret)
-            .expect("32-byte secret key");
-
-        let public_key: PublicKey = (&secret_key).into();
-        let public_key_bytes = public_key.to_bytes();
+        let public_key_bytes = crate::crypto::ecdsa::public_key_from_secret(secret);
 
         
         // Construct full keypair bytes: secret (32) + public (32)
@@ -509,26 +503,7 @@ impl Wallet {
     /// - Return false jika verification gagal
     /// - Tidak panic
     pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
-        use ed25519_dalek::{Signature, PublicKey, Verifier};
-
-        if signature.len() != 64 {
-            return false;
-        }
-
-        // Signature::from_bytes untuk ed25519-dalek 1.x
-        let sig = match Signature::from_bytes(signature) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        // Gunakan PublicKey, BUKAN VerifyingKey
-        let public_key = match PublicKey::from_bytes(&self.public_key) {
-            Ok(pk) => pk,
-            Err(_) => return false,
-        };
-
-        // Verify
-        public_key.verify(message, &sig).is_ok()
+        verify_signature(&self.public_key, message, signature).unwrap_or(false)
     }
 }
 
