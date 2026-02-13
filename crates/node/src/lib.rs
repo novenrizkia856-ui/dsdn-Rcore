@@ -211,6 +211,7 @@
 //! | `multi_da_source`   | Multi-DA source abstraction (Primary/Secondary/Emergency) |
 //! | `metrics`           | Node fallback metrics for Prometheus export          |
 //! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
+//! | `tls_manager`       | TLS certificate loading, generation, and fingerprint computation (14B.42) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -273,6 +274,55 @@
 //! - `generate()`: Uses OS entropy (`OsRng`); subsequent operations
 //!   are deterministic for the generated key.
 //!
+//! ## TLSCertManager (14B.42)
+//!
+//! `TLSCertManager` loads or generates TLS certificates and exposes the
+//! pre-computed `TLSCertInfo` needed for coordinator admission gating.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │                TLSCertManager                         │
+//! │  ┌──────────────┐    ┌───────────────────────────┐   │
+//! │  │  cert_der    │───▶│      TLSCertInfo          │   │
+//! │  │  (DER bytes) │    │  - fingerprint [u8; 32]   │   │
+//! │  │              │    │  - subject_cn  String      │   │
+//! │  └──────────────┘    │  - not_before  u64         │   │
+//! │                      │  - not_after   u64         │   │
+//! │  No private key      │  - issuer      String      │   │
+//! │  stored here!        └───────────────────────────┘   │
+//! └──────────────────────────────────────────────────────┘
+//!                          │
+//!                          ▼
+//! ┌──────────────────────────────────────────────────────┐
+//! │          Coordinator TLSVerifier (14B.23)             │
+//! │  - Validates fingerprint ↔ NodeIdentity binding      │
+//! │  - Checks not_before ≤ timestamp ≤ not_after         │
+//! │  - Verifies subject CN                               │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Relation to TLSVerifier
+//!
+//! `TLSVerifier` (14B.23) is a stateless verifier on the coordinator side.
+//! It compares the certificate's SHA-256 fingerprint against the
+//! `tls_cert_fingerprint` in `NodeIdentity`. The node must set
+//! `NodeIdentity::tls_cert_fingerprint` to `TLSCertManager::fingerprint()`
+//! before submitting an admission request.
+//!
+//! ### Fingerprint Guarantee
+//!
+//! `fingerprint = SHA-256(cert_der)` — computed once at construction,
+//! stored in `TLSCertInfo::fingerprint`, returned by reference. Same
+//! DER bytes always produce the same fingerprint. This matches
+//! `TLSCertInfo::compute_fingerprint` in `dsdn_common`.
+//!
+//! ### Security
+//!
+//! - `TLSCertManager` stores only the certificate (public) bytes.
+//! - No private key is retained after `generate_self_signed`.
+//! - The struct is `Send + Sync` (no interior mutability).
+//! - No `unsafe` code.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -297,6 +347,7 @@ pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
 pub mod state_sync;
+pub mod tls_manager;
 
 pub use da_follower::{
     DAFollower, NodeDerivedState, ChunkAssignment, StateError, ReplicaStatus,
@@ -316,3 +367,4 @@ pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
 // HTTP API handlers (Axum) - READ-ONLY observability endpoints
 pub use handlers::{NodeAppState, build_router};
 pub use identity_manager::{NodeIdentityManager, IdentityError};
+pub use tls_manager::{TLSCertManager, TLSError};
