@@ -53,6 +53,7 @@ use crate::crypto::{generate_ed25519_keypair_bytes, address_from_pubkey_bytes, s
 use crate::tx::TxEnvelope;
 use crate::encryption::EncryptedFile;
 use crate::celestia::BlobCommitment;
+use crate::mnemonic::{self, MnemonicError};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // WALLET ERROR (13.17.2)
@@ -92,6 +93,9 @@ pub enum WalletError {
     /// Authentication tag verification gagal
     /// Indicates tampering atau wrong key
     AuthenticationFailed,
+    
+    /// Mnemonic seed phrase tidak valid
+    MnemonicError(String),
 }
 
 impl std::fmt::Display for WalletError {
@@ -104,11 +108,18 @@ impl std::fmt::Display for WalletError {
             WalletError::DecryptionFailed => write!(f, "decryption failed"),
             WalletError::InvalidCiphertext => write!(f, "invalid ciphertext"),
             WalletError::AuthenticationFailed => write!(f, "authentication failed"),
+            WalletError::MnemonicError(msg) => write!(f, "mnemonic error: {}", msg),
         }
     }
 }
 
 impl std::error::Error for WalletError {}
+
+impl From<MnemonicError> for WalletError {
+    fn from(e: MnemonicError) -> Self {
+        WalletError::MnemonicError(e.to_string())
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // WALLET STRUCT (13.17.1)
@@ -278,6 +289,57 @@ impl Wallet {
             address,
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // MNEMONIC CONSTRUCTORS (13.17.9)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Generate wallet baru dan return beserta 24-word seed phrase.
+    ///
+    /// Menggunakan BIP39 untuk generate 256-bit entropy sebagai mnemonic,
+    /// lalu entropy tersebut digunakan sebagai Ed25519 secret key.
+    ///
+    /// # Returns
+    /// `(Wallet, String)` — wallet instance dan 24-word mnemonic phrase.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let (wallet, seed_phrase) = Wallet::generate_with_mnemonic();
+    /// println!("Seed: {}", seed_phrase);
+    /// println!("Address: {:?}", wallet.address());
+    /// ```
+    ///
+    /// # Panics
+    /// Panics jika mnemonic generation gagal (sangat unlikely).
+    pub fn generate_with_mnemonic() -> (Self, String) {
+        let (phrase, secret) = mnemonic::generate_mnemonic()
+            .expect("BIP39 mnemonic generation should not fail");
+
+        let wallet = Self::from_secret_key(&secret);
+        (wallet, phrase)
+    }
+
+    /// Restore wallet dari 24-word BIP39 mnemonic seed phrase.
+    ///
+    /// Memvalidasi mnemonic (word count, wordlist, checksum) lalu
+    /// extract entropy sebagai Ed25519 secret key.
+    ///
+    /// # Arguments
+    /// * `phrase` — 24 words separated by spaces
+    ///
+    /// # Returns
+    /// * `Ok(Wallet)` — wallet restored dari seed phrase
+    /// * `Err(WalletError::MnemonicError)` — jika phrase tidak valid
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let phrase = "abandon ability able about above absent ...";
+    /// let wallet = Wallet::from_mnemonic(phrase)?;
+    /// ```
+    pub fn from_mnemonic(phrase: &str) -> Result<Self, WalletError> {
+        let secret = mnemonic::mnemonic_to_secret_key(phrase)?;
+        Ok(Self::from_secret_key(&secret))
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -380,6 +442,31 @@ impl Wallet {
     /// ```
     pub fn export_secret_hex(&self) -> String {
         hex::encode(&self.keypair_bytes[0..32])
+    }
+
+    /// Export secret key sebagai 24-word BIP39 mnemonic seed phrase.
+    ///
+    /// Mengambil 32-byte secret key dan meng-encode sebagai BIP39 mnemonic.
+    /// Digunakan untuk human-readable backup.
+    ///
+    /// # Returns
+    /// * `Ok(String)` — 24-word mnemonic phrase
+    /// * `Err(WalletError)` — jika encoding gagal (seharusnya tidak terjadi)
+    ///
+    /// # Security Warning
+    /// Ini adalah secret key dalam bentuk kata-kata. Handle dengan sangat hati-hati!
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let phrase = wallet.export_mnemonic()?;
+    /// // "abandon ability able about ..." (24 words)
+    /// ```
+    pub fn export_mnemonic(&self) -> Result<String, WalletError> {
+        let secret: &[u8; 32] = self.keypair_bytes[0..32]
+            .try_into()
+            .expect("keypair_bytes always 64 bytes");
+        
+        mnemonic::secret_key_to_mnemonic(secret).map_err(|e| e.into())
     }
 }
 
@@ -1503,6 +1590,147 @@ mod tests {
         assert!(format!("{}", err4).contains("authentication"));
         
         println!("✅ test_wallet_encryption_error_display PASSED");
+    }
+    
+    // ════════════════════════════════════════════════════════════════════════════════
+    // MNEMONIC TESTS (13.17.9)
+    // ════════════════════════════════════════════════════════════════════════════════
+    
+    #[test]
+    fn test_wallet_generate_with_mnemonic() {
+        let (wallet, phrase) = Wallet::generate_with_mnemonic();
+        
+        // Phrase harus 24 words
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        assert_eq!(words.len(), 24, "Must be 24 words");
+        
+        // Address tidak boleh zero
+        assert_ne!(wallet.address(), Address::from_bytes([0u8; 20]));
+        
+        // Public key harus 32 bytes
+        assert_eq!(wallet.public_key().len(), 32);
+        
+        println!("✅ test_wallet_generate_with_mnemonic PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_from_mnemonic_roundtrip() {
+        let (original, phrase) = Wallet::generate_with_mnemonic();
+        
+        // Restore dari mnemonic
+        let restored = Wallet::from_mnemonic(&phrase).expect("import should succeed");
+        
+        // Address harus match
+        assert_eq!(original.address(), restored.address());
+        
+        // Public key harus match
+        assert_eq!(original.public_key(), restored.public_key());
+        
+        // Secret key harus match
+        assert_eq!(original.secret_key(), restored.secret_key());
+        
+        println!("✅ test_wallet_from_mnemonic_roundtrip PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_export_mnemonic() {
+        let (wallet, original_phrase) = Wallet::generate_with_mnemonic();
+        
+        // Export mnemonic dari wallet
+        let exported_phrase = wallet.export_mnemonic().expect("export should succeed");
+        
+        // Harus sama dengan phrase saat generate
+        assert_eq!(original_phrase, exported_phrase);
+        
+        // Import kembali harus menghasilkan wallet yang sama
+        let restored = Wallet::from_mnemonic(&exported_phrase).expect("import");
+        assert_eq!(wallet.address(), restored.address());
+        assert_eq!(wallet.secret_key(), restored.secret_key());
+        
+        println!("✅ test_wallet_export_mnemonic PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_mnemonic_determinism() {
+        let (wallet1, phrase1) = Wallet::generate_with_mnemonic();
+        
+        // Import 2x dari phrase yang sama
+        let wallet2 = Wallet::from_mnemonic(&phrase1).expect("import 1");
+        let wallet3 = Wallet::from_mnemonic(&phrase1).expect("import 2");
+        
+        assert_eq!(wallet1.address(), wallet2.address());
+        assert_eq!(wallet2.address(), wallet3.address());
+        assert_eq!(wallet1.secret_key(), wallet2.secret_key());
+        assert_eq!(wallet2.secret_key(), wallet3.secret_key());
+        
+        println!("✅ test_wallet_mnemonic_determinism PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_mnemonic_compatible_with_secret_key() {
+        // Generate via mnemonic
+        let (mnemonic_wallet, phrase) = Wallet::generate_with_mnemonic();
+        
+        // Extract secret key dan restore via from_secret_key
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(mnemonic_wallet.secret_key());
+        let secret_wallet = Wallet::from_secret_key(&secret);
+        
+        // Harus identik
+        assert_eq!(mnemonic_wallet.address(), secret_wallet.address());
+        assert_eq!(mnemonic_wallet.public_key(), secret_wallet.public_key());
+        
+        // Dan secret_wallet juga bisa export mnemonic yang sama
+        let exported = secret_wallet.export_mnemonic().expect("export");
+        assert_eq!(phrase, exported);
+        
+        println!("✅ test_wallet_mnemonic_compatible_with_secret_key PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_from_mnemonic_invalid() {
+        // Wrong word count
+        let result = Wallet::from_mnemonic("abandon ability able");
+        assert!(result.is_err());
+        
+        // Invalid words
+        let result = Wallet::from_mnemonic("xyzzy foobar baz qux a b c d e f g h i j k l m n o p q r s t");
+        assert!(result.is_err());
+        
+        // Empty
+        let result = Wallet::from_mnemonic("");
+        assert!(result.is_err());
+        
+        println!("✅ test_wallet_from_mnemonic_invalid PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_mnemonic_sign_verify() {
+        // Wallet dari mnemonic harus bisa sign dan verify
+        let (wallet, _phrase) = Wallet::generate_with_mnemonic();
+        let message = b"test signing from mnemonic wallet";
+        
+        let signature = wallet.sign_message(message);
+        assert_eq!(signature.len(), 64);
+        
+        assert!(wallet.verify_signature(message, &signature));
+        
+        println!("✅ test_wallet_mnemonic_sign_verify PASSED");
+    }
+    
+    #[test]
+    fn test_wallet_mnemonic_encrypt_decrypt() {
+        // Wallet dari mnemonic harus bisa encrypt/decrypt
+        let (wallet, _phrase) = Wallet::generate_with_mnemonic();
+        let plaintext = b"encrypted with mnemonic wallet";
+        let file_id = b"mnemonic_file_001";
+        
+        let encrypted = wallet.encrypt_file(plaintext, file_id).expect("encrypt");
+        let decrypted = wallet.decrypt_file(&encrypted, file_id).expect("decrypt");
+        
+        assert_eq!(decrypted, plaintext);
+        
+        println!("✅ test_wallet_mnemonic_encrypt_decrypt PASSED");
     }
     
     // ════════════════════════════════════════════════════════════════════════════════

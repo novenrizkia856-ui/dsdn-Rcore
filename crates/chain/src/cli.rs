@@ -487,12 +487,17 @@ pub enum ServiceNodeCommand {
 #[derive(Subcommand)]
 pub enum WalletCommand {
     /// Create a new wallet (generates new keypair, saves to wallet.dat)
-    /// SECURITY: Backup the secret key immediately!
+    /// SECURITY: Backup the seed phrase immediately!
     Create,
-    /// Import wallet from private key
+    /// Import wallet from private key (hex)
     Import { 
         #[arg(long)] 
         privkey: String 
+    },
+    /// Import wallet from 24-word BIP39 seed phrase
+    ImportSeed {
+        #[arg(long, help = "24-word BIP39 seed phrase (quoted)")]
+        mnemonic: String,
     },
     /// Show wallet status (address only)
     Status,
@@ -518,6 +523,8 @@ pub enum WalletCommand {
         #[arg(long, help = "Output file path")]
         output: String,
     },
+    /// Export wallet's 24-word seed phrase (for backup)
+    ExportSeed,
 }
 
 /// Storage contract commands (13.17.8)
@@ -956,19 +963,32 @@ pub fn run_cli() -> Result<()> {
                 let pubkey_bytes: [u8; 32] = pubkey.to_bytes();
                 let address = crate::crypto::address_from_pubkey_bytes(&pubkey_bytes)?;
 
+                // Generate seed phrase dari secret key
+                let mut secret_arr = [0u8; 32];
+                secret_arr.copy_from_slice(priv_key.as_bytes());
+                let seed_phrase = crate::mnemonic::secret_key_to_mnemonic(&secret_arr)
+                    .map_err(|e| anyhow::anyhow!("Failed to generate seed phrase: {}", e))?;
+
                 save_wallet(address, &priv_key)?;
                 
                 println!("═══════════════════════════════════════════════════════════");
-                println!("🔐 NEW WALLET CREATED (13.17.8)");
+                println!("🔐 NEW WALLET CREATED");
                 println!("═══════════════════════════════════════════════════════════");
                 println!("Address:    0x{}", hex::encode(address.as_bytes()));
                 println!("Public Key: {}", hex::encode(pubkey_bytes));
-                println!("Secret Key: {}", hex::encode(priv_key.as_bytes()));
                 println!("File:       {}", path.display());
                 println!("═══════════════════════════════════════════════════════════");
-                println!("⚠️  WARNING: BACKUP YOUR SECRET KEY IMMEDIATELY!");
-                println!("⚠️  Anyone with your secret key can steal your funds!");
-                println!("⚠️  Store it securely and NEVER share it!");
+                println!("🌱 SEED PHRASE (24 words) — BACKUP IMMEDIATELY!");
+                println!("═══════════════════════════════════════════════════════════");
+                println!();
+                println!("{}", crate::mnemonic::format_mnemonic_display(&seed_phrase));
+                println!();
+                println!("═══════════════════════════════════════════════════════════");
+                println!("⚠️  WARNING: SIMPAN SEED PHRASE INI DI TEMPAT AMAN!");
+                println!("⚠️  Siapa saja yang memiliki seed phrase ini bisa");
+                println!("⚠️  mengakses wallet dan semua aset di dalamnya!");
+                println!("⚠️  JANGAN screenshot, JANGAN simpan digital!");
+                println!("⚠️  Tulis di kertas dan simpan di tempat aman!");
                 println!("═══════════════════════════════════════════════════════════");
                 Ok(())
             }
@@ -985,7 +1005,26 @@ pub fn run_cli() -> Result<()> {
 
                 save_wallet(address, &priv_key)?;
                 println!("═══════════════════════════════════════════════════════════");
-                println!("✅ WALLET IMPORTED (13.17.8)");
+                println!("✅ WALLET IMPORTED (from private key)");
+                println!("═══════════════════════════════════════════════════════════");
+                println!("Address: 0x{}", hex::encode(address.as_bytes()));
+                println!("File:    {}", wallet_path().display());
+                println!("═══════════════════════════════════════════════════════════");
+                Ok(())
+            }
+            WalletCommand::ImportSeed { mnemonic } => {
+                // Validate dan extract secret key dari mnemonic
+                let secret = crate::mnemonic::mnemonic_to_secret_key(mnemonic)
+                    .map_err(|e| anyhow::anyhow!("Seed phrase tidak valid: {}", e))?;
+
+                let priv_key = Ed25519PrivateKey::from_bytes(&secret)?;
+                let pubkey = priv_key.public_key();
+                let pubkey_bytes: [u8; 32] = pubkey.to_bytes();
+                let address = crate::crypto::address_from_pubkey_bytes(&pubkey_bytes)?;
+
+                save_wallet(address, &priv_key)?;
+                println!("═══════════════════════════════════════════════════════════");
+                println!("✅ WALLET IMPORTED (from seed phrase)");
                 println!("═══════════════════════════════════════════════════════════");
                 println!("Address: 0x{}", hex::encode(address.as_bytes()));
                 println!("File:    {}", wallet_path().display());
@@ -1103,6 +1142,28 @@ pub fn run_cli() -> Result<()> {
                 println!("Input:  {}", file);
                 println!("Output: {}", output);
                 println!("Size:   {} bytes", decrypted.len());
+                println!("═══════════════════════════════════════════════════════════");
+                Ok(())
+            }
+            WalletCommand::ExportSeed => {
+                let w = load_wallet()?;
+
+                // Derive seed phrase dari private key
+                let mut secret_arr = [0u8; 32];
+                secret_arr.copy_from_slice(w.priv_key.as_bytes());
+                let seed_phrase = crate::mnemonic::secret_key_to_mnemonic(&secret_arr)
+                    .map_err(|e| anyhow::anyhow!("Failed to derive seed phrase: {}", e))?;
+
+                println!("═══════════════════════════════════════════════════════════");
+                println!("🌱 WALLET SEED PHRASE");
+                println!("═══════════════════════════════════════════════════════════");
+                println!("Address: 0x{}", hex::encode(w.address.as_bytes()));
+                println!("═══════════════════════════════════════════════════════════");
+                println!();
+                println!("{}", crate::mnemonic::format_mnemonic_display(&seed_phrase));
+                println!();
+                println!("═══════════════════════════════════════════════════════════");
+                println!("⚠️  JANGAN share seed phrase ini ke siapa pun!");
                 println!("═══════════════════════════════════════════════════════════");
                 Ok(())
             }

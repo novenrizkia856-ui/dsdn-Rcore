@@ -783,6 +783,7 @@ pub mod wallet;
 pub mod encryption;
 pub mod coordinator;
 pub mod gating;
+pub mod mnemonic;
 
 use crate::types::{Address, Hash};
 use std::str::FromStr;
