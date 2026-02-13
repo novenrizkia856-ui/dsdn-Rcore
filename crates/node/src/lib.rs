@@ -213,6 +213,7 @@
 //! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
 //! | `tls_manager`       | TLS certificate loading, generation, and fingerprint computation (14B.42) |
 //! | `join_request`      | Join request builder with validation and deterministic proof construction (14B.43) |
+//! | `status_tracker`    | Node-side lifecycle state machine with transition validation and audit history (14B.44) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -377,6 +378,53 @@
 //! and non-empty, (3) identity proof construction. Missing fields
 //! produce specific `JoinError` variants. No partial state is returned.
 //!
+//! ## NodeStatusTracker (14B.44)
+//!
+//! `NodeStatusTracker` maintains the node's local view of its lifecycle
+//! status and an ordered history of all transitions.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │             NodeStatusTracker                         │
+//! │  current_status: NodeStatus                          │
+//! │  history: Vec<StatusTransition>                      │
+//! │  registered_at: Option<u64>                          │
+//! │                                                      │
+//! │  update_status(new, reason, ts) → Result<(), String> │
+//! │  current() → &NodeStatus                             │
+//! │  is_active() → bool                                  │
+//! │  is_schedulable() → bool                             │
+//! │  time_in_current_status(now) → u64                   │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Relation to GateKeeper
+//!
+//! The coordinator's `NodeLifecycleManager` (14B.38) manages the
+//! authoritative node status. `NodeStatusTracker` is the node-side
+//! mirror: it applies the same transition rules
+//! (`NodeStatus::can_transition_to`) to maintain a consistent local
+//! view. Status updates arrive via coordinator responses or DA events.
+//!
+//! ### Determinism
+//!
+//! All transitions are validated against the same 7-transition state
+//! machine defined in `NodeStatus::can_transition_to`. Timestamps are
+//! strictly monotonic. Arithmetic uses `saturating_sub`.
+//!
+//! ### History as Audit Trail
+//!
+//! Every successful transition appends a `StatusTransition` record
+//! (from, to, reason, timestamp). History is append-only, never
+//! truncated or reordered. `registered_at` records the first
+//! transition away from `Pending`.
+//!
+//! ### No Implicit Transitions
+//!
+//! The tracker never changes status on its own. All transitions
+//! require an explicit `update_status` call with a reason and
+//! timestamp. Failed transitions leave all state unchanged.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -402,6 +450,7 @@ pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
 pub mod state_sync;
+pub mod status_tracker;
 pub mod tls_manager;
 
 pub use da_follower::{
@@ -423,4 +472,5 @@ pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
 pub use handlers::{NodeAppState, build_router};
 pub use identity_manager::{NodeIdentityManager, IdentityError};
 pub use join_request::{JoinRequest, JoinRequestBuilder, JoinResponse, JoinError};
+pub use status_tracker::NodeStatusTracker;
 pub use tls_manager::{TLSCertManager, TLSError};
