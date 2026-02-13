@@ -214,6 +214,7 @@
 //! | `tls_manager`       | TLS certificate loading, generation, and fingerprint computation (14B.42) |
 //! | `join_request`      | Join request builder with validation and deterministic proof construction (14B.43) |
 //! | `status_tracker`    | Node-side lifecycle state machine with transition validation and audit history (14B.44) |
+//! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -425,6 +426,55 @@
 //! require an explicit `update_status` call with a reason and
 //! timestamp. Failed transitions leave all state unchanged.
 //!
+//! ## QuarantineHandler (14B.45)
+//!
+//! `QuarantineHandler` processes quarantine notifications from the
+//! coordinator and manages quarantine-specific metadata (reason,
+//! start timestamp, duration).
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │             QuarantineHandler                         │
+//! │  &mut NodeStatusTracker ─── update_status(Quarantined)│
+//! │  quarantine_reason: Option<String>                   │
+//! │  quarantined_since: Option<u64>                      │
+//! │                                                      │
+//! │  handle_quarantine_notification(reason, ts)           │
+//! │  attempt_recovery(cur_stake, req_stake) → bool        │
+//! │  is_quarantined() → bool                             │
+//! │  quarantine_duration(now) → Option<u64>               │
+//! │  clear_quarantine_metadata() → Result                │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Relation to GateKeeper and NodeLifecycleManager
+//!
+//! The coordinator's `QuarantineManager` (14B.36) decides when to
+//! quarantine a node. `NodeLifecycleManager` (14B.38) executes the
+//! transition authoritatively. `QuarantineHandler` is the node-side
+//! counterpart: it applies the coordinator's decision to the local
+//! `NodeStatusTracker` using the same transition rules.
+//!
+//! ### Stake-Based Recovery
+//!
+//! `attempt_recovery(current_stake, required_stake)` is a pure
+//! read-only check. It returns `true` only if the node is
+//! quarantined and stake is sufficient. It does NOT perform any
+//! transition — the coordinator must explicitly approve recovery.
+//!
+//! ### Duration Tracking
+//!
+//! `quarantine_duration(now)` returns `Some(elapsed)` if the handler
+//! recorded a quarantine start time, computed via `saturating_sub`.
+//! Returns `None` if no quarantine was processed through this handler.
+//!
+//! ### No Implicit Auto-Recovery
+//!
+//! The handler never transitions the node out of quarantine on its
+//! own. Recovery requires an explicit `update_status` call on the
+//! tracker (via `tracker_mut()`), followed by `clear_quarantine_metadata`
+//! to maintain the state consistency invariant.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -449,6 +499,7 @@ pub mod join_request;
 pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
+pub mod quarantine_handler;
 pub mod state_sync;
 pub mod status_tracker;
 pub mod tls_manager;
@@ -472,5 +523,6 @@ pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
 pub use handlers::{NodeAppState, build_router};
 pub use identity_manager::{NodeIdentityManager, IdentityError};
 pub use join_request::{JoinRequest, JoinRequestBuilder, JoinResponse, JoinError};
+pub use quarantine_handler::QuarantineHandler;
 pub use status_tracker::NodeStatusTracker;
 pub use tls_manager::{TLSCertManager, TLSError};
