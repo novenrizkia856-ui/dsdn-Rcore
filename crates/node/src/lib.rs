@@ -211,6 +211,7 @@
 //! | `multi_da_source`   | Multi-DA source abstraction (Primary/Secondary/Emergency) |
 //! | `metrics`           | Node fallback metrics for Prometheus export          |
 //! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
+//! | `identity_persistence`| Secure disk persistence for Ed25519 keys and operator addresses (14B.47) |
 //! | `tls_manager`       | TLS certificate loading, generation, and fingerprint computation (14B.42) |
 //! | `join_request`      | Join request builder with validation and deterministic proof construction (14B.43) |
 //! | `status_tracker`    | Node-side lifecycle state machine with transition validation and audit history (14B.44) |
@@ -530,6 +531,44 @@
 //! Only `handle_rejoin_response` mutates the tracker, and only if
 //! the response is approved AND the transition is legal.
 //!
+//! ## IdentityStore (14B.47)
+//!
+//! `IdentityStore` persists and loads the node's Ed25519 secret key,
+//! operator address, and TLS fingerprint to a base directory on disk.
+//!
+//! ```text
+//! {base_path}/
+//! ├── node_identity.key   # Raw 32-byte Ed25519 secret (0600)
+//! ├── operator.addr       # 40-char lowercase hex
+//! └── tls.fp              # 64-char lowercase hex
+//! ```
+//!
+//! ### Security Model
+//!
+//! - `node_identity.key` is written with permission `0600`.
+//! - Secret key bytes are never logged or included in error messages.
+//! - Writes use `truncate(true)` + `sync_all()` for atomicity.
+//! - No JSON, no metadata, no hidden fields.
+//!
+//! ### Permission Enforcement
+//!
+//! On Unix, `set_permissions(0o600)` is called after writing the key
+//! file. If permission setting fails, the error is propagated. On
+//! non-Unix platforms, permission enforcement is delegated to the
+//! OS-specific ACL layer.
+//!
+//! ### Identity Corruption Handling
+//!
+//! `load_or_generate` validates that the stored operator address
+//! matches the one derived from the loaded keypair. If they diverge,
+//! `PersistenceError::Corruption` is returned. No silent regeneration.
+//!
+//! ### Deterministic Restart
+//!
+//! Given an intact `node_identity.key`, the same `NodeIdentityManager`
+//! is reconstructed on every restart. Same secret → same `node_id`,
+//! same `operator_address`, same signing behavior.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -550,6 +589,7 @@ pub mod event_processor;
 pub mod handlers;
 pub mod health;
 pub mod identity_manager;
+pub mod identity_persistence;
 pub mod join_request;
 pub mod metrics;
 pub mod multi_da_source;
@@ -578,6 +618,7 @@ pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
 // HTTP API handlers (Axum) - READ-ONLY observability endpoints
 pub use handlers::{NodeAppState, build_router};
 pub use identity_manager::{NodeIdentityManager, IdentityError};
+pub use identity_persistence::{IdentityStore, PersistenceError};
 pub use join_request::{JoinRequest, JoinRequestBuilder, JoinResponse, JoinError};
 pub use quarantine_handler::QuarantineHandler;
 pub use rejoin_manager::RejoinManager;
