@@ -215,6 +215,7 @@
 //! | `join_request`      | Join request builder with validation and deterministic proof construction (14B.43) |
 //! | `status_tracker`    | Node-side lifecycle state machine with transition validation and audit history (14B.44) |
 //! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
+//! | `rejoin_manager`    | Re-join eligibility, request building, and coordinator response handling (14B.46) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -475,6 +476,60 @@
 //! tracker (via `tracker_mut()`), followed by `clear_quarantine_metadata`
 //! to maintain the state consistency invariant.
 //!
+//! ## RejoinManager (14B.46)
+//!
+//! `RejoinManager` handles re-admission after ban expiry or quarantine
+//! recovery. It evaluates eligibility, builds re-join requests, and
+//! applies coordinator responses to the local status tracker.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │               RejoinManager                           │
+//! │  Arc<NodeIdentityManager>                            │
+//! │  Arc<TLSCertManager>                                 │
+//! │  Arc<Mutex<NodeStatusTracker>>                       │
+//! │                                                      │
+//! │  can_rejoin(ts, cooldown?) → bool                    │
+//! │  build_rejoin_request(class, challenge, addr)         │
+//! │     → Result<JoinRequest, JoinError>                 │
+//! │  handle_rejoin_response(resp, ts) → Result           │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Initial Join vs Re-Join
+//!
+//! Both use the same `JoinRequest` format and `JoinRequestBuilder`.
+//! The structural difference is zero. The semantic difference:
+//! - Initial: fresh node in `Pending`.
+//! - Re-join from ban: `Banned → Pending` (cooldown must have expired).
+//! - Re-join from quarantine: `Quarantined → Active` (stake restored).
+//!
+//! ### Ban Expiry
+//!
+//! `can_rejoin` checks: status == `Banned` AND `cooldown` is `Some`
+//! AND `cooldown.is_active(ts)` returns `false`. If no cooldown is
+//! provided, banned nodes cannot rejoin (conservative).
+//!
+//! ### Quarantine Recovery
+//!
+//! `can_rejoin` checks: status == `Quarantined` AND no active
+//! cooldown blocks the attempt. Stake verification is the
+//! coordinator's responsibility — the node cannot verify on-chain
+//! stake autonomously.
+//!
+//! ### Determinism
+//!
+//! `can_rejoin` is a pure read-only function. `build_rejoin_request`
+//! produces deterministic output for the same inputs (Ed25519 RFC 8032).
+//! `handle_rejoin_response` delegates to `NodeStatusTracker::update_status`
+//! which enforces the state machine rules.
+//!
+//! ### No Implicit State Mutation
+//!
+//! `can_rejoin` and `build_rejoin_request` do not modify any state.
+//! Only `handle_rejoin_response` mutates the tracker, and only if
+//! the response is approved AND the transition is legal.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -500,6 +555,7 @@ pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
 pub mod quarantine_handler;
+pub mod rejoin_manager;
 pub mod state_sync;
 pub mod status_tracker;
 pub mod tls_manager;
@@ -524,5 +580,6 @@ pub use handlers::{NodeAppState, build_router};
 pub use identity_manager::{NodeIdentityManager, IdentityError};
 pub use join_request::{JoinRequest, JoinRequestBuilder, JoinResponse, JoinError};
 pub use quarantine_handler::QuarantineHandler;
+pub use rejoin_manager::RejoinManager;
 pub use status_tracker::NodeStatusTracker;
 pub use tls_manager::{TLSCertManager, TLSError};
