@@ -212,6 +212,7 @@
 //! | `metrics`           | Node fallback metrics for Prometheus export          |
 //! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
 //! | `tls_manager`       | TLS certificate loading, generation, and fingerprint computation (14B.42) |
+//! | `join_request`      | Join request builder with validation and deterministic proof construction (14B.43) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -323,6 +324,59 @@
 //! - The struct is `Send + Sync` (no interior mutability).
 //! - No `unsafe` code.
 //!
+//! ## JoinRequestBuilder (14B.43)
+//!
+//! `JoinRequestBuilder` constructs a validated [`JoinRequest`] from
+//! the node's identity manager, TLS manager, and coordinator-issued
+//! challenge. The builder enforces that all required fields are present
+//! before construction.
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │            JoinRequestBuilder                         │
+//! │  ┌────────────────────┐                              │
+//! │  │ &NodeIdentityManager│──── create_identity_proof   │
+//! │  └────────────────────┘                              │
+//! │  ┌────────────────────┐                              │
+//! │  │ &TLSCertManager    │──── cert_info().clone()      │
+//! │  └────────────────────┘                              │
+//! │  with_addr(addr)                                     │
+//! │  with_capacity(gb)                                   │
+//! │  with_meta(k, v)                                     │
+//! │         │                                            │
+//! │         ▼                                            │
+//! │  build(challenge) ──▶ Result<JoinRequest, JoinError> │
+//! └──────────────────────────────────────────────────────┘
+//!                          │
+//!                          ▼
+//! ┌──────────────────────────────────────────────────────┐
+//! │        Coordinator GateKeeper (14B.31–40)             │
+//! │  Extracts: identity, claimed_class, identity_proof,  │
+//! │            tls_cert_info → AdmissionRequest (14B.32)  │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Relation to AdmissionRequest (14B.32)
+//!
+//! `JoinRequest` is the node-side representation. The coordinator
+//! extracts the four gating-relevant fields (`identity`, `claimed_class`,
+//! `identity_proof`, `tls_cert_info`) to construct an `AdmissionRequest`.
+//! The remaining fields (`node_addr`, `capacity_gb`, `meta`) are stored
+//! in the node registry for operational use.
+//!
+//! ### Determinism
+//!
+//! Same `NodeIdentityManager` + same `TLSCertManager` + same
+//! `IdentityChallenge` always produce the same `JoinRequest`.
+//! The identity proof signature is deterministic (Ed25519, RFC 8032).
+//! No implicit defaults — all required fields must be explicitly set.
+//!
+//! ### Validation
+//!
+//! `build()` checks in strict order: (1) TLS info set, (2) addr set
+//! and non-empty, (3) identity proof construction. Missing fields
+//! produce specific `JoinError` variants. No partial state is returned.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -343,6 +397,7 @@ pub mod event_processor;
 pub mod handlers;
 pub mod health;
 pub mod identity_manager;
+pub mod join_request;
 pub mod metrics;
 pub mod multi_da_source;
 pub mod placement_verifier;
@@ -367,4 +422,5 @@ pub use state_sync::{StateSync, ConsistencyReport, SyncError, SyncStorage};
 // HTTP API handlers (Axum) - READ-ONLY observability endpoints
 pub use handlers::{NodeAppState, build_router};
 pub use identity_manager::{NodeIdentityManager, IdentityError};
+pub use join_request::{JoinRequest, JoinRequestBuilder, JoinResponse, JoinError};
 pub use tls_manager::{TLSCertManager, TLSError};
