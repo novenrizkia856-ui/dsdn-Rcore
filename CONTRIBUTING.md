@@ -1,192 +1,196 @@
 # Contributing to DSDN
 
-DSDN adalah proyek infrastruktur dengan arsitektur deterministik dan model verifiable-by-design.  
-Kontribusi harus mengikuti arah pengembangan aktif dan tidak boleh menyimpang dari tahap yang sedang berjalan.
+DSDN is an infrastructure project with deterministic architecture and a verifiable-by-design model.  
+Contributions must follow the active development direction and must not deviate from the current stage.
 
 ---
 
 ## Development Philosophy
 
-DSDN dibangun secara bertahap dan berurutan.
+DSDN is built incrementally and sequentially.
 
-- Tidak boleh melompat ke tahap berikutnya.
-- Tidak boleh mengerjakan fitur masa depan.
-- Tidak boleh eksperimen di luar tahap aktif.
-- Semua kontribusi harus relevan dengan tahap pengembangan yang sedang berjalan.
+- Do not skip ahead to the next stage.
+- Do not work on future features.
+- Do not experiment outside the active stage.
+- All contributions must be relevant to the current development stage.
 
-Status tahap aktif dapat dilihat di file:
+The active stage status can be found in:
 `/assets/docs/checklist_roadmap`
 
-Dan roadmap tahap ada di:
+And the stage roadmap is at:
 `/assets/docs/roadmap.md`
 
-Setiap Issue dan Pull Request harus menyebutkan stage aktif.
+Every Issue and Pull Request must reference the active stage.
 
-Contoh:
+Example:
 
+```
 [Stage Active] Implement stake verification in coordinator
+```
 
+Pull Requests must include:
 
-Pull Request harus mencantumkan:
-
+```
 Stage: Active
 Closes #issue_number
-
+```
 
 ---
 
 ## Approval & Review Policy
 
-Semua Pull Request memerlukan:
+All Pull Requests require:
 
-- Minimal 1 maintainer approval sebelum merge.
-- Review eksplisit untuk perubahan di modul kritikal.
+- At least 1 maintainer approval before merge.
+- Explicit review for changes in critical modules.
 
-Modul kritikal:
+Critical modules:
 
 - `coordinator/`
 - `chain/`
 - `node/`
 - `common/`
 
-Perubahan pada modul tersebut akan diperiksa lebih ketat,
-terutama terkait determinisme, keamanan, dan integritas state.
+Changes to these modules will be reviewed more strictly,
+especially regarding determinism, security, and state integrity.
 
 ---
 
 ## Testing Requirements (Mandatory)
 
-Semua Pull Request wajib menyertakan:
+All Pull Requests must include:
 
-- Unit test yang relevan.
-- Test harus lulus tanpa flaky behavior.
-- Logic deterministik harus dapat direplay.
+- Relevant unit tests.
+- Tests must pass without flaky behavior.
+- Deterministic logic must be replayable.
 
-PR tanpa unit test akan ditolak.
+PRs without unit tests will be rejected.
 
-Jika perubahan menyentuh:
+If changes touch:
 - state reconstruction
 - scheduling
 - stake validation
 - consensus logic
 
-Maka test harus mencakup edge-case dan negative-case.
+Then tests must cover edge-cases and negative-cases.
 
 ---
 
 ## AI-Assisted Contributions Policy
 
-DSDN memperbolehkan penggunaan AI sebagai alat bantu coding.
+DSDN permits the use of AI as a coding aid.
 
-Aturan:
+Rules:
 
-1. Contributor tetap bertanggung jawab penuh atas kode yang dikirim.
-2. AI boleh digunakan dalam bentuk apa pun.
-3. Kode hasil AI harus:
-   - Dipahami sepenuhnya oleh contributor.
-   - Diaudit sebelum dikirim.
-   - Dijelaskan secara ringkas di deskripsi PR.
+1. Contributors remain fully responsible for all submitted code.
+2. AI may be used in any form.
+3. Code produced by AI must be:
+   - Fully understood by the contributor.
+   - Audited before submission.
+   - Briefly explained in the PR description.
 
-Tambahkan label pada PR:
+Add the following label to your PR:
 
+```
 [AI-Assisted]
+```
 
+AI must not be used to:
 
-AI tidak boleh digunakan untuk:
+- Modify deterministic logic without audit.
+- Replace cryptographic primitives.
+- Add external dependencies without review.
 
-- Mengubah logic deterministik tanpa audit.
-- Mengganti primitive kriptografi.
-- Menambahkan dependency eksternal tanpa review.
-
-AI adalah tool.  
-Keputusan akhir tetap pada manusia.
+AI is a tool.  
+Final decisions rest with humans.
 
 ---
 
 ## Code Discipline
 
-- Semua crate wajib dikompilasi menggunakan `cargo rustsp`.
-- Modul dengan logic kritikal wajib menggunakan RustS+.
-- Gunakan Rust pada bagian non-critical atau utility.
+- All crates must be compiled using `cargo rustsp`.
+- Modules with critical logic must use RustS+.
+- Use standard Rust for non-critical or utility sections.
 
-Format dan linting:
+Format and linting:
 
+```
 cargo rustsp build
 cargo clippy
 cargo fmt
+```
 
-
-PR yang gagal build akan ditolak.
+PRs that fail to build will be rejected.
 
 ---
 
 ## Pull Request Size
 
-Maksimal 1000 LOC per PR.
+Maximum 1000 LOC per PR.
 
-Jika lebih besar:
-- Pecah menjadi beberapa PR.
-- Pastikan tiap PR tetap koheren dan bisa direview.
+If larger:
+- Split into multiple PRs.
+- Ensure each PR remains coherent and reviewable.
 
-Tujuan: menjaga kualitas review dan menghindari perubahan besar tanpa audit memadai.
+Goal: maintain review quality and prevent large changes without adequate audit.
 
 ---
 
 ## Determinism Rule
 
-DSDN mengandalkan deterministic replay.
+DSDN relies on deterministic replay.
 
-Dilarang:
+Prohibited:
 
-- Menggunakan randomness tanpa seed deterministik.
-- Menggunakan system time langsung untuk logic konsensus.
-- Menggunakan state lokal sebagai sumber kebenaran.
+- Using randomness without a deterministic seed.
+- Using system time directly for consensus logic.
+- Using local state as a source of truth.
 
-Semua state harus dapat direkonstruksi dari log yang tersedia.
+All state must be reconstructable from available logs.
 
 ---
 
 ## Dependencies
 
-Dependency baru:
+New dependencies:
 
-- Harus dijelaskan alasan teknisnya.
-- Harus melalui review maintainer.
-- Tidak boleh memperkenalkan non-deterministic behavior.
+- Must include a technical justification.
+- Must go through maintainer review.
+- Must not introduce non-deterministic behavior.
 
 ---
 
 ## Security Expectations
 
-Kontributor harus mempertimbangkan:
+Contributors must consider:
 
 - Anti-self-dealing
-- Replay attack
+- Replay attacks
 - Signature verification
 - State consistency
 - Failure recovery
 
-Jika perubahan menyentuh area tersebut, jelaskan implikasi keamanan dalam PR.
+If changes touch any of these areas, explain the security implications in the PR.
 
 ---
 
 ## Communication
 
-Gunakan Issue sebelum membuat PR besar.
+Open an Issue before creating large PRs.
 
-Diskusikan terlebih dahulu jika:
+Discuss beforehand if:
 
-- Mengubah arsitektur.
-- Mengubah interface publik.
-- Mengubah logic kriptografi.
-- Mengubah mekanisme state.
+- Changing architecture.
+- Changing public interfaces.
+- Changing cryptographic logic.
+- Changing state mechanisms.
 
 ---
 
 ## Final Responsibility
 
-Setiap kontributor bertanggung jawab penuh atas kode yang dikirim,
-termasuk kode yang dihasilkan oleh AI.
+Every contributor is fully responsible for the code they submit,
+including code generated by AI.
 
-DSDN adalah proyek jangka panjang.
-Stabilitas dan determinisme lebih penting daripada kecepatan.
+DSDN is a long-term project.
+Stability and determinism are more important than speed.

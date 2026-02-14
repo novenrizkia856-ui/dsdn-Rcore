@@ -4,118 +4,118 @@
 
 # DSDN — Distributed Storage & Data Network
 
-**DSDN** adalah sistem **data dan komputasi terdistribusi semi-desentral** yang
-dirancang agar **verifiable-by-design**, bukan berbasis kepercayaan pada satu
-entitas.
+**DSDN** is a **semi-decentralized distributed data and compute system**
+designed to be **verifiable-by-design**, rather than relying on trust in a
+single entity.
 
-DSDN menggabungkan:
-- data availability log,
-- replikasi lintas zona,
-- eksekusi komputasi terisolasi,
-- serta governance & compliance yang dibatasi secara teknis.
+DSDN combines:
+- data availability logging,
+- cross-zone replication,
+- isolated compute execution,
+- and technically constrained governance & compliance.
 
-Repositori ini berisi **implementasi inti DSDN** dalam tahap aktif pengembangan.
-
----
-
-## Status Proyek
-
-⚠️ **Experimental / Work in Progress**  
-Belum siap produksi. Arsitektur, API, dan model state **masih dapat berubah**.
+This repository contains the **core DSDN implementation**, currently under
+active development.
 
 ---
 
-## Masalah yang Ingin Diselesaikan
+## Project Status
 
-Infrastruktur internet modern sangat bergantung pada:
-- pusat data terpusat,
-- operator yang dipercaya,
-- dan kontrol administratif tunggal.
-
-Hal ini menciptakan:
-- single point of failure,
-- risiko privasi,
-- dan konsentrasi kekuasaan.
-
-DSDN bertujuan memindahkan **data dan komputasi** ke jaringan node terdistribusi,
-tanpa menciptakan aktor baru yang harus dipercaya.
+**Experimental / Work in Progress**  
+Not production-ready. Architecture, APIs, and the state model **are subject to change**.
 
 ---
 
-## Prinsip Desain Utama
+## Problem Statement
+
+Modern internet infrastructure is heavily dependent on:
+- centralized data centers,
+- trusted operators,
+- and single administrative control.
+
+This creates:
+- single points of failure,
+- privacy risks,
+- and concentration of power.
+
+DSDN aims to move **data and compute** to a distributed node network,
+without introducing new actors that must be trusted.
+
+---
+
+## Core Design Principles
 
 - **Verifiable-by-design**  
-  Tidak ada coordinator, validator, atau foundation yang menjadi sumber
-  kebenaran tunggal.
+  No coordinator, validator, or foundation serves as a single source of truth.
 
 - **Deterministic state reconstruction**  
-  State jaringan dibangun ulang secara deterministik dari log Data Availability,
-  bukan disimpan sebagai state otoritatif.
+  Network state is rebuilt deterministically from Data Availability logs,
+  not stored as authoritative state.
 
 - **Minimal trust assumptions**  
-  Node, validator, dan coordinator diasumsikan tidak dipercaya secara default.
+  Nodes, validators, and coordinators are assumed untrusted by default.
 
 - **Auditability & transparency**  
-  Seluruh keputusan sistem dapat direplay dan diaudit.
+  All system decisions can be replayed and audited.
 
 ---
 
-## Arsitektur Tingkat Tinggi
+## High-Level Architecture
 
-DSDN terdiri dari tiga plane utama:
+DSDN consists of three main planes:
 
 ### 1. Control Plane (Metadata)
-- Metadata dipost sebagai blob ke **Data Availability layer**.
-- Setiap node merekonstruksi state lokal melalui replay log deterministik.
-- Tidak ada state otoritatif tunggal.
+- Metadata is posted as blobs to the **Data Availability layer**.
+- Each node reconstructs local state through deterministic log replay.
+- There is no single authoritative state.
 
 ### 2. Data & Compute Plane
-- Data disimpan sebagai chunk beralamat hash.
-- Replikasi target: **3 replika di zona berbeda**.
-- Eksekusi program dijalankan dalam sandbox:
+- Data is stored as hash-addressed chunks.
+- Replication target: **3 replicas across different zones**.
+- Program execution runs in sandboxed environments:
   - WASM/WASI
-  - microVM (mis. Firecracker)
+  - microVM (e.g., Firecracker)
 
 ### 3. Governance & Compliance Plane
-- Dijalankan oleh validator dengan identitas terverifikasi.
-- Validator **tidak memiliki akses ke data terenkripsi**.
-- Tindakan terbatas pada penghapusan pointer/endpoint publik, bukan data fisik.
+- Operated by validators with verified identities.
+- Validators **do not have access to encrypted data**.
+- Actions are limited to removing public pointers/endpoints, not physical data.
 
 ---
 
-## Model Kepercayaan (Trust Model)
+## Trust Model
 
-- **Node**: tidak dipercaya → diverifikasi melalui replikasi & kuorum  
-- **Coordinator**: stateless → keputusannya dapat direkonstruksi  
-- **Validator**: tidak dipercaya untuk privasi → tidak memegang kunci dekripsi  
-- **Foundation**: kewenangan dibatasi dan dicatat secara on-chain  
+- **Node**: untrusted → verified through replication & quorum  
+- **Coordinator**: stateless → decisions are reconstructable  
+- **Validator**: untrusted for privacy → does not hold decryption keys  
+- **Foundation**: authority is limited and recorded on-chain  
 
-Kegagalan satu komponen tidak dapat mengubah kebenaran state jaringan.
+Failure of any single component cannot alter the truth of network state.
 
-*jika anda ingin langkah langkah menjadi node operator*
-silahkan buka [DSDN_NODE_OPERATOR_GUIDE](assets/docs/DSDN_NODE_OPERATOR_GUIDE.md)
+*If you want a step-by-step guide on becoming a node operator,*
+please see [DSDN_NODE_OPERATOR_GUIDE](assets/docs/DSDN_NODE_OPERATOR_GUIDE.md)
 
 ---
 
-## Dokumen
+## Documentation
 
-Desain lengkap dan rasional teknis tersedia di whitepaper DSDN  
-(lihat folder `assets/docs/`).
+Full design and technical rationale are available in the DSDN whitepaper  
+(see the `assets/docs/` folder).
 
-Roadmap tahap-tahap development dsdn hingga produksi skala luas:
-lihat [Roadmap](assets/docs/roadmap.md)
+Development roadmap from initial stages through large-scale production:
+see [Roadmap](assets/docs/roadmap.md)
 
 ---
 
 ## CLI Usage
 
-DSDN terdiri dari beberapa komponen utama yang dapat dijalankan melalui CLI:
+DSDN consists of several main components that can be run via CLI:
 
-- `chain` → Blockchain Nusantara
+- `chain` → Nusantara Blockchain
 - `node` → Storage & Compute node
 - `storage` → Storage engine & chunk handling
 
-Detail penggunaan tersedia di:
+Usage details are available at:
 
 - [Chain CLI Guide](crates/chain/README.md)
 - [Node CLI Guide](crates/node/README.md)
@@ -123,16 +123,19 @@ Detail penggunaan tersedia di:
 
 ---
 
-## Bahasa program
+## Programming Languages
 
-DSDN menggabungkan Rust dan Rusts+, Rust dan Rusts+ di niatkan menjadi bahasa utama di DSDN, Rusts+ adalah bahasa dengan backend Rust dengan aturan tambahan dan sintaks berbeda, digunakan di berbagai tempat, agar dsdn makin aman secara logic dan bug
+DSDN combines Rust and RustS+. Both Rust and RustS+ are intended to be the
+primary languages of DSDN. RustS+ is a language with a Rust backend featuring
+additional rules and different syntax, used in various places to make DSDN
+more secure in terms of logic and bugs.
 
-dsdn harus menggunakan cargo rustsp
+DSDN must be compiled using `cargo rustsp`.
 
-[Bahasa Rusts+](https://github.com/novenrizkia856-ui/rustsp-Rlang)
+[RustS+ Language](https://github.com/novenrizkia856-ui/rustsp-Rlang)
 
 ---
 
-## Lisensi
+## License
 
 MIT License.
