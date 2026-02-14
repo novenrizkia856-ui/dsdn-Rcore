@@ -15,7 +15,7 @@ DSDN is built incrementally and sequentially.
 - All contributions must be relevant to the current development stage.
 
 The active stage status can be found in:
-`/assets/docs/checklist_roadmap`
+`/assets/docs/PROGRES.md`
 
 And the stage roadmap is at:
 `/assets/docs/roadmap.md`
