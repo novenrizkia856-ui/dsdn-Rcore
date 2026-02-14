@@ -35,10 +35,16 @@
 //! - `health coordinator`: Check coordinator health only
 //! - `health nodes`: Check all nodes health
 //!
-//! ### Identity Management (14B.51)
+//! ### Identity Management (14B.51–14B.52)
 //! - `identity generate`: Generate Ed25519 identity keypair
 //!   - `--out-dir`: Persist to disk
 //!   - `--operator`: Override operator address (40 hex chars)
+//! - `identity show`: Show existing identity (node_id, operator, TLS fingerprint)
+//!   - `--dir`: Directory containing identity files (required)
+//!   - `--json`: Output as JSON
+//! - `identity export`: Export identity including secret key
+//!   - `--dir`: Directory containing identity files (required)
+//!   - `--format`: hex, base64, or json
 //!
 //! ## DA Integration
 //!
@@ -327,6 +333,24 @@ enum IdentityCommands {
         /// Override operator address (40 hex characters, no 0x prefix)
         #[arg(long)]
         operator: Option<String>,
+    },
+    /// Show existing identity (node_id, operator, TLS fingerprint)
+    Show {
+        /// Directory containing identity files
+        #[arg(long)]
+        dir: PathBuf,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export identity including secret key (SECURITY SENSITIVE)
+    Export {
+        /// Directory containing identity files
+        #[arg(long)]
+        dir: PathBuf,
+        /// Export format: hex, base64, or json
+        #[arg(long)]
+        format: String,
     },
 }
 
@@ -1630,6 +1654,12 @@ async fn main() -> Result<()> {
                         out_dir.as_deref(),
                         operator.as_deref(),
                     )?;
+                }
+                IdentityCommands::Show { dir, json } => {
+                    cmd_identity::handle_identity_show(&dir, json)?;
+                }
+                IdentityCommands::Export { dir, format } => {
+                    cmd_identity::handle_identity_export(&dir, &format)?;
                 }
             }
         }

@@ -29,6 +29,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
 
 use dsdn_node::{IdentityStore, NodeIdentityManager};
 
@@ -137,6 +138,196 @@ fn handle_ephemeral(operator_override: Option<[u8; 20]>) -> Result<()> {
     println!("operator_address: {}", bytes_to_hex(&display_operator));
 
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC API: SHOW (14B.52)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Handles `identity show --dir <path> [--json]`.
+///
+/// Loads an existing identity from disk and displays node_id,
+/// operator_address, and TLS fingerprint (if available).
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - No identity exists at the given path.
+/// - Keypair or operator files are corrupted.
+/// - `from_keypair` fails (invalid key bytes).
+pub fn handle_identity_show(dir: &Path, json: bool) -> Result<()> {
+    let store = IdentityStore::new(dir.to_path_buf());
+
+    if !store.exists() {
+        return Err(anyhow::anyhow!(
+            "no identity found at '{}': run `identity generate --out-dir {}` first",
+            dir.display(),
+            dir.display(),
+        ));
+    }
+
+    let secret = store.load_keypair().map_err(|e| {
+        anyhow::anyhow!("failed to load keypair from '{}': {}", dir.display(), e)
+    })?;
+
+    let operator_stored = store.load_operator_address().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load operator address from '{}': {}",
+            dir.display(),
+            e,
+        )
+    })?;
+
+    let mgr = NodeIdentityManager::from_keypair(secret).map_err(|e| {
+        anyhow::anyhow!("failed to reconstruct identity: {}", e)
+    })?;
+
+    let node_id_hex = bytes_to_hex(mgr.node_id());
+    // Use stored operator (may differ from derived if --operator override was used)
+    let operator_hex = bytes_to_hex(&operator_stored);
+
+    // Attempt to load TLS fingerprint (optional, not an error if missing)
+    let tls_fp_hex = load_tls_fingerprint_hex(dir);
+
+    if json {
+        let tls_json = match &tls_fp_hex {
+            Some(fp) => format!("\"{}\"", fp),
+            None => "null".to_string(),
+        };
+        println!(
+            "{{\n  \"node_id\": \"{}\",\n  \"operator_address\": \"{}\",\n  \"tls_fingerprint\": {}\n}}",
+            node_id_hex,
+            operator_hex,
+            tls_json,
+        );
+    } else {
+        println!("Node ID:         {}", node_id_hex);
+        println!("Operator:        {}", operator_hex);
+        println!(
+            "TLS Fingerprint: {}",
+            tls_fp_hex.as_deref().unwrap_or("None"),
+        );
+    }
+
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC API: EXPORT (14B.52)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Handles `identity export --dir <path> --format <hex|base64|json>`.
+///
+/// Loads an existing identity and exports node_id, operator_address,
+/// and **secret key** in the requested format.
+///
+/// ## Security
+///
+/// This command intentionally exposes the secret key. A warning is
+/// printed to stderr for non-JSON formats.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - No identity exists at the given path.
+/// - Format is not one of "hex", "base64", "json".
+pub fn handle_identity_export(dir: &Path, format: &str) -> Result<()> {
+    // Step 1: Validate format
+    match format {
+        "hex" | "base64" | "json" => {}
+        other => {
+            return Err(anyhow::anyhow!(
+                "invalid export format '{}': must be 'hex', 'base64', or 'json'",
+                other,
+            ));
+        }
+    }
+
+    // Step 2: Load identity
+    let store = IdentityStore::new(dir.to_path_buf());
+
+    if !store.exists() {
+        return Err(anyhow::anyhow!(
+            "no identity found at '{}': run `identity generate --out-dir {}` first",
+            dir.display(),
+            dir.display(),
+        ));
+    }
+
+    let secret = store.load_keypair().map_err(|e| {
+        anyhow::anyhow!("failed to load keypair from '{}': {}", dir.display(), e)
+    })?;
+
+    let operator_stored = store.load_operator_address().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load operator address from '{}': {}",
+            dir.display(),
+            e,
+        )
+    })?;
+
+    let mgr = NodeIdentityManager::from_keypair(secret).map_err(|e| {
+        anyhow::anyhow!("failed to reconstruct identity: {}", e)
+    })?;
+
+    // Step 3: Export
+    match format {
+        "hex" => {
+            eprintln!("WARNING: secret key is being exported. Do not share this output.");
+            println!("node_id: {}", bytes_to_hex(mgr.node_id()));
+            println!("operator_address: {}", bytes_to_hex(&operator_stored));
+            println!("secret_key: {}", bytes_to_hex(&secret));
+        }
+        "base64" => {
+            eprintln!("WARNING: secret key is being exported. Do not share this output.");
+            println!("node_id: {}", general_purpose::STANDARD.encode(mgr.node_id()));
+            println!(
+                "operator_address: {}",
+                general_purpose::STANDARD.encode(operator_stored),
+            );
+            println!(
+                "secret_key: {}",
+                general_purpose::STANDARD.encode(secret),
+            );
+        }
+        "json" => {
+            eprintln!("WARNING: secret key is being exported. Do not share this output.");
+            println!(
+                "{{\n  \"node_id\": \"{}\",\n  \"operator_address\": \"{}\",\n  \"secret_key\": \"{}\"\n}}",
+                bytes_to_hex(mgr.node_id()),
+                bytes_to_hex(&operator_stored),
+                bytes_to_hex(&secret),
+            );
+        }
+        // Unreachable after validation above, but safe fallback
+        _ => {}
+    }
+
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: TLS FINGERPRINT LOADER
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Attempts to load the TLS fingerprint hex string from `<dir>/tls.fp`.
+///
+/// Returns `None` if the file does not exist or is unreadable.
+/// Returns `Some(hex_string)` if the file contains valid 64-char hex.
+fn load_tls_fingerprint_hex(dir: &Path) -> Option<String> {
+    let path = dir.join("tls.fp");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 {
+        return None;
+    }
+    if !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -460,6 +651,232 @@ mod tests {
 
         let r2 = handle_identity_generate(Some(dir.as_path()), None);
         assert!(r2.is_ok(), "idempotent call must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // F. handle_identity_show (14B.52)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_no_identity_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_show_empty_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let result = handle_identity_show(dir.as_path(), false);
+        assert!(result.is_err(), "show on empty dir must fail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_existing_identity_text() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_show_text_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Generate first
+        let gen = handle_identity_generate(Some(dir.as_path()), None);
+        assert!(gen.is_ok());
+
+        // Show
+        let result = handle_identity_show(dir.as_path(), false);
+        assert!(result.is_ok(), "show existing identity must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_existing_identity_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_show_json_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let gen = handle_identity_generate(Some(dir.as_path()), None);
+        assert!(gen.is_ok());
+
+        let result = handle_identity_show(dir.as_path(), true);
+        assert!(result.is_ok(), "show --json must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // G. handle_identity_export (14B.52)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_no_identity_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_empty_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let result = handle_identity_export(dir.as_path(), "hex");
+        assert!(result.is_err(), "export on empty dir must fail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_invalid_format_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_badfmt_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let gen = handle_identity_generate(Some(dir.as_path()), None);
+        assert!(gen.is_ok());
+
+        let result = handle_identity_export(dir.as_path(), "yaml");
+        assert!(result.is_err(), "invalid format must fail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_hex_succeeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_hex_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let gen = handle_identity_generate(Some(dir.as_path()), None);
+        assert!(gen.is_ok());
+
+        let result = handle_identity_export(dir.as_path(), "hex");
+        assert!(result.is_ok(), "export hex must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_base64_succeeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_b64_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let gen = handle_identity_generate(Some(dir.as_path()), None);
+        assert!(gen.is_ok());
+
+        let result = handle_identity_export(dir.as_path(), "base64");
+        assert!(result.is_ok(), "export base64 must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_json_succeeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_json_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let gen = handle_identity_generate(Some(dir.as_path()), None);
+        assert!(gen.is_ok());
+
+        let result = handle_identity_export(dir.as_path(), "json");
+        assert!(result.is_ok(), "export json must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // H. load_tls_fingerprint_hex (14B.52)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tls_fp_missing_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_none_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        assert!(
+            load_tls_fingerprint_hex(dir.as_path()).is_none(),
+            "missing tls.fp must return None"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_fp_valid_returns_some() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_valid_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Write a valid 64-char hex fingerprint
+        let fp_hex = "aa".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), &fp_hex);
+
+        let result = load_tls_fingerprint_hex(dir.as_path());
+        assert!(result.is_some(), "valid tls.fp must return Some");
+        if let Some(hex) = result {
+            assert_eq!(hex.len(), 64);
+            assert_eq!(hex, fp_hex);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_fp_invalid_length_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_badlen_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let _ = std::fs::write(dir.join("tls.fp"), "tooshort");
+
+        assert!(
+            load_tls_fingerprint_hex(dir.as_path()).is_none(),
+            "wrong-length tls.fp must return None"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_fp_invalid_hex_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_badhex_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        // 64 chars but not valid hex
+        let bad = "zz".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), &bad);
+
+        assert!(
+            load_tls_fingerprint_hex(dir.as_path()).is_none(),
+            "non-hex tls.fp must return None"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
