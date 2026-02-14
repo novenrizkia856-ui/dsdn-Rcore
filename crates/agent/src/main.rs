@@ -46,7 +46,7 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
-//! ### Gating Operations (14B.53–14B.56)
+//! ### Gating Operations (14B.53–14B.57)
 //! - `gating stake-check`: Check stake status for a service node
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
@@ -62,6 +62,13 @@
 //!   - `--json`: Output as JSON
 //! - `gating slashing-status`: Query slashing & cooldown status
 //!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//! - `gating node-class`: Query node class and stake requirements
+//!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//! - `gating list-active`: List all active service nodes
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
 //!
@@ -381,7 +388,7 @@ enum IdentityCommands {
     },
 }
 
-/// Gating subcommands (14B.53–14B.56)
+/// Gating subcommands (14B.53–14B.57)
 #[derive(Subcommand)]
 enum GatingCommands {
     /// Check stake status for a service node operator address
@@ -431,6 +438,29 @@ enum GatingCommands {
         /// Operator address (40 hex characters, no 0x prefix)
         #[arg(long)]
         address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query node class and stake requirements (14B.57)
+    NodeClass {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all active service nodes sorted by stake (14B.57)
+    ListActive {
         /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
         #[arg(long)]
         chain_rpc: Option<String>,
@@ -1782,6 +1812,19 @@ async fn main() -> Result<()> {
                 GatingCommands::SlashingStatus { address, chain_rpc, json } => {
                     cmd_gating::handle_slashing_status(
                         &address,
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
+                }
+                GatingCommands::NodeClass { address, chain_rpc, json } => {
+                    cmd_gating::handle_node_class(
+                        &address,
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
+                }
+                GatingCommands::ListActive { chain_rpc, json } => {
+                    cmd_gating::handle_list_active(
                         chain_rpc.as_deref(),
                         json,
                     ).await?;

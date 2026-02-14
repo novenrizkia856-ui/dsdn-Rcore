@@ -1,4 +1,4 @@
-//! # Gating CLI Commands (14B.53–14B.56)
+//! # Gating CLI Commands (14B.53–14B.57)
 //!
 //! Handles gating-related subcommands for the DSDN Agent CLI.
 //!
@@ -9,6 +9,8 @@
 //!     --chain-rpc <url> [--keyfile <path>]`
 //! - `gating status --address <hex> [--chain-rpc <url>] [--json]`
 //! - `gating slashing-status --address <hex> [--chain-rpc <url>] [--json]`
+//! - `gating node-class --address <hex> [--chain-rpc <url>] [--json]`
+//! - `gating list-active [--chain-rpc <url>] [--json]`
 //!
 //! ## Chain RPC Resolution (stake-check, status)
 //!
@@ -28,6 +30,9 @@
 //! - status (info): `GET {chain_rpc}/api/service_node/info/{operator_hex}`
 //! - status (slashing): `GET {chain_rpc}/api/service_node/slashing/{operator_hex}`
 //! - slashing-status: `GET {chain_rpc}/api/service_node/slashing/{operator_hex}`
+//! - node-class: `GET {chain_rpc}/api/service_node/class/{operator_hex}`
+//!              + `GET {chain_rpc}/api/service_node/stake/{operator_hex}`
+//! - list-active: `GET {chain_rpc}/api/service_node/active`
 
 use std::path::Path;
 use anyhow::Result;
@@ -60,6 +65,14 @@ const INFO_ENDPOINT_PATH: &str = "/api/service_node/info/";
 /// REST path for service node slashing status query (14B.55).
 /// Maps to `FullNodeRpc::get_service_node_slashing_status` on chain node.
 const SLASHING_ENDPOINT_PATH: &str = "/api/service_node/slashing/";
+
+/// REST path for service node class query (14B.57).
+/// Maps to `FullNodeRpc::get_service_node_class` on chain node.
+const CLASS_ENDPOINT_PATH: &str = "/api/service_node/class/";
+
+/// REST path for listing active service nodes (14B.57).
+/// Maps to `FullNodeRpc::list_active_service_nodes` on chain node.
+const ACTIVE_ENDPOINT_PATH: &str = "/api/service_node/active";
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RESPONSE TYPE (mirrors chain rpc.rs ServiceNodeStakeRes)
@@ -158,6 +171,23 @@ struct ServiceNodeSlashingResponse {
     cooldown_remaining_secs: Option<u64>,
     /// Total count of slashing-related events
     slash_count: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NODE-CLASS / LIST-ACTIVE RESPONSE TYPES (14B.57) — mirrors chain rpc.rs
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Response from chain RPC `get_service_node_class`.
+///
+/// Field names and types MUST match `ServiceNodeClassRes` in chain rpc.rs.
+#[derive(Deserialize, Debug, Clone)]
+struct ServiceNodeClassResponse {
+    /// Operator address (hex string with 0x prefix)
+    operator: String,
+    /// Node class ("Storage" or "Compute")
+    class: String,
+    /// Minimum stake required for this class (u128 as string)
+    min_stake_required: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -541,6 +571,120 @@ pub async fn handle_slashing_status(
     Ok(())
 }
 
+/// Handles `gating node-class --address <hex> [--chain-rpc <url>] [--json]`.
+///
+/// Queries TWO chain RPC endpoints to assemble node class information:
+///
+/// 1. `get_service_node_class` → class, min_stake_required
+/// 2. `get_service_node_stake` → current_stake, meets_minimum
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Address is not valid 40-char hex.
+/// - Either HTTP request to chain RPC fails.
+/// - Chain RPC returns an error (node not found).
+/// - Response JSON does not match expected schema.
+pub async fn handle_node_class(
+    address_hex: &str,
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Validate address ────────────────────────────────────────
+    validate_operator_hex(address_hex)?;
+
+    // ── Step 2: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 3: Build HTTP client (reused for both queries) ─────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 4: Query get_service_node_class ─────────────────────────────
+    let class_url = format!("{}{}{}", base, CLASS_ENDPOINT_PATH, address_hex);
+    let class_res = query_chain_rpc::<ServiceNodeClassResponse>(
+        &client, &class_url, &chain_rpc, "node class",
+    ).await?;
+
+    // ── Step 5: Query get_service_node_stake ─────────────────────────────
+    let stake_url = format!("{}{}{}", base, STAKE_ENDPOINT_PATH, address_hex);
+    let stake_res = query_chain_rpc::<ServiceNodeStakeResponse>(
+        &client, &stake_url, &chain_rpc, "node stake",
+    ).await?;
+
+    // ── Step 6: Display ─────────────────────────────────────────────────
+    if json {
+        print_node_class_json(&class_res, &stake_res);
+    } else {
+        print_node_class_table(&class_res, &stake_res);
+    }
+
+    Ok(())
+}
+
+/// Handles `gating list-active [--chain-rpc <url>] [--json]`.
+///
+/// Queries chain RPC for all active service nodes, sorts by stake
+/// descending, and displays with per-class counts.
+///
+/// ## Notes
+///
+/// - Chain returns nodes filtered to `Active` status and sorted by operator.
+/// - Agent re-sorts by staked_amount descending (deterministic: ties broken
+///   by operator address ascending, matching chain's default order).
+/// - Stake is parsed as u128 for sorting; unparseable values sort as 0.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - HTTP request to chain RPC fails.
+/// - Response JSON does not match expected schema.
+pub async fn handle_list_active(
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 2: Build HTTP client ───────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 3: Query list_active_service_nodes ─────────────────────────
+    let url = format!("{}{}", base, ACTIVE_ENDPOINT_PATH);
+    let mut nodes = query_chain_rpc::<Vec<ServiceNodeInfoResponse>>(
+        &client, &url, &chain_rpc, "active service nodes",
+    ).await?;
+
+    // ── Step 4: Sort by stake descending ────────────────────────────────
+    //            Stable sort: ties preserve chain ordering (by operator asc)
+    nodes.sort_by(|a, b| {
+        let stake_a = a.staked_amount.parse::<u128>().unwrap_or(0);
+        let stake_b = b.staked_amount.parse::<u128>().unwrap_or(0);
+        stake_b.cmp(&stake_a)
+    });
+
+    // ── Step 5: Count by class ──────────────────────────────────────────
+    let total = nodes.len();
+    let storage_count = nodes.iter().filter(|n| n.class == "Storage").count();
+    let compute_count = nodes.iter().filter(|n| n.class == "Compute").count();
+
+    // ── Step 6: Display ─────────────────────────────────────────────────
+    if json {
+        print_active_json(&nodes);
+    } else {
+        print_active_table(&nodes, total, storage_count, compute_count);
+    }
+
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERNAL: VALIDATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -807,6 +951,134 @@ fn format_cooldown_remaining(active: bool, remaining_secs: Option<u64>) -> Strin
             }
         }
         None => "Active (unknown duration)".to_string(),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (node-class, 14B.57)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints node class info as a text table.
+fn print_node_class_table(
+    class_res: &ServiceNodeClassResponse,
+    stake_res: &ServiceNodeStakeResponse,
+) {
+    println!("Operator:               {}", class_res.operator);
+    println!("Class:                  {}", class_res.class);
+    println!("Minimum Stake Required: {}", class_res.min_stake_required);
+    println!("Current Stake:          {}", stake_res.staked_amount);
+    println!(
+        "Meets Minimum:          {}",
+        if stake_res.meets_minimum { "Yes" } else { "No" },
+    );
+}
+
+/// Prints node class info as JSON.
+fn print_node_class_json(
+    class_res: &ServiceNodeClassResponse,
+    stake_res: &ServiceNodeStakeResponse,
+) {
+    println!(
+        "{{\
+        \n  \"operator\": \"{}\",\
+        \n  \"class\": \"{}\",\
+        \n  \"min_stake_required\": \"{}\",\
+        \n  \"current_stake\": \"{}\",\
+        \n  \"meets_minimum\": {}\
+        \n}}",
+        class_res.operator,
+        class_res.class,
+        class_res.min_stake_required,
+        stake_res.staked_amount,
+        stake_res.meets_minimum,
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (list-active, 14B.57)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints active nodes as a text table with footer counts.
+///
+/// Node ID is truncated to first 16 hex chars + "..." for readability.
+/// Columns: Operator | Node ID | Class | Stake | Status
+fn print_active_table(
+    nodes: &[ServiceNodeInfoResponse],
+    total: usize,
+    storage_count: usize,
+    compute_count: usize,
+) {
+    if nodes.is_empty() {
+        println!("No active service nodes found.");
+        println!();
+        println!("Total Active Nodes: 0");
+        return;
+    }
+
+    // Header
+    println!(
+        "{:<44} {:<19} {:<9} {:<26} {}",
+        "Operator", "Node ID", "Class", "Stake", "Status",
+    );
+    println!("{}", "-".repeat(110));
+
+    // Rows
+    for node in nodes {
+        println!(
+            "{:<44} {:<19} {:<9} {:<26} {}",
+            node.operator,
+            truncate_node_id(&node.node_id_hex),
+            node.class,
+            node.staked_amount,
+            node.status,
+        );
+    }
+
+    // Footer
+    println!();
+    println!("Total Active Nodes: {}", total);
+    println!("Storage Nodes:      {}", storage_count);
+    println!("Compute Nodes:      {}", compute_count);
+}
+
+/// Prints active nodes as a JSON array.
+///
+/// Each element has: operator, node_id, class, stake, status.
+/// Array is sorted by stake descending (caller ensures ordering).
+fn print_active_json(nodes: &[ServiceNodeInfoResponse]) {
+    println!("[");
+    for (i, node) in nodes.iter().enumerate() {
+        let comma = if i + 1 < nodes.len() { "," } else { "" };
+        println!(
+            "  {{\
+            \n    \"operator\": \"{}\",\
+            \n    \"node_id\": \"{}\",\
+            \n    \"class\": \"{}\",\
+            \n    \"stake\": \"{}\",\
+            \n    \"status\": \"{}\"\
+            \n  }}{}",
+            node.operator,
+            node.node_id_hex,
+            node.class,
+            node.staked_amount,
+            node.status,
+            comma,
+        );
+    }
+    println!("]");
+}
+
+/// Truncates a node ID hex string for table display.
+///
+/// Shows first 16 hex characters followed by "..." for readability.
+/// If the input is 16 chars or fewer, returns it unchanged.
+fn truncate_node_id(hex: &str) -> String {
+    if hex.len() <= 16 {
+        hex.to_string()
+    } else {
+        let mut s = hex[..16].to_string();
+        s.push_str("...");
+        s
     }
 }
 
@@ -1760,6 +2032,179 @@ mod tests {
     async fn slashing_status_nonhex_errors() {
         let hex = "gg".repeat(20);
         let result = handle_slashing_status(&hex, None, false).await;
+        assert!(result.is_err(), "non-hex must fail before HTTP");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // V. ServiceNodeClassResponse deserialization (14B.57)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_class_response() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "class": "Storage",
+            "min_stake_required": "5000000000000000000000"
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeClassResponse>(json);
+        assert!(result.is_ok(), "class response must parse");
+        if let Ok(res) = result {
+            assert_eq!(res.class, "Storage");
+        }
+    }
+
+    #[test]
+    fn deserialize_class_response_compute() {
+        let json = r#"{
+            "operator": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "class": "Compute",
+            "min_stake_required": "1000000000000000000000"
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeClassResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert_eq!(res.class, "Compute");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // W. print_node_class smoke tests (14B.57)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_node_class_table_no_panic() {
+        let class_res = ServiceNodeClassResponse {
+            operator: "0xaaaa".to_string(),
+            class: "Storage".to_string(),
+            min_stake_required: "5000".to_string(),
+        };
+        let stake_res = ServiceNodeStakeResponse {
+            operator: "0xaaaa".to_string(),
+            staked_amount: "10000".to_string(),
+            class: "Storage".to_string(),
+            meets_minimum: true,
+        };
+        print_node_class_table(&class_res, &stake_res);
+    }
+
+    #[test]
+    fn print_node_class_json_no_panic() {
+        let class_res = ServiceNodeClassResponse {
+            operator: "0xbbbb".to_string(),
+            class: "Compute".to_string(),
+            min_stake_required: "1000".to_string(),
+        };
+        let stake_res = ServiceNodeStakeResponse {
+            operator: "0xbbbb".to_string(),
+            staked_amount: "500".to_string(),
+            class: "Compute".to_string(),
+            meets_minimum: false,
+        };
+        print_node_class_json(&class_res, &stake_res);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // X. truncate_node_id (14B.57)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_node_id_long() {
+        let hex = "aa".repeat(32); // 64 chars
+        let result = truncate_node_id(&hex);
+        assert_eq!(result.len(), 19); // 16 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_node_id_short() {
+        let hex = "aabb";
+        assert_eq!(truncate_node_id(hex), "aabb");
+    }
+
+    #[test]
+    fn truncate_node_id_exact() {
+        let hex = "a".repeat(16);
+        assert_eq!(truncate_node_id(&hex), hex);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Y. print_active smoke tests (14B.57)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_active_table_empty() {
+        let nodes: Vec<ServiceNodeInfoResponse> = vec![];
+        print_active_table(&nodes, 0, 0, 0);
+    }
+
+    #[test]
+    fn print_active_table_with_nodes() {
+        let nodes = vec![
+            ServiceNodeInfoResponse {
+                operator: "0xaaaa".to_string(),
+                node_id_hex: "bb".repeat(32),
+                class: "Storage".to_string(),
+                status: "Active".to_string(),
+                staked_amount: "10000".to_string(),
+                registered_height: 100,
+                tls_fingerprint_hex: Some("cc".repeat(32)),
+            },
+            ServiceNodeInfoResponse {
+                operator: "0xdddd".to_string(),
+                node_id_hex: "ee".repeat(32),
+                class: "Compute".to_string(),
+                status: "Active".to_string(),
+                staked_amount: "5000".to_string(),
+                registered_height: 200,
+                tls_fingerprint_hex: None,
+            },
+        ];
+        print_active_table(&nodes, 2, 1, 1);
+    }
+
+    #[test]
+    fn print_active_json_empty() {
+        let nodes: Vec<ServiceNodeInfoResponse> = vec![];
+        print_active_json(&nodes);
+    }
+
+    #[test]
+    fn print_active_json_with_nodes() {
+        let nodes = vec![
+            ServiceNodeInfoResponse {
+                operator: "0xaaaa".to_string(),
+                node_id_hex: "bb".repeat(32),
+                class: "Storage".to_string(),
+                status: "Active".to_string(),
+                staked_amount: "10000".to_string(),
+                registered_height: 100,
+                tls_fingerprint_hex: None,
+            },
+        ];
+        print_active_json(&nodes);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Z. handle_node_class — validation failures (no network, 14B.57)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn node_class_invalid_address_errors() {
+        let result = handle_node_class("short", None, false).await;
+        assert!(result.is_err(), "invalid address must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn node_class_0x_prefix_errors() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = handle_node_class(&hex, None, false).await;
+        assert!(result.is_err(), "0x prefix must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn node_class_nonhex_errors() {
+        let hex = "gg".repeat(20);
+        let result = handle_node_class(&hex, None, false).await;
         assert!(result.is_err(), "non-hex must fail before HTTP");
     }
 }
