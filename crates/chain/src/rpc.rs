@@ -807,6 +807,58 @@ pub struct ServiceNodeInfoRes {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SERVICE NODE QUARANTINE & BAN STATUS RPC RESPONSE TYPES (14B.58)
+// ════════════════════════════════════════════════════════════════════════════
+// READ-ONLY structs for quarantine and ban observability.
+// Combines data from state.service_nodes and state.node_liveness_records.
+// No state mutation. Safe for monitoring and dashboards.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Response for service node quarantine status query.
+///
+/// Combines service node record (status, class, stake) with liveness
+/// record (slashing flags, timestamps) to produce a quarantine overview.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuarantineStatusRes {
+    /// Operator address (hex string with 0x prefix)
+    pub operator: String,
+    /// Whether the node is currently quarantined
+    pub is_quarantined: bool,
+    /// Reason for quarantine (derived from liveness flags, None if unknown)
+    pub reason: Option<String>,
+    /// Timestamp when quarantine started (approximated from last_seen, None if unavailable)
+    pub since_timestamp: Option<u64>,
+    /// Duration in seconds since quarantine started (None if not quarantined or unknown)
+    pub duration_secs: Option<u64>,
+    /// Current staked amount (u128 as string)
+    pub current_stake: String,
+    /// Minimum stake required for this class (u128 as string)
+    pub required_stake: String,
+    /// Whether current_stake >= required_stake (recovery eligibility)
+    pub can_recover: bool,
+}
+
+/// Response for service node ban status query.
+///
+/// Combines service node record (status) with liveness record
+/// (slashing flags, force_unbond_until) to produce a ban overview.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BanStatusRes {
+    /// Operator address (hex string with 0x prefix)
+    pub operator: String,
+    /// Whether the node is currently banned
+    pub is_banned: bool,
+    /// Reason for ban (derived from liveness flags, None if unknown)
+    pub reason: Option<String>,
+    /// Timestamp when ban was recorded (approximated from last_seen, None if unavailable)
+    pub banned_since: Option<u64>,
+    /// Timestamp when cooldown expires (None if no cooldown or not banned)
+    pub cooldown_until: Option<u64>,
+    /// Seconds remaining in cooldown (0 if expired or not banned)
+    pub cooldown_remaining_secs: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // SERVICE NODE REGISTRATION RPC REQUEST TYPE (14B.54)
 // ════════════════════════════════════════════════════════════════════════════
 // Request struct for service node on-chain registration.
@@ -3552,6 +3604,195 @@ SyncRequest::GetChainTip => {
         active.sort_by(|a, b| a.operator_address.as_bytes().cmp(b.operator_address.as_bytes()));
 
         active.iter().map(|record| record_to_info_res(record)).collect()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE QUARANTINE & BAN STATUS (14B.58)
+    // ════════════════════════════════════════════════════════════════════════════
+    // READ-ONLY endpoints for quarantine and ban observability.
+    // Combines data from state.service_nodes (status, class, stake) and
+    // state.node_liveness_records (slashing flags, force_unbond_until).
+    // No state mutation. No consensus impact.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Query quarantine status for a registered service node.
+    ///
+    /// # Arguments
+    /// * `operator_hex` - Operator address as hex string (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// * `QuarantineStatusRes` with quarantine details and recovery eligibility
+    ///
+    /// # Errors
+    /// * -32600: Invalid address format
+    /// * -32100: Service node not found
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Dual lookup: service_nodes for status/stake, node_liveness_records for flags
+    /// - Reason derived from liveness flags (may be None if no liveness record)
+    /// - since_timestamp approximated from liveness last_seen_timestamp
+    pub fn get_quarantine_status(&self, operator_hex: String) -> Result<QuarantineStatusRes, RpcError> {
+        let addr = operator_hex.trim_start_matches("0x");
+        let parsed_addr = Address::from_hex(addr).map_err(|e| RpcError {
+            code: -32600,
+            message: format!("invalid address format: {}", e),
+        })?;
+
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let state = self.chain.state.read();
+
+        // Primary lookup: service node record
+        let record = state.service_nodes.get(&parsed_addr)
+            .ok_or_else(|| RpcError {
+                code: -32100,
+                message: format!("service node not found for operator 0x{}", addr),
+            })?;
+
+        let is_quarantined = record.status == dsdn_common::gating::NodeStatus::Quarantined;
+        let class_min = min_stake_display(record.class);
+        let current_stake: u128 = record.staked_amount;
+        let can_recover = current_stake >= class_min;
+
+        // Secondary lookup: liveness record for reason and timestamps
+        let (reason, since_timestamp) = match state.node_liveness_records.get(&parsed_addr) {
+            Some(liveness) => {
+                let reason_str = if liveness.slashed {
+                    if liveness.double_sign_detected {
+                        Some("DoubleSigning".to_string())
+                    } else if liveness.malicious_block_detected {
+                        Some("MaliciousBlock".to_string())
+                    } else if liveness.data_corruption_count > 0 {
+                        Some("DataCorruption".to_string())
+                    } else if liveness.consecutive_failures > 0 {
+                        Some("LivenessFailure".to_string())
+                    } else if liveness.malicious_behavior_count > 0 {
+                        Some("MaliciousBehavior".to_string())
+                    } else {
+                        Some("Unknown".to_string())
+                    }
+                } else {
+                    None
+                };
+                let since = if is_quarantined {
+                    Some(liveness.last_seen_timestamp)
+                } else {
+                    None
+                };
+                (reason_str, since)
+            }
+            None => (None, None),
+        };
+
+        let duration_secs = match since_timestamp {
+            Some(since) if is_quarantined => {
+                Some(current_timestamp.saturating_sub(since))
+            }
+            _ => None,
+        };
+
+        Ok(QuarantineStatusRes {
+            operator: format!("0x{}", parsed_addr.to_hex()),
+            is_quarantined,
+            reason,
+            since_timestamp,
+            duration_secs,
+            current_stake: current_stake.to_string(),
+            required_stake: class_min.to_string(),
+            can_recover,
+        })
+    }
+
+    /// Query ban status for a registered service node.
+    ///
+    /// # Arguments
+    /// * `operator_hex` - Operator address as hex string (with or without 0x prefix)
+    ///
+    /// # Returns
+    /// * `BanStatusRes` with ban details and cooldown information
+    ///
+    /// # Errors
+    /// * -32600: Invalid address format
+    /// * -32100: Service node not found
+    ///
+    /// # Notes
+    /// - READ-ONLY: Does not modify state
+    /// - Dual lookup: service_nodes for status, node_liveness_records for flags/cooldown
+    /// - cooldown_until from force_unbond_until (None if no liveness record)
+    /// - cooldown_remaining computed from current system time
+    pub fn get_ban_status(&self, operator_hex: String) -> Result<BanStatusRes, RpcError> {
+        let addr = operator_hex.trim_start_matches("0x");
+        let parsed_addr = Address::from_hex(addr).map_err(|e| RpcError {
+            code: -32600,
+            message: format!("invalid address format: {}", e),
+        })?;
+
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let state = self.chain.state.read();
+
+        // Primary lookup: service node record
+        let record = state.service_nodes.get(&parsed_addr)
+            .ok_or_else(|| RpcError {
+                code: -32100,
+                message: format!("service node not found for operator 0x{}", addr),
+            })?;
+
+        let is_banned = record.status == dsdn_common::gating::NodeStatus::Banned;
+
+        // Secondary lookup: liveness record for reason and cooldown
+        let (reason, banned_since, cooldown_until) = match state.node_liveness_records.get(&parsed_addr) {
+            Some(liveness) => {
+                let reason_str = if liveness.slashed {
+                    if liveness.double_sign_detected {
+                        Some("DoubleSigning".to_string())
+                    } else if liveness.malicious_block_detected {
+                        Some("MaliciousBlock".to_string())
+                    } else if liveness.data_corruption_count > 0 {
+                        Some("DataCorruption".to_string())
+                    } else if liveness.consecutive_failures > 0 {
+                        Some("LivenessFailure".to_string())
+                    } else if liveness.malicious_behavior_count > 0 {
+                        Some("MaliciousBehavior".to_string())
+                    } else {
+                        Some("Unknown".to_string())
+                    }
+                } else {
+                    None
+                };
+                let since = if is_banned {
+                    Some(liveness.last_seen_timestamp)
+                } else {
+                    None
+                };
+                (reason_str, since, liveness.force_unbond_until)
+            }
+            None => (None, None, None),
+        };
+
+        // Compute cooldown remaining
+        let cooldown_remaining_secs = match cooldown_until {
+            Some(until) if is_banned && current_timestamp < until => {
+                until.saturating_sub(current_timestamp)
+            }
+            _ => 0,
+        };
+
+        Ok(BanStatusRes {
+            operator: format!("0x{}", parsed_addr.to_hex()),
+            is_banned,
+            reason,
+            banned_since,
+            cooldown_until,
+            cooldown_remaining_secs,
+        })
     }
 
     // ════════════════════════════════════════════════════════════════════════════

@@ -1,4 +1,4 @@
-//! # Gating CLI Commands (14B.53–14B.57)
+//! # Gating CLI Commands (14B.53–14B.58)
 //!
 //! Handles gating-related subcommands for the DSDN Agent CLI.
 //!
@@ -11,6 +11,8 @@
 //! - `gating slashing-status --address <hex> [--chain-rpc <url>] [--json]`
 //! - `gating node-class --address <hex> [--chain-rpc <url>] [--json]`
 //! - `gating list-active [--chain-rpc <url>] [--json]`
+//! - `gating quarantine-status --address <hex> [--chain-rpc <url>] [--json]`
+//! - `gating ban-status --address <hex> [--chain-rpc <url>] [--json]`
 //!
 //! ## Chain RPC Resolution (stake-check, status)
 //!
@@ -33,6 +35,8 @@
 //! - node-class: `GET {chain_rpc}/api/service_node/class/{operator_hex}`
 //!              + `GET {chain_rpc}/api/service_node/stake/{operator_hex}`
 //! - list-active: `GET {chain_rpc}/api/service_node/active`
+//! - quarantine-status: `GET {chain_rpc}/api/service_node/quarantine/{operator_hex}`
+//! - ban-status: `GET {chain_rpc}/api/service_node/ban/{operator_hex}`
 
 use std::path::Path;
 use anyhow::Result;
@@ -73,6 +77,14 @@ const CLASS_ENDPOINT_PATH: &str = "/api/service_node/class/";
 /// REST path for listing active service nodes (14B.57).
 /// Maps to `FullNodeRpc::list_active_service_nodes` on chain node.
 const ACTIVE_ENDPOINT_PATH: &str = "/api/service_node/active";
+
+/// REST path for service node quarantine status query (14B.58).
+/// Maps to `FullNodeRpc::get_quarantine_status` on chain node.
+const QUARANTINE_ENDPOINT_PATH: &str = "/api/service_node/quarantine/";
+
+/// REST path for service node ban status query (14B.58).
+/// Maps to `FullNodeRpc::get_ban_status` on chain node.
+const BAN_ENDPOINT_PATH: &str = "/api/service_node/ban/";
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RESPONSE TYPE (mirrors chain rpc.rs ServiceNodeStakeRes)
@@ -188,6 +200,52 @@ struct ServiceNodeClassResponse {
     class: String,
     /// Minimum stake required for this class (u128 as string)
     min_stake_required: String,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// QUARANTINE & BAN STATUS RESPONSE TYPES (14B.58) — mirrors chain rpc.rs
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Response from chain RPC `get_quarantine_status`.
+///
+/// Field names and types MUST match `QuarantineStatusRes` in chain rpc.rs.
+#[derive(Deserialize, Debug, Clone)]
+struct QuarantineStatusResponse {
+    /// Operator address (hex string with 0x prefix)
+    operator: String,
+    /// Whether the node is currently quarantined
+    is_quarantined: bool,
+    /// Reason for quarantine (None if unavailable from chain)
+    reason: Option<String>,
+    /// Timestamp when quarantine started (None if unavailable)
+    since_timestamp: Option<u64>,
+    /// Duration in seconds since quarantine started (None if not quarantined)
+    duration_secs: Option<u64>,
+    /// Current staked amount (u128 as string)
+    current_stake: String,
+    /// Minimum stake required for this class (u128 as string)
+    required_stake: String,
+    /// Whether current_stake >= required_stake
+    can_recover: bool,
+}
+
+/// Response from chain RPC `get_ban_status`.
+///
+/// Field names and types MUST match `BanStatusRes` in chain rpc.rs.
+#[derive(Deserialize, Debug, Clone)]
+struct BanStatusResponse {
+    /// Operator address (hex string with 0x prefix)
+    operator: String,
+    /// Whether the node is currently banned
+    is_banned: bool,
+    /// Reason for ban (None if unavailable from chain)
+    reason: Option<String>,
+    /// Timestamp when ban was recorded (None if unavailable)
+    banned_since: Option<u64>,
+    /// Timestamp when cooldown expires (None if no cooldown)
+    cooldown_until: Option<u64>,
+    /// Seconds remaining in cooldown (0 if expired or not banned)
+    cooldown_remaining_secs: u64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -685,6 +743,98 @@ pub async fn handle_list_active(
     Ok(())
 }
 
+/// Handles `gating quarantine-status --address <hex> [--chain-rpc <url>] [--json]`.
+///
+/// Queries chain RPC for quarantine status of a service node including
+/// reason, duration, stake info, and recovery eligibility.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Address is not valid 40-char hex.
+/// - HTTP request to chain RPC fails.
+/// - Chain RPC returns an error (node not found).
+/// - Response JSON does not match expected schema.
+pub async fn handle_quarantine_status(
+    address_hex: &str,
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Validate address ────────────────────────────────────────
+    validate_operator_hex(address_hex)?;
+
+    // ── Step 2: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 3: Build HTTP client ───────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 4: Query get_quarantine_status ──────────────────────────────
+    let url = format!("{}{}{}", base, QUARANTINE_ENDPOINT_PATH, address_hex);
+    let res = query_chain_rpc::<QuarantineStatusResponse>(
+        &client, &url, &chain_rpc, "quarantine status",
+    ).await?;
+
+    // ── Step 5: Display ─────────────────────────────────────────────────
+    if json {
+        print_quarantine_json(&res);
+    } else {
+        print_quarantine_table(&res);
+    }
+
+    Ok(())
+}
+
+/// Handles `gating ban-status --address <hex> [--chain-rpc <url>] [--json]`.
+///
+/// Queries chain RPC for ban status of a service node including
+/// reason, cooldown expiry, and remaining time.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Address is not valid 40-char hex.
+/// - HTTP request to chain RPC fails.
+/// - Chain RPC returns an error (node not found).
+/// - Response JSON does not match expected schema.
+pub async fn handle_ban_status(
+    address_hex: &str,
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Validate address ────────────────────────────────────────
+    validate_operator_hex(address_hex)?;
+
+    // ── Step 2: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 3: Build HTTP client ───────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 4: Query get_ban_status ────────────────────────────────────
+    let url = format!("{}{}{}", base, BAN_ENDPOINT_PATH, address_hex);
+    let res = query_chain_rpc::<BanStatusResponse>(
+        &client, &url, &chain_rpc, "ban status",
+    ).await?;
+
+    // ── Step 5: Display ─────────────────────────────────────────────────
+    if json {
+        print_ban_json(&res);
+    } else {
+        print_ban_table(&res);
+    }
+
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERNAL: VALIDATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1079,6 +1229,174 @@ fn truncate_node_id(hex: &str) -> String {
         let mut s = hex[..16].to_string();
         s.push_str("...");
         s
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (quarantine-status, 14B.58)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints quarantine status as a text table.
+fn print_quarantine_table(res: &QuarantineStatusResponse) {
+    let dash = "-".to_string();
+
+    println!("Operator:       {}", res.operator);
+    println!(
+        "Is Quarantined: {}",
+        if res.is_quarantined { "Yes" } else { "No" },
+    );
+    println!(
+        "Reason:         {}",
+        res.reason.as_deref().unwrap_or("-"),
+    );
+    println!(
+        "Since:          {}",
+        res.since_timestamp.map(|t| t.to_string()).as_deref().unwrap_or(&dash),
+    );
+    println!(
+        "Duration:       {}",
+        match res.duration_secs {
+            Some(s) => format_duration_human(s),
+            None => dash.clone(),
+        },
+    );
+    println!("Current Stake:  {}", res.current_stake);
+    println!("Required Stake: {}", res.required_stake);
+    println!(
+        "Can Recover:    {}",
+        if res.can_recover { "Yes" } else { "No" },
+    );
+}
+
+/// Prints quarantine status as JSON.
+fn print_quarantine_json(res: &QuarantineStatusResponse) {
+    let reason_json = match &res.reason {
+        Some(r) => format!("\"{}\"", r),
+        None => "null".to_string(),
+    };
+    let since_json = match res.since_timestamp {
+        Some(t) => format!("{}", t),
+        None => "null".to_string(),
+    };
+    let duration_json = match res.duration_secs {
+        Some(d) => format!("{}", d),
+        None => "null".to_string(),
+    };
+
+    println!(
+        "{{\
+        \n  \"operator\": \"{}\",\
+        \n  \"is_quarantined\": {},\
+        \n  \"reason\": {},\
+        \n  \"since_timestamp\": {},\
+        \n  \"duration\": {},\
+        \n  \"current_stake\": \"{}\",\
+        \n  \"required_stake\": \"{}\",\
+        \n  \"can_recover\": {}\
+        \n}}",
+        res.operator,
+        res.is_quarantined,
+        reason_json,
+        since_json,
+        duration_json,
+        res.current_stake,
+        res.required_stake,
+        res.can_recover,
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (ban-status, 14B.58)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints ban status as a text table.
+///
+/// If ban has expired (cooldown_remaining_secs == 0 and is_banned), prints
+/// an additional line indicating re-registration eligibility.
+fn print_ban_table(res: &BanStatusResponse) {
+    let dash = "-".to_string();
+
+    println!("Operator:           {}", res.operator);
+    println!(
+        "Is Banned:          {}",
+        if res.is_banned { "Yes" } else { "No" },
+    );
+    println!(
+        "Reason:             {}",
+        res.reason.as_deref().unwrap_or("-"),
+    );
+    println!(
+        "Banned Since:       {}",
+        res.banned_since.map(|t| t.to_string()).as_deref().unwrap_or(&dash),
+    );
+    println!(
+        "Cooldown Until:     {}",
+        res.cooldown_until.map(|t| t.to_string()).as_deref().unwrap_or(&dash),
+    );
+    println!(
+        "Cooldown Remaining: {}",
+        if res.cooldown_remaining_secs > 0 {
+            format_duration_human(res.cooldown_remaining_secs)
+        } else if res.is_banned {
+            "0 (expired)".to_string()
+        } else {
+            "0".to_string()
+        },
+    );
+
+    if res.is_banned && res.cooldown_remaining_secs == 0 {
+        println!();
+        println!("Ban expired. Node can re-register.");
+    }
+}
+
+/// Prints ban status as JSON.
+fn print_ban_json(res: &BanStatusResponse) {
+    let reason_json = match &res.reason {
+        Some(r) => format!("\"{}\"", r),
+        None => "null".to_string(),
+    };
+    let since_json = match res.banned_since {
+        Some(t) => format!("{}", t),
+        None => "null".to_string(),
+    };
+    let until_json = match res.cooldown_until {
+        Some(t) => format!("{}", t),
+        None => "null".to_string(),
+    };
+
+    println!(
+        "{{\
+        \n  \"operator\": \"{}\",\
+        \n  \"is_banned\": {},\
+        \n  \"reason\": {},\
+        \n  \"banned_since\": {},\
+        \n  \"cooldown_until\": {},\
+        \n  \"cooldown_remaining\": {}\
+        \n}}",
+        res.operator,
+        res.is_banned,
+        reason_json,
+        since_json,
+        until_json,
+        res.cooldown_remaining_secs,
+    );
+}
+
+/// Formats a duration in seconds to human-readable "X hours Y minutes" form.
+///
+/// Overflow-safe: all arithmetic on u64 division.
+fn format_duration_human(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let remaining_secs = secs % 60;
+
+    if hours > 0 {
+        format!("{} hours {} minutes", hours, minutes)
+    } else if minutes > 0 {
+        format!("{} minutes {} seconds", minutes, remaining_secs)
+    } else {
+        format!("{} seconds", secs)
     }
 }
 
@@ -2205,6 +2523,274 @@ mod tests {
     async fn node_class_nonhex_errors() {
         let hex = "gg".repeat(20);
         let result = handle_node_class(&hex, None, false).await;
+        assert!(result.is_err(), "non-hex must fail before HTTP");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AA. QuarantineStatusResponse deserialization (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_quarantine_not_quarantined() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "is_quarantined": false,
+            "reason": null,
+            "since_timestamp": null,
+            "duration_secs": null,
+            "current_stake": "10000",
+            "required_stake": "5000",
+            "can_recover": true
+        }"#;
+        let result = serde_json::from_str::<QuarantineStatusResponse>(json);
+        assert!(result.is_ok(), "non-quarantined response must parse");
+        if let Ok(res) = result {
+            assert!(!res.is_quarantined);
+            assert!(res.can_recover);
+        }
+    }
+
+    #[test]
+    fn deserialize_quarantine_active() {
+        let json = r#"{
+            "operator": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "is_quarantined": true,
+            "reason": "DataCorruption",
+            "since_timestamp": 1700000000,
+            "duration_secs": 3600,
+            "current_stake": "100",
+            "required_stake": "5000",
+            "can_recover": false
+        }"#;
+        let result = serde_json::from_str::<QuarantineStatusResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert!(res.is_quarantined);
+            assert_eq!(res.reason.as_deref(), Some("DataCorruption"));
+            assert!(!res.can_recover);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AB. BanStatusResponse deserialization (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_ban_not_banned() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "is_banned": false,
+            "reason": null,
+            "banned_since": null,
+            "cooldown_until": null,
+            "cooldown_remaining_secs": 0
+        }"#;
+        let result = serde_json::from_str::<BanStatusResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert!(!res.is_banned);
+            assert_eq!(res.cooldown_remaining_secs, 0);
+        }
+    }
+
+    #[test]
+    fn deserialize_ban_active() {
+        let json = r#"{
+            "operator": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "is_banned": true,
+            "reason": "DoubleSigning",
+            "banned_since": 1700000000,
+            "cooldown_until": 1700003600,
+            "cooldown_remaining_secs": 1800
+        }"#;
+        let result = serde_json::from_str::<BanStatusResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert!(res.is_banned);
+            assert_eq!(res.cooldown_remaining_secs, 1800);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AC. print_quarantine smoke tests (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_quarantine_table_not_quarantined() {
+        let res = QuarantineStatusResponse {
+            operator: "0xaaaa".to_string(),
+            is_quarantined: false,
+            reason: None,
+            since_timestamp: None,
+            duration_secs: None,
+            current_stake: "10000".to_string(),
+            required_stake: "5000".to_string(),
+            can_recover: true,
+        };
+        print_quarantine_table(&res);
+    }
+
+    #[test]
+    fn print_quarantine_table_active() {
+        let res = QuarantineStatusResponse {
+            operator: "0xbbbb".to_string(),
+            is_quarantined: true,
+            reason: Some("DataCorruption".to_string()),
+            since_timestamp: Some(1700000000),
+            duration_secs: Some(3600),
+            current_stake: "100".to_string(),
+            required_stake: "5000".to_string(),
+            can_recover: false,
+        };
+        print_quarantine_table(&res);
+    }
+
+    #[test]
+    fn print_quarantine_json_no_panic() {
+        let res = QuarantineStatusResponse {
+            operator: "0xaaaa".to_string(),
+            is_quarantined: true,
+            reason: Some("LivenessFailure".to_string()),
+            since_timestamp: Some(1700000000),
+            duration_secs: Some(7200),
+            current_stake: "6000".to_string(),
+            required_stake: "5000".to_string(),
+            can_recover: true,
+        };
+        print_quarantine_json(&res);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AD. print_ban smoke tests (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_ban_table_not_banned() {
+        let res = BanStatusResponse {
+            operator: "0xaaaa".to_string(),
+            is_banned: false,
+            reason: None,
+            banned_since: None,
+            cooldown_until: None,
+            cooldown_remaining_secs: 0,
+        };
+        print_ban_table(&res);
+    }
+
+    #[test]
+    fn print_ban_table_active_cooldown() {
+        let res = BanStatusResponse {
+            operator: "0xbbbb".to_string(),
+            is_banned: true,
+            reason: Some("DoubleSigning".to_string()),
+            banned_since: Some(1700000000),
+            cooldown_until: Some(1700003600),
+            cooldown_remaining_secs: 1800,
+        };
+        print_ban_table(&res);
+    }
+
+    #[test]
+    fn print_ban_table_expired() {
+        let res = BanStatusResponse {
+            operator: "0xcccc".to_string(),
+            is_banned: true,
+            reason: Some("MaliciousBlock".to_string()),
+            banned_since: Some(1700000000),
+            cooldown_until: Some(1700003600),
+            cooldown_remaining_secs: 0,
+        };
+        // Should print "Ban expired. Node can re-register."
+        print_ban_table(&res);
+    }
+
+    #[test]
+    fn print_ban_json_no_panic() {
+        let res = BanStatusResponse {
+            operator: "0xbbbb".to_string(),
+            is_banned: true,
+            reason: Some("DoubleSigning".to_string()),
+            banned_since: Some(1700000000),
+            cooldown_until: Some(1700003600),
+            cooldown_remaining_secs: 1800,
+        };
+        print_ban_json(&res);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AE. format_duration_human (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration_human(7200), "2 hours 0 minutes");
+    }
+
+    #[test]
+    fn format_duration_mixed() {
+        assert_eq!(format_duration_human(5430), "1 hours 30 minutes");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration_human(330), "5 minutes 30 seconds");
+    }
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration_human(45), "45 seconds");
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration_human(0), "0 seconds");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AF. handle_quarantine_status — validation failures (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn quarantine_status_invalid_address_errors() {
+        let result = handle_quarantine_status("short", None, false).await;
+        assert!(result.is_err(), "invalid address must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn quarantine_status_0x_prefix_errors() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = handle_quarantine_status(&hex, None, false).await;
+        assert!(result.is_err(), "0x prefix must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn quarantine_status_nonhex_errors() {
+        let hex = "gg".repeat(20);
+        let result = handle_quarantine_status(&hex, None, false).await;
+        assert!(result.is_err(), "non-hex must fail before HTTP");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AG. handle_ban_status — validation failures (14B.58)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ban_status_invalid_address_errors() {
+        let result = handle_ban_status("short", None, false).await;
+        assert!(result.is_err(), "invalid address must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn ban_status_0x_prefix_errors() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = handle_ban_status(&hex, None, false).await;
+        assert!(result.is_err(), "0x prefix must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn ban_status_nonhex_errors() {
+        let hex = "gg".repeat(20);
+        let result = handle_ban_status(&hex, None, false).await;
         assert!(result.is_err(), "non-hex must fail before HTTP");
     }
 }

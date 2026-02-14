@@ -46,7 +46,7 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
-//! ### Gating Operations (14B.53–14B.57)
+//! ### Gating Operations (14B.53–14B.58)
 //! - `gating stake-check`: Check stake status for a service node
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
@@ -69,6 +69,14 @@
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
 //! - `gating list-active`: List all active service nodes
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//! - `gating quarantine-status`: Query quarantine details and recovery
+//!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//! - `gating ban-status`: Query ban details and cooldown
+//!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
 //!
@@ -388,7 +396,7 @@ enum IdentityCommands {
     },
 }
 
-/// Gating subcommands (14B.53–14B.57)
+/// Gating subcommands (14B.53–14B.58)
 #[derive(Subcommand)]
 enum GatingCommands {
     /// Check stake status for a service node operator address
@@ -461,6 +469,32 @@ enum GatingCommands {
 
     /// List all active service nodes sorted by stake (14B.57)
     ListActive {
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query quarantine details and recovery eligibility (14B.58)
+    QuarantineStatus {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query ban details and cooldown status (14B.58)
+    BanStatus {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
         /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
         #[arg(long)]
         chain_rpc: Option<String>,
@@ -1825,6 +1859,20 @@ async fn main() -> Result<()> {
                 }
                 GatingCommands::ListActive { chain_rpc, json } => {
                     cmd_gating::handle_list_active(
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
+                }
+                GatingCommands::QuarantineStatus { address, chain_rpc, json } => {
+                    cmd_gating::handle_quarantine_status(
+                        &address,
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
+                }
+                GatingCommands::BanStatus { address, chain_rpc, json } => {
+                    cmd_gating::handle_ban_status(
+                        &address,
                         chain_rpc.as_deref(),
                         json,
                     ).await?;
