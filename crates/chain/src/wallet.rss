@@ -48,12 +48,12 @@
 //! - File encryption → 13.17.5
 //! - RPC/CLI integration → 13.17.8
 
-use crate::types::Address;
-use crate::crypto::{generate_ed25519_keypair_bytes, address_from_pubkey_bytes, sign_message_with_keypair_bytes, verify_signature};
-use crate::tx::TxEnvelope;
-use crate::encryption::EncryptedFile;
-use crate::celestia::BlobCommitment;
-use crate::mnemonic::{self, MnemonicError};
+use crate::types::Address
+use crate::crypto::{generate_ed25519_keypair_bytes, address_from_pubkey_bytes, sign_message_with_keypair_bytes, verify_signature}
+use crate::tx::TxEnvelope
+use crate::encryption::EncryptedFile
+use crate::celestia::BlobCommitment
+use crate::mnemonic::{self, MnemonicError}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // WALLET ERROR (13.17.2)
@@ -69,54 +69,54 @@ use crate::mnemonic::{self, MnemonicError};
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalletError {
     /// Signing operation gagal
-    SigningFailed(String),
-    
+    SigningFailed(String)
+
     /// Panjang key tidak valid (bukan 32 atau 64 bytes)
-    InvalidKeyLength,
-    
+    InvalidKeyLength
+
     /// Serialization payload gagal
-    SerializationError(String),
-    
+    SerializationError(String)
+
     // ════════════════════════════════════════════════════════════════════════════
     // ENCRYPTION ERRORS (13.17.5)
     // ════════════════════════════════════════════════════════════════════════════
-    
+
     /// Encryption operation gagal (AES-GCM error)
-    EncryptionFailed,
-    
+    EncryptionFailed
+
     /// Decryption operation gagal
-    DecryptionFailed,
-    
+    DecryptionFailed
+
     /// Ciphertext format atau panjang tidak valid
-    InvalidCiphertext,
-    
+    InvalidCiphertext
+
     /// Authentication tag verification gagal
     /// Indicates tampering atau wrong key
-    AuthenticationFailed,
-    
+    AuthenticationFailed
+
     /// Mnemonic seed phrase tidak valid
-    MnemonicError(String),
+    MnemonicError(String)
 }
 
 impl std::fmt::Display for WalletError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f &mut std::fmt::Formatter['_]) effects(io) std::fmt::Result {
         match self {
-            WalletError::SigningFailed(msg) => write!(f, "signing failed: {}", msg),
-            WalletError::InvalidKeyLength => write!(f, "invalid key length"),
-            WalletError::SerializationError(msg) => write!(f, "serialization error: {}", msg),
-            WalletError::EncryptionFailed => write!(f, "encryption failed"),
-            WalletError::DecryptionFailed => write!(f, "decryption failed"),
-            WalletError::InvalidCiphertext => write!(f, "invalid ciphertext"),
-            WalletError::AuthenticationFailed => write!(f, "authentication failed"),
-            WalletError::MnemonicError(msg) => write!(f, "mnemonic error: {}", msg),
+            WalletError::SigningFailed(msg) { write(f, "signing failed: {}", msg) }
+            WalletError::InvalidKeyLength { write(f, "invalid key length") }
+            WalletError::SerializationError(msg) { write(f, "serialization error: {}", msg) }
+            WalletError::EncryptionFailed { write(f, "encryption failed") }
+            WalletError::DecryptionFailed { write(f, "decryption failed") }
+            WalletError::InvalidCiphertext { write(f, "invalid ciphertext") }
+            WalletError::AuthenticationFailed { write(f, "authentication failed") }
+            WalletError::MnemonicError(msg) { write(f, "mnemonic error: {}", msg) }
         }
     }
 }
 
 impl std::error::Error for WalletError {}
 
-impl From<MnemonicError> for WalletError {
-    fn from(e: MnemonicError) -> Self {
+impl From[MnemonicError] for WalletError {
+    fn from(e MnemonicError) effects(alloc) Self {
         WalletError::MnemonicError(e.to_string())
     }
 }
@@ -137,19 +137,18 @@ impl From<MnemonicError> for WalletError {
 ///
 /// Berisi Ed25519 keypair dan derived blockchain address.
 /// Semua operasi deterministik dan tidak akan panic.
-#[derive(Clone)]
 pub struct Wallet {
     /// Full Ed25519 keypair: secret (32 bytes) + public (32 bytes)
     /// CRITICAL: Bytes [0..32] adalah SECRET KEY
-    keypair_bytes: [u8; 64],
-    
+    keypair_bytes [u8; 64]
+
     /// Public key extracted dari keypair (untuk convenience)
     /// INVARIANT: Harus identik dengan keypair_bytes[32..64]
-    public_key: [u8; 32],
-    
+    public_key [u8; 32]
+
     /// Blockchain address derived dari public key
     /// INVARIANT: Harus konsisten dengan chain address derivation
-    address: Address,
+    address Address
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -175,37 +174,36 @@ impl Wallet {
     /// - Menggunakan HANYA `generate_ed25519_keypair_bytes()` dari crypto module
     /// - Tidak ada manual key generation
     /// - Tidak mengubah urutan bytes
-    pub fn generate() -> Self {
+    pub fn generate() effects(io, alloc, panic) Self {
         // Generate keypair menggunakan chain's crypto module
         // Returns: (pubkey_vec: Vec<u8>, keypair_bytes: [u8; 64])
-        let (pubkey_vec, keypair_vec) = generate_ed25519_keypair_bytes();
+        (pubkey_vec, keypair_vec) = generate_ed25519_keypair_bytes()
 
         // Validasi panjang (SECURITY CRITICAL)
-        assert_eq!(keypair_vec.len(), 64, "invalid keypair length");
+        assert_eq!(keypair_vec.len(), 64, "invalid keypair length")
 
-        let mut keypair_bytes = [0u8; 64];
-        keypair_bytes.copy_from_slice(&keypair_vec);
+        mut keypair_bytes = [0u8; 64]
+        keypair_bytes.copy_from_slice(&keypair_vec)
 
-        
         // Extract public key dari keypair_bytes[32..64]
         // SAFETY: keypair_bytes selalu 64 bytes dari generate_ed25519_keypair_bytes
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(&keypair_bytes[32..64]);
-        
+        mut public_key = [0u8; 32]
+        public_key.copy_from_slice(&keypair_bytes[32..64])
+
         // Derive address dari public key menggunakan chain's address derivation
         // Fallback ke zero address jika derivation gagal (seharusnya tidak terjadi)
-        let address = match address_from_pubkey_bytes(&pubkey_vec) {
-            Ok(addr) => addr,
-            Err(_) => Address::from_bytes([0u8; 20]),
-        };
-        
+        address = match address_from_pubkey_bytes(&pubkey_vec) {
+            Ok(addr) { addr }
+            Err(_) { Address::from_bytes([0u8; 20]) }
+        }
+
         Self {
-            keypair_bytes,
-            public_key,
-            address,
+            keypair_bytes = keypair_bytes
+            public_key = public_key
+            address = address
         }
     }
-    
+
     /// Restore wallet dari 32-byte secret key.
     ///
     /// Derive public key dari secret key menggunakan Ed25519 scalar multiplication.
@@ -228,28 +226,27 @@ impl Wallet {
     /// - Construct full [u8; 64] keypair
     /// - Public key konsisten dengan Ed25519 derivation
     /// - Tidak panic
-    pub fn from_secret_key(secret: &[u8; 32]) -> Self {
-        let public_key_bytes = crate::crypto::ecdsa::public_key_from_secret(secret);
+    pub fn from_secret_key(secret &[u8; 32]) effects(alloc) Self {
+        public_key_bytes = crate::crypto::ecdsa::public_key_from_secret(secret)
 
-        
         // Construct full keypair bytes: secret (32) + public (32)
-        let mut keypair_bytes = [0u8; 64];
-        keypair_bytes[0..32].copy_from_slice(secret);
-        keypair_bytes[32..64].copy_from_slice(&public_key_bytes);
-        
+        mut keypair_bytes = [0u8; 64]
+        keypair_bytes[0..32].copy_from_slice(secret)
+        keypair_bytes[32..64].copy_from_slice(&public_key_bytes)
+
         // Derive address dari public key
-        let address = match address_from_pubkey_bytes(&public_key_bytes.to_vec()) {
-            Ok(addr) => addr,
-            Err(_) => Address::from_bytes([0u8; 20]),
-        };
-        
+        address = match address_from_pubkey_bytes(&public_key_bytes.to_vec()) {
+            Ok(addr) { addr }
+            Err(_) { Address::from_bytes([0u8; 20]) }
+        }
+
         Self {
-            keypair_bytes,
-            public_key: public_key_bytes,
-            address,
+            keypair_bytes = keypair_bytes
+            public_key = public_key_bytes
+            address = address
         }
     }
-    
+
     /// Restore wallet dari full 64-byte keypair.
     ///
     /// Format yang diharapkan: secret (32 bytes) + public (32 bytes).
@@ -272,21 +269,21 @@ impl Wallet {
     /// - Tidak regenerate key
     /// - Tidak reorder bytes
     /// - Validasi implicit via type system (compile-time length check)
-    pub fn from_bytes(keypair_bytes: &[u8; 64]) -> Self {
+    pub fn from_bytes(keypair_bytes &[u8; 64]) effects(alloc) Self {
         // Extract public key dari bytes [32..64]
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(&keypair_bytes[32..64]);
-        
+        mut public_key = [0u8; 32]
+        public_key.copy_from_slice(&keypair_bytes[32..64])
+
         // Derive address dari public key
-        let address = match address_from_pubkey_bytes(&public_key.to_vec()) {
-            Ok(addr) => addr,
-            Err(_) => Address::from_bytes([0u8; 20]),
-        };
-        
+        address = match address_from_pubkey_bytes(&public_key.to_vec()) {
+            Ok(addr) { addr }
+            Err(_) { Address::from_bytes([0u8; 20]) }
+        }
+
         Self {
-            keypair_bytes: *keypair_bytes,
-            public_key,
-            address,
+            keypair_bytes = *keypair_bytes
+            public_key = public_key
+            address = address
         }
     }
 
@@ -311,11 +308,11 @@ impl Wallet {
     ///
     /// # Panics
     /// Panics jika mnemonic generation gagal (sangat unlikely).
-    pub fn generate_with_mnemonic() -> (Self, String) {
-        let (phrase, secret) = mnemonic::generate_mnemonic()
-            .expect("BIP39 mnemonic generation should not fail");
+    pub fn generate_with_mnemonic() effects(io, alloc, panic) (Self, String) {
+        (phrase, secret) = mnemonic::generate_mnemonic()
+            .expect("BIP39 mnemonic generation should not fail")
 
-        let wallet = Self::from_secret_key(&secret);
+        wallet = Self::from_secret_key(&secret)
         (wallet, phrase)
     }
 
@@ -336,8 +333,8 @@ impl Wallet {
     /// let phrase = "abandon ability able about above absent ...";
     /// let wallet = Wallet::from_mnemonic(phrase)?;
     /// ```
-    pub fn from_mnemonic(phrase: &str) -> Result<Self, WalletError> {
-        let secret = mnemonic::mnemonic_to_secret_key(phrase)?;
+    pub fn from_mnemonic(phrase &str) effects(alloc) Result[Self, WalletError] {
+        secret = mnemonic::mnemonic_to_secret_key(phrase)?
         Ok(Self::from_secret_key(&secret))
     }
 }
@@ -357,10 +354,10 @@ impl Wallet {
     /// # Returns
     /// Copy dari wallet's Address.
     #[inline]
-    pub fn address(&self) -> Address {
+    pub fn address(&self) Address {
         self.address
     }
-    
+
     /// Get reference ke 32-byte public key.
     ///
     /// Public key aman untuk di-share dan digunakan untuk:
@@ -371,10 +368,10 @@ impl Wallet {
     /// # Returns
     /// Reference ke public key bytes.
     #[inline]
-    pub fn public_key(&self) -> &[u8; 32] {
+    pub fn public_key(&self) &[u8; 32] {
         &self.public_key
     }
-    
+
     /// Get reference ke 32-byte secret key.
     ///
     /// # Security Warning
@@ -386,20 +383,19 @@ impl Wallet {
     /// # Returns
     /// Reference ke secret key bytes (first 32 bytes of keypair).
     #[inline]
-    pub fn secret_key(&self) -> &[u8; 32] {
+    pub fn secret_key(&self) effects(panic) &[u8; 32] {
         // SAFETY: keypair_bytes selalu 64 bytes
         // First 32 bytes adalah secret key
         // Menggunakan array reference untuk zero-copy
         //
         // Equivalent to: &keypair_bytes[0..32] as &[u8; 32]
         // Tapi dengan compile-time guarantee
-        // SAFETY: 
+        // SAFETY:
         // 1. keypair_bytes adalah [u8; 64], always valid
         // 2. ptr points to start of array
         // 3. We only read first 32 bytes which is within bounds
         // 4. Alignment is 1 for u8
-        self.keypair_bytes[0..32]
-            .try_into()
+        <&[u8; 32]>::try_from(&self.keypair_bytes[0..32])
             .expect("keypair_bytes always 64 bytes")
     }
 }
@@ -420,10 +416,10 @@ impl Wallet {
     /// # Returns
     /// Copy dari full keypair bytes.
     #[inline]
-    pub fn export_keypair(&self) -> [u8; 64] {
+    pub fn export_keypair(&self) [u8; 64] {
         self.keypair_bytes
     }
-    
+
     /// Export secret key sebagai lowercase hexadecimal string.
     ///
     /// Format: 64 hex characters (32 bytes), tanpa prefix "0x".
@@ -440,7 +436,7 @@ impl Wallet {
     /// let hex = wallet.export_secret_hex();
     /// // "a1b2c3d4..." (64 characters)
     /// ```
-    pub fn export_secret_hex(&self) -> String {
+    pub fn export_secret_hex(&self) effects(alloc) String {
         hex::encode(&self.keypair_bytes[0..32])
     }
 
@@ -461,11 +457,12 @@ impl Wallet {
     /// let phrase = wallet.export_mnemonic()?;
     /// // "abandon ability able about ..." (24 words)
     /// ```
-    pub fn export_mnemonic(&self) -> Result<String, WalletError> {
-        let secret: &[u8; 32] = self.keypair_bytes[0..32]
-            .try_into()
-            .expect("keypair_bytes always 64 bytes");
-        
+    pub fn export_mnemonic(&self) effects(alloc, panic) Result[String, WalletError] {
+        secret &[u8; 32] =
+            <&[u8; 32]>::try_from(&self.keypair_bytes[0..32])
+                .expect("keypair_bytes always 64 bytes")
+
+
         mnemonic::secret_key_to_mnemonic(secret).map_err(|e| e.into())
     }
 }
@@ -510,15 +507,15 @@ impl Wallet {
     /// - Tidak ada hashing manual
     /// - Tidak ada encoding tambahan
     /// - Return empty Vec jika gagal (tidak panic)
-    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+    pub fn sign_message(&self, message [u8]) effects(alloc) Vec[u8] {
         // Gunakan chain's crypto module untuk signing
         // Return empty Vec jika gagal (tidak crash)
         match sign_message_with_keypair_bytes(&self.keypair_bytes, message) {
-            Ok(signature) => signature,
-            Err(_) => Vec::new(),
+            Ok(signature) { signature }
+            Err(_) { Vec::new() }
         }
     }
-    
+
     /// Sign TxEnvelope dan return envelope baru dengan signature.
     ///
     /// ALUR:
@@ -543,30 +540,30 @@ impl Wallet {
     /// - Input `tx` TIDAK dimodifikasi (immutable)
     /// - Hanya payload yang di-sign, bukan seluruh envelope
     /// - Public key di-inject ke envelope untuk verification
-    pub fn sign_tx(&self, tx: &TxEnvelope) -> Result<TxEnvelope, WalletError> {
+    pub fn sign_tx(&self, tx &TxEnvelope) effects(alloc, write tx) Result[TxEnvelope, WalletError] {
         // Step 1: Serialize payload untuk signing
-        let payload_bytes = tx.payload_bytes()
-            .map_err(|e| WalletError::SerializationError(format!("{}", e)))?;
-        
+        payload_bytes = tx.payload_bytes()
+            .map_err(|e| WalletError::SerializationError(format("{}", e)))?
+
         // Step 2: Sign payload bytes
-        let signature = sign_message_with_keypair_bytes(&self.keypair_bytes, &payload_bytes)
-            .map_err(|e| WalletError::SigningFailed(format!("{}", e)))?;
-        
+        signature = sign_message_with_keypair_bytes(&self.keypair_bytes, &payload_bytes)
+            .map_err(|e| WalletError::SigningFailed(format("{}", e)))?
+
         // Validate signature length (MUST be 64 bytes)
         if signature.len() != 64 {
             return Err(WalletError::SigningFailed(
-                format!("invalid signature length: {} (expected 64)", signature.len())
-            ));
+                format("invalid signature length: {} (expected 64)", signature.len())
+            ))
         }
-        
+
         // Step 3: Create new envelope dengan signature
-        let mut signed_tx = tx.clone();
-        signed_tx.signature = signature;
-        signed_tx.pubkey = self.public_key.to_vec();
-        
+        mut signed_tx = tx.clone()
+        signed_tx.signature = signature
+        signed_tx.pubkey = self.public_key.to_vec()
+
         Ok(signed_tx)
     }
-    
+
     /// Verify signature dengan public key milik wallet sendiri.
     ///
     /// # Arguments
@@ -589,7 +586,7 @@ impl Wallet {
     /// - Return false jika signature length != 64
     /// - Return false jika verification gagal
     /// - Tidak panic
-    pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
+    pub fn verify_signature(&self, message [u8], signature [u8]) bool {
         verify_signature(&self.public_key, message, signature).unwrap_or(false)
     }
 }
@@ -635,19 +632,19 @@ impl Wallet {
     /// - Deterministik: same input → same output
     /// - Context WAJIB unique per file/purpose
     /// - Tidak panic
-    pub fn derive_encryption_key(&self, context: &[u8]) -> [u8; 32] {
-        use sha3::{Sha3_256, Digest};
-        
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.secret_key());
-        hasher.update(context);
-        
-        let result = hasher.finalize();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&result[..32]);
+    pub fn derive_encryption_key(&self, context [u8]) effects(panic) [u8; 32] {
+        use sha3::{Sha3_256, Digest}
+
+        mut hasher = Sha3_256::new()
+        hasher.update(self.secret_key())
+        hasher.update(context)
+
+        result = hasher.finalize()
+        mut key = [0u8; 32]
+        key.copy_from_slice(&result[..32])
         key
     }
-    
+
     /// Encrypt file dengan wallet-derived key.
     ///
     /// Menggunakan AES-256-GCM authenticated encryption.
@@ -674,45 +671,45 @@ impl Wallet {
     /// - Key derived deterministik dari file_id
     pub fn encrypt_file(
         &self,
-        plaintext: &[u8],
-        file_id: &[u8],
-    ) -> Result<EncryptedFile, WalletError> {
+        plaintext [u8],
+        file_id [u8],
+    ) effects(io, alloc, panic) Result[EncryptedFile, WalletError] {
         use aes_gcm::{
             aead::{Aead, KeyInit},
             Aes256Gcm, Nonce,
-        };
-        use rand::Rng;
-        
+        }
+        use rand::Rng
+
         // Step 1: Derive key dengan file_id sebagai context
-        let key = self.derive_encryption_key(file_id);
-        
+        key = self.derive_encryption_key(file_id)
+
         // Step 2: Generate random nonce (12 bytes)
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        
+        mut nonce_bytes = [0u8; 12]
+        rand::thread_rng().fill(&mut nonce_bytes)
+        nonce = Nonce::from_slice(&nonce_bytes)
+
         // Step 3: Create cipher dan encrypt
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| WalletError::EncryptionFailed)?;
-        
-        let ciphertext_with_tag = cipher
+        cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|_| WalletError::EncryptionFailed)?
+
+        ciphertext_with_tag = cipher
             .encrypt(nonce, plaintext)
-            .map_err(|_| WalletError::EncryptionFailed)?;
-        
+            .map_err(|_| WalletError::EncryptionFailed)?
+
         // Step 4: Separate ciphertext and tag
         // AES-GCM appends 16-byte tag to ciphertext
         if ciphertext_with_tag.len() < 16 {
-            return Err(WalletError::EncryptionFailed);
+            return Err(WalletError::EncryptionFailed)
         }
-        
-        let tag_start = ciphertext_with_tag.len() - 16;
-        let ciphertext = ciphertext_with_tag[..tag_start].to_vec();
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&ciphertext_with_tag[tag_start..]);
-        
+
+        tag_start = ciphertext_with_tag.len() - 16
+        ciphertext = ciphertext_with_tag[..tag_start].to_vec()
+        mut tag = [0u8; 16]
+        tag.copy_from_slice(&ciphertext_with_tag[tag_start..])
+
         Ok(EncryptedFile::new(nonce_bytes, ciphertext, tag))
     }
-    
+
     /// Decrypt file dengan wallet-derived key.
     ///
     /// Menggunakan AES-256-GCM authenticated decryption.
@@ -738,37 +735,37 @@ impl Wallet {
     /// - Tidak panic
     pub fn decrypt_file(
         &self,
-        encrypted: &EncryptedFile,
-        file_id: &[u8],
-    ) -> Result<Vec<u8>, WalletError> {
+        encrypted &EncryptedFile,
+        file_id [u8],
+    ) effects(alloc, panic) Result[Vec[u8], WalletError] {
         use aes_gcm::{
             aead::{Aead, KeyInit},
             Aes256Gcm, Nonce,
-        };
-        
+        }
+
         // Step 1: Derive key dengan context yang sama
-        let key = self.derive_encryption_key(file_id);
-        
+        key = self.derive_encryption_key(file_id)
+
         // Step 2: Reconstruct nonce
-        let nonce = Nonce::from_slice(encrypted.nonce());
-        
+        nonce = Nonce::from_slice(encrypted.nonce())
+
         // Step 3: Create cipher
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| WalletError::DecryptionFailed)?;
-        
+        cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|_| WalletError::DecryptionFailed)?
+
         // Step 4: Reconstruct ciphertext with tag for aes-gcm
         // aes-gcm expects ciphertext || tag
-        let mut ciphertext_with_tag = encrypted.ciphertext().to_vec();
-        ciphertext_with_tag.extend_from_slice(encrypted.tag());
-        
+        mut ciphertext_with_tag = encrypted.ciphertext().to_vec()
+        ciphertext_with_tag.extend_from_slice(encrypted.tag())
+
         // Step 5: Decrypt dan verify tag
-        let plaintext = cipher
+        plaintext = cipher
             .decrypt(nonce, ciphertext_with_tag.as_slice())
-            .map_err(|_| WalletError::AuthenticationFailed)?;
-        
+            .map_err(|_| WalletError::AuthenticationFailed)?
+
         Ok(plaintext)
     }
-    
+
     /// Wrap file encryption key untuk sharing ke recipient.
     ///
     /// Menggunakan X25519 ECDH untuk derive shared secret,
@@ -794,59 +791,59 @@ impl Wallet {
     /// - Authenticated encryption untuk key
     pub fn wrap_file_key(
         &self,
-        file_key: &[u8; 32],
-        recipient_pubkey: &[u8; 32],
-    ) -> Vec<u8> {
-        use x25519_dalek::{StaticSecret, PublicKey};
+        file_key &[u8; 32],
+        recipient_pubkey &[u8; 32],
+    ) effects(io, alloc, panic) Vec[u8] {
+        use x25519_dalek::{StaticSecret, PublicKey}
         use aes_gcm::{
             aead::{Aead, KeyInit},
             Aes256Gcm, Nonce,
-        };
-        use sha3::{Sha3_256, Digest};
-        use rand::Rng;
-        
-        // Step 1: Generate ephemeral X25519 keypair using random bytes
-        let mut ephemeral_secret_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut ephemeral_secret_bytes);
-        let ephemeral_secret = StaticSecret::from(ephemeral_secret_bytes);
-        let ephemeral_public = PublicKey::from(&ephemeral_secret);
-        
-        // Step 2: Derive shared secret via ECDH
-        let recipient_pk = PublicKey::from(*recipient_pubkey);
-        let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk);
-        
-        // Step 3: Derive encryption key dari shared secret
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"dsdn_file_key_wrap_v1");
-        hasher.update(shared_secret.as_bytes());
-        let wrap_key: [u8; 32] = hasher.finalize().into();
-        
-        // Step 4: Generate random nonce
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        // Step 5: Encrypt file_key dengan wrap_key
-        let cipher = match Aes256Gcm::new_from_slice(&wrap_key) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
+        }
+        use sha3::{Sha3_256, Digest}
+        use rand::Rng
 
-        let encrypted_key = match cipher.encrypt(nonce, file_key.as_slice()) {
-            Ok(ct) => ct,
-            Err(_) => return Vec::new(),
-        };
-        
+        // Step 1: Generate ephemeral X25519 keypair using random bytes
+        mut ephemeral_secret_bytes = [0u8; 32]
+        rand::thread_rng().fill(&mut ephemeral_secret_bytes)
+        ephemeral_secret = StaticSecret::from(ephemeral_secret_bytes)
+        ephemeral_public = PublicKey::from(&ephemeral_secret)
+
+        // Step 2: Derive shared secret via ECDH
+        recipient_pk = PublicKey::from(*recipient_pubkey)
+        shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk)
+
+        // Step 3: Derive encryption key dari shared secret
+        mut hasher = Sha3_256::new()
+        hasher.update(b"dsdn_file_key_wrap_v1")
+        hasher.update(shared_secret.as_bytes())
+        wrap_key [u8; 32] = hasher.finalize().into()
+
+        // Step 4: Generate random nonce
+        mut nonce_bytes = [0u8; 12]
+        rand::thread_rng().fill(&mut nonce_bytes)
+        nonce = Nonce::from_slice(&nonce_bytes)
+
+        // Step 5: Encrypt file_key dengan wrap_key
+        cipher = match Aes256Gcm::new_from_slice(&wrap_key) {
+            Ok(c) { c }
+            Err(_) { return Vec::new() }
+        }
+
+        encrypted_key = match cipher.encrypt(nonce, file_key.as_slice()) {
+            Ok(ct) { ct }
+            Err(_) { return Vec::new() }
+        }
+
         // Step 6: Construct wrapped output
         // Format: ephemeral_pubkey (32) || encrypted_key_with_tag (48) || nonce (12)
-        let mut wrapped = Vec::with_capacity(92);
-        wrapped.extend_from_slice(ephemeral_public.as_bytes());
-        wrapped.extend_from_slice(&encrypted_key);
-        wrapped.extend_from_slice(&nonce_bytes);
-        
+        mut wrapped = Vec::with_capacity(92)
+        wrapped.extend_from_slice(ephemeral_public.as_bytes())
+        wrapped.extend_from_slice(&encrypted_key)
+        wrapped.extend_from_slice(&nonce_bytes)
+
         wrapped
     }
-    
+
     /// Unwrap file encryption key received dari sender.
     ///
     /// Decrypt wrapped key menggunakan wallet's secret key
@@ -871,66 +868,66 @@ impl Wallet {
     /// - Tag verification untuk integrity
     pub fn unwrap_file_key(
         &self,
-        wrapped_key: &[u8],
-    ) -> Result<[u8; 32], WalletError> {
-        use x25519_dalek::{PublicKey, StaticSecret};
+        wrapped_key [u8],
+    ) effects(alloc, panic) Result[[u8; 32], WalletError] {
+        use x25519_dalek::{PublicKey, StaticSecret}
         use aes_gcm::{
             aead::{Aead, KeyInit},
             Aes256Gcm, Nonce,
-        };
-        use sha3::{Sha3_256, Digest};
-        
+        }
+        use sha3::{Sha3_256, Digest}
+
         // Validate length: 32 (pubkey) + 48 (encrypted_key + tag) + 12 (nonce) = 92
         if wrapped_key.len() != 92 {
-            return Err(WalletError::InvalidCiphertext);
+            return Err(WalletError::InvalidCiphertext)
         }
-        
+
         // Step 1: Extract components
-        let mut ephemeral_pubkey_bytes = [0u8; 32];
-        ephemeral_pubkey_bytes.copy_from_slice(&wrapped_key[0..32]);
-        let encrypted_key_with_tag = &wrapped_key[32..80];
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes.copy_from_slice(&wrapped_key[80..92]);
-        
+        mut ephemeral_pubkey_bytes = [0u8; 32]
+        ephemeral_pubkey_bytes.copy_from_slice(&wrapped_key[0..32])
+        encrypted_key_with_tag = &wrapped_key[32..80]
+        mut nonce_bytes = [0u8; 12]
+        nonce_bytes.copy_from_slice(&wrapped_key[80..92])
+
         // Step 2: Convert wallet secret to X25519 secret
         // Ed25519 secret key dapat digunakan untuk X25519 dengan hashing
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"dsdn_ed25519_to_x25519");
-        hasher.update(self.secret_key());
-        let x25519_secret_bytes: [u8; 32] = hasher.finalize().into();
-        let my_secret = StaticSecret::from(x25519_secret_bytes);
-        
+        mut hasher = Sha3_256::new()
+        hasher.update(b"dsdn_ed25519_to_x25519")
+        hasher.update(self.secret_key())
+        x25519_secret_bytes [u8; 32] = hasher.finalize().into()
+        my_secret = StaticSecret::from(x25519_secret_bytes)
+
         // Step 3: Derive shared secret via ECDH
-        let ephemeral_pubkey = PublicKey::from(ephemeral_pubkey_bytes);
-        let shared_secret = my_secret.diffie_hellman(&ephemeral_pubkey);
-        
+        ephemeral_pubkey = PublicKey::from(ephemeral_pubkey_bytes)
+        shared_secret = my_secret.diffie_hellman(&ephemeral_pubkey)
+
         // Step 4: Derive wrap key
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"dsdn_file_key_wrap_v1");
-        hasher.update(shared_secret.as_bytes());
-        let wrap_key: [u8; 32] = hasher.finalize().into();
-        
+        mut hasher = Sha3_256::new()
+        hasher.update(b"dsdn_file_key_wrap_v1")
+        hasher.update(shared_secret.as_bytes())
+        wrap_key [u8; 32] = hasher.finalize().into()
+
         // Step 5: Decrypt file_key
-        let cipher = Aes256Gcm::new_from_slice(&wrap_key)
-            .map_err(|_| WalletError::DecryptionFailed)?;
-        
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        let file_key_bytes = cipher
+        cipher = Aes256Gcm::new_from_slice(&wrap_key)
+            .map_err(|_| WalletError::DecryptionFailed)?
+
+        nonce = Nonce::from_slice(&nonce_bytes)
+
+        file_key_bytes = cipher
             .decrypt(nonce, encrypted_key_with_tag)
-            .map_err(|_| WalletError::AuthenticationFailed)?;
-        
+            .map_err(|_| WalletError::AuthenticationFailed)?
+
         // Step 6: Validate length
         if file_key_bytes.len() != 32 {
-            return Err(WalletError::InvalidCiphertext);
+            return Err(WalletError::InvalidCiphertext)
         }
-        
-        let mut file_key = [0u8; 32];
-        file_key.copy_from_slice(&file_key_bytes);
-        
+
+        mut file_key = [0u8; 32]
+        file_key.copy_from_slice(&file_key_bytes)
+
         Ok(file_key)
     }
-    
+
     /// Get X25519 public key untuk key wrapping.
     ///
     /// Derived dari wallet's Ed25519 secret key.
@@ -938,19 +935,19 @@ impl Wallet {
     ///
     /// # Returns
     /// 32-byte X25519 public key.
-    pub fn x25519_public_key(&self) -> [u8; 32] {
-        use x25519_dalek::{PublicKey, StaticSecret};
-        use sha3::{Sha3_256, Digest};
-        
+    pub fn x25519_public_key(&self) effects(panic, alloc) [u8; 32] {
+        use x25519_dalek::{PublicKey, StaticSecret}
+        use sha3::{Sha3_256, Digest}
+
         // Convert Ed25519 secret to X25519
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"dsdn_ed25519_to_x25519");
-        hasher.update(self.secret_key());
-        let x25519_secret_bytes: [u8; 32] = hasher.finalize().into();
-        
-        let secret = StaticSecret::from(x25519_secret_bytes);
-        let public = PublicKey::from(&secret);
-        
+        mut hasher = Sha3_256::new()
+        hasher.update(b"dsdn_ed25519_to_x25519")
+        hasher.update(self.secret_key())
+        x25519_secret_bytes [u8; 32] = hasher.finalize().into()
+
+        secret = StaticSecret::from(x25519_secret_bytes)
+        public = PublicKey::from(&secret)
+
         *public.as_bytes()
     }
 }
@@ -991,12 +988,12 @@ impl Wallet {
     /// - Tidak panic
     pub fn verify_da_commitment(
         &self,
-        data: &[u8],
-        commitment: &BlobCommitment,
-    ) -> bool {
-        use crate::celestia::compute_blob_commitment;
-        
-        let computed = compute_blob_commitment(data);
+        data [u8],
+        commitment &BlobCommitment,
+    ) bool {
+        use crate::celestia::compute_blob_commitment
+
+        computed = compute_blob_commitment(data)
         computed == commitment.commitment
     }
 }
@@ -1006,7 +1003,7 @@ impl Wallet {
 // ════════════════════════════════════════════════════════════════════════════════
 
 impl std::fmt::Debug for Wallet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f &mut std::fmt::Formatter['_]) effects(io, alloc) std::fmt::Result {
         // HANYA show address dan public key, TIDAK PERNAH secret key
         f.debug_struct("Wallet")
             .field("address", &self.address)
@@ -1021,784 +1018,784 @@ impl std::fmt::Debug for Wallet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    
+    use super::*
+
     #[test]
-    fn test_wallet_generate() {
-        let wallet = Wallet::generate();
-        
+    fn test_wallet_generate() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+
         // Address tidak boleh zero
-        assert_ne!(wallet.address(), Address::from_bytes([0u8; 20]));
-        
+        assert_ne!(wallet.address(), Address::from_bytes([0u8; 20]))
+
         // Public key harus 32 bytes
-        assert_eq!(wallet.public_key().len(), 32);
-        
+        assert_eq!(wallet.public_key().len(), 32)
+
         // Secret key harus 32 bytes
-        assert_eq!(wallet.secret_key().len(), 32);
-        
+        assert_eq!(wallet.secret_key().len(), 32)
+
         // Keypair harus 64 bytes
-        assert_eq!(wallet.export_keypair().len(), 64);
-        
+        assert_eq!(wallet.export_keypair().len(), 64)
+
         // Public key di struct harus sama dengan keypair[32..64]
-        assert_eq!(wallet.public_key(), &wallet.export_keypair()[32..64]);
-        
+        assert_eq!(wallet.public_key(), &wallet.export_keypair()[32..64])
+
         // Secret key harus sama dengan keypair[0..32]
-        assert_eq!(wallet.secret_key(), &wallet.export_keypair()[0..32]);
-        
-        println!("✅ test_wallet_generate PASSED");
+        assert_eq!(wallet.secret_key(), &wallet.export_keypair()[0..32])
+
+        println("✅ test_wallet_generate PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_from_secret_key() {
+    fn test_wallet_from_secret_key() effects(io, alloc, panic) {
         // Generate wallet
-        let original = Wallet::generate();
-        let mut secret = [0u8; 32];
-        secret.copy_from_slice(original.secret_key());
-        
+        original = Wallet::generate()
+        mut secret = [0u8; 32]
+        secret.copy_from_slice(original.secret_key())
+
         // Restore dari secret
-        let restored = Wallet::from_secret_key(&secret);
-        
+        restored = Wallet::from_secret_key(&secret)
+
         // Address harus match
-        assert_eq!(original.address(), restored.address());
-        
+        assert_eq!(original.address(), restored.address())
+
         // Public key harus match
-        assert_eq!(original.public_key(), restored.public_key());
-        
+        assert_eq!(original.public_key(), restored.public_key())
+
         // Secret key harus match
-        assert_eq!(original.secret_key(), restored.secret_key());
-        
-        println!("✅ test_wallet_from_secret_key PASSED");
+        assert_eq!(original.secret_key(), restored.secret_key())
+
+        println("✅ test_wallet_from_secret_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_from_bytes() {
+    fn test_wallet_from_bytes() effects(io, alloc, panic) {
         // Generate wallet
-        let original = Wallet::generate();
-        let keypair = original.export_keypair();
-        
+        original = Wallet::generate()
+        keypair = original.export_keypair()
+
         // Restore dari bytes
-        let restored = Wallet::from_bytes(&keypair);
-        
+        restored = Wallet::from_bytes(&keypair)
+
         // Address harus match
-        assert_eq!(original.address(), restored.address());
-        
+        assert_eq!(original.address(), restored.address())
+
         // Public key harus match
-        assert_eq!(original.public_key(), restored.public_key());
-        
+        assert_eq!(original.public_key(), restored.public_key())
+
         // Secret key harus match
-        assert_eq!(original.secret_key(), restored.secret_key());
-        
+        assert_eq!(original.secret_key(), restored.secret_key())
+
         // Full keypair harus match
-        assert_eq!(original.export_keypair(), restored.export_keypair());
-        
-        println!("✅ test_wallet_from_bytes PASSED");
+        assert_eq!(original.export_keypair(), restored.export_keypair())
+
+        println("✅ test_wallet_from_bytes PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_export_secret_hex() {
-        let wallet = Wallet::generate();
-        let hex_str = wallet.export_secret_hex();
-        
+    fn test_wallet_export_secret_hex() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        hex_str = wallet.export_secret_hex()
+
         // Harus 64 hex characters (32 bytes)
-        assert_eq!(hex_str.len(), 64);
-        
+        assert_eq!(hex_str.len(), 64)
+
         // Harus valid hex
-        assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
-        
+        assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()))
+
         // Harus lowercase
-        assert!(hex_str.chars().all(|c| !c.is_ascii_uppercase()));
-        
+        assert!(hex_str.chars().all(|c| !c.is_ascii_uppercase()))
+
         // Decode dan compare dengan secret_key
-        let decoded = hex::decode(&hex_str);
-        assert!(decoded.is_ok());
-        assert_eq!(&decoded.unwrap()[..], wallet.secret_key());
-        
-        println!("✅ test_wallet_export_secret_hex PASSED");
+        decoded = hex::decode(&hex_str)
+        assert!(decoded.is_ok())
+        assert_eq!(&decoded.unwrap()[..], wallet.secret_key())
+
+        println("✅ test_wallet_export_secret_hex PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_determinism() {
+    fn test_wallet_determinism() effects(io, alloc, panic) {
         // Same secret harus selalu produce same wallet
-        let secret = [0x42u8; 32];
-        
-        let wallet1 = Wallet::from_secret_key(&secret);
-        let wallet2 = Wallet::from_secret_key(&secret);
-        
-        assert_eq!(wallet1.address(), wallet2.address());
-        assert_eq!(wallet1.public_key(), wallet2.public_key());
-        assert_eq!(wallet1.secret_key(), wallet2.secret_key());
-        assert_eq!(wallet1.export_keypair(), wallet2.export_keypair());
-        
-        println!("✅ test_wallet_determinism PASSED");
+        secret = [0x42u8; 32]
+
+        wallet1 = Wallet::from_secret_key(&secret)
+        wallet2 = Wallet::from_secret_key(&secret)
+
+        assert_eq!(wallet1.address(), wallet2.address())
+        assert_eq!(wallet1.public_key(), wallet2.public_key())
+        assert_eq!(wallet1.secret_key(), wallet2.secret_key())
+        assert_eq!(wallet1.export_keypair(), wallet2.export_keypair())
+
+        println("✅ test_wallet_determinism PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_debug_does_not_leak_secret() {
-        let wallet = Wallet::generate();
-        let debug_str = format!("{:?}", wallet);
-        
+    fn test_wallet_debug_does_not_leak_secret() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        debug_str = format("{:?}", wallet)
+
         // Debug harus contain address
-        assert!(debug_str.contains("address"));
-        
+        assert!(debug_str.contains("address"))
+
         // Debug harus contain public_key
-        assert!(debug_str.contains("public_key"));
-        
+        assert!(debug_str.contains("public_key"))
+
         // Debug TIDAK BOLEH contain "secret" atau "keypair_bytes"
-        let lowercase = debug_str.to_lowercase();
-        assert!(!lowercase.contains("secret"));
-        assert!(!lowercase.contains("keypair_bytes"));
-        
+        lowercase = debug_str.to_lowercase()
+        assert!(!lowercase.contains("secret"))
+        assert!(!lowercase.contains("keypair_bytes"))
+
         // Secret key hex TIDAK BOLEH muncul di debug string
-        let secret_hex = wallet.export_secret_hex();
-        assert!(!debug_str.contains(&secret_hex));
-        
-        println!("✅ test_wallet_debug_does_not_leak_secret PASSED");
+        secret_hex = wallet.export_secret_hex()
+        assert!(!debug_str.contains(&secret_hex))
+
+        println("✅ test_wallet_debug_does_not_leak_secret PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_different_secrets_different_addresses() {
-        let wallet1 = Wallet::from_secret_key(&[0x01u8; 32]);
-        let wallet2 = Wallet::from_secret_key(&[0x02u8; 32]);
-        
+    fn test_wallet_different_secrets_different_addresses() effects(io, alloc, panic) {
+        wallet1 = Wallet::from_secret_key(&[0x01u8; 32])
+        wallet2 = Wallet::from_secret_key(&[0x02u8; 32])
+
         // Different secrets harus produce different addresses
-        assert_ne!(wallet1.address(), wallet2.address());
-        assert_ne!(wallet1.public_key(), wallet2.public_key());
-        
-        println!("✅ test_wallet_different_secrets_different_addresses PASSED");
+        assert_ne!(wallet1.address(), wallet2.address())
+        assert_ne!(wallet1.public_key(), wallet2.public_key())
+
+        println("✅ test_wallet_different_secrets_different_addresses PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_keypair_structure() {
-        let wallet = Wallet::generate();
-        let keypair = wallet.export_keypair();
-        
+    fn test_wallet_keypair_structure() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        keypair = wallet.export_keypair()
+
         // keypair[0..32] harus = secret_key
-        assert_eq!(&keypair[0..32], wallet.secret_key());
-        
+        assert_eq!(&keypair[0..32], wallet.secret_key())
+
         // keypair[32..64] harus = public_key
-        assert_eq!(&keypair[32..64], wallet.public_key());
-        
-        println!("✅ test_wallet_keypair_structure PASSED");
+        assert_eq!(&keypair[32..64], wallet.public_key())
+
+        println("✅ test_wallet_keypair_structure PASSED")
     }
-    
+
     // ════════════════════════════════════════════════════════════════════════════════
     // SIGNING TESTS (13.17.2)
     // ════════════════════════════════════════════════════════════════════════════════
-    
+
     #[test]
-    fn test_wallet_sign_message() {
-        let wallet = Wallet::generate();
-        let message = b"hello world";
-        
+    fn test_wallet_sign_message() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        message = b"hello world"
+
         // Sign message
-        let signature = wallet.sign_message(message);
-        
+        signature = wallet.sign_message(message)
+
         // Signature harus 64 bytes
-        assert_eq!(signature.len(), 64, "Signature must be 64 bytes");
-        
+        assert_eq!(signature.len(), 64, "Signature must be 64 bytes")
+
         // Signature tidak boleh semua zero
-        assert!(!signature.iter().all(|&b| b == 0), "Signature should not be all zeros");
-        
-        println!("✅ test_wallet_sign_message PASSED");
+        assert!(!signature.iter().all(|&b| b == 0), "Signature should not be all zeros")
+
+        println("✅ test_wallet_sign_message PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_verify_signature() {
-        let wallet = Wallet::generate();
-        let message = b"hello blockchain";
-        
+    fn test_wallet_verify_signature() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        message = b"hello blockchain"
+
         // Sign message
-        let signature = wallet.sign_message(message);
-        
+        signature = wallet.sign_message(message)
+
         // Verify signature
-        assert!(wallet.verify_signature(message, &signature), "Signature should be valid");
-        
-        println!("✅ test_wallet_verify_signature PASSED");
+        assert!(wallet.verify_signature(message, &signature), "Signature should be valid")
+
+        println("✅ test_wallet_verify_signature PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_verify_signature_wrong_message() {
-        let wallet = Wallet::generate();
-        let message1 = b"message one";
-        let message2 = b"message two";
-        
+    fn test_wallet_verify_signature_wrong_message() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        message1 = b"message one"
+        message2 = b"message two"
+
         // Sign message1
-        let signature = wallet.sign_message(message1);
-        
+        signature = wallet.sign_message(message1)
+
         // Verify dengan message2 harus fail
-        assert!(!wallet.verify_signature(message2, &signature), 
-            "Signature should be invalid for different message");
-        
-        println!("✅ test_wallet_verify_signature_wrong_message PASSED");
+        assert!(!wallet.verify_signature(message2, &signature),
+            "Signature should be invalid for different message")
+
+        println("✅ test_wallet_verify_signature_wrong_message PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_verify_signature_wrong_key() {
-        let wallet1 = Wallet::generate();
-        let wallet2 = Wallet::generate();
-        let message = b"secret message";
-        
+    fn test_wallet_verify_signature_wrong_key() effects(io, alloc, panic) {
+        wallet1 = Wallet::generate()
+        wallet2 = Wallet::generate()
+        message = b"secret message"
+
         // Sign dengan wallet1
-        let signature = wallet1.sign_message(message);
-        
+        signature = wallet1.sign_message(message)
+
         // Verify dengan wallet2 harus fail
-        assert!(!wallet2.verify_signature(message, &signature), 
-            "Signature should be invalid for different wallet");
-        
-        println!("✅ test_wallet_verify_signature_wrong_key PASSED");
+        assert!(!wallet2.verify_signature(message, &signature),
+            "Signature should be invalid for different wallet")
+
+        println("✅ test_wallet_verify_signature_wrong_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_verify_signature_invalid_length() {
-        let wallet = Wallet::generate();
-        let message = b"test message";
-        
+    fn test_wallet_verify_signature_invalid_length() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        message = b"test message"
+
         // Invalid signature lengths
-        let short_sig = vec![0u8; 32];
-        let long_sig = vec![0u8; 128];
-        let empty_sig: Vec<u8> = vec![];
-        
-        assert!(!wallet.verify_signature(message, &short_sig), "Short signature should be invalid");
-        assert!(!wallet.verify_signature(message, &long_sig), "Long signature should be invalid");
-        assert!(!wallet.verify_signature(message, &empty_sig), "Empty signature should be invalid");
-        
-        println!("✅ test_wallet_verify_signature_invalid_length PASSED");
+        short_sig = vec![0u8; 32]
+        long_sig = vec![0u8; 128]
+        empty_sig Vec[u8] = vec![]
+
+        assert!(!wallet.verify_signature(message, &short_sig), "Short signature should be invalid")
+        assert!(!wallet.verify_signature(message, &long_sig), "Long signature should be invalid")
+        assert!(!wallet.verify_signature(message, &empty_sig), "Empty signature should be invalid")
+
+        println("✅ test_wallet_verify_signature_invalid_length PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_sign_determinism() {
-        let wallet = Wallet::generate();
-        let message = b"deterministic signing";
-        
+    fn test_wallet_sign_determinism() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        message = b"deterministic signing"
+
         // Sign same message twice
-        let sig1 = wallet.sign_message(message);
-        let sig2 = wallet.sign_message(message);
-        
+        sig1 = wallet.sign_message(message)
+        sig2 = wallet.sign_message(message)
+
         // Signatures harus sama (Ed25519 deterministic)
-        assert_eq!(sig1, sig2, "Ed25519 signatures should be deterministic");
-        
-        println!("✅ test_wallet_sign_determinism PASSED");
+        assert_eq!(sig1, sig2, "Ed25519 signatures should be deterministic")
+
+        println("✅ test_wallet_sign_determinism PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_sign_empty_message() {
-        let wallet = Wallet::generate();
-        let empty_message: &[u8] = b"";
-        
+    fn test_wallet_sign_empty_message() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        empty_message &[u8] = b""
+
         // Sign empty message
-        let signature = wallet.sign_message(empty_message);
-        
+        signature = wallet.sign_message(empty_message)
+
         // Should still produce valid 64-byte signature
-        assert_eq!(signature.len(), 64, "Empty message signature must be 64 bytes");
-        
+        assert_eq!(signature.len(), 64, "Empty message signature must be 64 bytes")
+
         // Should be verifiable
-        assert!(wallet.verify_signature(empty_message, &signature), 
-            "Empty message signature should be valid");
-        
-        println!("✅ test_wallet_sign_empty_message PASSED");
+        assert!(wallet.verify_signature(empty_message, &signature),
+            "Empty message signature should be valid")
+
+        println("✅ test_wallet_sign_empty_message PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_error_display() {
-        let err1 = WalletError::SigningFailed("test error".to_string());
-        let err2 = WalletError::InvalidKeyLength;
-        let err3 = WalletError::SerializationError("serialize failed".to_string());
-        
+    fn test_wallet_error_display() effects(io, alloc, panic) {
+        err1 = WalletError::SigningFailed("test error".to_string())
+        err2 = WalletError::InvalidKeyLength
+        err3 = WalletError::SerializationError("serialize failed".to_string())
+
         // Check display output
-        assert!(format!("{}", err1).contains("signing failed"));
-        assert!(format!("{}", err2).contains("invalid key length"));
-        assert!(format!("{}", err3).contains("serialization error"));
-        
-        println!("✅ test_wallet_error_display PASSED");
+        assert!(format("{}", err1).contains("signing failed"))
+        assert!(format("{}", err2).contains("invalid key length"))
+        assert!(format("{}", err3).contains("serialization error"))
+
+        println("✅ test_wallet_error_display PASSED")
     }
-    
+
     // ════════════════════════════════════════════════════════════════════════════════
     // ENCRYPTION TESTS (13.17.5)
     // ════════════════════════════════════════════════════════════════════════════════
-    
+
     #[test]
-    fn test_wallet_derive_encryption_key() {
-        let wallet = Wallet::generate();
-        
+    fn test_wallet_derive_encryption_key() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+
         // Derive key dengan context
-        let context1 = b"file_001";
-        let context2 = b"file_002";
-        
-        let key1a = wallet.derive_encryption_key(context1);
-        let key1b = wallet.derive_encryption_key(context1);
-        let key2 = wallet.derive_encryption_key(context2);
-        
+        context1 = b"file_001"
+        context2 = b"file_002"
+
+        key1a = wallet.derive_encryption_key(context1)
+        key1b = wallet.derive_encryption_key(context1)
+        key2 = wallet.derive_encryption_key(context2)
+
         // Key harus 32 bytes
-        assert_eq!(key1a.len(), 32);
-        
+        assert_eq!(key1a.len(), 32)
+
         // Same context → same key (deterministic)
-        assert_eq!(key1a, key1b);
-        
+        assert_eq!(key1a, key1b)
+
         // Different context → different key
-        assert_ne!(key1a, key2);
-        
-        println!("✅ test_wallet_derive_encryption_key PASSED");
+        assert_ne!(key1a, key2)
+
+        println("✅ test_wallet_derive_encryption_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_derive_encryption_key_different_wallets() {
-        let wallet1 = Wallet::from_secret_key(&[0x01u8; 32]);
-        let wallet2 = Wallet::from_secret_key(&[0x02u8; 32]);
-        let context = b"same_context";
-        
-        let key1 = wallet1.derive_encryption_key(context);
-        let key2 = wallet2.derive_encryption_key(context);
-        
+    fn test_wallet_derive_encryption_key_different_wallets() effects(io, alloc, panic) {
+        wallet1 = Wallet::from_secret_key(&[0x01u8; 32])
+        wallet2 = Wallet::from_secret_key(&[0x02u8; 32])
+        context = b"same_context"
+
+        key1 = wallet1.derive_encryption_key(context)
+        key2 = wallet2.derive_encryption_key(context)
+
         // Different wallets → different keys
-        assert_ne!(key1, key2);
-        
-        println!("✅ test_wallet_derive_encryption_key_different_wallets PASSED");
+        assert_ne!(key1, key2)
+
+        println("✅ test_wallet_derive_encryption_key_different_wallets PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_encrypt_decrypt_file() {
-        let wallet = Wallet::generate();
-        let plaintext = b"hello encrypted world";
-        let file_id = b"test_file_001";
-        
+    fn test_wallet_encrypt_decrypt_file() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        plaintext = b"hello encrypted world"
+        file_id = b"test_file_001"
+
         // Encrypt
-        let encrypted = wallet.encrypt_file(plaintext, file_id);
-        assert!(encrypted.is_ok(), "Encryption should succeed");
-        
-        let encrypted = encrypted.unwrap();
-        
+        mut encrypted = wallet.encrypt_file(plaintext, file_id)
+        assert!(encrypted.is_ok(), "Encryption should succeed")
+
+        encrypted = encrypted.unwrap()
+
         // Verify structure
-        assert_eq!(encrypted.nonce().len(), 12);
-        assert_eq!(encrypted.tag().len(), 16);
-        assert_eq!(encrypted.ciphertext().len(), plaintext.len());
-        
+        assert_eq!(encrypted.nonce().len(), 12)
+        assert_eq!(encrypted.tag().len(), 16)
+        assert_eq!(encrypted.ciphertext().len(), plaintext.len())
+
         // Decrypt
-        let decrypted = wallet.decrypt_file(&encrypted, file_id);
-        assert!(decrypted.is_ok(), "Decryption should succeed");
-        
-        assert_eq!(decrypted.unwrap(), plaintext);
-        
-        println!("✅ test_wallet_encrypt_decrypt_file PASSED");
+        decrypted = wallet.decrypt_file(&encrypted, file_id)
+        assert!(decrypted.is_ok(), "Decryption should succeed")
+
+        assert_eq!(decrypted.unwrap(), plaintext)
+
+        println("✅ test_wallet_encrypt_decrypt_file PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_encrypt_decrypt_empty() {
-        let wallet = Wallet::generate();
-        let plaintext: &[u8] = b"";
-        let file_id = b"empty_file";
-        
+    fn test_wallet_encrypt_decrypt_empty() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        plaintext &[u8] = b""
+        file_id = b"empty_file"
+
         // Encrypt empty
-        let encrypted = wallet.encrypt_file(plaintext, file_id);
-        assert!(encrypted.is_ok());
-        
-        let encrypted = encrypted.unwrap();
-        assert_eq!(encrypted.ciphertext().len(), 0);
-        
+        mut encrypted = wallet.encrypt_file(plaintext, file_id)
+        assert!(encrypted.is_ok())
+
+        encrypted = encrypted.unwrap()
+        assert_eq!(encrypted.ciphertext().len(), 0)
+
         // Decrypt empty
-        let decrypted = wallet.decrypt_file(&encrypted, file_id);
-        assert!(decrypted.is_ok());
-        assert_eq!(decrypted.unwrap(), plaintext);
-        
-        println!("✅ test_wallet_encrypt_decrypt_empty PASSED");
+        decrypted = wallet.decrypt_file(&encrypted, file_id)
+        assert!(decrypted.is_ok())
+        assert_eq!(decrypted.unwrap(), plaintext)
+
+        println("✅ test_wallet_encrypt_decrypt_empty PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_decrypt_wrong_file_id() {
-        let wallet = Wallet::generate();
-        let plaintext = b"secret data";
-        let file_id = b"correct_id";
-        let wrong_id = b"wrong_id";
-        
+    fn test_wallet_decrypt_wrong_file_id() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        plaintext = b"secret data"
+        file_id = b"correct_id"
+        wrong_id = b"wrong_id"
+
         // Encrypt dengan correct_id
-        let encrypted = wallet.encrypt_file(plaintext, file_id).unwrap();
-        
+        encrypted = wallet.encrypt_file(plaintext, file_id).unwrap()
+
         // Decrypt dengan wrong_id harus fail
-        let result = wallet.decrypt_file(&encrypted, wrong_id);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed);
-        
-        println!("✅ test_wallet_decrypt_wrong_file_id PASSED");
+        result = wallet.decrypt_file(&encrypted, wrong_id)
+        assert!(result.is_err())
+        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed)
+
+        println("✅ test_wallet_decrypt_wrong_file_id PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_decrypt_tampered_ciphertext() {
-        let wallet = Wallet::generate();
-        let plaintext = b"important data";
-        let file_id = b"file_id";
-        
+    fn test_wallet_decrypt_tampered_ciphertext() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        plaintext = b"important data"
+        file_id = b"file_id"
+
         // Encrypt
-        let mut encrypted = wallet.encrypt_file(plaintext, file_id).unwrap();
-        
+        mut encrypted = wallet.encrypt_file(plaintext, file_id).unwrap()
+
         // Tamper ciphertext
         if !encrypted.ciphertext.is_empty() {
-            encrypted.ciphertext[0] ^= 0xFF;
+            encrypted.ciphertext[0] ^= 0xFF
         }
-        
+
         // Decrypt harus fail
-        let result = wallet.decrypt_file(&encrypted, file_id);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed);
-        
-        println!("✅ test_wallet_decrypt_tampered_ciphertext PASSED");
+        result = wallet.decrypt_file(&encrypted, file_id)
+        assert!(result.is_err())
+        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed)
+
+        println("✅ test_wallet_decrypt_tampered_ciphertext PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_decrypt_tampered_tag() {
-        let wallet = Wallet::generate();
-        let plaintext = b"important data";
-        let file_id = b"file_id";
-        
+    fn test_wallet_decrypt_tampered_tag() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        plaintext = b"important data"
+        file_id = b"file_id"
+
         // Encrypt
-        let mut encrypted = wallet.encrypt_file(plaintext, file_id).unwrap();
-        
+        mut encrypted = wallet.encrypt_file(plaintext, file_id).unwrap()
+
         // Tamper tag
-        encrypted.tag[0] ^= 0xFF;
-        
+        encrypted.tag[0] ^= 0xFF
+
         // Decrypt harus fail
-        let result = wallet.decrypt_file(&encrypted, file_id);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed);
-        
-        println!("✅ test_wallet_decrypt_tampered_tag PASSED");
+        result = wallet.decrypt_file(&encrypted, file_id)
+        assert!(result.is_err())
+        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed)
+
+        println("✅ test_wallet_decrypt_tampered_tag PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_encryption_deterministic_key() {
-        let secret = [0x42u8; 32];
-        let wallet1 = Wallet::from_secret_key(&secret);
-        let wallet2 = Wallet::from_secret_key(&secret);
-        
-        let plaintext = b"test message";
-        let file_id = b"file_001";
-        
+    fn test_wallet_encryption_deterministic_key() effects(io, alloc, panic) {
+        secret = [0x42u8; 32]
+        wallet1 = Wallet::from_secret_key(&secret)
+        wallet2 = Wallet::from_secret_key(&secret)
+
+        plaintext = b"test message"
+        file_id = b"file_001"
+
         // Encrypt dengan wallet1
-        let encrypted = wallet1.encrypt_file(plaintext, file_id).unwrap();
-        
+        encrypted = wallet1.encrypt_file(plaintext, file_id).unwrap()
+
         // Decrypt dengan wallet2 (sama secret)
-        let decrypted = wallet2.decrypt_file(&encrypted, file_id);
-        assert!(decrypted.is_ok());
-        assert_eq!(decrypted.unwrap(), plaintext);
-        
-        println!("✅ test_wallet_encryption_deterministic_key PASSED");
+        decrypted = wallet2.decrypt_file(&encrypted, file_id)
+        assert!(decrypted.is_ok())
+        assert_eq!(decrypted.unwrap(), plaintext)
+
+        println("✅ test_wallet_encryption_deterministic_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_x25519_public_key() {
-        let wallet = Wallet::generate();
-        let x25519_pk = wallet.x25519_public_key();
-        
+    fn test_wallet_x25519_public_key() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        x25519_pk = wallet.x25519_public_key()
+
         // Harus 32 bytes
-        assert_eq!(x25519_pk.len(), 32);
-        
+        assert_eq!(x25519_pk.len(), 32)
+
         // Harus deterministic
-        let x25519_pk2 = wallet.x25519_public_key();
-        assert_eq!(x25519_pk, x25519_pk2);
-        
+        x25519_pk2 = wallet.x25519_public_key()
+        assert_eq!(x25519_pk, x25519_pk2)
+
         // Harus berbeda dari Ed25519 public key
-        assert_ne!(&x25519_pk[..], wallet.public_key());
-        
-        println!("✅ test_wallet_x25519_public_key PASSED");
+        assert_ne!(&x25519_pk[..], wallet.public_key())
+
+        println("✅ test_wallet_x25519_public_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_wrap_unwrap_file_key() {
-        let sender = Wallet::generate();
-        let recipient = Wallet::generate();
-        
+    fn test_wallet_wrap_unwrap_file_key() effects(io, alloc, panic) {
+        sender = Wallet::generate()
+        recipient = Wallet::generate()
+
         // File key untuk dienkripsi
-        let file_key: [u8; 32] = [0x42u8; 32];
-        
+        file_key [u8; 32] = [0x42u8; 32]
+
         // Sender wrap key untuk recipient
-        let recipient_x25519_pk = recipient.x25519_public_key();
-        let wrapped = sender.wrap_file_key(&file_key, &recipient_x25519_pk);
-        
+        recipient_x25519_pk = recipient.x25519_public_key()
+        wrapped = sender.wrap_file_key(&file_key, &recipient_x25519_pk)
+
         // Wrapped harus 92 bytes
-        assert_eq!(wrapped.len(), 92);
-        
+        assert_eq!(wrapped.len(), 92)
+
         // Recipient unwrap key
-        let unwrapped = recipient.unwrap_file_key(&wrapped);
-        assert!(unwrapped.is_ok(), "Unwrap should succeed");
-        assert_eq!(unwrapped.unwrap(), file_key);
-        
-        println!("✅ test_wallet_wrap_unwrap_file_key PASSED");
+        unwrapped = recipient.unwrap_file_key(&wrapped)
+        assert!(unwrapped.is_ok(), "Unwrap should succeed")
+        assert_eq!(unwrapped.unwrap(), file_key)
+
+        println("✅ test_wallet_wrap_unwrap_file_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_unwrap_wrong_recipient() {
-        let sender = Wallet::generate();
-        let recipient = Wallet::generate();
-        let wrong_recipient = Wallet::generate();
-        
-        let file_key: [u8; 32] = [0xABu8; 32];
-        
+    fn test_wallet_unwrap_wrong_recipient() effects(io, alloc, panic) {
+        sender = Wallet::generate()
+        recipient = Wallet::generate()
+        wrong_recipient = Wallet::generate()
+
+        file_key [u8; 32] = [0xABu8; 32]
+
         // Wrap untuk recipient
-        let wrapped = sender.wrap_file_key(&file_key, &recipient.x25519_public_key());
-        
+        wrapped = sender.wrap_file_key(&file_key, &recipient.x25519_public_key())
+
         // Wrong recipient coba unwrap
-        let result = wrong_recipient.unwrap_file_key(&wrapped);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed);
-        
-        println!("✅ test_wallet_unwrap_wrong_recipient PASSED");
+        result = wrong_recipient.unwrap_file_key(&wrapped)
+        assert!(result.is_err())
+        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed)
+
+        println("✅ test_wallet_unwrap_wrong_recipient PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_unwrap_invalid_length() {
-        let wallet = Wallet::generate();
-        
+    fn test_wallet_unwrap_invalid_length() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+
         // Too short
-        let short = vec![0u8; 50];
-        let result = wallet.unwrap_file_key(&short);
-        assert_eq!(result.unwrap_err(), WalletError::InvalidCiphertext);
-        
+        short = vec![0u8; 50]
+        mut result = wallet.unwrap_file_key(&short)
+        assert_eq!(result.unwrap_err(), WalletError::InvalidCiphertext)
+
         // Too long
-        let long = vec![0u8; 100];
-        let result = wallet.unwrap_file_key(&long);
-        assert_eq!(result.unwrap_err(), WalletError::InvalidCiphertext);
-        
-        println!("✅ test_wallet_unwrap_invalid_length PASSED");
+        long = vec![0u8; 100]
+        result = wallet.unwrap_file_key(&long)
+        assert_eq!(result.unwrap_err(), WalletError::InvalidCiphertext)
+
+        println("✅ test_wallet_unwrap_invalid_length PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_unwrap_tampered_wrapped_key() {
-        let sender = Wallet::generate();
-        let recipient = Wallet::generate();
-        
-        let file_key: [u8; 32] = [0xCDu8; 32];
-        let mut wrapped = sender.wrap_file_key(&file_key, &recipient.x25519_public_key());
-        
+    fn test_wallet_unwrap_tampered_wrapped_key() effects(io, alloc, panic) {
+        sender = Wallet::generate()
+        recipient = Wallet::generate()
+
+        file_key [u8; 32] = [0xCDu8; 32]
+        mut wrapped = sender.wrap_file_key(&file_key, &recipient.x25519_public_key())
+
         // Tamper wrapped key
-        wrapped[50] ^= 0xFF;
-        
-        let result = recipient.unwrap_file_key(&wrapped);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed);
-        
-        println!("✅ test_wallet_unwrap_tampered_wrapped_key PASSED");
+        wrapped[50] ^= 0xFF
+
+        result = recipient.unwrap_file_key(&wrapped)
+        assert!(result.is_err())
+        assert_eq!(result.unwrap_err(), WalletError::AuthenticationFailed)
+
+        println("✅ test_wallet_unwrap_tampered_wrapped_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_encryption_error_display() {
-        let err1 = WalletError::EncryptionFailed;
-        let err2 = WalletError::DecryptionFailed;
-        let err3 = WalletError::InvalidCiphertext;
-        let err4 = WalletError::AuthenticationFailed;
-        
-        assert!(format!("{}", err1).contains("encryption"));
-        assert!(format!("{}", err2).contains("decryption"));
-        assert!(format!("{}", err3).contains("ciphertext"));
-        assert!(format!("{}", err4).contains("authentication"));
-        
-        println!("✅ test_wallet_encryption_error_display PASSED");
+    fn test_wallet_encryption_error_display() effects(io, alloc, panic) {
+        err1 = WalletError::EncryptionFailed
+        err2 = WalletError::DecryptionFailed
+        err3 = WalletError::InvalidCiphertext
+        err4 = WalletError::AuthenticationFailed
+
+        assert!(format("{}", err1).contains("encryption"))
+        assert!(format("{}", err2).contains("decryption"))
+        assert!(format("{}", err3).contains("ciphertext"))
+        assert!(format("{}", err4).contains("authentication"))
+
+        println("✅ test_wallet_encryption_error_display PASSED")
     }
-    
+
     // ════════════════════════════════════════════════════════════════════════════════
     // MNEMONIC TESTS (13.17.9)
     // ════════════════════════════════════════════════════════════════════════════════
-    
+
     #[test]
-    fn test_wallet_generate_with_mnemonic() {
-        let (wallet, phrase) = Wallet::generate_with_mnemonic();
-        
+    fn test_wallet_generate_with_mnemonic() effects(io, alloc, panic) {
+        (wallet, phrase) = Wallet::generate_with_mnemonic()
+
         // Phrase harus 24 words
-        let words: Vec<&str> = phrase.split_whitespace().collect();
-        assert_eq!(words.len(), 24, "Must be 24 words");
-        
+        words Vec[&str] = phrase.split_whitespace().collect()
+        assert_eq!(words.len(), 24, "Must be 24 words")
+
         // Address tidak boleh zero
-        assert_ne!(wallet.address(), Address::from_bytes([0u8; 20]));
-        
+        assert_ne!(wallet.address(), Address::from_bytes([0u8; 20]))
+
         // Public key harus 32 bytes
-        assert_eq!(wallet.public_key().len(), 32);
-        
-        println!("✅ test_wallet_generate_with_mnemonic PASSED");
+        assert_eq!(wallet.public_key().len(), 32)
+
+        println("✅ test_wallet_generate_with_mnemonic PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_from_mnemonic_roundtrip() {
-        let (original, phrase) = Wallet::generate_with_mnemonic();
-        
+    fn test_wallet_from_mnemonic_roundtrip() effects(io, alloc, panic) {
+        (original, phrase) = Wallet::generate_with_mnemonic()
+
         // Restore dari mnemonic
-        let restored = Wallet::from_mnemonic(&phrase).expect("import should succeed");
-        
+        restored = Wallet::from_mnemonic(&phrase).expect("import should succeed")
+
         // Address harus match
-        assert_eq!(original.address(), restored.address());
-        
+        assert_eq!(original.address(), restored.address())
+
         // Public key harus match
-        assert_eq!(original.public_key(), restored.public_key());
-        
+        assert_eq!(original.public_key(), restored.public_key())
+
         // Secret key harus match
-        assert_eq!(original.secret_key(), restored.secret_key());
-        
-        println!("✅ test_wallet_from_mnemonic_roundtrip PASSED");
+        assert_eq!(original.secret_key(), restored.secret_key())
+
+        println("✅ test_wallet_from_mnemonic_roundtrip PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_export_mnemonic() {
-        let (wallet, original_phrase) = Wallet::generate_with_mnemonic();
-        
+    fn test_wallet_export_mnemonic() effects(io, alloc, panic) {
+        (wallet, original_phrase) = Wallet::generate_with_mnemonic()
+
         // Export mnemonic dari wallet
-        let exported_phrase = wallet.export_mnemonic().expect("export should succeed");
-        
+        exported_phrase = wallet.export_mnemonic().expect("export should succeed")
+
         // Harus sama dengan phrase saat generate
-        assert_eq!(original_phrase, exported_phrase);
-        
+        assert_eq!(original_phrase, exported_phrase)
+
         // Import kembali harus menghasilkan wallet yang sama
-        let restored = Wallet::from_mnemonic(&exported_phrase).expect("import");
-        assert_eq!(wallet.address(), restored.address());
-        assert_eq!(wallet.secret_key(), restored.secret_key());
-        
-        println!("✅ test_wallet_export_mnemonic PASSED");
+        restored = Wallet::from_mnemonic(&exported_phrase).expect("import")
+        assert_eq!(wallet.address(), restored.address())
+        assert_eq!(wallet.secret_key(), restored.secret_key())
+
+        println("✅ test_wallet_export_mnemonic PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_mnemonic_determinism() {
-        let (wallet1, phrase1) = Wallet::generate_with_mnemonic();
-        
+    fn test_wallet_mnemonic_determinism() effects(io, alloc, panic) {
+        (wallet1, phrase1) = Wallet::generate_with_mnemonic()
+
         // Import 2x dari phrase yang sama
-        let wallet2 = Wallet::from_mnemonic(&phrase1).expect("import 1");
-        let wallet3 = Wallet::from_mnemonic(&phrase1).expect("import 2");
-        
-        assert_eq!(wallet1.address(), wallet2.address());
-        assert_eq!(wallet2.address(), wallet3.address());
-        assert_eq!(wallet1.secret_key(), wallet2.secret_key());
-        assert_eq!(wallet2.secret_key(), wallet3.secret_key());
-        
-        println!("✅ test_wallet_mnemonic_determinism PASSED");
+        wallet2 = Wallet::from_mnemonic(&phrase1).expect("import 1")
+        wallet3 = Wallet::from_mnemonic(&phrase1).expect("import 2")
+
+        assert_eq!(wallet1.address(), wallet2.address())
+        assert_eq!(wallet2.address(), wallet3.address())
+        assert_eq!(wallet1.secret_key(), wallet2.secret_key())
+        assert_eq!(wallet2.secret_key(), wallet3.secret_key())
+
+        println("✅ test_wallet_mnemonic_determinism PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_mnemonic_compatible_with_secret_key() {
+    fn test_wallet_mnemonic_compatible_with_secret_key() effects(io, alloc, panic) {
         // Generate via mnemonic
-        let (mnemonic_wallet, phrase) = Wallet::generate_with_mnemonic();
-        
+        (mnemonic_wallet, phrase) = Wallet::generate_with_mnemonic()
+
         // Extract secret key dan restore via from_secret_key
-        let mut secret = [0u8; 32];
-        secret.copy_from_slice(mnemonic_wallet.secret_key());
-        let secret_wallet = Wallet::from_secret_key(&secret);
-        
+        mut secret = [0u8; 32]
+        secret.copy_from_slice(mnemonic_wallet.secret_key())
+        secret_wallet = Wallet::from_secret_key(&secret)
+
         // Harus identik
-        assert_eq!(mnemonic_wallet.address(), secret_wallet.address());
-        assert_eq!(mnemonic_wallet.public_key(), secret_wallet.public_key());
-        
+        assert_eq!(mnemonic_wallet.address(), secret_wallet.address())
+        assert_eq!(mnemonic_wallet.public_key(), secret_wallet.public_key())
+
         // Dan secret_wallet juga bisa export mnemonic yang sama
-        let exported = secret_wallet.export_mnemonic().expect("export");
-        assert_eq!(phrase, exported);
-        
-        println!("✅ test_wallet_mnemonic_compatible_with_secret_key PASSED");
+        exported = secret_wallet.export_mnemonic().expect("export")
+        assert_eq!(phrase, exported)
+
+        println("✅ test_wallet_mnemonic_compatible_with_secret_key PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_from_mnemonic_invalid() {
+    fn test_wallet_from_mnemonic_invalid() effects(io, alloc, panic) {
         // Wrong word count
-        let result = Wallet::from_mnemonic("abandon ability able");
-        assert!(result.is_err());
-        
+        mut result = Wallet::from_mnemonic("abandon ability able")
+        assert!(result.is_err())
+
         // Invalid words
-        let result = Wallet::from_mnemonic("xyzzy foobar baz qux a b c d e f g h i j k l m n o p q r s t");
-        assert!(result.is_err());
-        
+        result = Wallet::from_mnemonic("xyzzy foobar baz qux a b c d e f g h i j k l m n o p q r s t")
+        assert!(result.is_err())
+
         // Empty
-        let result = Wallet::from_mnemonic("");
-        assert!(result.is_err());
-        
-        println!("✅ test_wallet_from_mnemonic_invalid PASSED");
+        result = Wallet::from_mnemonic("")
+        assert!(result.is_err())
+
+        println("✅ test_wallet_from_mnemonic_invalid PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_mnemonic_sign_verify() {
+    fn test_wallet_mnemonic_sign_verify() effects(io, alloc, panic) {
         // Wallet dari mnemonic harus bisa sign dan verify
-        let (wallet, _phrase) = Wallet::generate_with_mnemonic();
-        let message = b"test signing from mnemonic wallet";
-        
-        let signature = wallet.sign_message(message);
-        assert_eq!(signature.len(), 64);
-        
-        assert!(wallet.verify_signature(message, &signature));
-        
-        println!("✅ test_wallet_mnemonic_sign_verify PASSED");
+        (wallet, _phrase) = Wallet::generate_with_mnemonic()
+        message = b"test signing from mnemonic wallet"
+
+        signature = wallet.sign_message(message)
+        assert_eq!(signature.len(), 64)
+
+        assert!(wallet.verify_signature(message, &signature))
+
+        println("✅ test_wallet_mnemonic_sign_verify PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_mnemonic_encrypt_decrypt() {
+    fn test_wallet_mnemonic_encrypt_decrypt() effects(io, alloc, panic) {
         // Wallet dari mnemonic harus bisa encrypt/decrypt
-        let (wallet, _phrase) = Wallet::generate_with_mnemonic();
-        let plaintext = b"encrypted with mnemonic wallet";
-        let file_id = b"mnemonic_file_001";
-        
-        let encrypted = wallet.encrypt_file(plaintext, file_id).expect("encrypt");
-        let decrypted = wallet.decrypt_file(&encrypted, file_id).expect("decrypt");
-        
-        assert_eq!(decrypted, plaintext);
-        
-        println!("✅ test_wallet_mnemonic_encrypt_decrypt PASSED");
+        (wallet, _phrase) = Wallet::generate_with_mnemonic()
+        plaintext = b"encrypted with mnemonic wallet"
+        file_id = b"mnemonic_file_001"
+
+        encrypted = wallet.encrypt_file(plaintext, file_id).expect("encrypt")
+        decrypted = wallet.decrypt_file(&encrypted, file_id).expect("decrypt")
+
+        assert_eq!(decrypted, plaintext)
+
+        println("✅ test_wallet_mnemonic_encrypt_decrypt PASSED")
     }
-    
+
     // ════════════════════════════════════════════════════════════════════════════════
     // DA VERIFICATION TESTS (13.17.6)
     // ════════════════════════════════════════════════════════════════════════════════
-    
+
     #[test]
-    fn test_wallet_verify_da_commitment_true() {
-        let wallet = Wallet::generate();
-        let data = b"blob data for DA";
-        
+    fn test_wallet_verify_da_commitment_true() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        data = b"blob data for DA"
+
         // Compute correct commitment
-        let commitment_bytes = crate::celestia::compute_blob_commitment(data);
-        let commitment = BlobCommitment::new(
+        commitment_bytes = crate::celestia::compute_blob_commitment(data)
+        commitment = BlobCommitment::new(
             commitment_bytes,
             [0u8; 29],
             100,
             0,
-        );
-        
+        )
+
         // Verify should return true
-        assert!(wallet.verify_da_commitment(data, &commitment));
-        
-        println!("✅ test_wallet_verify_da_commitment_true PASSED");
+        assert!(wallet.verify_da_commitment(data, &commitment))
+
+        println("✅ test_wallet_verify_da_commitment_true PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_verify_da_commitment_false() {
-        let wallet = Wallet::generate();
-        let data = b"original blob";
-        let wrong_data = b"tampered blob";
-        
+    fn test_wallet_verify_da_commitment_false() effects(io, alloc, panic) {
+        wallet = Wallet::generate()
+        data = b"original blob"
+        wrong_data = b"tampered blob"
+
         // Compute commitment from original
-        let commitment_bytes = crate::celestia::compute_blob_commitment(data);
-        let commitment = BlobCommitment::new(
+        commitment_bytes = crate::celestia::compute_blob_commitment(data)
+        commitment = BlobCommitment::new(
             commitment_bytes,
             [0u8; 29],
             100,
             0,
-        );
-        
+        )
+
         // Verify with wrong data should return false
-        assert!(!wallet.verify_da_commitment(wrong_data, &commitment));
-        
-        println!("✅ test_wallet_verify_da_commitment_false PASSED");
+        assert!(!wallet.verify_da_commitment(wrong_data, &commitment))
+
+        println("✅ test_wallet_verify_da_commitment_false PASSED")
     }
-    
+
     #[test]
-    fn test_wallet_verify_da_commitment_no_secret_key_needed() {
+    fn test_wallet_verify_da_commitment_no_secret_key_needed() effects(io, alloc, panic) {
         // Different wallets should verify the same (no secret key used)
-        let wallet1 = Wallet::from_secret_key(&[0x01u8; 32]);
-        let wallet2 = Wallet::from_secret_key(&[0x02u8; 32]);
-        
-        let data = b"shared verification";
-        let commitment_bytes = crate::celestia::compute_blob_commitment(data);
-        let commitment = BlobCommitment::new(
+        wallet1 = Wallet::from_secret_key(&[0x01u8; 32])
+        wallet2 = Wallet::from_secret_key(&[0x02u8; 32])
+
+        data = b"shared verification"
+        commitment_bytes = crate::celestia::compute_blob_commitment(data)
+        commitment = BlobCommitment::new(
             commitment_bytes,
             [0u8; 29],
             100,
             0,
-        );
-        
+        )
+
         // Both wallets should verify the same
         assert_eq!(
             wallet1.verify_da_commitment(data, &commitment),
             wallet2.verify_da_commitment(data, &commitment)
-        );
-        
-        println!("✅ test_wallet_verify_da_commitment_no_secret_key_needed PASSED");
+        )
+
+        println("✅ test_wallet_verify_da_commitment_no_secret_key_needed PASSED")
     }
 }
