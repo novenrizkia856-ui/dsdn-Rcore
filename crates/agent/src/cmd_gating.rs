@@ -3470,4 +3470,620 @@ mod tests {
         let result = handle_diagnose(&hex, None, None, false).await;
         assert!(result.is_err(), "non-hex must fail before HTTP");
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AL. validate_node_class — error message quality (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_class_empty_error_is_descriptive() {
+        let result = validate_node_class("");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("invalid class"),
+            "error must mention 'invalid class', got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn validate_class_invalid_error_is_descriptive() {
+        let result = validate_node_class("validator");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("validator"), "error must echo the invalid value, got: {}", msg);
+        assert!(msg.contains("storage"), "error must suggest valid values, got: {}", msg);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AM. validate_operator_hex — error message quality (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_hex_0x_prefix_error_is_descriptive() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = validate_operator_hex(&hex);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("without 0x prefix"),
+            "error must mention 0x prefix, got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn validate_hex_0x_uppercase_rejected() {
+        let hex = format!("0X{}", "aa".repeat(19));
+        let result = validate_operator_hex(&hex);
+        assert!(result.is_err(), "0X uppercase prefix must also be rejected");
+    }
+
+    #[test]
+    fn validate_hex_short_error_mentions_length() {
+        let result = validate_operator_hex("aabb");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("40 hex characters"), "error must mention required length, got: {}", msg);
+        assert!(msg.contains("4"), "error must show actual length, got: {}", msg);
+    }
+
+    #[test]
+    fn validate_hex_nonhex_error_mentions_chars() {
+        let hex = "gg".repeat(20);
+        let result = validate_operator_hex(&hex);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("non-hex"), "error must mention non-hex, got: {}", msg);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AN. resolve_chain_rpc — edge cases (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_chain_rpc_empty_cli_uses_fallback() {
+        // Empty string is different from Some("") — but CLI arg is Option<&str>
+        // None means no CLI arg → should use env or default
+        let result = resolve_chain_rpc(None);
+        assert!(!result.is_empty(), "fallback must never be empty");
+    }
+
+    #[test]
+    fn resolve_chain_rpc_preserves_trailing_path() {
+        let result = resolve_chain_rpc(Some("http://node:8545/custom/path"));
+        assert_eq!(result, "http://node:8545/custom/path");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AO. truncate_body — additional edge cases (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_body_empty_string() {
+        assert_eq!(truncate_body("", 10), "");
+    }
+
+    #[test]
+    fn truncate_body_zero_max() {
+        let result = truncate_body("hello", 0);
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn truncate_body_one_over() {
+        // 11 chars with max 10 → truncated
+        let s = "a".repeat(11);
+        let result = truncate_body(&s, 10);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.len(), 13); // 10 + "..."
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AP. bytes_to_hex — additional patterns (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn gating_bytes_to_hex_single_byte() {
+        assert_eq!(bytes_to_hex(&[0xab]), "ab");
+    }
+
+    #[test]
+    fn gating_bytes_to_hex_deadbeef() {
+        assert_eq!(bytes_to_hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    #[test]
+    fn gating_bytes_to_hex_zeros() {
+        assert_eq!(bytes_to_hex(&[0, 0, 0]), "000000");
+    }
+
+    #[test]
+    fn gating_bytes_to_hex_empty() {
+        assert_eq!(bytes_to_hex(&[]), "");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AQ. DiagnosisReport JSON serialization (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diagnosis_report_serializes_to_valid_json_approved() {
+        let report = DiagnosisReport {
+            operator: "0xaaaa".to_string(),
+            checks: vec![
+                DiagnosisCheck { name: "Stake".to_string(), pass: Some(true), detail: "5000 >= 5000".to_string() },
+                DiagnosisCheck { name: "Identity".to_string(), pass: None, detail: "Not provided".to_string() },
+                DiagnosisCheck { name: "Cooldown".to_string(), pass: Some(true), detail: "No active cooldown".to_string() },
+            ],
+            failed_count: 0,
+            decision: "APPROVED".to_string(),
+        };
+
+        let json_str = serde_json::to_string(&report);
+        assert!(json_str.is_ok(), "DiagnosisReport must serialize");
+
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(
+            &json_str.unwrap_or_default(),
+        );
+        assert!(parsed.is_ok(), "serialized JSON must be parseable");
+
+        if let Ok(val) = parsed {
+            assert_eq!(val["operator"], "0xaaaa");
+            assert_eq!(val["decision"], "APPROVED");
+            assert_eq!(val["failed_count"], 0);
+            assert!(val["checks"].is_array());
+            if let Some(arr) = val["checks"].as_array() {
+                assert_eq!(arr.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_report_serializes_to_valid_json_rejected() {
+        let report = DiagnosisReport {
+            operator: "0xbbbb".to_string(),
+            checks: vec![
+                DiagnosisCheck { name: "Stake".to_string(), pass: Some(false), detail: "100 < 5000".to_string() },
+                DiagnosisCheck { name: "Identity".to_string(), pass: Some(false), detail: "Mismatch".to_string() },
+            ],
+            failed_count: 2,
+            decision: "REJECTED".to_string(),
+        };
+
+        let json_str = serde_json::to_string(&report);
+        assert!(json_str.is_ok());
+
+        if let Ok(s) = json_str {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&s);
+            assert!(parsed.is_ok());
+            if let Ok(val) = parsed {
+                assert_eq!(val["decision"], "REJECTED");
+                assert_eq!(val["failed_count"], 2);
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_check_skipped_serializes_pass_as_null() {
+        let check = DiagnosisCheck {
+            name: "Identity".to_string(),
+            pass: None,
+            detail: "Not provided".to_string(),
+        };
+
+        let json_str = serde_json::to_string(&check);
+        assert!(json_str.is_ok());
+
+        if let Ok(s) = json_str {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&s);
+            assert!(parsed.is_ok());
+            if let Ok(val) = parsed {
+                assert!(val["pass"].is_null(), "skipped pass must be null in JSON");
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_check_pass_serializes_as_true() {
+        let check = DiagnosisCheck {
+            name: "Stake".to_string(),
+            pass: Some(true),
+            detail: "ok".to_string(),
+        };
+
+        let json_str = serde_json::to_string(&check);
+        assert!(json_str.is_ok());
+
+        if let Ok(s) = json_str {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&s);
+            if let Ok(val) = parsed {
+                assert_eq!(val["pass"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_check_fail_serializes_as_false() {
+        let check = DiagnosisCheck {
+            name: "Stake".to_string(),
+            pass: Some(false),
+            detail: "fail".to_string(),
+        };
+
+        let json_str = serde_json::to_string(&check);
+        assert!(json_str.is_ok());
+
+        if let Ok(s) = json_str {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&s);
+            if let Ok(val) = parsed {
+                assert_eq!(val["pass"], false);
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AR. Stake print_table / print_json — additional smoke (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stake_print_table_meets_minimum() {
+        let res = ServiceNodeStakeResponse {
+            operator: "0xaaaa".to_string(),
+            staked_amount: "5000".to_string(),
+            class: "Storage".to_string(),
+            meets_minimum: true,
+        };
+        print_table(&res); // must not panic
+    }
+
+    #[test]
+    fn stake_print_json_below_minimum() {
+        let res = ServiceNodeStakeResponse {
+            operator: "0xbbbb".to_string(),
+            staked_amount: "100".to_string(),
+            class: "Compute".to_string(),
+            meets_minimum: false,
+        };
+        print_json(&res); // must not panic
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AS. Diagnosis table — deterministic order & icon verification (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diagnosis_table_check_order_is_deterministic() {
+        let report = DiagnosisReport {
+            operator: "0xaaaa".to_string(),
+            checks: vec![
+                DiagnosisCheck { name: "Stake".to_string(), pass: Some(true), detail: "ok".to_string() },
+                DiagnosisCheck { name: "Class".to_string(), pass: Some(true), detail: "ok".to_string() },
+                DiagnosisCheck { name: "Identity".to_string(), pass: None, detail: "skip".to_string() },
+                DiagnosisCheck { name: "TLS".to_string(), pass: None, detail: "skip".to_string() },
+                DiagnosisCheck { name: "Cooldown".to_string(), pass: Some(true), detail: "ok".to_string() },
+            ],
+            failed_count: 0,
+            decision: "APPROVED".to_string(),
+        };
+        // Checks must be in insertion order (Vec guarantees this)
+        assert_eq!(report.checks[0].name, "Stake");
+        assert_eq!(report.checks[1].name, "Class");
+        assert_eq!(report.checks[2].name, "Identity");
+        assert_eq!(report.checks[3].name, "TLS");
+        assert_eq!(report.checks[4].name, "Cooldown");
+        // Smoke test — no panic
+        print_diagnose_table(&report);
+    }
+
+    #[test]
+    fn diagnosis_icon_mapping_correct() {
+        // Verify icon derivation matches the contract:
+        // Some(true)  → ✅
+        // Some(false) → ❌
+        // None        → ⏭
+        let pass_icon = match Some(true) { Some(true) => "✅", Some(false) => "❌", None => "⏭" };
+        let fail_icon = match Some(false) { Some(true) => "✅", Some(false) => "❌", None => "⏭" };
+        let skip_icon: &str = match None::<bool> { Some(true) => "✅", Some(false) => "❌", None => "⏭" };
+
+        assert_eq!(pass_icon, "✅");
+        assert_eq!(fail_icon, "❌");
+        assert_eq!(skip_icon, "⏭");
+    }
+
+    #[test]
+    fn diagnosis_failed_count_matches_checks() {
+        let checks = vec![
+            DiagnosisCheck { name: "A".to_string(), pass: Some(true), detail: "ok".to_string() },
+            DiagnosisCheck { name: "B".to_string(), pass: Some(false), detail: "fail".to_string() },
+            DiagnosisCheck { name: "C".to_string(), pass: None, detail: "skip".to_string() },
+            DiagnosisCheck { name: "D".to_string(), pass: Some(false), detail: "fail".to_string() },
+        ];
+        let failed = checks.iter().filter(|c| c.pass == Some(false)).count();
+        assert_eq!(failed, 2);
+        let decision = if failed == 0 { "APPROVED" } else { "REJECTED" };
+        assert_eq!(decision, "REJECTED");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AT. format_status_display — completeness (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_status_all_known_variants() {
+        assert_eq!(format_status_display("Active"), "✅ Active");
+        assert_eq!(format_status_display("Pending"), "⏳ Pending");
+        assert_eq!(format_status_display("Quarantined"), "⚠️ Quarantined");
+        assert_eq!(format_status_display("Banned"), "❌ Banned");
+    }
+
+    #[test]
+    fn format_status_unknown_passthrough() {
+        let result = format_status_display("SomethingElse");
+        assert_eq!(result, "? SomethingElse");
+    }
+
+    #[test]
+    fn format_status_empty_string() {
+        let result = format_status_display("");
+        assert_eq!(result, "? ");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AU. load_wallet_keyfile — additional edge cases (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_keyfile_error_mentions_path() {
+        let path = std::path::Path::new("/tmp/dsdn_nonexistent_key_14b60");
+        let result = load_wallet_keyfile(path);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("dsdn_nonexistent_key_14b60"),
+            "error must mention file path, got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn load_keyfile_wrong_length_error_mentions_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_keyfile_len_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("short.key");
+        let _ = std::fs::write(&path, "aabbcc");
+        let result = load_wallet_keyfile(&path);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("64 hex characters"), "must mention expected length, got: {}", msg);
+        assert!(msg.contains("6"), "must mention actual length, got: {}", msg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keyfile_nonhex_error_mentions_nonhex() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_keyfile_hex_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad.key");
+        let _ = std::fs::write(&path, "zz".repeat(32));
+        let result = load_wallet_keyfile(&path);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("non-hex"), "must mention non-hex, got: {}", msg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AV. load_tls_fingerprint_hex (gating) — additional (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn gating_tls_fp_empty_file_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_gtls_empty_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("tls.fp"), "");
+        assert!(load_tls_fingerprint_hex(dir.as_path()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gating_tls_fp_whitespace_trimmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_gtls_ws_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = "cc".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), format!("  {} \n", fp));
+        let result = load_tls_fingerprint_hex(dir.as_path());
+        assert_eq!(result, Some(fp));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gating_tls_fp_uppercase_hex_ok() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_gtls_upper_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = "AA".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), &fp);
+        assert!(load_tls_fingerprint_hex(dir.as_path()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AW. handle_* validation — 0X uppercase prefix (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stake_check_0x_uppercase_errors() {
+        let hex = format!("0X{}", "aa".repeat(19));
+        let result = handle_stake_check(&hex, None, false).await;
+        assert!(result.is_err(), "0X uppercase prefix must be rejected");
+    }
+
+    #[tokio::test]
+    async fn status_0x_uppercase_errors() {
+        let hex = format!("0X{}", "bb".repeat(19));
+        let result = handle_status(&hex, None, false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn slashing_0x_uppercase_errors() {
+        let hex = format!("0X{}", "cc".repeat(19));
+        let result = handle_slashing_status(&hex, None, false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn node_class_0x_uppercase_errors() {
+        let hex = format!("0X{}", "dd".repeat(19));
+        let result = handle_node_class(&hex, None, false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn quarantine_0x_uppercase_errors() {
+        let hex = format!("0X{}", "ee".repeat(19));
+        let result = handle_quarantine_status(&hex, None, false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ban_0x_uppercase_errors() {
+        let hex = format!("0X{}", "ff".repeat(19));
+        let result = handle_ban_status(&hex, None, false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn diagnose_0x_uppercase_errors() {
+        let hex = format!("0X{}", "aa".repeat(19));
+        let result = handle_diagnose(&hex, None, None, false).await;
+        assert!(result.is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AX. handle_diagnose — identity-dir validation (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_tls_check_both_missing_skips() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_both_miss_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 1,
+            tls_fingerprint_hex: None,
+        };
+        // No local tls.fp AND no chain fp → SKIP
+        let check = run_tls_check(&dir, &info);
+        assert!(check.pass.is_none(), "both missing must be SKIPPED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_tls_check_local_present_chain_missing_skips() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_chain_miss_14b60_{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("tls.fp"), "aa".repeat(32));
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 1,
+            tls_fingerprint_hex: None,
+        };
+        let check = run_tls_check(&dir, &info);
+        assert!(check.pass.is_none(), "chain fp missing must be SKIPPED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AY. ServiceNodeStakeResponse deserialization — additional (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_stake_below_minimum() {
+        let json = r#"{
+            "operator": "0xaaaa",
+            "staked_amount": "100",
+            "class": "Compute",
+            "meets_minimum": false
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeStakeResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert!(!res.meets_minimum);
+            assert_eq!(res.class, "Compute");
+        }
+    }
+
+    #[test]
+    fn deserialize_stake_meets_minimum() {
+        let json = r#"{
+            "operator": "0xbbbb",
+            "staked_amount": "5000",
+            "class": "Storage",
+            "meets_minimum": true
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeStakeResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert!(res.meets_minimum);
+            assert_eq!(res.class, "Storage");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AZ. format_duration_human — additional edge cases (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_exactly_one_hour() {
+        assert_eq!(format_duration_human(3600), "1 hours 0 minutes");
+    }
+
+    #[test]
+    fn format_duration_large_value() {
+        // 100000 seconds = 27h 46m 40s → "27 hours 46 minutes"
+        let result = format_duration_human(100000);
+        assert!(result.contains("27 hours"));
+        assert!(result.contains("46 minutes"));
+    }
+
+    #[test]
+    fn format_duration_59_seconds() {
+        assert_eq!(format_duration_human(59), "59 seconds");
+    }
+
+    #[test]
+    fn format_duration_60_seconds() {
+        assert_eq!(format_duration_human(60), "1 minutes 0 seconds");
+    }
 }

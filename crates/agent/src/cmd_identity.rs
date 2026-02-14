@@ -880,4 +880,205 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // I. load_tls_fingerprint_hex — additional edge cases (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tls_fp_whitespace_trimmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_ws_14b60_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let fp_hex = "dd".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), format!("  {} \n", fp_hex));
+
+        let result = load_tls_fingerprint_hex(dir.as_path());
+        assert!(result.is_some(), "whitespace-padded tls.fp must return Some");
+        if let Some(hex) = result {
+            assert_eq!(hex, fp_hex);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_fp_uppercase_hex_valid() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_upper_14b60_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let fp_hex = "AA".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), &fp_hex);
+
+        assert!(
+            load_tls_fingerprint_hex(dir.as_path()).is_some(),
+            "uppercase hex tls.fp must return Some"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_fp_empty_file_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_tls_empty_14b60_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let _ = std::fs::write(dir.join("tls.fp"), "");
+
+        assert!(
+            load_tls_fingerprint_hex(dir.as_path()).is_none(),
+            "empty tls.fp must return None"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // J. handle_identity_export — format validation (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_uppercase_format_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_case_14b60_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let result = handle_identity_export(&dir, "HEX");
+        assert!(result.is_err(), "uppercase 'HEX' must be rejected");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("invalid export format"), "got: {}", msg);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_empty_format_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsdn_export_empty_14b60_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let result = handle_identity_export(&dir, "");
+        assert!(result.is_err(), "empty format must be rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // K. parse_operator_hex — additional edge cases (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_hex_0x_uppercase_prefix_rejected() {
+        let hex = format!("0X{}", "aa".repeat(19));
+        let result = parse_operator_hex(&hex);
+        assert!(result.is_err(), "0X uppercase prefix must be rejected");
+    }
+
+    #[test]
+    fn parse_hex_single_byte_too_short() {
+        let result = parse_operator_hex("ab");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("40 hex characters"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_hex_error_mentions_actual_length() {
+        let result = parse_operator_hex("aabb");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("4 characters"), "error must mention actual length, got: {}", msg);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // L. bytes_to_hex / parse_operator_hex roundtrip (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_roundtrip_20_bytes() {
+        let original = "aabbccddeeff00112233aabbccddeeff00112233";
+        let parsed = parse_operator_hex(original);
+        assert!(parsed.is_ok());
+        if let Ok(bytes) = parsed {
+            let re_encoded = bytes_to_hex(&bytes);
+            assert_eq!(re_encoded, original);
+        }
+    }
+
+    #[test]
+    fn hex_roundtrip_preserves_lowercase() {
+        let hex = "abcdef0123456789abcdef0123456789abcdef01";
+        let parsed = parse_operator_hex(hex);
+        assert!(parsed.is_ok());
+        if let Ok(bytes) = parsed {
+            assert_eq!(bytes_to_hex(&bytes), hex);
+        }
+    }
+
+    #[test]
+    fn hex_roundtrip_uppercase_normalizes() {
+        // parse_operator_hex accepts uppercase but bytes_to_hex always returns lowercase
+        let hex = "AABBCCDDEEFF00112233AABBCCDDEEFF00112233";
+        let parsed = parse_operator_hex(hex);
+        assert!(parsed.is_ok());
+        if let Ok(bytes) = parsed {
+            let re_encoded = bytes_to_hex(&bytes);
+            assert_eq!(re_encoded, hex.to_lowercase());
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // M. handle_identity_show / export — nonexistent dir (14B.60)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_nonexistent_dir_errors() {
+        let dir = std::path::Path::new("/tmp/dsdn_nonexistent_14b60_show");
+        let result = handle_identity_show(dir, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn show_json_nonexistent_dir_errors() {
+        let dir = std::path::Path::new("/tmp/dsdn_nonexistent_14b60_show_json");
+        let result = handle_identity_show(dir, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn export_nonexistent_dir_hex_errors() {
+        let dir = std::path::Path::new("/tmp/dsdn_nonexistent_14b60_export");
+        let result = handle_identity_export(dir, "hex");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn export_nonexistent_dir_json_errors() {
+        let dir = std::path::Path::new("/tmp/dsdn_nonexistent_14b60_export_json");
+        let result = handle_identity_export(dir, "json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn export_nonexistent_dir_base64_errors() {
+        let dir = std::path::Path::new("/tmp/dsdn_nonexistent_14b60_export_b64");
+        let result = handle_identity_export(dir, "base64");
+        assert!(result.is_err());
+    }
 }
