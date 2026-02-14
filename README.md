@@ -100,10 +100,10 @@ silahkan buka [DSDN_NODE_OPERATOR_GUIDE](assets/docs/DSDN_NODE_OPERATOR_GUIDE.md
 ## Dokumen
 
 Desain lengkap dan rasional teknis tersedia di whitepaper DSDN  
-(lihat folder `docs/`).
+(lihat folder `assets/docs/`).
 
 Roadmap tahap-tahap development dsdn hingga produksi skala luas:
-lihat [Roadmap](docs/roadmap.md)
+lihat [Roadmap](assets/docs/roadmap.md)
 
 ---
 
