@@ -217,6 +217,7 @@
 //! | `status_tracker`    | Node-side lifecycle state machine with transition validation and audit history (14B.44) |
 //! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
 //! | `rejoin_manager`    | Re-join eligibility, request building, and coordinator response handling (14B.46) |
+//! | `status_notification`| Status notification processing, DA gating event handling, and lifecycle transitions (14B.49) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -596,6 +597,38 @@
 //! and is not sensitive. The secret key is never exposed via any
 //! health reporting path.
 //!
+//! ## Status Notification Handler (14B.49)
+//!
+//! [`StatusNotificationHandler`] is the single entry point for all
+//! coordinator-originated status lifecycle updates on the node.
+//!
+//! ### Event-Driven Lifecycle
+//!
+//! Status changes arrive via two channels:
+//! - **Direct notifications** (`StatusNotification`) processed by `handle()`.
+//! - **DA gating events** (`GatingEvent`) processed by `process_da_gating_events()`.
+//!
+//! ### DA Integration
+//!
+//! `process_da_gating_events` filters events by hex-encoded `node_id`,
+//! maps relevant events to notifications, and applies them sequentially.
+//! Events targeting other nodes are silently skipped. `NodeRejected`
+//! and `NodeBanExpired` events are not processed (informational only).
+//!
+//! ### Deterministic State Transition
+//!
+//! Same tracker state + same notifications → same transitions.
+//! No randomness. No implicit timestamps. Quarantine transitions
+//! are delegated to `QuarantineHandler` for validation. All other
+//! transitions go through `NodeStatusTracker::update_status`.
+//!
+//! ### Safety Invariants
+//!
+//! - No `panic!`, `unwrap()`, `expect()` in production code.
+//! - Mutex is locked only for the duration of each transition.
+//! - On error, no state is changed (atomic: success or no-op).
+//! - Quarantine metadata is cleared on transition away from Quarantined.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -624,6 +657,7 @@ pub mod placement_verifier;
 pub mod quarantine_handler;
 pub mod rejoin_manager;
 pub mod state_sync;
+pub mod status_notification;
 pub mod status_tracker;
 pub mod tls_manager;
 
@@ -651,4 +685,5 @@ pub use join_request::{JoinRequest, JoinRequestBuilder, JoinResponse, JoinError}
 pub use quarantine_handler::QuarantineHandler;
 pub use rejoin_manager::RejoinManager;
 pub use status_tracker::NodeStatusTracker;
+pub use status_notification::{StatusNotificationHandler, StatusNotification};
 pub use tls_manager::{TLSCertManager, TLSError};
