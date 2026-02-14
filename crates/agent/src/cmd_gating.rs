@@ -1,37 +1,35 @@
-//! # Gating CLI Commands (14B.53)
+//! # Gating CLI Commands (14B.53–14B.54)
 //!
 //! Handles gating-related subcommands for the DSDN Agent CLI.
 //!
 //! ## Commands
 //!
 //! - `gating stake-check --address <hex> [--chain-rpc <url>] [--json]`
+//! - `gating register --identity-dir <path> --class <storage|compute>
+//!     --chain-rpc <url> [--keyfile <path>]`
 //!
-//! ## Chain RPC Resolution
+//! ## Chain RPC Resolution (stake-check)
 //!
 //! Endpoint resolution order:
 //! 1. `--chain-rpc <url>` argument (highest priority)
 //! 2. `DSDN_CHAIN_RPC` environment variable
 //! 3. Default: `http://127.0.0.1:8545`
 //!
-//! ## Endpoint
+//! ## Chain RPC (register)
 //!
-//! Calls `GET {chain_rpc}/api/service_node/stake/{operator_hex}`
-//! which maps to `FullNodeRpc::get_service_node_stake` on the chain node.
+//! `--chain-rpc` is REQUIRED. No fallback.
 //!
-//! ## Response Type
+//! ## Endpoints
 //!
-//! Expects JSON matching `ServiceNodeStakeRes` from chain rpc.rs:
-//! ```json
-//! {
-//!   "operator": "0x...",
-//!   "staked_amount": "5000000000000000000000",
-//!   "class": "Storage",
-//!   "meets_minimum": true
-//! }
-//! ```
+//! - stake-check: `GET {chain_rpc}/api/service_node/stake/{operator_hex}`
+//! - register: `POST {chain_rpc}/api/service_node/register`
 
+use std::path::Path;
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use dsdn_node::{IdentityStore, NodeIdentityManager};
+use dsdn_common::gating::IdentityChallenge;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -46,6 +44,9 @@ const ENV_CHAIN_RPC: &str = "DSDN_CHAIN_RPC";
 /// REST path template for service node stake query.
 /// `{}` is replaced with the operator hex address (no 0x prefix).
 const STAKE_ENDPOINT_PATH: &str = "/api/service_node/stake/";
+
+/// REST path for service node registration (POST).
+const REGISTER_ENDPOINT_PATH: &str = "/api/service_node/register";
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RESPONSE TYPE (mirrors chain rpc.rs ServiceNodeStakeRes)
@@ -73,6 +74,34 @@ struct ServiceNodeStakeResponse {
 #[derive(Deserialize, Debug, Clone)]
 struct ChainRpcError {
     code: i64,
+    message: String,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// REGISTER TYPES (14B.54) — mirrors chain rpc.rs RegisterServiceNodeReq
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Request body for POST to chain RPC `/api/service_node/register`.
+///
+/// Field names and types MUST match `RegisterServiceNodeReq` in chain rpc.rs.
+#[derive(Serialize, Debug, Clone)]
+struct RegisterRequest {
+    operator_hex: String,
+    node_id_hex: String,
+    class: String,
+    tls_fingerprint_hex: String,
+    identity_proof_sig_hex: String,
+    secret_hex: String,
+    fee: String,
+}
+
+/// Response from chain RPC `register_service_node`.
+///
+/// Field names MUST match `SubmitTxRes` in chain rpc.rs.
+#[derive(Deserialize, Debug, Clone)]
+struct SubmitTxResponse {
+    success: bool,
+    txid: String,
     message: String,
 }
 
@@ -174,6 +203,171 @@ pub async fn handle_stake_check(
     Ok(())
 }
 
+/// Handles `gating register --identity-dir <path> --class <storage|compute>
+/// --chain-rpc <url> [--keyfile <path>]`.
+///
+/// ## Flow
+///
+/// 1. Load identity from disk (IdentityStore + NodeIdentityManager).
+/// 2. Load TLS fingerprint from identity directory (REQUIRED).
+/// 3. Create IdentityChallenge with current timestamp.
+/// 4. Sign challenge to produce IdentityProof.
+/// 5. Load wallet secret key from keyfile (REQUIRED).
+/// 6. POST registration request to chain RPC.
+/// 7. Display Tx Hash and Status.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Identity directory does not exist or is corrupted.
+/// - TLS fingerprint file is missing or invalid.
+/// - Keyfile is not provided, not found, or contains invalid data.
+/// - Class value is not "storage" or "compute".
+/// - Chain RPC is unreachable or returns an error.
+pub async fn handle_register(
+    identity_dir: &Path,
+    class: &str,
+    chain_rpc: &str,
+    keyfile: Option<&Path>,
+) -> Result<()> {
+    // ── Step 1: Validate class ──────────────────────────────────────────
+    validate_node_class(class)?;
+
+    // ── Step 2: Validate keyfile (REQUIRED per spec) ────────────────────
+    let keyfile_path = keyfile.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--keyfile is required: provide path to wallet secret key file (64 hex chars)",
+        )
+    })?;
+
+    // ── Step 3: Load identity from disk ─────────────────────────────────
+    let store = IdentityStore::new(identity_dir.to_path_buf());
+    if !store.exists() {
+        return Err(anyhow::anyhow!(
+            "no identity found at '{}': run `identity generate --out-dir {}` first",
+            identity_dir.display(),
+            identity_dir.display(),
+        ));
+    }
+
+    let secret = store.load_keypair().map_err(|e| {
+        anyhow::anyhow!("failed to load keypair from '{}': {}", identity_dir.display(), e)
+    })?;
+
+    let operator_stored = store.load_operator_address().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load operator address from '{}': {}",
+            identity_dir.display(),
+            e,
+        )
+    })?;
+
+    let mgr = NodeIdentityManager::from_keypair(secret).map_err(|e| {
+        anyhow::anyhow!("failed to reconstruct identity: {}", e)
+    })?;
+
+    // ── Step 4: Load TLS fingerprint (REQUIRED for registration) ────────
+    let tls_fp_hex = load_tls_fingerprint_hex(identity_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "TLS fingerprint not found at '{}/tls.fp': generate TLS certificate first",
+            identity_dir.display(),
+        )
+    })?;
+
+    // ── Step 5: Create identity proof ───────────────────────────────────
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| anyhow::anyhow!("system clock error: {}", e))?;
+
+    let mut nonce = [0u8; 32];
+    nonce[0..8].copy_from_slice(&timestamp.to_le_bytes());
+
+    let challenge = IdentityChallenge {
+        nonce,
+        timestamp,
+        challenger: "agent-register".to_string(),
+    };
+
+    let proof = mgr.create_identity_proof(challenge);
+
+    // ── Step 6: Load wallet secret from keyfile ─────────────────────────
+    let wallet_secret_hex = load_wallet_keyfile(keyfile_path)?;
+
+    // ── Step 7: Build request body ──────────────────────────────────────
+    let request_body = RegisterRequest {
+        operator_hex: bytes_to_hex(&operator_stored),
+        node_id_hex: bytes_to_hex(mgr.node_id()),
+        class: class.to_lowercase(),
+        tls_fingerprint_hex: tls_fp_hex,
+        identity_proof_sig_hex: bytes_to_hex(&proof.signature),
+        secret_hex: wallet_secret_hex,
+        fee: "0".to_string(),
+    };
+
+    // ── Step 8: POST to chain RPC ───────────────────────────────────────
+    let url = format!(
+        "{}{}",
+        chain_rpc.trim_end_matches('/'),
+        REGISTER_ENDPOINT_PATH,
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to connect to chain RPC at '{}': {}",
+                chain_rpc,
+                e,
+            )
+        })?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response body: {}", e))?;
+
+    if !status.is_success() {
+        if let Ok(rpc_err) = serde_json::from_str::<ChainRpcError>(&body) {
+            return Err(anyhow::anyhow!(
+                "chain RPC error (code {}): {}",
+                rpc_err.code,
+                rpc_err.message,
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "chain RPC returned HTTP {}: {}",
+            status.as_u16(),
+            truncate_body(&body, 200),
+        ));
+    }
+
+    // ── Step 9: Parse and display result ────────────────────────────────
+    let tx_res: SubmitTxResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("failed to parse registration response: {}", e))?;
+
+    if tx_res.success {
+        println!("Tx Hash: {}", tx_res.txid);
+        println!("Status:  submitted");
+    } else {
+        let hash_display = if tx_res.txid.is_empty() { "(none)" } else { &tx_res.txid };
+        println!("Tx Hash: {}", hash_display);
+        println!("Status:  failed");
+        println!("Error:   {}", tx_res.message);
+    }
+
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERNAL: VALIDATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -266,6 +460,82 @@ fn truncate_body(s: &str, max_len: usize) -> String {
         truncated.push_str("...");
         truncated
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: REGISTER HELPERS (14B.54)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Validates node class string.
+///
+/// Accepts "storage" or "compute" (case-insensitive).
+fn validate_node_class(class: &str) -> Result<()> {
+    match class.to_lowercase().as_str() {
+        "storage" | "compute" => Ok(()),
+        _ => Err(anyhow::anyhow!(
+            "invalid class '{}': must be 'storage' or 'compute'",
+            class,
+        )),
+    }
+}
+
+/// Loads wallet secret key hex from a file.
+///
+/// File must contain exactly 64 hex characters (32 bytes).
+/// Leading/trailing whitespace and newlines are trimmed.
+///
+/// ## Errors
+///
+/// - File not found or unreadable.
+/// - Content is not exactly 64 hex characters after trimming.
+fn load_wallet_keyfile(path: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!("failed to read keyfile '{}': {}", path.display(), e)
+    })?;
+
+    let trimmed = raw.trim();
+
+    if trimmed.len() != 64 {
+        return Err(anyhow::anyhow!(
+            "keyfile must contain exactly 64 hex characters (32 bytes), got {} characters in '{}'",
+            trimmed.len(),
+            path.display(),
+        ));
+    }
+
+    if !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "keyfile contains non-hex characters in '{}'",
+            path.display(),
+        ));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+/// Loads TLS fingerprint hex from `<dir>/tls.fp`.
+///
+/// Returns `None` if file is missing, wrong length, or invalid hex.
+/// Does NOT propagate errors — graceful degradation.
+fn load_tls_fingerprint_hex(dir: &Path) -> Option<String> {
+    let path = dir.join("tls.fp");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 {
+        return None;
+    }
+    if !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Converts a byte slice to a lowercase hex string.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -468,5 +738,213 @@ mod tests {
         let hex = "gg".repeat(20);
         let result = handle_stake_check(&hex, None, false).await;
         assert!(result.is_err(), "non-hex must fail before HTTP");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // G. validate_node_class (14B.54)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_class_storage() {
+        assert!(validate_node_class("storage").is_ok());
+    }
+
+    #[test]
+    fn validate_class_compute() {
+        assert!(validate_node_class("compute").is_ok());
+    }
+
+    #[test]
+    fn validate_class_case_insensitive() {
+        assert!(validate_node_class("Storage").is_ok());
+        assert!(validate_node_class("COMPUTE").is_ok());
+    }
+
+    #[test]
+    fn validate_class_invalid() {
+        assert!(validate_node_class("validator").is_err());
+        assert!(validate_node_class("").is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // H. load_wallet_keyfile (14B.54)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_keyfile_valid() {
+        let dir = std::env::temp_dir().join("dsdn_test_keyfile_valid");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("wallet.key");
+        let hex = "aa".repeat(32);
+        std::fs::write(&path, &hex).ok();
+        let result = load_wallet_keyfile(&path);
+        assert!(result.is_ok(), "valid keyfile must parse");
+        let val = result.unwrap_or_default();
+        assert_eq!(val, hex);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_keyfile_with_whitespace() {
+        let dir = std::env::temp_dir().join("dsdn_test_keyfile_ws");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("wallet.key");
+        let hex = "bb".repeat(32);
+        std::fs::write(&path, format!("  {}  \n", hex)).ok();
+        let result = load_wallet_keyfile(&path);
+        assert!(result.is_ok(), "whitespace-trimmed keyfile must parse");
+        let val = result.unwrap_or_default();
+        assert_eq!(val, hex);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_keyfile_wrong_length() {
+        let dir = std::env::temp_dir().join("dsdn_test_keyfile_len");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("wallet.key");
+        std::fs::write(&path, "aabb").ok();
+        assert!(load_wallet_keyfile(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_keyfile_nonhex() {
+        let dir = std::env::temp_dir().join("dsdn_test_keyfile_nonhex");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("wallet.key");
+        std::fs::write(&path, "gg".repeat(32)).ok();
+        assert!(load_wallet_keyfile(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_keyfile_not_found() {
+        let path = std::path::PathBuf::from("/tmp/dsdn_nonexistent_keyfile_12345");
+        assert!(load_wallet_keyfile(&path).is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // I. load_tls_fingerprint_hex (14B.54)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tls_fp_missing_returns_none() {
+        let dir = std::env::temp_dir().join("dsdn_test_tls_miss");
+        std::fs::create_dir_all(&dir).ok();
+        assert!(load_tls_fingerprint_hex(&dir).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tls_fp_valid_returns_some() {
+        let dir = std::env::temp_dir().join("dsdn_test_tls_valid");
+        std::fs::create_dir_all(&dir).ok();
+        let hex = "cc".repeat(32);
+        std::fs::write(dir.join("tls.fp"), &hex).ok();
+        let result = load_tls_fingerprint_hex(&dir);
+        assert_eq!(result.as_deref(), Some(hex.as_str()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tls_fp_wrong_length_returns_none() {
+        let dir = std::env::temp_dir().join("dsdn_test_tls_len");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("tls.fp"), "aabb").ok();
+        assert!(load_tls_fingerprint_hex(&dir).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // J. bytes_to_hex (14B.54)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bytes_to_hex_empty() {
+        assert_eq!(bytes_to_hex(&[]), "");
+    }
+
+    #[test]
+    fn bytes_to_hex_known() {
+        assert_eq!(bytes_to_hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // K. RegisterRequest serialization (14B.54)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn register_request_serializes() {
+        let req = RegisterRequest {
+            operator_hex: "aa".repeat(20),
+            node_id_hex: "bb".repeat(32),
+            class: "storage".to_string(),
+            tls_fingerprint_hex: "cc".repeat(32),
+            identity_proof_sig_hex: "dd".repeat(64),
+            secret_hex: "ee".repeat(32),
+            fee: "0".to_string(),
+        };
+        let json = serde_json::to_string(&req);
+        assert!(json.is_ok(), "RegisterRequest must serialize to JSON");
+    }
+
+    #[test]
+    fn submit_tx_response_deserializes() {
+        let json = r#"{"success": true, "txid": "abc123", "message": "Transaction accepted"}"#;
+        let result = serde_json::from_str::<SubmitTxResponse>(json);
+        assert!(result.is_ok());
+        if let Ok(res) = result {
+            assert!(res.success);
+            assert_eq!(res.txid, "abc123");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // L. handle_register — validation failures (no network)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_invalid_class_errors() {
+        let dir = std::env::temp_dir().join("dsdn_test_reg_class");
+        std::fs::create_dir_all(&dir).ok();
+        let result = handle_register(
+            &dir,
+            "validator",
+            "http://127.0.0.1:8545",
+            Some(std::path::Path::new("/tmp/dummy")),
+        ).await;
+        assert!(result.is_err(), "invalid class must fail before network");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn register_no_keyfile_errors() {
+        let dir = std::env::temp_dir().join("dsdn_test_reg_nokey");
+        std::fs::create_dir_all(&dir).ok();
+        let result = handle_register(
+            &dir,
+            "storage",
+            "http://127.0.0.1:8545",
+            None,
+        ).await;
+        assert!(result.is_err(), "missing keyfile must fail before network");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn register_no_identity_errors() {
+        let dir = std::env::temp_dir().join("dsdn_test_reg_noid");
+        std::fs::create_dir_all(&dir).ok();
+        let keyfile = dir.join("wallet.key");
+        std::fs::write(&keyfile, "aa".repeat(32)).ok();
+        let result = handle_register(
+            &dir,
+            "storage",
+            "http://127.0.0.1:8545",
+            Some(&keyfile),
+        ).await;
+        assert!(result.is_err(), "missing identity must fail before network");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

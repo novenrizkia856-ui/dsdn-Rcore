@@ -46,11 +46,16 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
-//! ### Gating Operations (14B.53)
+//! ### Gating Operations (14B.53–14B.54)
 //! - `gating stake-check`: Check stake status for a service node
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
+//! - `gating register`: Register service node on-chain
+//!   - `--identity-dir`: Path to identity directory (required)
+//!   - `--class`: "storage" or "compute" (required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (required)
+//!   - `--keyfile`: Path to wallet secret key file (optional, errors if missing)
 //!
 //! ## DA Integration
 //!
@@ -368,7 +373,7 @@ enum IdentityCommands {
     },
 }
 
-/// Gating subcommands (14B.53)
+/// Gating subcommands (14B.53–14B.54)
 #[derive(Subcommand)]
 enum GatingCommands {
     /// Check stake status for a service node operator address
@@ -382,6 +387,22 @@ enum GatingCommands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+    },
+
+    /// Register a service node on-chain (14B.54)
+    Register {
+        /// Directory containing identity files (keypair, operator, tls.fp)
+        #[arg(long)]
+        identity_dir: PathBuf,
+        /// Node class: "storage" or "compute"
+        #[arg(long)]
+        class: String,
+        /// Chain RPC endpoint URL (REQUIRED, no default)
+        #[arg(long)]
+        chain_rpc: String,
+        /// Path to wallet secret key file (64 hex chars)
+        #[arg(long)]
+        keyfile: Option<PathBuf>,
     },
 }
 
@@ -1702,6 +1723,19 @@ async fn main() -> Result<()> {
                         &address,
                         chain_rpc.as_deref(),
                         json,
+                    ).await?;
+                }
+                GatingCommands::Register {
+                    identity_dir,
+                    class,
+                    chain_rpc,
+                    keyfile,
+                } => {
+                    cmd_gating::handle_register(
+                        &identity_dir,
+                        &class,
+                        &chain_rpc,
+                        keyfile.as_deref(),
                     ).await?;
                 }
             }

@@ -806,6 +806,44 @@ pub struct ServiceNodeInfoRes {
     pub tls_fingerprint_hex: Option<String>,
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// SERVICE NODE REGISTRATION RPC REQUEST TYPE (14B.54)
+// ════════════════════════════════════════════════════════════════════════════
+// Request struct for service node on-chain registration.
+// Chain node builds, signs, and submits the transaction.
+// Agent only provides parameters and wallet secret.
+//
+// SECURITY:
+// - `secret_hex` is NEVER stored or logged by the server.
+// - All signing is stateless — secret used once then discarded.
+// - Follows the same pattern as `wallet_sign_tx` (13.17.8).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Request for service node registration (14B.54).
+///
+/// Chain RPC endpoint builds `TxPayload::RegisterServiceNode`,
+/// signs with provided wallet secret, and submits to mempool.
+///
+/// Returns `SubmitTxRes` with txid on success.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterServiceNodeReq {
+    /// Operator address (hex, 40 chars, no 0x prefix)
+    pub operator_hex: String,
+    /// Node identity Ed25519 public key (hex, 64 chars = 32 bytes)
+    pub node_id_hex: String,
+    /// Node class: "storage" or "compute" (case-insensitive)
+    pub class: String,
+    /// TLS certificate fingerprint (hex, 64 chars = 32 bytes)
+    pub tls_fingerprint_hex: String,
+    /// Identity proof Ed25519 signature (hex, 128 chars = 64 bytes)
+    pub identity_proof_sig_hex: String,
+    /// Wallet Ed25519 secret key (hex, 64 chars = 32 bytes)
+    /// SECURITY: Never stored or logged by server
+    pub secret_hex: String,
+    /// Transaction fee (u128 as string, smallest unit). "0" if omitted.
+    pub fee: String,
+}
+
 /// RPC handler for public full node operations
 pub struct FullNodeRpc {
     chain: Chain,
@@ -3514,6 +3552,223 @@ SyncRequest::GetChainTip => {
         active.sort_by(|a, b| a.operator_address.as_bytes().cmp(b.operator_address.as_bytes()));
 
         active.iter().map(|record| record_to_info_res(record)).collect()
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // SERVICE NODE REGISTRATION (14B.54)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Builds, signs, and submits a RegisterServiceNode transaction.
+    // Combines the roles of wallet_sign_tx + submit_tx into one call.
+    //
+    // SECURITY:
+    // - Secret key is used for signing then immediately dropped.
+    // - No secret key stored, logged, or persisted.
+    // - Follows wallet_sign_tx (13.17.8) pattern exactly.
+    //
+    // FLOW:
+    // 1. Parse and validate all input fields.
+    // 2. Look up nonce from chain state.
+    // 3. Build TxPayload::RegisterServiceNode.
+    // 4. Create unsigned TxEnvelope.
+    // 5. Sign with provided wallet secret.
+    // 6. Submit via chain.submit_tx().
+    // 7. Return SubmitTxRes with txid.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Register a service node on-chain.
+    ///
+    /// Builds `TxPayload::RegisterServiceNode`, signs with the provided
+    /// wallet secret key, and submits the transaction to the mempool.
+    ///
+    /// # Arguments
+    /// * `req` - Registration request with all required fields.
+    ///
+    /// # Returns
+    /// * `SubmitTxRes` with `success=true` and `txid` if accepted.
+    /// * `SubmitTxRes` with `success=false` and error message if rejected.
+    ///
+    /// # Errors
+    /// * `-32602`: Invalid input (bad hex, wrong length, unknown class).
+    /// * `-32603`: Internal signing or serialization error.
+    ///
+    /// # Security Notes
+    /// - `secret_hex` is NEVER stored or logged.
+    /// - Wallet is reconstructed in-memory, used once, then dropped.
+    /// - Follows the same security model as `wallet_sign_tx`.
+    pub fn register_service_node(
+        &self,
+        req: RegisterServiceNodeReq,
+    ) -> Result<SubmitTxRes, RpcError> {
+        use crate::wallet::Wallet;
+        use crate::tx::{TxEnvelope, TxPayload};
+        use dsdn_common::gating::NodeClass;
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 1: Parse operator address
+        // ─────────────────────────────────────────────────────────
+        let addr_str = req.operator_hex.trim_start_matches("0x");
+        let from = Address::from_hex(addr_str).map_err(|e| RpcError {
+            code: -32602,
+            message: format!("invalid operator address: {}", e),
+        })?;
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 2: Parse node_id (must be 32 bytes)
+        // ─────────────────────────────────────────────────────────
+        let node_id = hex::decode(&req.node_id_hex).map_err(|e| RpcError {
+            code: -32602,
+            message: format!("invalid node_id hex: {}", e),
+        })?;
+        if node_id.len() != 32 {
+            return Err(RpcError {
+                code: -32602,
+                message: format!(
+                    "node_id must be exactly 32 bytes, got {}",
+                    node_id.len(),
+                ),
+            });
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 3: Parse node class
+        // ─────────────────────────────────────────────────────────
+        let class = match req.class.to_lowercase().as_str() {
+            "storage" => NodeClass::Storage,
+            "compute" => NodeClass::Compute,
+            _ => {
+                return Err(RpcError {
+                    code: -32602,
+                    message: format!(
+                        "invalid class '{}': must be 'storage' or 'compute'",
+                        req.class,
+                    ),
+                });
+            }
+        };
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 4: Parse TLS fingerprint (must be 32 bytes)
+        // ─────────────────────────────────────────────────────────
+        let tls_fingerprint = hex::decode(&req.tls_fingerprint_hex).map_err(|e| RpcError {
+            code: -32602,
+            message: format!("invalid tls_fingerprint hex: {}", e),
+        })?;
+        if tls_fingerprint.len() != 32 {
+            return Err(RpcError {
+                code: -32602,
+                message: format!(
+                    "tls_fingerprint must be exactly 32 bytes, got {}",
+                    tls_fingerprint.len(),
+                ),
+            });
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 5: Parse identity proof signature (must be 64 bytes)
+        // ─────────────────────────────────────────────────────────
+        let identity_proof_sig = hex::decode(&req.identity_proof_sig_hex).map_err(|e| RpcError {
+            code: -32602,
+            message: format!("invalid identity_proof_sig hex: {}", e),
+        })?;
+        if identity_proof_sig.len() != 64 {
+            return Err(RpcError {
+                code: -32602,
+                message: format!(
+                    "identity_proof_sig must be exactly 64 bytes, got {}",
+                    identity_proof_sig.len(),
+                ),
+            });
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 6: Parse fee
+        // ─────────────────────────────────────────────────────────
+        let fee: u128 = req.fee.parse().map_err(|e| RpcError {
+            code: -32602,
+            message: format!("invalid fee '{}': {}", req.fee, e),
+        })?;
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 7: Parse wallet secret key (must be 32 bytes)
+        // ─────────────────────────────────────────────────────────
+        let secret_bytes = hex::decode(&req.secret_hex).map_err(|e| RpcError {
+            code: -32602,
+            message: format!("invalid secret key hex: {}", e),
+        })?;
+        if secret_bytes.len() != 32 {
+            return Err(RpcError {
+                code: -32602,
+                message: "secret key must be 32 bytes (64 hex chars)".to_string(),
+            });
+        }
+        let mut secret_arr = [0u8; 32];
+        secret_arr.copy_from_slice(&secret_bytes);
+        let wallet = Wallet::from_secret_key(&secret_arr);
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 8: Get nonce from chain state
+        // ─────────────────────────────────────────────────────────
+        let nonce = {
+            let state = self.chain.state.read();
+            state.get_nonce(&from)
+        };
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 9: Build TxPayload::RegisterServiceNode
+        // ─────────────────────────────────────────────────────────
+        let payload = TxPayload::RegisterServiceNode {
+            from,
+            node_id,
+            class,
+            tls_fingerprint,
+            identity_proof_sig,
+            fee,
+            nonce,
+            gas_limit: 21_000, // MIN_GAS_LIMIT from tx.rs
+        };
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 10: Create unsigned envelope and sign
+        // ─────────────────────────────────────────────────────────
+        let tx = TxEnvelope::new_unsigned(payload);
+        let signed_tx = wallet.sign_tx(&tx).map_err(|e| RpcError {
+            code: -32603,
+            message: format!("transaction signing failed: {}", e),
+        })?;
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 11: Compute txid
+        // ─────────────────────────────────────────────────────────
+        let txid = match signed_tx.compute_txid() {
+            Ok(hash) => hash.to_hex(),
+            Err(e) => {
+                return Ok(SubmitTxRes {
+                    success: false,
+                    txid: String::new(),
+                    message: format!("failed to compute transaction ID: {}", e),
+                });
+            }
+        };
+
+        // ─────────────────────────────────────────────────────────
+        // STEP 12: Submit to chain
+        // ─────────────────────────────────────────────────────────
+        match self.chain.submit_tx(signed_tx) {
+            Ok(()) => {
+                Ok(SubmitTxRes {
+                    success: true,
+                    txid,
+                    message: "Transaction accepted".to_string(),
+                })
+            }
+            Err(e) => {
+                Ok(SubmitTxRes {
+                    success: false,
+                    txid: String::new(),
+                    message: e.to_string(),
+                })
+            }
+        }
     }
 }
 
