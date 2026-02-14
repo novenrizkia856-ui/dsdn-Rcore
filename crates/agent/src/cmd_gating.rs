@@ -1,4 +1,4 @@
-//! # Gating CLI Commands (14B.53–14B.55)
+//! # Gating CLI Commands (14B.53–14B.56)
 //!
 //! Handles gating-related subcommands for the DSDN Agent CLI.
 //!
@@ -8,6 +8,7 @@
 //! - `gating register --identity-dir <path> --class <storage|compute>
 //!     --chain-rpc <url> [--keyfile <path>]`
 //! - `gating status --address <hex> [--chain-rpc <url>] [--json]`
+//! - `gating slashing-status --address <hex> [--chain-rpc <url>] [--json]`
 //!
 //! ## Chain RPC Resolution (stake-check, status)
 //!
@@ -26,6 +27,7 @@
 //! - register: `POST {chain_rpc}/api/service_node/register`
 //! - status (info): `GET {chain_rpc}/api/service_node/info/{operator_hex}`
 //! - status (slashing): `GET {chain_rpc}/api/service_node/slashing/{operator_hex}`
+//! - slashing-status: `GET {chain_rpc}/api/service_node/slashing/{operator_hex}`
 
 use std::path::Path;
 use anyhow::Result;
@@ -146,6 +148,8 @@ struct ServiceNodeInfoResponse {
 /// Field names and types MUST match `ServiceNodeSlashingRes` in chain rpc.rs.
 #[derive(Deserialize, Debug, Clone)]
 struct ServiceNodeSlashingResponse {
+    /// Operator address (hex string with 0x prefix)
+    operator: String,
     /// Whether the node is currently slashed
     is_slashed: bool,
     /// Whether a cooldown period is currently active
@@ -480,6 +484,63 @@ pub async fn handle_status(
     Ok(())
 }
 
+/// Handles `gating slashing-status --address <hex> [--chain-rpc <url>] [--json]`.
+///
+/// Queries chain RPC for slashing & cooldown status of a service node.
+///
+/// ## Parameters
+///
+/// - `address_hex`: Operator address as hex string (40 chars, no 0x prefix).
+/// - `chain_rpc_arg`: Optional chain RPC URL override from CLI.
+/// - `json`: If true, output as JSON.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Address is not valid 40-char hex.
+/// - HTTP request to chain RPC fails.
+/// - Chain RPC returns an error (node not found, invalid address).
+/// - Response JSON does not match expected schema.
+///
+/// ## Notes
+///
+/// Chain `ServiceNodeSlashingRes` does NOT contain `last_slash_height`.
+/// Only available fields: operator, is_slashed, cooldown_active,
+/// cooldown_remaining_secs, slash_count.
+pub async fn handle_slashing_status(
+    address_hex: &str,
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Validate address ────────────────────────────────────────
+    validate_operator_hex(address_hex)?;
+
+    // ── Step 2: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 3: Build HTTP client ───────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 4: Query get_service_node_slashing_status ──────────────────
+    let url = format!("{}{}{}", base, SLASHING_ENDPOINT_PATH, address_hex);
+    let res = query_chain_rpc::<ServiceNodeSlashingResponse>(
+        &client, &url, &chain_rpc, "slashing status",
+    ).await?;
+
+    // ── Step 5: Display ─────────────────────────────────────────────────
+    if json {
+        print_slashing_json(&res);
+    } else {
+        print_slashing_table(&res);
+    }
+
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERNAL: VALIDATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -659,6 +720,93 @@ fn format_cooldown(slashing: Option<&ServiceNodeSlashingResponse>) -> String {
                 }
             }
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (slashing-status, 14B.56)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints slashing status as a text table.
+///
+/// If `slash_count == 0` and no active slashing/cooldown, prints a short
+/// summary instead of full table.
+fn print_slashing_table(res: &ServiceNodeSlashingResponse) {
+    if res.slash_count == 0 && !res.is_slashed && !res.cooldown_active {
+        println!("No slashing events found for {}", res.operator);
+        return;
+    }
+
+    println!("Operator:           {}", res.operator);
+    println!(
+        "Slashed:            {}",
+        if res.is_slashed { "true" } else { "false" },
+    );
+    println!("Slash Count:        {}", res.slash_count);
+    println!(
+        "Cooldown Active:    {}",
+        if res.cooldown_active { "true" } else { "false" },
+    );
+    println!(
+        "Cooldown Remaining: {}",
+        format_cooldown_remaining(res.cooldown_active, res.cooldown_remaining_secs),
+    );
+}
+
+/// Prints slashing status as JSON.
+///
+/// All fields are present. `cooldown_remaining_seconds` is `null` when
+/// not in cooldown.
+fn print_slashing_json(res: &ServiceNodeSlashingResponse) {
+    let cooldown_json = match res.cooldown_remaining_secs {
+        Some(secs) => format!("{}", secs),
+        None => "null".to_string(),
+    };
+
+    println!(
+        "{{\
+        \n  \"operator\": \"{}\",\
+        \n  \"is_slashed\": {},\
+        \n  \"slash_count\": {},\
+        \n  \"cooldown_active\": {},\
+        \n  \"cooldown_remaining_seconds\": {}\
+        \n}}",
+        res.operator,
+        res.is_slashed,
+        res.slash_count,
+        res.cooldown_active,
+        cooldown_json,
+    );
+}
+
+/// Formats cooldown remaining time for table display.
+///
+/// Returns:
+/// - `"No cooldown"` if cooldown not active
+/// - `"X hours Y minutes"` if cooldown active with known duration (hours > 0)
+/// - `"Y minutes"` if cooldown active with known duration (hours == 0, min > 0)
+/// - `"Z seconds"` if cooldown active with known duration (< 1 minute)
+/// - `"Active (unknown duration)"` if cooldown active but no seconds
+///
+/// All arithmetic is overflow-safe (u64 division, no panics).
+fn format_cooldown_remaining(active: bool, remaining_secs: Option<u64>) -> String {
+    if !active {
+        return "No cooldown".to_string();
+    }
+
+    match remaining_secs {
+        Some(secs) => {
+            let hours = secs / 3600;
+            let minutes = (secs % 3600) / 60;
+            if hours > 0 {
+                format!("{} hours {} minutes", hours, minutes)
+            } else if minutes > 0 {
+                format!("{} minutes", minutes)
+            } else {
+                format!("{} seconds", secs)
+            }
+        }
+        None => "Active (unknown duration)".to_string(),
     }
 }
 
@@ -1357,6 +1505,7 @@ mod tests {
     #[test]
     fn cooldown_none_when_inactive() {
         let s = ServiceNodeSlashingResponse {
+            operator: "0xaaaa".to_string(),
             is_slashed: false,
             cooldown_active: false,
             cooldown_remaining_secs: None,
@@ -1368,6 +1517,7 @@ mod tests {
     #[test]
     fn cooldown_with_remaining() {
         let s = ServiceNodeSlashingResponse {
+            operator: "0xaaaa".to_string(),
             is_slashed: true,
             cooldown_active: true,
             cooldown_remaining_secs: Some(7200),
@@ -1379,6 +1529,7 @@ mod tests {
     #[test]
     fn cooldown_active_no_duration() {
         let s = ServiceNodeSlashingResponse {
+            operator: "0xaaaa".to_string(),
             is_slashed: true,
             cooldown_active: true,
             cooldown_remaining_secs: None,
@@ -1403,6 +1554,7 @@ mod tests {
             tls_fingerprint_hex: Some("cc".repeat(32)),
         };
         let slashing = ServiceNodeSlashingResponse {
+            operator: "0xaaaa".to_string(),
             is_slashed: false,
             cooldown_active: false,
             cooldown_remaining_secs: None,
@@ -1437,6 +1589,7 @@ mod tests {
             tls_fingerprint_hex: None,
         };
         let slashing = ServiceNodeSlashingResponse {
+            operator: "0xaaaa".to_string(),
             is_slashed: true,
             cooldown_active: true,
             cooldown_remaining_secs: Some(3600),
@@ -1466,6 +1619,147 @@ mod tests {
     async fn status_nonhex_errors() {
         let hex = "gg".repeat(20);
         let result = handle_status(&hex, None, false).await;
+        assert!(result.is_err(), "non-hex must fail before HTTP");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // S. print_slashing_table / print_slashing_json smoke tests (14B.56)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_slashing_table_no_events() {
+        let res = ServiceNodeSlashingResponse {
+            operator: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            is_slashed: false,
+            cooldown_active: false,
+            cooldown_remaining_secs: None,
+            slash_count: 0,
+        };
+        // Must print "No slashing events found" and not panic
+        print_slashing_table(&res);
+    }
+
+    #[test]
+    fn print_slashing_table_active_slash() {
+        let res = ServiceNodeSlashingResponse {
+            operator: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            is_slashed: true,
+            cooldown_active: true,
+            cooldown_remaining_secs: Some(7200),
+            slash_count: 2,
+        };
+        print_slashing_table(&res);
+    }
+
+    #[test]
+    fn print_slashing_json_no_events() {
+        let res = ServiceNodeSlashingResponse {
+            operator: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            is_slashed: false,
+            cooldown_active: false,
+            cooldown_remaining_secs: None,
+            slash_count: 0,
+        };
+        // Must output valid JSON even with no events
+        print_slashing_json(&res);
+    }
+
+    #[test]
+    fn print_slashing_json_active_cooldown() {
+        let res = ServiceNodeSlashingResponse {
+            operator: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            is_slashed: true,
+            cooldown_active: true,
+            cooldown_remaining_secs: Some(3600),
+            slash_count: 5,
+        };
+        print_slashing_json(&res);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // T. format_cooldown_remaining (14B.56)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cooldown_remaining_not_active() {
+        assert_eq!(format_cooldown_remaining(false, None), "No cooldown");
+    }
+
+    #[test]
+    fn cooldown_remaining_not_active_with_secs() {
+        // Even if secs present, if not active → "No cooldown"
+        assert_eq!(format_cooldown_remaining(false, Some(3600)), "No cooldown");
+    }
+
+    #[test]
+    fn cooldown_remaining_hours_and_minutes() {
+        assert_eq!(
+            format_cooldown_remaining(true, Some(7200)),
+            "2 hours 0 minutes",
+        );
+    }
+
+    #[test]
+    fn cooldown_remaining_mixed() {
+        assert_eq!(
+            format_cooldown_remaining(true, Some(5400)),
+            "1 hours 30 minutes",
+        );
+    }
+
+    #[test]
+    fn cooldown_remaining_minutes_only() {
+        assert_eq!(
+            format_cooldown_remaining(true, Some(300)),
+            "5 minutes",
+        );
+    }
+
+    #[test]
+    fn cooldown_remaining_seconds_only() {
+        assert_eq!(
+            format_cooldown_remaining(true, Some(45)),
+            "45 seconds",
+        );
+    }
+
+    #[test]
+    fn cooldown_remaining_zero() {
+        assert_eq!(
+            format_cooldown_remaining(true, Some(0)),
+            "0 seconds",
+        );
+    }
+
+    #[test]
+    fn cooldown_remaining_unknown() {
+        assert_eq!(
+            format_cooldown_remaining(true, None),
+            "Active (unknown duration)",
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // U. handle_slashing_status — validation failures (no network, 14B.56)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn slashing_status_invalid_address_errors() {
+        let result = handle_slashing_status("short", None, false).await;
+        assert!(result.is_err(), "invalid address must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn slashing_status_0x_prefix_errors() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = handle_slashing_status(&hex, None, false).await;
+        assert!(result.is_err(), "0x prefix must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn slashing_status_nonhex_errors() {
+        let hex = "gg".repeat(20);
+        let result = handle_slashing_status(&hex, None, false).await;
         assert!(result.is_err(), "non-hex must fail before HTTP");
     }
 }

@@ -46,7 +46,7 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
-//! ### Gating Operations (14B.53–14B.55)
+//! ### Gating Operations (14B.53–14B.56)
 //! - `gating stake-check`: Check stake status for a service node
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
@@ -57,6 +57,10 @@
 //!   - `--chain-rpc`: Chain RPC endpoint URL (required)
 //!   - `--keyfile`: Path to wallet secret key file (optional, errors if missing)
 //! - `gating status`: Query full gating status of a service node
+//!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//! - `gating slashing-status`: Query slashing & cooldown status
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
@@ -377,7 +381,7 @@ enum IdentityCommands {
     },
 }
 
-/// Gating subcommands (14B.53–14B.55)
+/// Gating subcommands (14B.53–14B.56)
 #[derive(Subcommand)]
 enum GatingCommands {
     /// Check stake status for a service node operator address
@@ -411,6 +415,19 @@ enum GatingCommands {
 
     /// Query full gating status of a service node (14B.55)
     Status {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Query slashing & cooldown status of a service node (14B.56)
+    SlashingStatus {
         /// Operator address (40 hex characters, no 0x prefix)
         #[arg(long)]
         address: String,
@@ -1757,6 +1774,13 @@ async fn main() -> Result<()> {
                 }
                 GatingCommands::Status { address, chain_rpc, json } => {
                     cmd_gating::handle_status(
+                        &address,
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
+                }
+                GatingCommands::SlashingStatus { address, chain_rpc, json } => {
+                    cmd_gating::handle_slashing_status(
                         &address,
                         chain_rpc.as_deref(),
                         json,
