@@ -35,6 +35,11 @@
 //! - `health coordinator`: Check coordinator health only
 //! - `health nodes`: Check all nodes health
 //!
+//! ### Identity Management (14B.51)
+//! - `identity generate`: Generate Ed25519 identity keypair
+//!   - `--out-dir`: Persist to disk
+//!   - `--operator`: Override operator address (40 hex chars)
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -54,6 +59,7 @@ mod cmd_verify;
 mod cmd_chunk;
 mod cmd_rebuild;
 mod cmd_health;
+mod cmd_identity;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -183,6 +189,12 @@ enum Commands {
         #[command(subcommand)]
         health_cmd: HealthCommands,
     },
+
+    /// Node identity management (14B.51)
+    Identity {
+        #[command(subcommand)]
+        identity_cmd: IdentityCommands,
+    },
 }
 
 /// DA layer subcommands
@@ -301,6 +313,20 @@ enum HealthCommands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Identity management subcommands (14B.51)
+#[derive(Subcommand)]
+enum IdentityCommands {
+    /// Generate a new Ed25519 identity keypair
+    Generate {
+        /// Persist identity to this directory (creates if missing)
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Override operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        operator: Option<String>,
     },
 }
 
@@ -1594,6 +1620,17 @@ async fn main() -> Result<()> {
             // Exit code: 0 = healthy, 1 = unhealthy/degraded
             if !is_healthy {
                 std::process::exit(1);
+            }
+        }
+
+        Commands::Identity { identity_cmd } => {
+            match identity_cmd {
+                IdentityCommands::Generate { out_dir, operator } => {
+                    cmd_identity::handle_identity_generate(
+                        out_dir.as_deref(),
+                        operator.as_deref(),
+                    )?;
+                }
             }
         }
     }
