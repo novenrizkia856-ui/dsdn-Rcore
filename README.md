@@ -102,9 +102,27 @@ silahkan buka [DSDN_NODE_OPERATOR_GUIDE](assets/docs/DSDN_NODE_OPERATOR_GUIDE.md
 Desain lengkap dan rasional teknis tersedia di whitepaper DSDN  
 (lihat folder `docs/`).
 
-## bahasa program
+---
 
-dsdn menggabungkan rust dan rusts+, rust dan rusts+ di niatkan menjadi bahasa utama di dsdn, rusts+ adalah bahasa dengan backend rust dengan aturan tambahan dan sintaks berbeda, digunakan di berbagai tempat, agar dsdn makin aman secara logic dan bug
+## CLI Usage
+
+DSDN terdiri dari beberapa komponen utama yang dapat dijalankan melalui CLI:
+
+- `chain` → Blockchain Nusantara
+- `node` → Storage & Compute node
+- `storage` → Storage engine & chunk handling
+
+Detail penggunaan tersedia di:
+
+- [Chain CLI Guide](crates/chain/README.md)
+- [Node CLI Guide](crates/node/README.md)
+- [Storage Guide](crates/storage/README.md)
+
+---
+
+## Bahasa program
+
+DSDN menggabungkan Rust dan Rusts+, Rust dan Rusts+ di niatkan menjadi bahasa utama di DSDN, Rusts+ adalah bahasa dengan backend Rust dengan aturan tambahan dan sintaks berbeda, digunakan di berbagai tempat, agar dsdn makin aman secara logic dan bug
 
 dsdn harus menggunakan cargo rustsp
 
