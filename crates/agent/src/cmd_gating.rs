@@ -1,4 +1,4 @@
-//! # Gating CLI Commands (14B.53–14B.58)
+//! # Gating CLI Commands (14B.53–14B.59)
 //!
 //! Handles gating-related subcommands for the DSDN Agent CLI.
 //!
@@ -13,6 +13,7 @@
 //! - `gating list-active [--chain-rpc <url>] [--json]`
 //! - `gating quarantine-status --address <hex> [--chain-rpc <url>] [--json]`
 //! - `gating ban-status --address <hex> [--chain-rpc <url>] [--json]`
+//! - `gating diagnose --address <hex> [--identity-dir <path>] [--chain-rpc <url>] [--json]`
 //!
 //! ## Chain RPC Resolution (stake-check, status)
 //!
@@ -37,6 +38,7 @@
 //! - list-active: `GET {chain_rpc}/api/service_node/active`
 //! - quarantine-status: `GET {chain_rpc}/api/service_node/quarantine/{operator_hex}`
 //! - ban-status: `GET {chain_rpc}/api/service_node/ban/{operator_hex}`
+//! - diagnose: queries stake + class + slashing + info endpoints combined
 
 use std::path::Path;
 use anyhow::Result;
@@ -246,6 +248,41 @@ struct BanStatusResponse {
     cooldown_until: Option<u64>,
     /// Seconds remaining in cooldown (0 if expired or not banned)
     cooldown_remaining_secs: u64,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DIAGNOSIS TYPES (14B.59)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Result of a single gating check within a diagnosis.
+///
+/// `pass` is tri-state:
+/// - `Some(true)` → check passed (✅)
+/// - `Some(false)` → check failed (❌)
+/// - `None` → check was skipped (⏭)
+///
+/// Skipped checks do NOT count as failures in the final decision.
+#[derive(Clone, Debug, Serialize)]
+struct DiagnosisCheck {
+    /// Check name (e.g. "Stake", "Class", "Identity", "TLS", "Cooldown")
+    name: String,
+    /// Pass/fail/skip tri-state
+    pass: Option<bool>,
+    /// Human-readable detail string
+    detail: String,
+}
+
+/// Aggregated diagnosis report.
+#[derive(Clone, Debug, Serialize)]
+struct DiagnosisReport {
+    /// Operator address (hex with 0x prefix from chain)
+    operator: String,
+    /// All checks in evaluation order
+    checks: Vec<DiagnosisCheck>,
+    /// Number of checks where pass == Some(false)
+    failed_count: usize,
+    /// "APPROVED" if failed_count == 0, else "REJECTED"
+    decision: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -835,6 +872,276 @@ pub async fn handle_ban_status(
     Ok(())
 }
 
+/// Handles `gating diagnose --address <hex> [--identity-dir <path>]
+///   [--chain-rpc <url>] [--json]`.
+///
+/// Performs full gating diagnosis by querying chain RPC for node state
+/// and optionally loading local identity for cross-verification.
+///
+/// ## Checks
+///
+/// 1. **Stake**: current_stake >= minimum for class
+/// 2. **Class**: class is valid ("Storage" or "Compute")
+/// 3. **Identity**: local node_id matches chain (SKIPPED if no --identity-dir)
+/// 4. **TLS**: local fingerprint matches chain (SKIPPED if unavailable)
+/// 5. **Cooldown**: no active cooldown period
+///
+/// ## Decision
+///
+/// - APPROVED if all non-skipped checks pass
+/// - REJECTED if any check fails
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Address is not valid 40-char hex.
+/// - Any chain RPC query fails.
+/// - Identity directory is provided but invalid.
+pub async fn handle_diagnose(
+    address_hex: &str,
+    identity_dir: Option<&Path>,
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Validate address ────────────────────────────────────────
+    validate_operator_hex(address_hex)?;
+
+    // ── Step 2: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 3: Build HTTP client ───────────────────────────────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 4: Query chain RPC endpoints ───────────────────────────────
+    let stake_url = format!("{}{}{}", base, STAKE_ENDPOINT_PATH, address_hex);
+    let stake_res = query_chain_rpc::<ServiceNodeStakeResponse>(
+        &client, &stake_url, &chain_rpc, "stake info",
+    ).await?;
+
+    let class_url = format!("{}{}{}", base, CLASS_ENDPOINT_PATH, address_hex);
+    let class_res = query_chain_rpc::<ServiceNodeClassResponse>(
+        &client, &class_url, &chain_rpc, "node class",
+    ).await?;
+
+    let slashing_url = format!("{}{}{}", base, SLASHING_ENDPOINT_PATH, address_hex);
+    let slashing_res = query_chain_rpc::<ServiceNodeSlashingResponse>(
+        &client, &slashing_url, &chain_rpc, "slashing status",
+    ).await?;
+
+    let info_url = format!("{}{}{}", base, INFO_ENDPOINT_PATH, address_hex);
+    let info_res = query_chain_rpc::<ServiceNodeInfoResponse>(
+        &client, &info_url, &chain_rpc, "node info",
+    ).await?;
+
+    // ── Step 5: Build checks ────────────────────────────────────────────
+    let mut checks: Vec<DiagnosisCheck> = Vec::with_capacity(5);
+
+    // CHECK 1 — Stake
+    checks.push(DiagnosisCheck {
+        name: "Stake".to_string(),
+        pass: Some(stake_res.meets_minimum),
+        detail: format!(
+            "{} {} {}",
+            stake_res.staked_amount,
+            if stake_res.meets_minimum { ">=" } else { "<" },
+            class_res.min_stake_required,
+        ),
+    });
+
+    // CHECK 2 — Class Validity
+    let class_valid = stake_res.class == "Storage" || stake_res.class == "Compute";
+    checks.push(DiagnosisCheck {
+        name: "Class".to_string(),
+        pass: Some(class_valid && stake_res.meets_minimum),
+        detail: if class_valid {
+            format!("{} valid", stake_res.class)
+        } else {
+            format!("{} invalid", stake_res.class)
+        },
+    });
+
+    // CHECK 3 — Identity
+    match identity_dir {
+        Some(dir) => {
+            let identity_check = run_identity_check(dir, &info_res)?;
+            checks.push(identity_check);
+        }
+        None => {
+            checks.push(DiagnosisCheck {
+                name: "Identity".to_string(),
+                pass: None,
+                detail: "Not provided".to_string(),
+            });
+        }
+    }
+
+    // CHECK 4 — TLS
+    match identity_dir {
+        Some(dir) => {
+            let tls_check = run_tls_check(dir, &info_res);
+            checks.push(tls_check);
+        }
+        None => {
+            checks.push(DiagnosisCheck {
+                name: "TLS".to_string(),
+                pass: None,
+                detail: "Not provided".to_string(),
+            });
+        }
+    }
+
+    // CHECK 5 — Cooldown / Slashing
+    let cooldown_pass = !slashing_res.cooldown_active
+        || slashing_res.cooldown_remaining_secs == Some(0);
+    checks.push(DiagnosisCheck {
+        name: "Cooldown".to_string(),
+        pass: Some(cooldown_pass),
+        detail: if !slashing_res.cooldown_active {
+            "No active cooldown".to_string()
+        } else {
+            match slashing_res.cooldown_remaining_secs {
+                Some(0) => "Cooldown expired".to_string(),
+                Some(secs) => format!("Cooldown active: {} remaining", format_duration_human(secs)),
+                None => "Cooldown active (unknown duration)".to_string(),
+            }
+        },
+    });
+
+    // ── Step 6: Compute decision ────────────────────────────────────────
+    let failed_count = checks.iter()
+        .filter(|c| c.pass == Some(false))
+        .count();
+
+    let decision = if failed_count == 0 {
+        "APPROVED".to_string()
+    } else {
+        "REJECTED".to_string()
+    };
+
+    let report = DiagnosisReport {
+        operator: stake_res.operator.clone(),
+        checks,
+        failed_count,
+        decision,
+    };
+
+    // ── Step 7: Display ─────────────────────────────────────────────────
+    if json {
+        print_diagnose_json(&report);
+    } else {
+        print_diagnose_table(&report);
+    }
+
+    Ok(())
+}
+
+/// Runs identity check: verifies local node_id matches chain record.
+///
+/// Loads identity from `IdentityStore` at the given directory, reconstructs
+/// `NodeIdentityManager`, and compares the local node ID (hex) against the
+/// chain's `node_id_hex` from `ServiceNodeInfoResponse`.
+///
+/// Returns a `DiagnosisCheck` with pass/fail.
+///
+/// ## Errors
+///
+/// Returns `Err` if identity directory is provided but cannot be loaded
+/// (missing, corrupted, invalid keypair). This is an explicit error, not
+/// a silent skip.
+fn run_identity_check(
+    dir: &Path,
+    info_res: &ServiceNodeInfoResponse,
+) -> Result<DiagnosisCheck> {
+    let store = IdentityStore::new(dir.to_path_buf());
+
+    if !store.exists() {
+        return Err(anyhow::anyhow!(
+            "identity directory '{}' does not contain a valid identity: \
+             run `identity generate --out-dir {}` first",
+            dir.display(),
+            dir.display(),
+        ));
+    }
+
+    let secret = store.load_keypair().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load keypair from '{}': {}",
+            dir.display(),
+            e,
+        )
+    })?;
+
+    let mgr = NodeIdentityManager::from_keypair(secret).map_err(|e| {
+        anyhow::anyhow!("failed to reconstruct identity: {}", e)
+    })?;
+
+    let local_node_id = bytes_to_hex(mgr.node_id());
+    let chain_node_id = &info_res.node_id_hex;
+
+    let id_matches = local_node_id == *chain_node_id;
+
+    Ok(DiagnosisCheck {
+        name: "Identity".to_string(),
+        pass: Some(id_matches),
+        detail: if id_matches {
+            "Node ID matches chain".to_string()
+        } else {
+            format!(
+                "Node ID mismatch: local={} chain={}",
+                truncate_node_id(&local_node_id),
+                truncate_node_id(chain_node_id),
+            )
+        },
+    })
+}
+
+/// Runs TLS check: verifies local fingerprint matches chain record.
+///
+/// Loads TLS fingerprint from `{dir}/tls.fp`. If file doesn't exist or
+/// chain has no TLS fingerprint, the check is SKIPPED (not failed).
+fn run_tls_check(
+    dir: &Path,
+    info_res: &ServiceNodeInfoResponse,
+) -> DiagnosisCheck {
+    let local_fp = match load_tls_fingerprint_hex(dir) {
+        Some(fp) => fp,
+        None => {
+            return DiagnosisCheck {
+                name: "TLS".to_string(),
+                pass: None,
+                detail: "No local TLS fingerprint".to_string(),
+            };
+        }
+    };
+
+    let chain_fp = match &info_res.tls_fingerprint_hex {
+        Some(fp) => fp,
+        None => {
+            return DiagnosisCheck {
+                name: "TLS".to_string(),
+                pass: None,
+                detail: "No TLS fingerprint on chain".to_string(),
+            };
+        }
+    };
+
+    let fp_matches = local_fp == *chain_fp;
+
+    DiagnosisCheck {
+        name: "TLS".to_string(),
+        pass: Some(fp_matches),
+        detail: if fp_matches {
+            "Fingerprint matches chain".to_string()
+        } else {
+            "Fingerprint mismatch".to_string()
+        },
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERNAL: VALIDATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1398,6 +1705,112 @@ fn format_duration_human(secs: u64) -> String {
     } else {
         format!("{} seconds", secs)
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (diagnose, 14B.59)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints diagnosis report as an ASCII-box table with icons.
+///
+/// Icon rules:
+/// - `Some(true)` → ✅
+/// - `Some(false)` → ❌
+/// - `None` → ⏭
+fn print_diagnose_table(report: &DiagnosisReport) {
+    println!("┌──────────────────────────────────────────┐");
+    println!("│         GATING DIAGNOSIS REPORT          │");
+    println!("├──────────────┬───────┬───────────────────┤");
+    println!("│ Check        │ Pass  │ Detail            │");
+    println!("├──────────────┼───────┼───────────────────┤");
+
+    for check in &report.checks {
+        let icon = match check.pass {
+            Some(true) => " ✅ ",
+            Some(false) => " ❌ ",
+            None => " ⏭  ",
+        };
+        // Truncate detail to fit column (max ~18 chars for alignment)
+        let detail_display = if check.detail.len() > 18 {
+            let mut s = check.detail[..15].to_string();
+            s.push_str("...");
+            s
+        } else {
+            check.detail.clone()
+        };
+        println!(
+            "│ {:<12} │ {} │ {:<17} │",
+            check.name, icon, detail_display,
+        );
+    }
+
+    println!("├──────────────┴───────┴───────────────────┤");
+    if report.failed_count == 0 {
+        println!("│ DECISION: APPROVED                       │");
+    } else {
+        println!(
+            "│ DECISION: REJECTED ({} failed){} │",
+            report.failed_count,
+            " ".repeat(14_usize.saturating_sub(
+                format!("{}", report.failed_count).len() + 8
+            )),
+        );
+    }
+    println!("└──────────────────────────────────────────┘");
+
+    // Also print full details below the box for readability
+    println!();
+    println!("Operator: {}", report.operator);
+    for check in &report.checks {
+        let icon = match check.pass {
+            Some(true) => "PASS",
+            Some(false) => "FAIL",
+            None => "SKIP",
+        };
+        println!("  [{}] {}: {}", icon, check.name, check.detail);
+    }
+}
+
+/// Prints diagnosis report as JSON.
+///
+/// Structure:
+/// ```json
+/// {
+///   "operator": "0x...",
+///   "checks": [...],
+///   "failed_count": N,
+///   "decision": "APPROVED"|"REJECTED"
+/// }
+/// ```
+fn print_diagnose_json(report: &DiagnosisReport) {
+    println!("{{");
+    println!("  \"operator\": \"{}\",", report.operator);
+    println!("  \"checks\": [");
+
+    for (i, check) in report.checks.iter().enumerate() {
+        let pass_json = match check.pass {
+            Some(true) => "true".to_string(),
+            Some(false) => "false".to_string(),
+            None => "null".to_string(),
+        };
+        let comma = if i + 1 < report.checks.len() { "," } else { "" };
+        println!(
+            "    {{\
+            \n      \"name\": \"{}\",\
+            \n      \"pass\": {},\
+            \n      \"detail\": \"{}\"\
+            \n    }}{}",
+            check.name,
+            pass_json,
+            check.detail,
+            comma,
+        );
+    }
+
+    println!("  ],");
+    println!("  \"failed_count\": {},", report.failed_count);
+    println!("  \"decision\": \"{}\"", report.decision);
+    println!("}}");
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2791,6 +3204,270 @@ mod tests {
     async fn ban_status_nonhex_errors() {
         let hex = "gg".repeat(20);
         let result = handle_ban_status(&hex, None, false).await;
+        assert!(result.is_err(), "non-hex must fail before HTTP");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AH. DiagnosisCheck / DiagnosisReport construction (14B.59)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diagnosis_check_pass() {
+        let check = DiagnosisCheck {
+            name: "Stake".to_string(),
+            pass: Some(true),
+            detail: "5000 >= 5000".to_string(),
+        };
+        assert_eq!(check.pass, Some(true));
+    }
+
+    #[test]
+    fn diagnosis_check_fail() {
+        let check = DiagnosisCheck {
+            name: "Stake".to_string(),
+            pass: Some(false),
+            detail: "100 < 5000".to_string(),
+        };
+        assert_eq!(check.pass, Some(false));
+    }
+
+    #[test]
+    fn diagnosis_check_skipped() {
+        let check = DiagnosisCheck {
+            name: "Identity".to_string(),
+            pass: None,
+            detail: "Not provided".to_string(),
+        };
+        assert!(check.pass.is_none());
+    }
+
+    #[test]
+    fn diagnosis_report_approved() {
+        let checks = vec![
+            DiagnosisCheck {
+                name: "Stake".to_string(),
+                pass: Some(true),
+                detail: "5000 >= 5000".to_string(),
+            },
+            DiagnosisCheck {
+                name: "Class".to_string(),
+                pass: Some(true),
+                detail: "Storage valid".to_string(),
+            },
+            DiagnosisCheck {
+                name: "Identity".to_string(),
+                pass: None,
+                detail: "Not provided".to_string(),
+            },
+            DiagnosisCheck {
+                name: "TLS".to_string(),
+                pass: None,
+                detail: "Not provided".to_string(),
+            },
+            DiagnosisCheck {
+                name: "Cooldown".to_string(),
+                pass: Some(true),
+                detail: "No active cooldown".to_string(),
+            },
+        ];
+        let failed = checks.iter().filter(|c| c.pass == Some(false)).count();
+        assert_eq!(failed, 0);
+        let decision = if failed == 0 { "APPROVED" } else { "REJECTED" };
+        assert_eq!(decision, "APPROVED");
+    }
+
+    #[test]
+    fn diagnosis_report_rejected() {
+        let checks = vec![
+            DiagnosisCheck {
+                name: "Stake".to_string(),
+                pass: Some(false),
+                detail: "100 < 5000".to_string(),
+            },
+            DiagnosisCheck {
+                name: "Identity".to_string(),
+                pass: None,
+                detail: "Not provided".to_string(),
+            },
+        ];
+        let failed = checks.iter().filter(|c| c.pass == Some(false)).count();
+        assert_eq!(failed, 1);
+        let decision = if failed == 0 { "APPROVED" } else { "REJECTED" };
+        assert_eq!(decision, "REJECTED");
+    }
+
+    #[test]
+    fn diagnosis_skipped_not_counted_as_fail() {
+        let checks = vec![
+            DiagnosisCheck {
+                name: "Stake".to_string(),
+                pass: Some(true),
+                detail: "ok".to_string(),
+            },
+            DiagnosisCheck {
+                name: "Identity".to_string(),
+                pass: None,
+                detail: "skipped".to_string(),
+            },
+            DiagnosisCheck {
+                name: "TLS".to_string(),
+                pass: None,
+                detail: "skipped".to_string(),
+            },
+        ];
+        let failed = checks.iter().filter(|c| c.pass == Some(false)).count();
+        assert_eq!(failed, 0);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AI. print_diagnose smoke tests (14B.59)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_diagnose_table_approved() {
+        let report = DiagnosisReport {
+            operator: "0xaaaa".to_string(),
+            checks: vec![
+                DiagnosisCheck { name: "Stake".to_string(), pass: Some(true), detail: "5000 >= 5000".to_string() },
+                DiagnosisCheck { name: "Class".to_string(), pass: Some(true), detail: "Storage valid".to_string() },
+                DiagnosisCheck { name: "Identity".to_string(), pass: None, detail: "Not provided".to_string() },
+                DiagnosisCheck { name: "TLS".to_string(), pass: None, detail: "Not provided".to_string() },
+                DiagnosisCheck { name: "Cooldown".to_string(), pass: Some(true), detail: "No active cooldown".to_string() },
+            ],
+            failed_count: 0,
+            decision: "APPROVED".to_string(),
+        };
+        print_diagnose_table(&report);
+    }
+
+    #[test]
+    fn print_diagnose_table_rejected() {
+        let report = DiagnosisReport {
+            operator: "0xbbbb".to_string(),
+            checks: vec![
+                DiagnosisCheck { name: "Stake".to_string(), pass: Some(false), detail: "100 < 5000".to_string() },
+                DiagnosisCheck { name: "Class".to_string(), pass: Some(true), detail: "Compute valid".to_string() },
+                DiagnosisCheck { name: "Identity".to_string(), pass: Some(false), detail: "Node ID mismatch".to_string() },
+                DiagnosisCheck { name: "TLS".to_string(), pass: Some(true), detail: "Fingerprint matches".to_string() },
+                DiagnosisCheck { name: "Cooldown".to_string(), pass: Some(true), detail: "No active cooldown".to_string() },
+            ],
+            failed_count: 2,
+            decision: "REJECTED".to_string(),
+        };
+        print_diagnose_table(&report);
+    }
+
+    #[test]
+    fn print_diagnose_json_no_panic() {
+        let report = DiagnosisReport {
+            operator: "0xaaaa".to_string(),
+            checks: vec![
+                DiagnosisCheck { name: "Stake".to_string(), pass: Some(true), detail: "5000 >= 5000".to_string() },
+                DiagnosisCheck { name: "Identity".to_string(), pass: None, detail: "Not provided".to_string() },
+            ],
+            failed_count: 0,
+            decision: "APPROVED".to_string(),
+        };
+        print_diagnose_json(&report);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AJ. run_tls_check (14B.59)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tls_check_no_local_fp() {
+        let dir = std::env::temp_dir().join("dsdn_test_no_tls_fp");
+        let _ = std::fs::create_dir_all(&dir);
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 1,
+            tls_fingerprint_hex: Some("cc".repeat(32)),
+        };
+        let check = run_tls_check(&dir, &info);
+        assert!(check.pass.is_none(), "missing local fp should be SKIPPED");
+    }
+
+    #[test]
+    fn tls_check_no_chain_fp() {
+        let dir = std::env::temp_dir().join("dsdn_test_tls_no_chain");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("tls.fp"), "aa".repeat(32));
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 1,
+            tls_fingerprint_hex: None,
+        };
+        let check = run_tls_check(&dir, &info);
+        assert!(check.pass.is_none(), "missing chain fp should be SKIPPED");
+    }
+
+    #[test]
+    fn tls_check_match() {
+        let dir = std::env::temp_dir().join("dsdn_test_tls_match");
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = "aa".repeat(32);
+        let _ = std::fs::write(dir.join("tls.fp"), &fp);
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 1,
+            tls_fingerprint_hex: Some(fp.clone()),
+        };
+        let check = run_tls_check(&dir, &info);
+        assert_eq!(check.pass, Some(true));
+    }
+
+    #[test]
+    fn tls_check_mismatch() {
+        let dir = std::env::temp_dir().join("dsdn_test_tls_mismatch");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("tls.fp"), "aa".repeat(32));
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 1,
+            tls_fingerprint_hex: Some("cc".repeat(32)),
+        };
+        let check = run_tls_check(&dir, &info);
+        assert_eq!(check.pass, Some(false));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // AK. handle_diagnose — validation failures (14B.59)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn diagnose_invalid_address_errors() {
+        let result = handle_diagnose("short", None, None, false).await;
+        assert!(result.is_err(), "invalid address must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn diagnose_0x_prefix_errors() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = handle_diagnose(&hex, None, None, false).await;
+        assert!(result.is_err(), "0x prefix must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn diagnose_nonhex_errors() {
+        let hex = "gg".repeat(20);
+        let result = handle_diagnose(&hex, None, None, false).await;
         assert!(result.is_err(), "non-hex must fail before HTTP");
     }
 }

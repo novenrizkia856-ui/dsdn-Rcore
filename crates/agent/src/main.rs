@@ -46,7 +46,7 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
-//! ### Gating Operations (14B.53–14B.58)
+//! ### Gating Operations (14B.53–14B.59)
 //! - `gating stake-check`: Check stake status for a service node
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
@@ -77,6 +77,11 @@
 //!   - `--json`: Output as JSON
 //! - `gating ban-status`: Query ban details and cooldown
 //!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//! - `gating diagnose`: Full gating diagnosis report
+//!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--identity-dir`: Path to identity directory (optional, enables identity/TLS checks)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
 //!
@@ -396,7 +401,7 @@ enum IdentityCommands {
     },
 }
 
-/// Gating subcommands (14B.53–14B.58)
+/// Gating subcommands (14B.53–14B.59)
 #[derive(Subcommand)]
 enum GatingCommands {
     /// Check stake status for a service node operator address
@@ -495,6 +500,22 @@ enum GatingCommands {
         /// Operator address (40 hex characters, no 0x prefix)
         #[arg(long)]
         address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Full gating diagnosis report (14B.59)
+    Diagnose {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
+        /// Path to identity directory (enables identity and TLS checks)
+        #[arg(long)]
+        identity_dir: Option<PathBuf>,
         /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
         #[arg(long)]
         chain_rpc: Option<String>,
@@ -1873,6 +1894,14 @@ async fn main() -> Result<()> {
                 GatingCommands::BanStatus { address, chain_rpc, json } => {
                     cmd_gating::handle_ban_status(
                         &address,
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
+                }
+                GatingCommands::Diagnose { address, identity_dir, chain_rpc, json } => {
+                    cmd_gating::handle_diagnose(
+                        &address,
+                        identity_dir.as_deref(),
                         chain_rpc.as_deref(),
                         json,
                     ).await?;
