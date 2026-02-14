@@ -221,6 +221,89 @@
 //!
 //! # Node Identity & Gating (14B)
 //!
+//! ## Architecture Overview
+//!
+//! The Node Identity & Gating subsystem implements the node-side
+//! counterpart to the coordinator's gating system (14B.29–14B.40).
+//! It handles identity management, TLS certificates, admission
+//! requests, status tracking, quarantine handling, re-join logic,
+//! persistent identity storage, health reporting, and event-driven
+//! status notification processing.
+//!
+//! All components operate under strict determinism: same inputs
+//! produce same outputs with no randomness, no implicit timestamps,
+//! and no hidden global state. The shared `NodeStatusTracker` is
+//! protected by `parking_lot::Mutex` and accessed via `Arc` for
+//! safe concurrent use across subsystems.
+//!
+//! ## Component Catalog
+//!
+//! | Component | Module | Phase |
+//! |-----------|--------|-------|
+//! | NodeIdentityManager | `identity_manager` | 14B.41 |
+//! | TLSCertManager | `tls_manager` | 14B.42 |
+//! | JoinRequestBuilder | `join_request` | 14B.43 |
+//! | NodeStatusTracker | `status_tracker` | 14B.44 |
+//! | QuarantineHandler | `quarantine_handler` | 14B.45 |
+//! | RejoinManager | `rejoin_manager` | 14B.46 |
+//! | IdentityStore | `identity_persistence` | 14B.47 |
+//! | Health Extension | `health` | 14B.48 |
+//! | StatusNotificationHandler | `status_notification` | 14B.49 |
+//! | Integration Tests | `gating_tests` | 14B.50 |
+//!
+//! ## Node Lifecycle (ASCII)
+//!
+//! ```text
+//!                  ┌─────────┐
+//!       start ───>│ Pending  │
+//!                  └────┬────┘
+//!                       │ NodeAdmitted
+//!               ┌───────▼───────┐
+//!               │    Active     │<──────────────────┐
+//!               └──┬─────────┬──┘                   │
+//!                  │         │                       │
+//!      stake drop  │         │ identity spoofing     │ stake restored
+//!                  │         │ severe slashing       │ (coordinator)
+//!          ┌───────▼──┐  ┌──▼──────┐          ┌─────┴────┐
+//!          │Quarantined│  │ Banned  │──expiry─>│ Pending  │
+//!          └───┬───┬───┘  └─────────┘          └──────────┘
+//!              │   │
+//!   escalation │   │ recovery
+//!              │   └──────────────────────────────────┘
+//!              │
+//!          ┌───▼─────┐
+//!          │ Banned  │
+//!          └─────────┘
+//! ```
+//!
+//! ## State Transition Rules
+//!
+//! | From | To | Condition |
+//! |------|----|-----------|
+//! | Pending | Active | Admitted by coordinator |
+//! | Pending | Banned | Identity spoofing at admission |
+//! | Active | Quarantined | Stake drop, minor violation |
+//! | Active | Banned | Severe slashing, identity spoofing |
+//! | Quarantined | Active | Stake restored (coordinator) |
+//! | Quarantined | Banned | Escalation |
+//! | Banned | Pending | Ban cooldown expired, re-admission |
+//!
+//! All other transitions are illegal and rejected by
+//! `NodeStatusTracker::update_status`. Timestamp monotonicity
+//! is enforced — each transition must have a strictly increasing
+//! timestamp.
+//!
+//! ## Determinism & Security Guarantees
+//!
+//! - Same inputs always produce same outputs. No randomness.
+//! - No `panic!`, `unwrap()`, `expect()` in production code.
+//! - No `unsafe` code in any gating module.
+//! - Secret keys are never exposed via health, logging, or serialization.
+//! - Only public identity (node_id, operator_address) is visible.
+//! - TLS fingerprint verification uses strict SHA-256 byte comparison.
+//! - All arithmetic uses saturating operations to prevent overflow.
+//! - Mutex locks are held only for the duration of single operations.
+//!
 //! ## NodeIdentityManager (14B.41)
 //!
 //! `NodeIdentityManager` encapsulates the node's Ed25519 keypair and provides
@@ -660,6 +743,10 @@ pub mod state_sync;
 pub mod status_notification;
 pub mod status_tracker;
 pub mod tls_manager;
+
+// Integration tests for Node Identity & Gating (14B.50)
+#[cfg(test)]
+mod gating_tests;
 
 pub use da_follower::{
     DAFollower, NodeDerivedState, ChunkAssignment, StateError, ReplicaStatus,
