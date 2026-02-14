@@ -46,6 +46,12 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
+//! ### Gating Operations (14B.53)
+//! - `gating stake-check`: Check stake status for a service node
+//!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -57,6 +63,7 @@
 //! - `DSDN_DA_ENDPOINT`: DA layer endpoint (default: http://127.0.0.1:26658)
 //! - `DSDN_DA_NAMESPACE`: DA namespace (default: dsdn)
 //! - `DSDN_COORDINATOR_ENDPOINT`: Coordinator endpoint (default: http://127.0.0.1:8080)
+//! - `DSDN_CHAIN_RPC`: Chain RPC endpoint for gating queries (default: http://127.0.0.1:8545)
 
 mod sss;
 mod crypto;
@@ -66,6 +73,7 @@ mod cmd_chunk;
 mod cmd_rebuild;
 mod cmd_health;
 mod cmd_identity;
+mod cmd_gating;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -200,6 +208,12 @@ enum Commands {
     Identity {
         #[command(subcommand)]
         identity_cmd: IdentityCommands,
+    },
+
+    /// Service node gating operations (14B.53)
+    Gating {
+        #[command(subcommand)]
+        gating_cmd: GatingCommands,
     },
 }
 
@@ -351,6 +365,23 @@ enum IdentityCommands {
         /// Export format: hex, base64, or json
         #[arg(long)]
         format: String,
+    },
+}
+
+/// Gating subcommands (14B.53)
+#[derive(Subcommand)]
+enum GatingCommands {
+    /// Check stake status for a service node operator address
+    StakeCheck {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1660,6 +1691,18 @@ async fn main() -> Result<()> {
                 }
                 IdentityCommands::Export { dir, format } => {
                     cmd_identity::handle_identity_export(&dir, &format)?;
+                }
+            }
+        }
+
+        Commands::Gating { gating_cmd } => {
+            match gating_cmd {
+                GatingCommands::StakeCheck { address, chain_rpc, json } => {
+                    cmd_gating::handle_stake_check(
+                        &address,
+                        chain_rpc.as_deref(),
+                        json,
+                    ).await?;
                 }
             }
         }
