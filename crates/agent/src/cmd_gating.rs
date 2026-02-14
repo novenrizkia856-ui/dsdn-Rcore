@@ -1,4 +1,4 @@
-//! # Gating CLI Commands (14B.53–14B.54)
+//! # Gating CLI Commands (14B.53–14B.55)
 //!
 //! Handles gating-related subcommands for the DSDN Agent CLI.
 //!
@@ -7,8 +7,9 @@
 //! - `gating stake-check --address <hex> [--chain-rpc <url>] [--json]`
 //! - `gating register --identity-dir <path> --class <storage|compute>
 //!     --chain-rpc <url> [--keyfile <path>]`
+//! - `gating status --address <hex> [--chain-rpc <url>] [--json]`
 //!
-//! ## Chain RPC Resolution (stake-check)
+//! ## Chain RPC Resolution (stake-check, status)
 //!
 //! Endpoint resolution order:
 //! 1. `--chain-rpc <url>` argument (highest priority)
@@ -23,6 +24,8 @@
 //!
 //! - stake-check: `GET {chain_rpc}/api/service_node/stake/{operator_hex}`
 //! - register: `POST {chain_rpc}/api/service_node/register`
+//! - status (info): `GET {chain_rpc}/api/service_node/info/{operator_hex}`
+//! - status (slashing): `GET {chain_rpc}/api/service_node/slashing/{operator_hex}`
 
 use std::path::Path;
 use anyhow::Result;
@@ -47,6 +50,14 @@ const STAKE_ENDPOINT_PATH: &str = "/api/service_node/stake/";
 
 /// REST path for service node registration (POST).
 const REGISTER_ENDPOINT_PATH: &str = "/api/service_node/register";
+
+/// REST path for service node info query (14B.55).
+/// Maps to `FullNodeRpc::get_service_node_info` on chain node.
+const INFO_ENDPOINT_PATH: &str = "/api/service_node/info/";
+
+/// REST path for service node slashing status query (14B.55).
+/// Maps to `FullNodeRpc::get_service_node_slashing_status` on chain node.
+const SLASHING_ENDPOINT_PATH: &str = "/api/service_node/slashing/";
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RESPONSE TYPE (mirrors chain rpc.rs ServiceNodeStakeRes)
@@ -103,6 +114,46 @@ struct SubmitTxResponse {
     success: bool,
     txid: String,
     message: String,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// STATUS RESPONSE TYPES (14B.55) — mirrors chain rpc.rs
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Response from chain RPC `get_service_node_info`.
+///
+/// Field names and types MUST match `ServiceNodeInfoRes` in chain rpc.rs.
+#[derive(Deserialize, Debug, Clone)]
+struct ServiceNodeInfoResponse {
+    /// Operator address (hex string with 0x prefix)
+    operator: String,
+    /// Node ID as lowercase hex string (64 chars, no prefix)
+    node_id_hex: String,
+    /// Node class ("Storage" or "Compute")
+    class: String,
+    /// Node lifecycle status ("Pending", "Active", "Quarantined", "Banned")
+    status: String,
+    /// Staked amount (u128 as string, smallest unit)
+    staked_amount: String,
+    /// Block height at which the node was first registered
+    registered_height: u64,
+    /// TLS certificate fingerprint as lowercase hex (None if not set)
+    tls_fingerprint_hex: Option<String>,
+}
+
+/// Response from chain RPC `get_service_node_slashing_status`.
+///
+/// Field names and types MUST match `ServiceNodeSlashingRes` in chain rpc.rs.
+#[derive(Deserialize, Debug, Clone)]
+struct ServiceNodeSlashingResponse {
+    /// Whether the node is currently slashed
+    is_slashed: bool,
+    /// Whether a cooldown period is currently active
+    cooldown_active: bool,
+    /// Seconds remaining in cooldown (None if not in cooldown)
+    cooldown_remaining_secs: Option<u64>,
+    /// Total count of slashing-related events
+    slash_count: u64,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -368,6 +419,67 @@ pub async fn handle_register(
     Ok(())
 }
 
+/// Handles `gating status --address <hex> [--chain-rpc <url>] [--json]`.
+///
+/// Queries two chain RPC endpoints to assemble full gating status:
+///
+/// 1. `get_service_node_info` → identity, class, status, stake, TLS
+/// 2. `get_service_node_slashing_status` → cooldown, slash count
+///
+/// ## Parameters
+///
+/// - `address_hex`: Operator address as hex string (40 chars, no 0x prefix).
+/// - `chain_rpc_arg`: Optional chain RPC URL override from CLI.
+/// - `json`: If true, output as JSON.
+///
+/// ## Errors
+///
+/// Returns `Err` if:
+/// - Address is not valid 40-char hex.
+/// - HTTP request to chain RPC fails.
+/// - Chain RPC returns an error (node not found, invalid address).
+/// - Response JSON does not match expected schema.
+pub async fn handle_status(
+    address_hex: &str,
+    chain_rpc_arg: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    // ── Step 1: Validate address ────────────────────────────────────────
+    validate_operator_hex(address_hex)?;
+
+    // ── Step 2: Resolve chain RPC endpoint ──────────────────────────────
+    let chain_rpc = resolve_chain_rpc(chain_rpc_arg);
+    let base = chain_rpc.trim_end_matches('/');
+
+    // ── Step 3: Build HTTP client (reused for both queries) ─────────────
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {}", e))?;
+
+    // ── Step 4: Query get_service_node_info ─────────────────────────────
+    let info_url = format!("{}{}{}", base, INFO_ENDPOINT_PATH, address_hex);
+    let info_res = query_chain_rpc::<ServiceNodeInfoResponse>(
+        &client, &info_url, &chain_rpc, "node info",
+    ).await?;
+
+    // ── Step 5: Query get_service_node_slashing_status ──────────────────
+    //            Non-fatal: if slashing endpoint fails, proceed without it
+    let slashing_url = format!("{}{}{}", base, SLASHING_ENDPOINT_PATH, address_hex);
+    let slashing_res = query_chain_rpc::<ServiceNodeSlashingResponse>(
+        &client, &slashing_url, &chain_rpc, "slashing status",
+    ).await.ok();
+
+    // ── Step 6: Display ─────────────────────────────────────────────────
+    if json {
+        print_status_json(&info_res, slashing_res.as_ref());
+    } else {
+        print_status_table(&info_res, slashing_res.as_ref());
+    }
+
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERNAL: VALIDATION
 // ════════════════════════════════════════════════════════════════════════════════
@@ -426,7 +538,7 @@ fn resolve_chain_rpc(cli_arg: Option<&str>) -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// INTERNAL: DISPLAY
+// INTERNAL: DISPLAY (stake-check)
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Prints stake check result as a text table.
@@ -449,6 +561,173 @@ fn print_json(res: &ServiceNodeStakeResponse) {
         res.class,
         res.meets_minimum,
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: DISPLAY (status, 14B.55)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Prints full gating status as a text table.
+///
+/// Slashing info is optional — if absent, cooldown shows "unknown".
+fn print_status_table(
+    info: &ServiceNodeInfoResponse,
+    slashing: Option<&ServiceNodeSlashingResponse>,
+) {
+    println!("Node ID:          {}", info.node_id_hex);
+    println!("Operator:         {}", info.operator);
+    println!("Class:            {}", info.class);
+    println!("Status:           {}", format_status_display(&info.status));
+    println!("Stake:            {}", info.staked_amount);
+    println!("Registered At:    block {}", info.registered_height);
+    println!("Cooldown:         {}", format_cooldown(slashing));
+    println!(
+        "TLS Valid:        {}",
+        if info.tls_fingerprint_hex.is_some() { "true" } else { "false" },
+    );
+}
+
+/// Prints full gating status as JSON.
+///
+/// All fields are present, `null` for missing values.
+fn print_status_json(
+    info: &ServiceNodeInfoResponse,
+    slashing: Option<&ServiceNodeSlashingResponse>,
+) {
+    let tls_valid = info.tls_fingerprint_hex.is_some();
+    let cooldown = format_cooldown(slashing);
+
+    // Build JSON manually for deterministic field ordering
+    let cooldown_json = if cooldown == "none" {
+        "null".to_string()
+    } else {
+        format!("\"{}\"", cooldown)
+    };
+
+    println!(
+        "{{\
+        \n  \"node_id\": \"{}\",\
+        \n  \"operator\": \"{}\",\
+        \n  \"class\": \"{}\",\
+        \n  \"status\": \"{}\",\
+        \n  \"staked_amount\": \"{}\",\
+        \n  \"registered_height\": {},\
+        \n  \"cooldown\": {},\
+        \n  \"tls_valid\": {}\
+        \n}}",
+        info.node_id_hex,
+        info.operator,
+        info.class,
+        info.status,
+        info.staked_amount,
+        info.registered_height,
+        cooldown_json,
+        tls_valid,
+    );
+}
+
+/// Maps node status string to human-readable display with emoji.
+///
+/// Explicit match — unknown values are shown as-is with question mark.
+fn format_status_display(status: &str) -> String {
+    match status {
+        "Active" => "\u{2705} Active".to_string(),
+        "Pending" => "\u{23f3} Pending".to_string(),
+        "Quarantined" => "\u{26a0}\u{fe0f} Quarantined".to_string(),
+        "Banned" => "\u{274c} Banned".to_string(),
+        other => format!("? {}", other),
+    }
+}
+
+/// Formats cooldown information from slashing response.
+///
+/// Returns:
+/// - `"none"` if no cooldown active
+/// - `"<N>s remaining"` if cooldown active with known duration
+/// - `"active (unknown duration)"` if cooldown active without duration
+/// - `"unknown"` if slashing data is unavailable
+fn format_cooldown(slashing: Option<&ServiceNodeSlashingResponse>) -> String {
+    match slashing {
+        None => "unknown".to_string(),
+        Some(s) => {
+            if !s.cooldown_active {
+                "none".to_string()
+            } else {
+                match s.cooldown_remaining_secs {
+                    Some(secs) => format!("{}s remaining", secs),
+                    None => "active (unknown duration)".to_string(),
+                }
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTERNAL: HTTP QUERY HELPER
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Generic HTTP GET → JSON parse for chain RPC queries.
+///
+/// Builds URL externally. Handles:
+/// - HTTP request failure → error with chain_rpc in message
+/// - Non-success HTTP status → try parse as `ChainRpcError`, fallback to body
+/// - JSON parse failure → error with context
+///
+/// ## Parameters
+///
+/// - `client`: Shared `reqwest::Client` (reuse across multiple queries).
+/// - `url`: Fully constructed URL.
+/// - `chain_rpc`: Base RPC URL for error messages only.
+/// - `context`: Human-readable name for error messages (e.g. "node info").
+async fn query_chain_rpc<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    chain_rpc: &str,
+    context: &str,
+) -> Result<T> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to query {} from chain RPC at '{}': {}",
+                context,
+                chain_rpc,
+                e,
+            )
+        })?;
+
+    let http_status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read {} response body: {}", context, e))?;
+
+    if !http_status.is_success() {
+        if let Ok(rpc_err) = serde_json::from_str::<ChainRpcError>(&body) {
+            return Err(anyhow::anyhow!(
+                "chain RPC error querying {} (code {}): {}",
+                context,
+                rpc_err.code,
+                rpc_err.message,
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "chain RPC returned HTTP {} for {}: {}",
+            http_status.as_u16(),
+            context,
+            truncate_body(&body, 200),
+        ));
+    }
+
+    serde_json::from_str::<T>(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse {} response from chain RPC: {}",
+            context,
+            e,
+        )
+    })
 }
 
 /// Truncates a string to `max_len` characters for error display.
@@ -946,5 +1225,247 @@ mod tests {
         ).await;
         assert!(result.is_err(), "missing identity must fail before network");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // M. ServiceNodeInfoResponse deserialization (14B.55)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_info_response_full() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "node_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "class": "Storage",
+            "status": "Active",
+            "staked_amount": "5000000000000000000000",
+            "registered_height": 12345,
+            "tls_fingerprint_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeInfoResponse>(json);
+        assert!(result.is_ok(), "full info response must parse");
+        if let Ok(res) = result {
+            assert_eq!(res.status, "Active");
+            assert_eq!(res.registered_height, 12345);
+            assert!(res.tls_fingerprint_hex.is_some());
+        }
+    }
+
+    #[test]
+    fn deserialize_info_response_null_tls() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "node_id_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "class": "Compute",
+            "status": "Pending",
+            "staked_amount": "0",
+            "registered_height": 0,
+            "tls_fingerprint_hex": null
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeInfoResponse>(json);
+        assert!(result.is_ok(), "null tls must parse");
+        if let Ok(res) = result {
+            assert_eq!(res.status, "Pending");
+            assert!(res.tls_fingerprint_hex.is_none());
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // N. ServiceNodeSlashingResponse deserialization (14B.55)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deserialize_slashing_no_cooldown() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "is_slashed": false,
+            "cooldown_active": false,
+            "cooldown_remaining_secs": null,
+            "slash_count": 0
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeSlashingResponse>(json);
+        assert!(result.is_ok(), "no-cooldown response must parse");
+        if let Ok(res) = result {
+            assert!(!res.cooldown_active);
+            assert!(res.cooldown_remaining_secs.is_none());
+        }
+    }
+
+    #[test]
+    fn deserialize_slashing_with_cooldown() {
+        let json = r#"{
+            "operator": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "is_slashed": true,
+            "cooldown_active": true,
+            "cooldown_remaining_secs": 3600,
+            "slash_count": 2
+        }"#;
+        let result = serde_json::from_str::<ServiceNodeSlashingResponse>(json);
+        assert!(result.is_ok(), "cooldown response must parse");
+        if let Ok(res) = result {
+            assert!(res.is_slashed);
+            assert!(res.cooldown_active);
+            assert_eq!(res.cooldown_remaining_secs, Some(3600));
+            assert_eq!(res.slash_count, 2);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // O. format_status_display (14B.55)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn status_display_active() {
+        let result = format_status_display("Active");
+        assert!(result.contains("Active"));
+    }
+
+    #[test]
+    fn status_display_pending() {
+        let result = format_status_display("Pending");
+        assert!(result.contains("Pending"));
+    }
+
+    #[test]
+    fn status_display_quarantined() {
+        let result = format_status_display("Quarantined");
+        assert!(result.contains("Quarantined"));
+    }
+
+    #[test]
+    fn status_display_banned() {
+        let result = format_status_display("Banned");
+        assert!(result.contains("Banned"));
+    }
+
+    #[test]
+    fn status_display_unknown() {
+        let result = format_status_display("SomeNewStatus");
+        assert!(result.contains("SomeNewStatus"));
+        assert!(result.starts_with("? "));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // P. format_cooldown (14B.55)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cooldown_none_when_no_slashing() {
+        assert_eq!(format_cooldown(None), "unknown");
+    }
+
+    #[test]
+    fn cooldown_none_when_inactive() {
+        let s = ServiceNodeSlashingResponse {
+            is_slashed: false,
+            cooldown_active: false,
+            cooldown_remaining_secs: None,
+            slash_count: 0,
+        };
+        assert_eq!(format_cooldown(Some(&s)), "none");
+    }
+
+    #[test]
+    fn cooldown_with_remaining() {
+        let s = ServiceNodeSlashingResponse {
+            is_slashed: true,
+            cooldown_active: true,
+            cooldown_remaining_secs: Some(7200),
+            slash_count: 1,
+        };
+        assert_eq!(format_cooldown(Some(&s)), "7200s remaining");
+    }
+
+    #[test]
+    fn cooldown_active_no_duration() {
+        let s = ServiceNodeSlashingResponse {
+            is_slashed: true,
+            cooldown_active: true,
+            cooldown_remaining_secs: None,
+            slash_count: 3,
+        };
+        assert_eq!(format_cooldown(Some(&s)), "active (unknown duration)");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Q. print_status_table / print_status_json smoke tests (14B.55)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_status_table_no_panic() {
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Active".to_string(),
+            staked_amount: "5000".to_string(),
+            registered_height: 100,
+            tls_fingerprint_hex: Some("cc".repeat(32)),
+        };
+        let slashing = ServiceNodeSlashingResponse {
+            is_slashed: false,
+            cooldown_active: false,
+            cooldown_remaining_secs: None,
+            slash_count: 0,
+        };
+        print_status_table(&info, Some(&slashing));
+    }
+
+    #[test]
+    fn print_status_table_no_slashing_no_panic() {
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Compute".to_string(),
+            status: "Pending".to_string(),
+            staked_amount: "0".to_string(),
+            registered_height: 0,
+            tls_fingerprint_hex: None,
+        };
+        print_status_table(&info, None);
+    }
+
+    #[test]
+    fn print_status_json_no_panic() {
+        let info = ServiceNodeInfoResponse {
+            operator: "0xaaaa".to_string(),
+            node_id_hex: "bb".repeat(32),
+            class: "Storage".to_string(),
+            status: "Quarantined".to_string(),
+            staked_amount: "1000".to_string(),
+            registered_height: 50,
+            tls_fingerprint_hex: None,
+        };
+        let slashing = ServiceNodeSlashingResponse {
+            is_slashed: true,
+            cooldown_active: true,
+            cooldown_remaining_secs: Some(3600),
+            slash_count: 1,
+        };
+        print_status_json(&info, Some(&slashing));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // R. handle_status — validation failures (no network, 14B.55)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_invalid_address_errors() {
+        let result = handle_status("short", None, false).await;
+        assert!(result.is_err(), "invalid address must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn status_0x_prefix_errors() {
+        let hex = format!("0x{}", "aa".repeat(19));
+        let result = handle_status(&hex, None, false).await;
+        assert!(result.is_err(), "0x prefix must fail before HTTP");
+    }
+
+    #[tokio::test]
+    async fn status_nonhex_errors() {
+        let hex = "gg".repeat(20);
+        let result = handle_status(&hex, None, false).await;
+        assert!(result.is_err(), "non-hex must fail before HTTP");
     }
 }

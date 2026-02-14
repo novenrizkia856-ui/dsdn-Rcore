@@ -46,7 +46,7 @@
 //!   - `--dir`: Directory containing identity files (required)
 //!   - `--format`: hex, base64, or json
 //!
-//! ### Gating Operations (14B.53–14B.54)
+//! ### Gating Operations (14B.53–14B.55)
 //! - `gating stake-check`: Check stake status for a service node
 //!   - `--address`: Operator address (40 hex chars, required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
@@ -56,6 +56,10 @@
 //!   - `--class`: "storage" or "compute" (required)
 //!   - `--chain-rpc`: Chain RPC endpoint URL (required)
 //!   - `--keyfile`: Path to wallet secret key file (optional, errors if missing)
+//! - `gating status`: Query full gating status of a service node
+//!   - `--address`: Operator address (40 hex chars, required)
+//!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
+//!   - `--json`: Output as JSON
 //!
 //! ## DA Integration
 //!
@@ -373,7 +377,7 @@ enum IdentityCommands {
     },
 }
 
-/// Gating subcommands (14B.53–14B.54)
+/// Gating subcommands (14B.53–14B.55)
 #[derive(Subcommand)]
 enum GatingCommands {
     /// Check stake status for a service node operator address
@@ -403,6 +407,19 @@ enum GatingCommands {
         /// Path to wallet secret key file (64 hex chars)
         #[arg(long)]
         keyfile: Option<PathBuf>,
+    },
+
+    /// Query full gating status of a service node (14B.55)
+    Status {
+        /// Operator address (40 hex characters, no 0x prefix)
+        #[arg(long)]
+        address: String,
+        /// Chain RPC endpoint URL (overrides DSDN_CHAIN_RPC env and default)
+        #[arg(long)]
+        chain_rpc: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1736,6 +1753,13 @@ async fn main() -> Result<()> {
                         &class,
                         &chain_rpc,
                         keyfile.as_deref(),
+                    ).await?;
+                }
+                GatingCommands::Status { address, chain_rpc, json } => {
+                    cmd_gating::handle_status(
+                        &address,
+                        chain_rpc.as_deref(),
+                        json,
                     ).await?;
                 }
             }
