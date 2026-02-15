@@ -1563,35 +1563,16 @@ Status node: `Pending`, `Active`, `Quarantined`, `Banned`. Node tidak akan di-sc
 
 ---
 
-## Tahap 14C --- Economic Flow v1 (Receipt Dasar, Non-Adaptive)
+## Tahap 14C.A --- Execution Commitment & Receipt v1 Foundation
 
-**Tujuan:** Mengaktifkan aliran ekonomi minimal yang benar, dengan foundation untuk compute verification.
+**Tujuan:** Membangun struct dasar ExecutionCommitment dan ReceiptV1, beserta serialization, hashing, dan unit test.
 
-**Prinsip Penting:**
-
-- Ekonomi harus deterministik.
+**Prinsip:**
+- Semua struct harus deterministic serialization (canonical encoding).
 - Tidak ada adaptive logic.
-- Tidak ada governance effect.
-- Compute output harus verifiable (preparation).
+- Fokus pada data layer, belum ada on-chain processing.
 
-### Flow Ekonomi
-
-```
-node executes workload
--> runtime_usage_proof
--> execution_commitment (BARU)
--> coordinator threshold-signs receipt
--> node submits ClaimReward
--> chain verifies:
-   - threshold signature
-   - stake
-   - no self-dealing
-   - execution_commitment valid (BARU)
--> reward distributed (dengan challenge period untuk compute)
-```
-
-### Execution Commitment (Preparation untuk Fraud Proof)
-
+### Execution Commitment Struct
 ```rust
 struct ExecutionCommitment {
     workload_id: WorkloadId,
@@ -1599,63 +1580,216 @@ struct ExecutionCommitment {
     output_hash: Hash,
     state_root_before: Hash,
     state_root_after: Hash,
-    execution_trace_merkle_root: Hash,  // untuk fraud proof
+    execution_trace_merkle_root: Hash,  // preparation untuk fraud proof
 }
 ```
 
-### Receipt v1 (With Execution Commitment)
+- Implementasi `ExecutionCommitment::new(...)`, `hash()`, `verify_structure()`.
+- Canonical serialization (borsh/bincode, pilih satu, konsisten).
+- `execution_trace_merkle_root` boleh dummy/zeroed untuk tahap ini, tapi field wajib ada.
 
+### Receipt v1 Struct
 ```rust
 struct ReceiptV1 {
     workload_id: WorkloadId,
     node_id: NodeId,
     usage_proof_hash: Hash,
-    execution_commitment: ExecutionCommitment,  // BARU
+    execution_commitment: ExecutionCommitment,
     coordinator_threshold_signature: FrostSignature,
     node_signature: Ed25519Signature,
     submitter_address: Address,
 }
 ```
 
-Isi receipt: `workload_id`, `node_id`, `usage_proof_hash`, `coordinator_signature`, `node_signature`, `submitter_address`.
+- Implementasi `ReceiptV1::new(...)`, `hash()`, `verify_signatures()`.
+- Signature verification: node_signature (Ed25519) + coordinator FROST threshold signature.
+- Receipt hashing harus deterministic dan reproducible.
 
-### Challenge Period untuk Compute
+### Deliverables
 
-- Storage receipts: immediate reward (data verifiable via merkle proof).
-- Compute receipts: 1-hour challenge period.
-- Selama challenge period, siapapun bisa submit fraud proof.
-- Jika tidak ada challenge, reward distributed.
+1. `ExecutionCommitment` struct + impl di `common` atau `proto`.
+2. `ReceiptV1` struct + impl di `common` atau `proto`.
+3. Serialization round-trip test (serialize → deserialize → equal).
+4. Signature creation + verification helpers.
+5. Unit test: valid receipt, invalid signature rejected, tampered commitment detected.
 
-### Distribusi Reward (Fixed)
+### Crates Terlibat
 
-- 70% --- node
-- 20% --- validator
-- 10% --- treasury
-
-Tidak ada burn. Tidak ada adaptive fee.
-
-### Anti-Self-Dealing (Wajib)
-
-Chain reject receipt jika: `node_owner == submitter` atau `wallet_affinity` match.
-
-### Validasi Wajib
-
-- Receipt tidak bisa dipakai ulang.
-- Reward tepat jumlah.
-- Node self-dealing ditolak.
-- DA receipt log match chain state.
-- Execution commitment dapat di-verify (preparation).
+`common`, `proto`, `tss` (untuk FROST signature types)
 
 ### Kriteria Selesai
 
-- Node menerima reward sah.
-- Chain reject pelanggaran.
-- DA --- coordinator --- chain sinkron.
-- Execution commitment infrastructure ready.
+- `ExecutionCommitment` dan `ReceiptV1` compile, serialize, deserialize deterministic.
+- Signature verify works untuk valid case, reject untuk invalid case.
+- Semua unit test pass.
+- Tidak ada logic on-chain di tahap ini.
 
-**Crates terlibat:** `chain`, `coordinator`, `node`, `validator`, `runtime_wasm`, `runtime_vm`, `proto`, `common`, `agent`, `ingress`, `tss`.
+---
 
-> Reward pada tahap ini bersifat accounting correctness test, bukan insentif pertumbuhan jaringan. Dilarang menampilkan APY, ROI, estimasi profit, atau kalkulator reward pada fase ini. Receipt pada tahap ini diasumsikan dapat direkonstruksi dan diverifikasi ulang dari DA log, dan coordinator tidak diperlakukan sebagai pihak terpercaya.
+## Tahap 14C.B --- On-Chain Economic Logic (Validation, Reward, Challenge)
+
+**Tujuan:** Implementasi on-chain processing: receipt validation, reward distribution fixed, anti-self-dealing, dan challenge period untuk compute receipts.
+
+**Prinsip:**
+- Ekonomi deterministik, fixed percentage.
+- Tidak ada adaptive fee, tidak ada burn, tidak ada governance effect.
+- Challenge period hanya untuk compute receipts.
+
+**Depends on:** 14C.A (ExecutionCommitment, ReceiptV1 structs ready)
+
+### ClaimReward Transaction
+```
+node submits ClaimReward(ReceiptV1)
+-> chain verifies:
+   1. threshold signature valid (FROST)
+   2. node_signature valid (Ed25519)
+   3. node is staked & active
+   4. receipt belum pernah dipakai (replay protection)
+   5. anti-self-dealing check
+   6. execution_commitment structure valid
+-> jika storage receipt: immediate reward
+-> jika compute receipt: masuk challenge period
+```
+
+### Reward Distribution (Fixed, Non-Adaptive)
+```
+Total reward per receipt = fixed_reward_amount
+
+Split:
+  70% -> node_id (executor)
+  20% -> validator set (pro-rata)
+  10% -> treasury
+```
+
+- Tidak ada burn mechanism.
+- Tidak ada adaptive multiplier.
+- `fixed_reward_amount` di-set sebagai chain parameter (constant untuk tahap ini).
+
+### Anti-Self-Dealing
+
+Chain WAJIB reject `ClaimReward` jika:
+- `receipt.node_id.owner == receipt.submitter_address`
+- `wallet_affinity(node_owner, submitter)` match (same derivation path / known alias)
+
+### Challenge Period (Compute Only)
+
+- Storage receipts: reward distributed immediately (data verifiable via merkle proof).
+- Compute receipts: 1-hour challenge period setelah ClaimReward accepted.
+- Selama challenge period, siapapun bisa submit fraud proof (stub untuk tahap ini — logic fraud proof belum diimplementasi, tapi interface harus ada).
+- Jika challenge period expires tanpa fraud proof → reward distributed.
+- State tracking: `PendingComputeReward { receipt_hash, expires_at, claimed: bool }`.
+
+### Replay Protection
+
+- Receipt hash disimpan di on-chain set setelah accepted.
+- Duplicate receipt hash → reject.
+
+### Deliverables
+
+1. `ClaimReward` transaction handler di `chain`.
+2. Receipt validation pipeline (signature, stake, replay, self-dealing).
+3. Fixed reward distribution logic (70/20/10 split).
+4. Challenge period state management (PendingComputeReward).
+5. `FraudProof` trait/interface (stub, belum ada implementation).
+6. Unit test: valid claim → reward, duplicate → reject, self-dealing → reject, unstaked node → reject.
+7. Unit test: storage receipt → immediate, compute receipt → pending → expire → distribute.
+
+### Crates Terlibat
+
+`chain`, `validator`, `common`, `proto`
+
+### Kriteria Selesai
+
+- Valid receipt → reward distributed (immediate atau setelah challenge period).
+- Semua rejection case tested dan enforced.
+- Reward amounts exactly match 70/20/10 split (no rounding leak).
+- Challenge period state correctly tracked dan expired.
+
+---
+
+## Tahap 14C.C --- End-to-End Integration & DA Sync
+
+**Tujuan:** Menyambungkan seluruh flow dari node execution → coordinator signing → on-chain claim → reward distribution, termasuk DA receipt log sync.
+
+**Prinsip:**
+- Full pipeline harus deterministic dan auditable.
+- DA layer (Celestia) harus mencatat receipt log yang match chain state.
+- Execution commitment infrastructure harus verified end-to-end.
+
+**Depends on:** 14C.A (structs), 14C.B (on-chain logic)
+
+### Full Economic Flow
+```
+1. node executes workload
+2. node produces runtime_usage_proof + ExecutionCommitment
+3. node sends proof + commitment ke coordinator
+4. coordinator validates, threshold-signs → ReceiptV1
+5. coordinator posts receipt log ke DA (Celestia)
+6. node submits ClaimReward(ReceiptV1) ke chain
+7. chain validates (semua checks dari 14C.B)
+8. chain cross-checks receipt hash vs DA receipt log
+9. reward distributed (immediate atau post-challenge)
+```
+
+### Node-Side Integration
+
+- `node` crate: setelah workload execution, generate `ExecutionCommitment`.
+- Compute `runtime_usage_proof` dan bundle dengan commitment.
+- Send ke coordinator via `proto` (gRPC/P2P message).
+
+### Coordinator-Side Integration
+
+- `coordinator` crate: receive proof + commitment dari node.
+- Validate proof structure.
+- Threshold-sign menghasilkan `ReceiptV1`.
+- Post receipt log ke DA layer (Celestia blob).
+- Return signed `ReceiptV1` ke node.
+
+### DA Receipt Log Sync
+
+- Coordinator posts receipt log ke Celestia setelah signing.
+- Chain verifies: receipt hash yang di-claim harus exist di DA receipt log.
+- Jika DA log tidak match → claim rejected.
+- `ingress` crate: fetch DA blobs, index receipt hashes untuk chain query.
+
+### Agent CLI Support
+
+- `agent` crate: command `claim-reward` yang wraps ClaimReward transaction.
+- Display status: pending (challenge period), distributed, rejected.
+- Query pending rewards dan history.
+
+### Integration Test Scenarios
+
+1. **Happy path storage:** node execute → coordinator sign → claim → immediate reward.
+2. **Happy path compute:** node execute → coordinator sign → claim → challenge period → expire → reward.
+3. **Replay attack:** same receipt submitted twice → second rejected.
+4. **Self-dealing:** node owner submits own receipt → rejected.
+5. **DA mismatch:** receipt not in DA log → rejected.
+6. **Invalid signature:** tampered receipt → rejected.
+7. **Unstaked node:** node tanpa stake → rejected.
+8. **Execution commitment tampering:** modified commitment → signature invalid → rejected.
+
+### Deliverables
+
+1. Node-side: workload → ExecutionCommitment → send to coordinator.
+2. Coordinator-side: validate → threshold-sign → post DA → return ReceiptV1.
+3. DA sync: ingress fetches receipt logs, chain cross-checks.
+4. Agent CLI: `claim-reward` command + status query.
+5. Full integration test suite (8 scenarios di atas).
+6. End-to-end test: seluruh pipeline dari execution sampai reward distribution.
+
+### Crates Terlibat
+
+`chain`, `coordinator`, `node`, `validator`, `runtime_wasm`, `runtime_vm`, `proto`, `common`, `agent`, `ingress`, `tss`
+
+### Kriteria Selesai
+
+- Full flow berjalan end-to-end tanpa manual intervention.
+- DA receipt log match chain state (no drift).
+- Semua 8 integration test scenarios pass.
+- Agent CLI bisa claim dan query reward status.
+- Execution commitment infrastructure verified (struct valid, signature covers commitment).
+- Tidak ada reward leak (total distributed == total claimed, exact match).
 
 ---
 

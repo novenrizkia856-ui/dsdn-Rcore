@@ -3,47 +3,63 @@
 
 focus on stage which is being worked on
 
-## Stage 14B --- Stake and Identity Gating (Security-First, No Economy)
+## Tahap 14C.A --- Execution Commitment & Receipt v1 Foundation
 
-**Objective:** Lock down who is allowed to become a node before the economic system is live. This stage separates security bugs from economic bugs.
+**Tujuan:** Membangun struct dasar ExecutionCommitment dan ReceiptV1, beserta serialization, hashing, dan unit test.
 
-**Key Principles:**
+**Prinsip:**
+- Semua struct harus deterministic serialization (canonical encoding).
+- Tidak ada adaptive logic.
+- Fokus pada data layer, belum ada on-chain processing.
 
-- Nodes must not be active without stake and identity verification.
-- Rewards do not exist yet.
-- Receipts do not exist yet.
+### Execution Commitment Struct
+```rust
+struct ExecutionCommitment {
+    workload_id: WorkloadId,
+    input_hash: Hash,
+    output_hash: Hash,
+    state_root_before: Hash,
+    state_root_after: Hash,
+    execution_trace_merkle_root: Hash,  // preparation untuk fraud proof
+}
+```
 
-### New Mechanisms
+- Implementasi `ExecutionCommitment::new(...)`, `hash()`, `verify_structure()`.
+- Canonical serialization (borsh/bincode, pilih satu, konsisten).
+- `execution_trace_merkle_root` boleh dummy/zeroed untuk tahap ini, tapi field wajib ada.
 
-#### 1. Node Identity
+### Receipt v1 Struct
+```rust
+struct ReceiptV1 {
+    workload_id: WorkloadId,
+    node_id: NodeId,
+    usage_proof_hash: Hash,
+    execution_commitment: ExecutionCommitment,
+    coordinator_threshold_signature: FrostSignature,
+    node_signature: Ed25519Signature,
+    submitter_address: Address,
+}
+```
 
-Every node must have: a valid TLS certificate, an Ed25519 `node_id`, and an `operator_address` (wallet).
+- Implementasi `ReceiptV1::new(...)`, `hash()`, `verify_signatures()`.
+- Signature verification: node_signature (Ed25519) + coordinator FROST threshold signature.
+- Receipt hashing harus deterministic dan reproducible.
 
-#### 2. Required Chain API
+### Deliverables
 
-Exposed on Chain Nusantara: `get_stake(address)`, `get_node_class(address)`, `get_slashing_status(address)`.
+1. `ExecutionCommitment` struct + impl di `common` atau `proto`.
+2. `ReceiptV1` struct + impl di `common` atau `proto`.
+3. Serialization round-trip test (serialize → deserialize → equal).
+4. Signature creation + verification helpers.
+5. Unit test: valid receipt, invalid signature rejected, tampered commitment detected.
 
-#### 3. Coordinator Gatekeeping
+### Crates Terlibat
 
-Coordinator rejects a node if: stake < 500 / 5000, slashing cooldown is active, TLS is invalid, or `node_id` does not match the operator.
+`common`, `proto`, `tss` (untuk FROST signature types)
 
-#### 4. Node Lifecycle
+### Kriteria Selesai
 
-Node statuses: `Pending`, `Active`, `Quarantined`, `Banned`. A node will not be scheduled unless its status = `Active`.
-
-### Required Validations
-
-- Node without stake --- rejected.
-- Node with insufficient stake --- quarantined.
-- Node with prior slashing --- cooldown enforced.
-- Identity spoofing --- join fails.
-
-### Completion Criteria
-
-- Only valid nodes are active.
-- Scheduler cannot select illegal nodes.
-- System is secure without active rewards.
-
-**Crates involved:** `coordinator`, `node`, `validator`, `chain`, `agent`, `common`.
-
-> The stake mechanism in this stage functions solely as a security gate, not as an economic signal, ROI indicator, or public participation incentive. Completion of this stage must not be interpreted as activation of the network economy or as an indicator of ROI viability for operators.
+- `ExecutionCommitment` dan `ReceiptV1` compile, serialize, deserialize deterministic.
+- Signature verify works untuk valid case, reject untuk invalid case.
+- Semua unit test pass.
+- Tidak ada logic on-chain di tahap ini.
