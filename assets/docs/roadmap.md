@@ -1853,6 +1853,10 @@ S = w1*CPU + w2*RAM + w3*GPU + w4*(1/latency)
 - Node reguler: `log2(stake / 500)`
 - Node DC: `log2(stake / 5000)`
 
+**Bootstrap system di masa mendatang**
+- Node identity (`node_id`, Ed25519 public key) yang sudah diimplementasi di tahap ini juga digunakan sebagai peer ID dalam bootstrap system (28.1). Pastikan `node_id` format compatible dengan peer identification di bootstrap handshake.
+- Tidak ada perubahan implementasi, hanya catatan forward-compatibility.
+
 **Anti-Self-Dealing:** Scheduler harus skip node jika `owner(node) == submitter(tx)` atau ada hubungan wallet-affinity on-chain.
 
 **Crates yang harus diubah / dilibatkan:** `coordinator`, `node`, `storage`, `chain`, `validator`, `ingress`.
@@ -2919,6 +2923,9 @@ Benchmark juga memeriksa: stake-weight scheduling performance, anti-self-dealing
 - TSS signing: < 500ms.
 - Trace generation: < 10% overhead.
 - Oracle update: < 1 minute.
+- Bootstrap performance: waktu dari fresh node start hingga pertama kali terhubung ke jaringan (target: < 30 detik dengan DNS seed available).
+- PEX propagation time: waktu hingga seluruh jaringan test (10 node) saling mengenal (target: < 10 menit).
+- peers.dat warm start time: waktu connect dari cache (target: < 5 detik).
 
 **Crates yang harus diubah / dilibatkan:** `coordinator`, `storage`, `node`, `chain`, `agent`, `e2e_tests` (file in `crates/chain`).
 
@@ -2944,6 +2951,11 @@ Pada genesis: stake requirement embed, multisig validator embed, slashing rules 
 - Oracle initial sources.
 - Bootstrap subsidy schedule.
 - Fee bounds initial values.
+- DNS seed domain(s) telah dibeli dan DNS A record aktif.
+- Minimal 1 dedicated bootstrap node running 24/7.
+- Bootstrap config default sudah terisi dengan DNS seed production.
+- `peers.dat` path sudah di-set di production config.
+- Full bootstrap test dari fresh node berhasil.
 
 **Crates yang harus diubah / dilibatkan:** `chain`, `validator`, `coordinator`, `node`, `ingress`, `agent`.
 
