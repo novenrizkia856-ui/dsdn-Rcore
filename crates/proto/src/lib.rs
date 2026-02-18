@@ -356,6 +356,8 @@ pub mod consistency_report;
 /// TSS protocol message types (14A.2B.1.21).
 pub mod tss;
 
+pub mod tx;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - DA Core Types
 // ════════════════════════════════════════════════════════════════════════════════
