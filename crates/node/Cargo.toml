@@ -9,6 +9,7 @@ dsdn-storage = { path = "../storage" }
 dsdn-coordinator = { path = "../coordinator" }
 dsdn-runtime-wasm = { path = "../runtime_wasm" }
 
+
 # Crypto: Ed25519 keypair for node identity (14B.41)
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 rand = "0.8.5"
@@ -36,6 +37,7 @@ dotenvy = "0.15"
 socket2 = "0.5"
 
 [dev-dependencies]
+dsdn-chain = { path = "../chain" }
 tempfile = "3.10"
 base64 = "0.21"
 

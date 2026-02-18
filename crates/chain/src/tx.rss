@@ -416,7 +416,9 @@ impl TxEnvelope {
 
         // Cek balance
         gas_cost = (gas_limit as u128) * crate::tx::GAS_PRICE
-        total_required = fee + extra_amount + gas_cost
+        total_required = fee.checked_add(extra_amount)
+            .and_then(|v| v.checked_add(gas_cost))
+            .ok_or_else(|| anyhow!("total cost overflow: values exceed u128"))?;
         balance = get_balance(sender)
 
         if balance < total_required {
@@ -456,7 +458,8 @@ impl TxEnvelope {
         }
 
         gas_cost = (gas_limit as u128) * crate::tx::GAS_PRICE
-        total_required = fee + gas_cost
+        total_required = fee.checked_add(gas_cost)
+            .ok_or_else(|| anyhow!("total cost overflow in custom tx: fee={} gas_cost={}", fee, gas_cost))?
         balance = get_balance(&sender)
 
         if balance < total_required {
@@ -500,7 +503,8 @@ impl TxEnvelope {
 
         // Balance check (fee + gas saja, karena amount terenkripsi)
         gas_cost = (gas_limit as u128) * crate::tx::GAS_PRICE
-        total_required = fee + gas_cost
+        total_required = fee.checked_add(gas_cost)
+            .ok_or_else(|| anyhow!("total cost overflow in private tx: fee={} gas_cost={}", fee, gas_cost))?
         balance = get_balance(&sender)
 
         if balance < total_required {
