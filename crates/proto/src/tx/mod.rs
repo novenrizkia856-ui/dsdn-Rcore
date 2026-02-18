@@ -9,3 +9,4 @@
 //! | [`claim_reward`] | ClaimReward transaction untuk claim reward berdasarkan ReceiptV1 |
 
 pub mod claim_reward;
+pub mod fraud_proof;
