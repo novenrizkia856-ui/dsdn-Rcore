@@ -3,63 +3,53 @@
 
 focus on stage which is being worked on
 
-## Tahap 14C.A --- Execution Commitment & Receipt v1 Foundation
+## Tahap 14C.A — Receipt Foundation & Chain Validation
 
-**Tujuan:** Membangun struct dasar ExecutionCommitment dan ReceiptV1, beserta serialization, hashing, dan unit test.
+**Tujuan:** Mendefinisikan struktur data ekonomi (ExecutionCommitment, ReceiptV1),
+mengimplementasikan validasi chain-side, dan menyiapkan coordinator untuk threshold-sign receipt.
 
-**Prinsip:**
-- Semua struct harus deterministic serialization (canonical encoding).
-- Tidak ada adaptive logic.
-- Fokus pada data layer, belum ada on-chain processing.
+**Crates terlibat:** `proto`, `common`, `chain`, `coordinator`
 
-### Execution Commitment Struct
-```rust
-struct ExecutionCommitment {
-    workload_id: WorkloadId,
-    input_hash: Hash,
-    output_hash: Hash,
-    state_root_before: Hash,
-    state_root_after: Hash,
-    execution_trace_merkle_root: Hash,  // preparation untuk fraud proof
-}
-```
+### Scope
 
-- Implementasi `ExecutionCommitment::new(...)`, `hash()`, `verify_structure()`.
-- Canonical serialization (borsh/bincode, pilih satu, konsisten).
-- `execution_trace_merkle_root` boleh dummy/zeroed untuk tahap ini, tapi field wajib ada.
+1. **`proto`** — Definisi protobuf/message types:
+   - Tambah message `ExecutionCommitment` (workload_id, input_hash, output_hash,
+     state_root_before, state_root_after, execution_trace_merkle_root).
+   - Tambah message `ReceiptV1` (workload_id, node_id, usage_proof_hash,
+     execution_commitment, coordinator_threshold_signature, node_signature,
+     submitter_address).
+   - Tambah message `ClaimReward` request/response.
+   - Tambah message `FraudProofChallenge` (placeholder, belum ada logic).
 
-### Receipt v1 Struct
-```rust
-struct ReceiptV1 {
-    workload_id: WorkloadId,
-    node_id: NodeId,
-    usage_proof_hash: Hash,
-    execution_commitment: ExecutionCommitment,
-    coordinator_threshold_signature: FrostSignature,
-    node_signature: Ed25519Signature,
-    submitter_address: Address,
-}
-```
+2. **`common`** — Shared types dan utility:
+   - Type alias dan helper untuk `WorkloadId`, `UsageProofHash`, `ExecutionCommitment`.
+   - Fungsi hashing deterministic untuk execution commitment fields.
+   - Konstanta ekonomi: rasio distribusi (70/20/10), challenge period duration (1 hour).
+   - Anti-self-dealing helper: fungsi `is_self_dealing(node_owner, submitter)`.
 
-- Implementasi `ReceiptV1::new(...)`, `hash()`, `verify_signatures()`.
-- Signature verification: node_signature (Ed25519) + coordinator FROST threshold signature.
-- Receipt hashing harus deterministic dan reproducible.
+3. **`chain`** — On-chain validation dan reward logic:
+   - Implementasi `ClaimReward` transaction handler.
+   - Validasi receipt: threshold signature valid, stake sufficient,
+     no duplicate receipt, anti-self-dealing check.
+   - Validasi execution commitment: hash consistency, fields non-empty.
+   - Reward distribution logic: 70% node, 20% validator, 10% treasury (fixed, no burn).
+   - Challenge period state: compute receipts masuk pending state selama 1 jam,
+     storage receipts langsung distribute.
+   - Reject logic: duplicate receipt, self-dealing, invalid signature, invalid commitment.
 
-### Deliverables
+4. **`coordinator`** — Threshold signing receipt:
+   - Coordinator menerima usage proof + execution commitment dari node.
+   - Verifikasi dasar: workload terdaftar, node eligible, proof format valid.
+   - Threshold-sign receipt menggunakan FROST (memanggil TSS, tapi TSS integration
+     dilakukan di 14C.C — di sini cukup define interface/trait).
+   - Return signed `ReceiptV1` ke node untuk di-submit ke chain.
 
-1. `ExecutionCommitment` struct + impl di `common` atau `proto`.
-2. `ReceiptV1` struct + impl di `common` atau `proto`.
-3. Serialization round-trip test (serialize → deserialize → equal).
-4. Signature creation + verification helpers.
-5. Unit test: valid receipt, invalid signature rejected, tampered commitment detected.
+### Kriteria Selesai 14C.A
 
-### Crates Terlibat
-
-`common`, `proto`, `tss` (untuk FROST signature types)
-
-### Kriteria Selesai
-
-- `ExecutionCommitment` dan `ReceiptV1` compile, serialize, deserialize deterministic.
-- Signature verify works untuk valid case, reject untuk invalid case.
-- Semua unit test pass.
-- Tidak ada logic on-chain di tahap ini.
+- Semua proto message terdefinisi dan bisa di-serialize/deserialize.
+- `chain` bisa menerima `ClaimReward`, validasi lengkap, dan distribute reward
+  (dengan mock signature untuk testing).
+- `coordinator` punya flow: terima proof → validasi → sign receipt (mock TSS).
+- Anti-self-dealing test pass.
+- Duplicate receipt rejection test pass.
+- Challenge period state untuk compute receipt tercatat di chain.
