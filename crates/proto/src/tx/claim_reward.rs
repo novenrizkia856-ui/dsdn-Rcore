@@ -397,6 +397,212 @@ fn validate_field_length(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// REWARD DISTRIBUTION ERROR (14C.A — P.6)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Expected size for receipt_hash in RewardDistributionProto.
+pub const REWARD_RECEIPT_HASH_SIZE: usize = 32;
+
+/// Error type untuk validasi `RewardDistributionProto`.
+///
+/// Setiap varian menjelaskan secara eksplisit kondisi yang gagal.
+/// Tidak ada string error generik.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewardDistributionError {
+    /// Sebuah field memiliki panjang yang tidak sesuai.
+    InvalidLength {
+        field: &'static str,
+        expected: usize,
+        found: usize,
+    },
+
+    /// Overflow terjadi saat menjumlahkan reward components.
+    ArithmeticOverflow,
+
+    /// Total tidak cocok dengan jumlah node_reward + validator_reward + treasury_reward.
+    TotalMismatch {
+        /// Nilai `total` yang disimpan dalam struct.
+        expected: u128,
+        /// Nilai yang dihitung dari `node_reward + validator_reward + treasury_reward`.
+        computed: u128,
+    },
+}
+
+impl fmt::Display for RewardDistributionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RewardDistributionError::InvalidLength {
+                field,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "invalid length for field '{}': expected {} bytes, found {} bytes",
+                    field, expected, found
+                )
+            }
+            RewardDistributionError::ArithmeticOverflow => {
+                write!(
+                    f,
+                    "arithmetic overflow when summing reward components"
+                )
+            }
+            RewardDistributionError::TotalMismatch { expected, computed } => {
+                write!(
+                    f,
+                    "total mismatch: stored total is {} but computed sum is {}",
+                    expected, computed
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RewardDistributionError {}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// REWARD DISTRIBUTION PROTO (14C.A — P.6)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Proto message untuk hasil distribusi reward dari chain.
+///
+/// `RewardDistributionProto` adalah response yang dihasilkan chain setelah
+/// `ClaimRewardProto` diproses dan divalidasi. Struct ini merepresentasikan
+/// hasil final pembagian reward — BUKAN yang menghitung pembagian.
+///
+/// ## Mapping ke FeeSplit (chain/tokenomics.rs)
+///
+/// | Component | Percentage | Field |
+/// |-----------|-----------|-------|
+/// | Node | 70% | `node_reward` |
+/// | Validator | 20% | `validator_reward` |
+/// | Treasury | 10% | `treasury_reward` |
+/// | **Total** | **100%** | `total` |
+///
+/// ## Important Notes
+///
+/// - Struct ini **TIDAK menghitung** pembagian persentase.
+///   Chain layer yang menghitung berdasarkan `reward_base` dari receipt.
+/// - Struct ini **HANYA merepresentasikan** hasil final.
+/// - `total` HARUS SAMA DENGAN `node_reward + validator_reward + treasury_reward`.
+/// - Semua reward boleh 0 (misalnya jika reward_base = 0), tetapi total
+///   harus tetap konsisten.
+///
+/// ## Anti-Self-Dealing
+///
+/// `anti_self_dealing_applied` bernilai `true` jika node address sama
+/// dengan submitter address dan aturan penalti diterapkan oleh chain.
+/// Dalam kasus ini, reward mungkin di-reduce atau di-redistribute.
+///
+/// ## Challenge Period
+///
+/// `challenge_period_active` bernilai `true` jika receipt adalah compute
+/// receipt dan challenge period belum cleared. Reward belum final dan
+/// masih bisa dibatalkan jika fraud terbukti.
+///
+/// ## Field Sizes
+///
+/// | Field | Type |
+/// |-------|------|
+/// | `receipt_hash` | 32 bytes |
+/// | `node_reward` | u128 |
+/// | `validator_reward` | u128 |
+/// | `treasury_reward` | u128 |
+/// | `total` | u128 |
+/// | `anti_self_dealing_applied` | bool |
+/// | `challenge_period_active` | bool |
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewardDistributionProto {
+    /// Hash dari receipt yang reward-nya didistribusikan (MUST be 32 bytes).
+    pub receipt_hash: Vec<u8>,
+
+    /// Reward untuk node yang melakukan kerja (70% dari reward_base).
+    pub node_reward: u128,
+
+    /// Reward untuk validator yang memvalidasi (20% dari reward_base).
+    pub validator_reward: u128,
+
+    /// Reward untuk treasury (10% dari reward_base).
+    pub treasury_reward: u128,
+
+    /// Total reward = node_reward + validator_reward + treasury_reward.
+    ///
+    /// HARUS konsisten — validation akan gagal jika mismatch.
+    pub total: u128,
+
+    /// True jika anti-self-dealing rule diterapkan.
+    ///
+    /// Terjadi ketika node address == submitter address.
+    pub anti_self_dealing_applied: bool,
+
+    /// True jika compute receipt dan challenge period belum cleared.
+    ///
+    /// Reward belum final — masih bisa dibatalkan jika fraud terbukti.
+    pub challenge_period_active: bool,
+}
+
+impl RewardDistributionProto {
+    /// Validates all fields and invariants.
+    ///
+    /// # Validation Rules
+    ///
+    /// 1. `receipt_hash.len() == 32`
+    /// 2. `node_reward + validator_reward + treasury_reward` MUST NOT overflow.
+    /// 3. `total` MUST EQUAL `node_reward + validator_reward + treasury_reward`.
+    /// 4. Semua reward boleh 0 — tapi total harus konsisten.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if all validations pass.
+    /// - `Err(RewardDistributionError)` with specific variant for the first failure.
+    pub fn validate(&self) -> Result<(), RewardDistributionError> {
+        // 1. receipt_hash length
+        if self.receipt_hash.len() != REWARD_RECEIPT_HASH_SIZE {
+            return Err(RewardDistributionError::InvalidLength {
+                field: "receipt_hash",
+                expected: REWARD_RECEIPT_HASH_SIZE,
+                found: self.receipt_hash.len(),
+            });
+        }
+
+        // 2. Overflow check via checked_add
+        let sum = self
+            .node_reward
+            .checked_add(self.validator_reward)
+            .and_then(|s| s.checked_add(self.treasury_reward))
+            .ok_or(RewardDistributionError::ArithmeticOverflow)?;
+
+        // 3. Total mismatch check
+        if self.total != sum {
+            return Err(RewardDistributionError::TotalMismatch {
+                expected: self.total,
+                computed: sum,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Encode ke bytes via bincode (little-endian, deterministic).
+    pub fn encode(&self) -> Result<Vec<u8>, RewardDistributionError> {
+        bincode::serialize(self).map_err(|_| RewardDistributionError::ArithmeticOverflow)
+    }
+
+    /// Decode dari bytes via bincode.
+    ///
+    /// Validates setelah decode. Jika hasil decode invalid, error dikembalikan.
+    pub fn decode(bytes: &[u8]) -> Result<Self, RewardDistributionError> {
+        let proto: Self = bincode::deserialize(bytes)
+            .map_err(|_| RewardDistributionError::ArithmeticOverflow)?;
+
+        proto.validate()?;
+
+        Ok(proto)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -830,5 +1036,244 @@ mod tests {
     fn test_constants() {
         assert_eq!(SUBMITTER_ADDRESS_SIZE, 20);
         assert_eq!(SUBMITTER_SIGNATURE_SIZE, 64);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.6 — REWARD DISTRIBUTION PROTO TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper: build valid RewardDistributionProto.
+    fn make_valid_distribution() -> RewardDistributionProto {
+        RewardDistributionProto {
+            receipt_hash: vec![0x01; 32],
+            node_reward: 700_000,
+            validator_reward: 200_000,
+            treasury_reward: 100_000,
+            total: 1_000_000,
+            anti_self_dealing_applied: false,
+            challenge_period_active: false,
+        }
+    }
+
+    // ── VALIDATE ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rd_validate_valid() {
+        assert!(make_valid_distribution().validate().is_ok());
+    }
+
+    #[test]
+    fn test_rd_validate_all_zeros_valid() {
+        let d = RewardDistributionProto {
+            receipt_hash: vec![0x00; 32],
+            node_reward: 0,
+            validator_reward: 0,
+            treasury_reward: 0,
+            total: 0,
+            anti_self_dealing_applied: false,
+            challenge_period_active: false,
+        };
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn test_rd_validate_with_anti_self_dealing() {
+        let mut d = make_valid_distribution();
+        d.anti_self_dealing_applied = true;
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn test_rd_validate_with_challenge_period_active() {
+        let mut d = make_valid_distribution();
+        d.challenge_period_active = true;
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn test_rd_validate_invalid_receipt_hash_too_short() {
+        let mut d = make_valid_distribution();
+        d.receipt_hash = vec![0x01; 16];
+        let err = d.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RewardDistributionError::InvalidLength {
+                field: "receipt_hash",
+                expected: 32,
+                found: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rd_validate_invalid_receipt_hash_too_long() {
+        let mut d = make_valid_distribution();
+        d.receipt_hash = vec![0x01; 64];
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn test_rd_validate_invalid_receipt_hash_empty() {
+        let mut d = make_valid_distribution();
+        d.receipt_hash = Vec::new();
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn test_rd_validate_total_mismatch() {
+        let mut d = make_valid_distribution();
+        d.total = 999_999; // Wrong: should be 1_000_000
+        let err = d.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RewardDistributionError::TotalMismatch {
+                expected: 999_999,
+                computed: 1_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rd_validate_total_zero_but_rewards_nonzero() {
+        let mut d = make_valid_distribution();
+        d.total = 0; // Wrong: rewards sum to 1_000_000
+        let err = d.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RewardDistributionError::TotalMismatch {
+                expected: 0,
+                computed: 1_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rd_validate_overflow_node_plus_validator() {
+        let d = RewardDistributionProto {
+            receipt_hash: vec![0x01; 32],
+            node_reward: u128::MAX,
+            validator_reward: 1,
+            treasury_reward: 0,
+            total: 0,
+            anti_self_dealing_applied: false,
+            challenge_period_active: false,
+        };
+        let err = d.validate().unwrap_err();
+        assert_eq!(err, RewardDistributionError::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn test_rd_validate_overflow_sum_plus_treasury() {
+        let d = RewardDistributionProto {
+            receipt_hash: vec![0x01; 32],
+            node_reward: u128::MAX - 1,
+            validator_reward: 1,
+            treasury_reward: 1,
+            total: 0,
+            anti_self_dealing_applied: false,
+            challenge_period_active: false,
+        };
+        let err = d.validate().unwrap_err();
+        assert_eq!(err, RewardDistributionError::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn test_rd_validate_max_no_overflow() {
+        // u128::MAX / 3 for each — no overflow
+        let third = u128::MAX / 3;
+        let remainder = u128::MAX - third * 2;
+        let d = RewardDistributionProto {
+            receipt_hash: vec![0x01; 32],
+            node_reward: third,
+            validator_reward: third,
+            treasury_reward: remainder,
+            total: third + third + remainder,
+            anti_self_dealing_applied: false,
+            challenge_period_active: false,
+        };
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn test_rd_validate_only_node_reward() {
+        let d = RewardDistributionProto {
+            receipt_hash: vec![0x01; 32],
+            node_reward: 500,
+            validator_reward: 0,
+            treasury_reward: 0,
+            total: 500,
+            anti_self_dealing_applied: false,
+            challenge_period_active: false,
+        };
+        assert!(d.validate().is_ok());
+    }
+
+    // ── ENCODE / DECODE ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_rd_encode_decode_roundtrip() {
+        let d = make_valid_distribution();
+        let bytes = d.encode().expect("encode");
+        let decoded = RewardDistributionProto::decode(&bytes).expect("decode");
+        assert_eq!(d, decoded);
+    }
+
+    #[test]
+    fn test_rd_encode_decode_with_flags() {
+        let mut d = make_valid_distribution();
+        d.anti_self_dealing_applied = true;
+        d.challenge_period_active = true;
+        let bytes = d.encode().expect("encode");
+        let decoded = RewardDistributionProto::decode(&bytes).expect("decode");
+        assert_eq!(d, decoded);
+    }
+
+    #[test]
+    fn test_rd_decode_invalid_bytes() {
+        assert!(RewardDistributionProto::decode(&[0xFF, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_rd_decode_empty_bytes() {
+        assert!(RewardDistributionProto::decode(&[]).is_err());
+    }
+
+    // ── ERROR DISPLAY ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_rd_error_display_invalid_length() {
+        let err = RewardDistributionError::InvalidLength {
+            field: "receipt_hash",
+            expected: 32,
+            found: 16,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("receipt_hash"));
+        assert!(msg.contains("32"));
+        assert!(msg.contains("16"));
+    }
+
+    #[test]
+    fn test_rd_error_display_overflow() {
+        let msg = format!("{}", RewardDistributionError::ArithmeticOverflow);
+        assert!(msg.contains("overflow"));
+    }
+
+    #[test]
+    fn test_rd_error_display_total_mismatch() {
+        let err = RewardDistributionError::TotalMismatch {
+            expected: 100,
+            computed: 200,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("100"));
+        assert!(msg.contains("200"));
+    }
+
+    // ── CONSTANTS ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rd_constants() {
+        assert_eq!(REWARD_RECEIPT_HASH_SIZE, 32);
     }
 }
