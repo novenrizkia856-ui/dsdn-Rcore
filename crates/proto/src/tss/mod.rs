@@ -389,6 +389,7 @@ pub mod dkg;
 pub mod signing;
 pub mod committee;
 pub mod execution;
+pub mod receipt_v1;
 
 #[cfg(test)]
 mod tests;
