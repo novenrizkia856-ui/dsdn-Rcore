@@ -316,30 +316,31 @@ impl ClaimRewardProto {
     }
 
     /// Encode ke bytes via bincode (little-endian, deterministic).
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Vec<u8>)` — encoded bytes.
-    /// - `Err(ClaimRewardError::EncodeFailed)` — if serialization fails.
-    pub fn encode(&self) -> Result<Vec<u8>, ClaimRewardError> {
-        bincode::serialize(self).map_err(|_| ClaimRewardError::EncodeFailed)
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
-    /// Decode dari bytes via bincode.
+    /// Decode dari bytes via bincode (tanpa validasi).
+    ///
+    /// Gunakan `decode_validated()` jika perlu decode + validate sekaligus.
+    pub fn decode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Decode dari bytes via bincode, lalu validate.
     ///
     /// Setelah decode, `validate()` dipanggil secara otomatis.
-    /// Jika hasil decode invalid, error dikembalikan.
+    /// Jika hasil decode tidak valid, error dikembalikan.
     ///
     /// # Returns
     ///
     /// - `Ok(Self)` — valid decoded proto.
     /// - `Err(ClaimRewardError::DecodeFailed)` — if deserialization fails.
     /// - `Err(ClaimRewardError)` — if validation fails setelah decode.
-    pub fn decode(bytes: &[u8]) -> Result<Self, ClaimRewardError> {
+    pub fn decode_validated(bytes: &[u8]) -> Result<Self, ClaimRewardError> {
         let proto: Self =
             bincode::deserialize(bytes).map_err(|_| ClaimRewardError::DecodeFailed)?;
 
-        // Validate setelah decode — WAJIB.
         proto.validate()?;
 
         Ok(proto)
@@ -585,14 +586,21 @@ impl RewardDistributionProto {
     }
 
     /// Encode ke bytes via bincode (little-endian, deterministic).
-    pub fn encode(&self) -> Result<Vec<u8>, RewardDistributionError> {
-        bincode::serialize(self).map_err(|_| RewardDistributionError::ArithmeticOverflow)
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
-    /// Decode dari bytes via bincode.
+    /// Decode dari bytes via bincode (tanpa validasi).
     ///
-    /// Validates setelah decode. Jika hasil decode invalid, error dikembalikan.
-    pub fn decode(bytes: &[u8]) -> Result<Self, RewardDistributionError> {
+    /// Gunakan `decode_validated()` jika perlu decode + validate sekaligus.
+    pub fn decode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Decode dari bytes via bincode, lalu validate.
+    ///
+    /// Validates setelah decode. Jika hasil decode tidak valid, error dikembalikan.
+    pub fn decode_validated(bytes: &[u8]) -> Result<Self, RewardDistributionError> {
         let proto: Self = bincode::deserialize(bytes)
             .map_err(|_| RewardDistributionError::ArithmeticOverflow)?;
 
@@ -1275,5 +1283,116 @@ mod tests {
     #[test]
     fn test_rd_constants() {
         assert_eq!(REWARD_RECEIPT_HASH_SIZE, 32);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.8 — ENCODE/DECODE INTEGRATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── ClaimRewardProto ────────────────────────────────────────────────
+
+    #[test]
+    fn test_p8_claim_encode_decode_encode_deterministic() {
+        let claim = make_storage_claim();
+        let bytes1 = claim.encode().expect("encode1");
+        let decoded = ClaimRewardProto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2, "encode→decode→encode must produce identical bytes");
+    }
+
+    #[test]
+    fn test_p8_claim_compute_encode_decode_encode_deterministic() {
+        let claim = make_compute_claim();
+        let bytes1 = claim.encode().expect("encode1");
+        let decoded = ClaimRewardProto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn test_p8_claim_method_and_standalone_same_bytes() {
+        let claim = make_storage_claim();
+        let bytes_method = claim.encode().expect("method");
+        let bytes_standalone = encode_claim_reward(&claim);
+        assert_eq!(bytes_method, bytes_standalone);
+    }
+
+    #[test]
+    fn test_p8_claim_decode_returns_bincode_error() {
+        let result = ClaimRewardProto::decode(&[0xFF, 0xFF]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_p8_claim_decode_validated_storage() {
+        let claim = make_storage_claim();
+        let bytes = claim.encode().expect("encode");
+        let decoded = ClaimRewardProto::decode_validated(&bytes).expect("validated");
+        assert_eq!(claim, decoded);
+    }
+
+    #[test]
+    fn test_p8_claim_decode_validated_compute() {
+        let claim = make_compute_claim();
+        let bytes = claim.encode().expect("encode");
+        let decoded = ClaimRewardProto::decode_validated(&bytes).expect("validated");
+        assert_eq!(claim, decoded);
+    }
+
+    #[test]
+    fn test_p8_claim_decode_validated_rejects_invalid_bytes() {
+        assert!(ClaimRewardProto::decode_validated(&[0xFF, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_p8_claim_roundtrip_1000() {
+        let claim = make_compute_claim();
+        let reference = claim.encode().expect("ref");
+        for _ in 0..1000 {
+            let decoded = ClaimRewardProto::decode(&reference).expect("dec");
+            let re_encoded = decoded.encode().expect("enc");
+            assert_eq!(reference, re_encoded);
+        }
+    }
+
+    // ── RewardDistributionProto ─────────────────────────────────────────
+
+    #[test]
+    fn test_p8_rd_encode_decode_encode_deterministic() {
+        let rd = make_valid_distribution();
+        let bytes1 = rd.encode().expect("encode1");
+        let decoded = RewardDistributionProto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2, "encode→decode→encode must produce identical bytes");
+    }
+
+    #[test]
+    fn test_p8_rd_decode_returns_bincode_error() {
+        let result = RewardDistributionProto::decode(&[0xFF, 0xFF]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_p8_rd_decode_validated_valid() {
+        let rd = make_valid_distribution();
+        let bytes = rd.encode().expect("encode");
+        let decoded = RewardDistributionProto::decode_validated(&bytes).expect("validated");
+        assert_eq!(rd, decoded);
+    }
+
+    #[test]
+    fn test_p8_rd_decode_validated_rejects_invalid_bytes() {
+        assert!(RewardDistributionProto::decode_validated(&[0xFF, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_p8_rd_roundtrip_1000() {
+        let rd = make_valid_distribution();
+        let reference = rd.encode().expect("ref");
+        for _ in 0..1000 {
+            let decoded = RewardDistributionProto::decode(&reference).expect("dec");
+            let re_encoded = decoded.encode().expect("enc");
+            assert_eq!(reference, re_encoded);
+        }
     }
 }

@@ -590,13 +590,13 @@ impl ReceiptV1Proto {
     }
 
     /// Encode ke bytes via bincode (little-endian, deterministic).
-    pub fn encode(&self) -> Result<Vec<u8>, ReceiptV1Error> {
-        bincode::serialize(self).map_err(|_| ReceiptV1Error::HashingFailed)
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
     /// Decode dari bytes via bincode.
-    pub fn decode(data: &[u8]) -> Result<Self, ReceiptV1Error> {
-        bincode::deserialize(data).map_err(|_| ReceiptV1Error::HashingFailed)
+    pub fn decode(data: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(data)
     }
 }
 
@@ -1072,14 +1072,21 @@ impl ChallengePeriodStatusProto {
     }
 
     /// Encode ke bytes via bincode (little-endian, deterministic).
-    pub fn encode(&self) -> Result<Vec<u8>, ChallengePeriodError> {
-        bincode::serialize(self).map_err(|_| ChallengePeriodError::EncodeFailed)
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
-    /// Decode dari bytes via bincode.
+    /// Decode dari bytes via bincode (tanpa validasi).
     ///
-    /// Validates setelah decode. Jika hasil decode invalid, error dikembalikan.
-    pub fn decode(bytes: &[u8]) -> Result<Self, ChallengePeriodError> {
+    /// Gunakan `decode_validated()` jika perlu decode + validate sekaligus.
+    pub fn decode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Decode dari bytes via bincode, lalu validate.
+    ///
+    /// Jika hasil decode tidak valid, error dikembalikan.
+    pub fn decode_validated(bytes: &[u8]) -> Result<Self, ChallengePeriodError> {
         let proto: Self =
             bincode::deserialize(bytes).map_err(|_| ChallengePeriodError::DecodeFailed)?;
 
@@ -2065,5 +2072,103 @@ mod tests {
         assert_eq!(ReceiptTypeProto::Storage, ReceiptTypeProto::Storage);
         assert_eq!(ReceiptTypeProto::Compute, ReceiptTypeProto::Compute);
         assert_ne!(ReceiptTypeProto::Storage, ReceiptTypeProto::Compute);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.8 — ENCODE/DECODE INTEGRATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── ReceiptV1Proto ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_p8_receipt_encode_decode_encode_deterministic() {
+        let receipt = make_storage_receipt();
+        let bytes1 = receipt.encode().expect("encode1");
+        let decoded = ReceiptV1Proto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2, "encode→decode→encode must produce identical bytes");
+    }
+
+    #[test]
+    fn test_p8_receipt_compute_encode_decode_encode_deterministic() {
+        let receipt = make_compute_receipt();
+        let bytes1 = receipt.encode().expect("encode1");
+        let decoded = ReceiptV1Proto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn test_p8_receipt_method_and_standalone_same_bytes() {
+        let receipt = make_storage_receipt();
+        let bytes_method = receipt.encode().expect("method");
+        let bytes_standalone = encode_receipt_v1(&receipt);
+        assert_eq!(bytes_method, bytes_standalone);
+    }
+
+    #[test]
+    fn test_p8_receipt_decode_returns_bincode_error() {
+        let result = ReceiptV1Proto::decode(&[0xFF, 0xFF]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_p8_receipt_roundtrip_1000() {
+        let receipt = make_compute_receipt();
+        let reference = receipt.encode().expect("ref");
+        for _ in 0..1000 {
+            let decoded = ReceiptV1Proto::decode(&reference).expect("dec");
+            let re_encoded = decoded.encode().expect("enc");
+            assert_eq!(reference, re_encoded);
+        }
+    }
+
+    // ── ChallengePeriodStatusProto ──────────────────────────────────────
+
+    #[test]
+    fn test_p8_cp_encode_decode_encode_deterministic() {
+        let s = make_pending_status();
+        let bytes1 = s.encode().expect("encode1");
+        let decoded = ChallengePeriodStatusProto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2, "encode→decode→encode must produce identical bytes");
+    }
+
+    #[test]
+    fn test_p8_cp_decode_validated_pending() {
+        let s = make_pending_status();
+        let bytes = s.encode().expect("encode");
+        let decoded = ChallengePeriodStatusProto::decode_validated(&bytes).expect("validated");
+        assert_eq!(s, decoded);
+    }
+
+    #[test]
+    fn test_p8_cp_decode_validated_challenged() {
+        let s = make_challenged_status();
+        let bytes = s.encode().expect("encode");
+        let decoded = ChallengePeriodStatusProto::decode_validated(&bytes).expect("validated");
+        assert_eq!(s, decoded);
+    }
+
+    #[test]
+    fn test_p8_cp_decode_validated_rejects_invalid_bytes() {
+        assert!(ChallengePeriodStatusProto::decode_validated(&[0xFF, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_p8_cp_decode_returns_bincode_error() {
+        let result = ChallengePeriodStatusProto::decode(&[0xFF, 0x01]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_p8_cp_roundtrip_1000() {
+        let s = make_challenged_status();
+        let reference = s.encode().expect("ref");
+        for _ in 0..1000 {
+            let decoded = ChallengePeriodStatusProto::decode(&reference).expect("dec");
+            let re_encoded = decoded.encode().expect("enc");
+            assert_eq!(reference, re_encoded);
+        }
     }
 }

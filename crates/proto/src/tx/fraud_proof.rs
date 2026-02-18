@@ -356,18 +356,24 @@ impl FraudProofChallengeProto {
     }
 
     /// Encode ke bytes via bincode (little-endian, deterministic).
-    pub fn encode(&self) -> Result<Vec<u8>, FraudProofError> {
-        bincode::serialize(self).map_err(|_| FraudProofError::HashingFailed)
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
-    /// Decode dari bytes via bincode.
+    /// Decode dari bytes via bincode (tanpa validasi).
     ///
-    /// Validates setelah decode. Jika hasil decode invalid, error dikembalikan.
-    pub fn decode(bytes: &[u8]) -> Result<Self, FraudProofError> {
+    /// Gunakan `decode_validated()` jika perlu decode + validate sekaligus.
+    pub fn decode(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Decode dari bytes via bincode, lalu validate.
+    ///
+    /// Validates setelah decode. Jika hasil decode tidak valid, error dikembalikan.
+    pub fn decode_validated(bytes: &[u8]) -> Result<Self, FraudProofError> {
         let proto: Self =
             bincode::deserialize(bytes).map_err(|_| FraudProofError::HashingFailed)?;
 
-        // Validate setelah decode — WAJIB.
         proto.validate()?;
 
         Ok(proto)
@@ -829,5 +835,56 @@ mod tests {
         assert_eq!(CHALLENGER_ADDRESS_SIZE, 20);
         assert_eq!(CHALLENGER_SIGNATURE_SIZE, 64);
         assert_eq!(EXPECTED_OUTPUT_HASH_SIZE, 32);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.8 — ENCODE/DECODE INTEGRATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_p8_encode_decode_encode_deterministic() {
+        let challenge = make_valid_challenge();
+        let bytes1 = challenge.encode().expect("encode1");
+        let decoded = FraudProofChallengeProto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2, "encode→decode→encode must produce identical bytes");
+    }
+
+    #[test]
+    fn test_p8_decode_returns_bincode_error() {
+        let result = FraudProofChallengeProto::decode(&[0xFF, 0xFF]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_p8_decode_validated_valid() {
+        let challenge = make_valid_challenge();
+        let bytes = challenge.encode().expect("encode");
+        let decoded = FraudProofChallengeProto::decode_validated(&bytes).expect("validated");
+        assert_eq!(challenge, decoded);
+    }
+
+    #[test]
+    fn test_p8_decode_validated_rejects_invalid_bytes() {
+        assert!(FraudProofChallengeProto::decode_validated(&[0xFF, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_p8_method_and_standalone_same_bytes() {
+        let challenge = make_valid_challenge();
+        let bytes_method = challenge.encode().expect("method");
+        let bytes_standalone = encode_fraud_proof(&challenge);
+        assert_eq!(bytes_method, bytes_standalone);
+    }
+
+    #[test]
+    fn test_p8_roundtrip_1000() {
+        let challenge = make_valid_challenge();
+        let reference = challenge.encode().expect("ref");
+        for _ in 0..1000 {
+            let decoded = FraudProofChallengeProto::decode(&reference).expect("dec");
+            let re_encoded = decoded.encode().expect("enc");
+            assert_eq!(reference, re_encoded);
+        }
     }
 }

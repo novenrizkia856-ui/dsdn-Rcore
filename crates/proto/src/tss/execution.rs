@@ -286,9 +286,9 @@ impl ExecutionCommitmentProto {
     /// # Returns
     ///
     /// - `Ok(Vec<u8>)` — encoded bytes.
-    /// - `Err(ExecutionCommitmentError::HashingFailed)` — if serialization fails.
-    pub fn encode(&self) -> Result<Vec<u8>, ExecutionCommitmentError> {
-        bincode::serialize(self).map_err(|_| ExecutionCommitmentError::HashingFailed)
+    /// - `Err(bincode::Error)` — if serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 
     /// Decode dari bytes via bincode.
@@ -296,9 +296,9 @@ impl ExecutionCommitmentProto {
     /// # Returns
     ///
     /// - `Ok(Self)` — decoded proto.
-    /// - `Err(ExecutionCommitmentError::HashingFailed)` — if deserialization fails.
-    pub fn decode(data: &[u8]) -> Result<Self, ExecutionCommitmentError> {
-        bincode::deserialize(data).map_err(|_| ExecutionCommitmentError::HashingFailed)
+    /// - `Err(bincode::Error)` — if deserialization fails.
+    pub fn decode(data: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(data)
     }
 }
 
@@ -791,5 +791,43 @@ mod tests {
     #[test]
     fn test_constant_execution_field_size() {
         assert_eq!(EXECUTION_FIELD_SIZE, 32);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.8 — ENCODE/DECODE INTEGRATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_p8_encode_decode_encode_deterministic() {
+        let commitment = make_valid_commitment();
+        let bytes1 = commitment.encode().expect("encode1");
+        let decoded = ExecutionCommitmentProto::decode(&bytes1).expect("decode");
+        let bytes2 = decoded.encode().expect("encode2");
+        assert_eq!(bytes1, bytes2, "encode→decode→encode must produce identical bytes");
+    }
+
+    #[test]
+    fn test_p8_method_and_standalone_encode_same_bytes() {
+        let commitment = make_valid_commitment();
+        let bytes_method = commitment.encode().expect("method");
+        let bytes_standalone = encode_execution_commitment(&commitment);
+        assert_eq!(bytes_method, bytes_standalone);
+    }
+
+    #[test]
+    fn test_p8_decode_returns_bincode_error() {
+        let result = ExecutionCommitmentProto::decode(&[0xFF, 0xFF]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_p8_roundtrip_1000_iterations() {
+        let commitment = make_valid_commitment();
+        let reference = commitment.encode().expect("ref");
+        for _ in 0..1000 {
+            let decoded = ExecutionCommitmentProto::decode(&reference).expect("dec");
+            let re_encoded = decoded.encode().expect("enc");
+            assert_eq!(reference, re_encoded);
+        }
     }
 }
