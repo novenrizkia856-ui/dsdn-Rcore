@@ -595,6 +595,388 @@ fn validate_field_length(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// CHALLENGE PERIOD STATUS (14C.A — P.5)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Expected size for receipt_hash in ChallengePeriodStatusProto.
+pub const CHALLENGE_RECEIPT_HASH_SIZE: usize = 32;
+
+/// Expected size for challenger address.
+pub const CHALLENGER_ADDRESS_SIZE: usize = 20;
+
+/// Default challenge window duration in seconds (1 hour).
+pub const CHALLENGE_WINDOW_SECS: u64 = 3600;
+
+// ────────────────────────────────────────────────────────────────────────────
+// CHALLENGE PERIOD ERROR
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Error type untuk validasi dan encoding `ChallengePeriodStatusProto`.
+///
+/// Setiap varian menjelaskan secara eksplisit kondisi yang gagal.
+/// Tidak ada string error generik.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChallengePeriodError {
+    /// Sebuah field memiliki panjang yang tidak sesuai.
+    InvalidLength {
+        field: &'static str,
+        expected: usize,
+        found: usize,
+    },
+
+    /// Nilai status tidak valid (harus 0..=3).
+    InvalidStatus(u8),
+
+    /// `challenge_end` < `challenge_start` — invalid timestamp order.
+    InvalidTimestampOrder,
+
+    /// Status Challenged tapi challenger tidak ada.
+    ChallengerRequired,
+
+    /// Status Pending/Cleared/Slashed tapi challenger ada.
+    ChallengerMustBeNone,
+
+    /// Encoding (serialization) gagal.
+    EncodeFailed,
+
+    /// Decoding (deserialization) gagal.
+    DecodeFailed,
+}
+
+impl fmt::Display for ChallengePeriodError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChallengePeriodError::InvalidLength {
+                field,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "invalid length for field '{}': expected {} bytes, found {} bytes",
+                    field, expected, found
+                )
+            }
+            ChallengePeriodError::InvalidStatus(s) => {
+                write!(f, "invalid challenge status: {} (must be 0..=3)", s)
+            }
+            ChallengePeriodError::InvalidTimestampOrder => {
+                write!(f, "challenge_end must be >= challenge_start")
+            }
+            ChallengePeriodError::ChallengerRequired => {
+                write!(
+                    f,
+                    "status is Challenged but challenger is None (must be Some)"
+                )
+            }
+            ChallengePeriodError::ChallengerMustBeNone => {
+                write!(
+                    f,
+                    "status is Pending/Cleared/Slashed but challenger is Some (must be None)"
+                )
+            }
+            ChallengePeriodError::EncodeFailed => {
+                write!(f, "encoding (serialization) failed")
+            }
+            ChallengePeriodError::DecodeFailed => {
+                write!(f, "decoding (deserialization) failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChallengePeriodError {}
+
+// ────────────────────────────────────────────────────────────────────────────
+// CHALLENGE STATUS ENUM
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Status enum untuk challenge period lifecycle.
+///
+/// ## State Transitions
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────────┐
+/// │                Challenge Period State Machine                    │
+/// └─────────────────────────────────────────────────────────────────┘
+///
+///   ┌─────────┐  fraud proof   ┌────────────┐  fraud proven  ┌─────────┐
+///   │ Pending │───submitted───▶│ Challenged │───────────────▶│ Slashed │
+///   └────┬────┘               └─────┬──────┘                └─────────┘
+///        │                          │                         (terminal)
+///        │ window expired           │ fraud rejected
+///        │                          │
+///        ▼                          ▼
+///   ┌─────────┐               ┌─────────┐
+///   │ Cleared │               │ Cleared │
+///   └─────────┘               └─────────┘
+///    (terminal)                (terminal)
+/// ```
+///
+/// ### Transitions
+///
+/// - `Pending → Challenged`: fraud proof challenge submitted within window.
+/// - `Pending → Cleared`: challenge window expired without challenge.
+/// - `Challenged → Slashed`: fraud proven valid — node slashed.
+/// - `Challenged → Cleared`: fraud proof rejected — challenger may be slashed.
+///
+/// ### Terminal States
+///
+/// - `Cleared`: Challenge period selesai. Reward dapat didistribusikan.
+/// - `Slashed`: Fraud terbukti. Reward dibatalkan. Node di-slash.
+///
+/// ## Numeric Values (consensus-sensitive)
+///
+/// | Variant | Value | Description |
+/// |---------|-------|-------------|
+/// | Pending | 0 | Dalam challenge period |
+/// | Challenged | 1 | Ada fraud proof challenge |
+/// | Cleared | 2 | Challenge window selesai tanpa fraud |
+/// | Slashed | 3 | Fraud terbukti, node di-slash |
+///
+/// Numeric values TIDAK BOLEH BERUBAH — consensus-critical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ChallengeStatusProto {
+    /// Dalam challenge period — menunggu challenge window expire.
+    Pending = 0,
+
+    /// Ada fraud proof challenge yang sedang diproses.
+    Challenged = 1,
+
+    /// Challenge period selesai tanpa fraud terbukti (terminal state).
+    Cleared = 2,
+
+    /// Fraud terbukti — node di-slash (terminal state).
+    Slashed = 3,
+}
+
+impl ChallengeStatusProto {
+    /// Convert dari u8 ke ChallengeStatusProto.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(status)` jika value valid (0..=3).
+    /// - `None` jika value invalid.
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(ChallengeStatusProto::Pending),
+            1 => Some(ChallengeStatusProto::Challenged),
+            2 => Some(ChallengeStatusProto::Cleared),
+            3 => Some(ChallengeStatusProto::Slashed),
+            _ => None,
+        }
+    }
+
+    /// Convert ke u8.
+    #[must_use]
+    #[inline]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Returns true jika status adalah terminal (Cleared atau Slashed).
+    #[must_use]
+    #[inline]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            ChallengeStatusProto::Cleared | ChallengeStatusProto::Slashed
+        )
+    }
+
+    /// Returns true jika challenge period masih aktif.
+    #[must_use]
+    #[inline]
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            ChallengeStatusProto::Pending | ChallengeStatusProto::Challenged
+        )
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// CHALLENGE PERIOD STATUS PROTO
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Proto message untuk Challenge Period Status.
+///
+/// `ChallengePeriodStatusProto` digunakan chain untuk melacak status
+/// challenge period sebuah compute receipt.
+///
+/// ## Lifecycle
+///
+/// Saat compute receipt disubmit ke chain, `ChallengePeriodStatusProto`
+/// dibuat dengan:
+/// - `status = Pending (0)`
+/// - `challenge_start = block_timestamp`
+/// - `challenge_end = block_timestamp + 3600` (1 jam)
+/// - `challenger = None`
+///
+/// Chain menggunakan struct ini untuk:
+/// - Menentukan kapan reward bisa didistribusikan (setelah Cleared).
+/// - Menentukan kapan slashing dilakukan (setelah Slashed).
+/// - Memastikan compute receipt tidak final sebelum challenge window selesai.
+///
+/// ## Default Challenge Window
+///
+/// Default challenge window adalah **1 jam** (3600 detik):
+/// `challenge_end = challenge_start + 3600`.
+///
+/// ## Field Sizes
+///
+/// | Field | Expected Size |
+/// |-------|---------------|
+/// | `receipt_hash` | 32 bytes |
+/// | `status` | 1 byte (u8, 0..=3) |
+/// | `challenge_start` | u64 |
+/// | `challenge_end` | u64 |
+/// | `challenger` | Optional, 20 bytes if present |
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengePeriodStatusProto {
+    /// Hash dari receipt yang sedang dalam challenge period (MUST be 32 bytes).
+    pub receipt_hash: Vec<u8>,
+
+    /// Status challenge period sebagai u8.
+    ///
+    /// Harus sesuai dengan `ChallengeStatusProto` (0..=3).
+    /// Disimpan sebagai u8 untuk kompatibilitas bincode.
+    pub status: u8,
+
+    /// Unix timestamp saat challenge period dimulai.
+    pub challenge_start: u64,
+
+    /// Unix timestamp saat challenge period berakhir.
+    ///
+    /// Harus >= `challenge_start`.
+    /// Default: `challenge_start + 3600` (1 jam).
+    pub challenge_end: u64,
+
+    /// Address challenger (20 bytes), jika ada.
+    ///
+    /// - MUST be `Some(20 bytes)` jika `status == Challenged (1)`.
+    /// - MUST be `None` jika `status == Pending (0)`, `Cleared (2)`, atau `Slashed (3)`.
+    pub challenger: Option<Vec<u8>>,
+}
+
+impl ChallengePeriodStatusProto {
+    /// Validates all fields and invariants.
+    ///
+    /// # Validation Rules
+    ///
+    /// 1. `receipt_hash.len() == 32`
+    /// 2. `status` is valid (0..=3, maps to `ChallengeStatusProto`).
+    /// 3. `challenge_end >= challenge_start`
+    /// 4. If `status == Challenged (1)`: `challenger` MUST be `Some(20 bytes)`.
+    /// 5. If `status == Pending (0)` or `Cleared (2)` or `Slashed (3)`:
+    ///    `challenger` MUST be `None`.
+    /// 6. If `challenger` is `Some`: length MUST be 20 bytes.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if all validations pass.
+    /// - `Err(ChallengePeriodError)` with specific variant for the first failure.
+    pub fn validate(&self) -> Result<(), ChallengePeriodError> {
+        // 1. receipt_hash
+        if self.receipt_hash.len() != CHALLENGE_RECEIPT_HASH_SIZE {
+            return Err(ChallengePeriodError::InvalidLength {
+                field: "receipt_hash",
+                expected: CHALLENGE_RECEIPT_HASH_SIZE,
+                found: self.receipt_hash.len(),
+            });
+        }
+
+        // 2. status valid
+        if ChallengeStatusProto::from_u8(self.status).is_none() {
+            return Err(ChallengePeriodError::InvalidStatus(self.status));
+        }
+
+        // 3. timestamp order
+        if self.challenge_end < self.challenge_start {
+            return Err(ChallengePeriodError::InvalidTimestampOrder);
+        }
+
+        // 4 & 5. challenger invariant based on status
+        match self.status {
+            1 => {
+                // Challenged — challenger required
+                match &self.challenger {
+                    None => return Err(ChallengePeriodError::ChallengerRequired),
+                    Some(addr) => {
+                        if addr.len() != CHALLENGER_ADDRESS_SIZE {
+                            return Err(ChallengePeriodError::InvalidLength {
+                                field: "challenger",
+                                expected: CHALLENGER_ADDRESS_SIZE,
+                                found: addr.len(),
+                            });
+                        }
+                    }
+                }
+            }
+            0 | 2 | 3 => {
+                // Pending, Cleared, Slashed — challenger must be None
+                if self.challenger.is_some() {
+                    return Err(ChallengePeriodError::ChallengerMustBeNone);
+                }
+            }
+            // Unreachable due to step 2 check, but explicit for safety.
+            _ => return Err(ChallengePeriodError::InvalidStatus(self.status)),
+        }
+
+        Ok(())
+    }
+
+    /// Returns true jika challenge period expired at the given time.
+    ///
+    /// # Arguments
+    ///
+    /// - `current_time`: Unix timestamp saat ini (caller-provided, bukan system clock).
+    ///
+    /// # Returns
+    ///
+    /// `true` jika `current_time >= challenge_end`.
+    ///
+    /// # Guarantees
+    ///
+    /// - Deterministik: tidak menggunakan system clock.
+    /// - Tidak ada side effect.
+    /// - Tidak panic.
+    #[must_use]
+    #[inline]
+    pub fn is_expired(&self, current_time: u64) -> bool {
+        current_time >= self.challenge_end
+    }
+
+    /// Returns the `ChallengeStatusProto` enum value.
+    ///
+    /// Returns `None` jika status value invalid.
+    #[must_use]
+    #[inline]
+    pub fn status_enum(&self) -> Option<ChallengeStatusProto> {
+        ChallengeStatusProto::from_u8(self.status)
+    }
+
+    /// Encode ke bytes via bincode (little-endian, deterministic).
+    pub fn encode(&self) -> Result<Vec<u8>, ChallengePeriodError> {
+        bincode::serialize(self).map_err(|_| ChallengePeriodError::EncodeFailed)
+    }
+
+    /// Decode dari bytes via bincode.
+    ///
+    /// Validates setelah decode. Jika hasil decode invalid, error dikembalikan.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ChallengePeriodError> {
+        let proto: Self =
+            bincode::deserialize(bytes).map_err(|_| ChallengePeriodError::DecodeFailed)?;
+
+        proto.validate()?;
+
+        Ok(proto)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -1124,5 +1506,373 @@ mod tests {
         assert_eq!(SUBMITTER_ADDRESS_SIZE, 20);
         assert_eq!(RECEIPT_TYPE_STORAGE, 0);
         assert_eq!(RECEIPT_TYPE_COMPUTE, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.5 — CHALLENGE STATUS PROTO TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_challenge_status_from_u8_valid() {
+        assert_eq!(
+            ChallengeStatusProto::from_u8(0),
+            Some(ChallengeStatusProto::Pending)
+        );
+        assert_eq!(
+            ChallengeStatusProto::from_u8(1),
+            Some(ChallengeStatusProto::Challenged)
+        );
+        assert_eq!(
+            ChallengeStatusProto::from_u8(2),
+            Some(ChallengeStatusProto::Cleared)
+        );
+        assert_eq!(
+            ChallengeStatusProto::from_u8(3),
+            Some(ChallengeStatusProto::Slashed)
+        );
+    }
+
+    #[test]
+    fn test_challenge_status_from_u8_invalid() {
+        assert_eq!(ChallengeStatusProto::from_u8(4), None);
+        assert_eq!(ChallengeStatusProto::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_challenge_status_as_u8() {
+        assert_eq!(ChallengeStatusProto::Pending.as_u8(), 0);
+        assert_eq!(ChallengeStatusProto::Challenged.as_u8(), 1);
+        assert_eq!(ChallengeStatusProto::Cleared.as_u8(), 2);
+        assert_eq!(ChallengeStatusProto::Slashed.as_u8(), 3);
+    }
+
+    #[test]
+    fn test_challenge_status_roundtrip() {
+        for val in 0..=3u8 {
+            let status = ChallengeStatusProto::from_u8(val).expect("valid");
+            assert_eq!(status.as_u8(), val);
+        }
+    }
+
+    #[test]
+    fn test_challenge_status_is_terminal() {
+        assert!(!ChallengeStatusProto::Pending.is_terminal());
+        assert!(!ChallengeStatusProto::Challenged.is_terminal());
+        assert!(ChallengeStatusProto::Cleared.is_terminal());
+        assert!(ChallengeStatusProto::Slashed.is_terminal());
+    }
+
+    #[test]
+    fn test_challenge_status_is_active() {
+        assert!(ChallengeStatusProto::Pending.is_active());
+        assert!(ChallengeStatusProto::Challenged.is_active());
+        assert!(!ChallengeStatusProto::Cleared.is_active());
+        assert!(!ChallengeStatusProto::Slashed.is_active());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.5 — CHALLENGE PERIOD STATUS PROTO TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper: build valid Pending ChallengePeriodStatusProto.
+    fn make_pending_status() -> ChallengePeriodStatusProto {
+        ChallengePeriodStatusProto {
+            receipt_hash: vec![0x01; 32],
+            status: ChallengeStatusProto::Pending.as_u8(),
+            challenge_start: 1_700_000_000,
+            challenge_end: 1_700_000_000 + CHALLENGE_WINDOW_SECS,
+            challenger: None,
+        }
+    }
+
+    /// Helper: build valid Challenged ChallengePeriodStatusProto.
+    fn make_challenged_status() -> ChallengePeriodStatusProto {
+        ChallengePeriodStatusProto {
+            receipt_hash: vec![0x01; 32],
+            status: ChallengeStatusProto::Challenged.as_u8(),
+            challenge_start: 1_700_000_000,
+            challenge_end: 1_700_000_000 + CHALLENGE_WINDOW_SECS,
+            challenger: Some(vec![0x02; 20]),
+        }
+    }
+
+    // ── VALIDATE ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cp_validate_pending_valid() {
+        assert!(make_pending_status().validate().is_ok());
+    }
+
+    #[test]
+    fn test_cp_validate_challenged_valid() {
+        assert!(make_challenged_status().validate().is_ok());
+    }
+
+    #[test]
+    fn test_cp_validate_cleared_valid() {
+        let mut s = make_pending_status();
+        s.status = ChallengeStatusProto::Cleared.as_u8();
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cp_validate_slashed_valid() {
+        let mut s = make_pending_status();
+        s.status = ChallengeStatusProto::Slashed.as_u8();
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cp_validate_invalid_receipt_hash() {
+        let mut s = make_pending_status();
+        s.receipt_hash = vec![0x01; 16];
+        let err = s.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ChallengePeriodError::InvalidLength {
+                field: "receipt_hash",
+                expected: 32,
+                found: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cp_validate_invalid_receipt_hash_empty() {
+        let mut s = make_pending_status();
+        s.receipt_hash = Vec::new();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn test_cp_validate_invalid_status() {
+        let mut s = make_pending_status();
+        s.status = 4;
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ChallengePeriodError::InvalidStatus(4));
+    }
+
+    #[test]
+    fn test_cp_validate_invalid_status_255() {
+        let mut s = make_pending_status();
+        s.status = 255;
+        assert_eq!(
+            s.validate().unwrap_err(),
+            ChallengePeriodError::InvalidStatus(255)
+        );
+    }
+
+    #[test]
+    fn test_cp_validate_invalid_timestamp_order() {
+        let mut s = make_pending_status();
+        s.challenge_end = s.challenge_start - 1;
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ChallengePeriodError::InvalidTimestampOrder);
+    }
+
+    #[test]
+    fn test_cp_validate_same_start_end_valid() {
+        let mut s = make_pending_status();
+        s.challenge_end = s.challenge_start; // equal is valid
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cp_validate_challenged_without_challenger() {
+        let mut s = make_challenged_status();
+        s.challenger = None;
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ChallengePeriodError::ChallengerRequired);
+    }
+
+    #[test]
+    fn test_cp_validate_challenged_with_wrong_length_challenger() {
+        let mut s = make_challenged_status();
+        s.challenger = Some(vec![0x02; 32]); // Should be 20
+        let err = s.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ChallengePeriodError::InvalidLength {
+                field: "challenger",
+                expected: 20,
+                found: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn test_cp_validate_pending_with_challenger_rejected() {
+        let mut s = make_pending_status();
+        s.challenger = Some(vec![0x02; 20]);
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ChallengePeriodError::ChallengerMustBeNone);
+    }
+
+    #[test]
+    fn test_cp_validate_cleared_with_challenger_rejected() {
+        let mut s = make_pending_status();
+        s.status = ChallengeStatusProto::Cleared.as_u8();
+        s.challenger = Some(vec![0x02; 20]);
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ChallengePeriodError::ChallengerMustBeNone);
+    }
+
+    #[test]
+    fn test_cp_validate_slashed_with_challenger_rejected() {
+        let mut s = make_pending_status();
+        s.status = ChallengeStatusProto::Slashed.as_u8();
+        s.challenger = Some(vec![0x02; 20]);
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ChallengePeriodError::ChallengerMustBeNone);
+    }
+
+    // ── IS_EXPIRED ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cp_is_expired_before_end() {
+        let s = make_pending_status();
+        assert!(!s.is_expired(s.challenge_end - 1));
+    }
+
+    #[test]
+    fn test_cp_is_expired_at_end() {
+        let s = make_pending_status();
+        assert!(s.is_expired(s.challenge_end));
+    }
+
+    #[test]
+    fn test_cp_is_expired_after_end() {
+        let s = make_pending_status();
+        assert!(s.is_expired(s.challenge_end + 1));
+    }
+
+    #[test]
+    fn test_cp_is_expired_at_start() {
+        let s = ChallengePeriodStatusProto {
+            receipt_hash: vec![0x01; 32],
+            status: 0,
+            challenge_start: 100,
+            challenge_end: 100, // start == end
+            challenger: None,
+        };
+        assert!(s.is_expired(100));
+    }
+
+    #[test]
+    fn test_cp_is_expired_zero_time() {
+        let s = ChallengePeriodStatusProto {
+            receipt_hash: vec![0x01; 32],
+            status: 0,
+            challenge_start: 0,
+            challenge_end: 0,
+            challenger: None,
+        };
+        assert!(s.is_expired(0));
+    }
+
+    // ── STATUS_ENUM ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cp_status_enum() {
+        let s = make_pending_status();
+        assert_eq!(s.status_enum(), Some(ChallengeStatusProto::Pending));
+
+        let s = make_challenged_status();
+        assert_eq!(s.status_enum(), Some(ChallengeStatusProto::Challenged));
+    }
+
+    #[test]
+    fn test_cp_status_enum_invalid() {
+        let mut s = make_pending_status();
+        s.status = 99;
+        assert_eq!(s.status_enum(), None);
+    }
+
+    // ── ENCODE / DECODE ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_cp_encode_decode_pending_roundtrip() {
+        let s = make_pending_status();
+        let bytes = s.encode().expect("encode");
+        let decoded = ChallengePeriodStatusProto::decode(&bytes).expect("decode");
+        assert_eq!(s, decoded);
+    }
+
+    #[test]
+    fn test_cp_encode_decode_challenged_roundtrip() {
+        let s = make_challenged_status();
+        let bytes = s.encode().expect("encode");
+        let decoded = ChallengePeriodStatusProto::decode(&bytes).expect("decode");
+        assert_eq!(s, decoded);
+    }
+
+    #[test]
+    fn test_cp_decode_invalid_bytes() {
+        assert!(ChallengePeriodStatusProto::decode(&[0xFF, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_cp_decode_empty_bytes() {
+        assert!(ChallengePeriodStatusProto::decode(&[]).is_err());
+    }
+
+    // ── ERROR DISPLAY ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_cp_error_display_invalid_length() {
+        let err = ChallengePeriodError::InvalidLength {
+            field: "receipt_hash",
+            expected: 32,
+            found: 16,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("receipt_hash"));
+        assert!(msg.contains("32"));
+        assert!(msg.contains("16"));
+    }
+
+    #[test]
+    fn test_cp_error_display_invalid_status() {
+        let msg = format!("{}", ChallengePeriodError::InvalidStatus(5));
+        assert!(msg.contains("5"));
+    }
+
+    #[test]
+    fn test_cp_error_display_invalid_timestamp_order() {
+        let msg = format!("{}", ChallengePeriodError::InvalidTimestampOrder);
+        assert!(msg.contains("challenge_end"));
+    }
+
+    #[test]
+    fn test_cp_error_display_challenger_required() {
+        let msg = format!("{}", ChallengePeriodError::ChallengerRequired);
+        assert!(msg.contains("Challenged"));
+    }
+
+    #[test]
+    fn test_cp_error_display_challenger_must_be_none() {
+        let msg = format!("{}", ChallengePeriodError::ChallengerMustBeNone);
+        assert!(msg.contains("None"));
+    }
+
+    #[test]
+    fn test_cp_error_display_encode_failed() {
+        let msg = format!("{}", ChallengePeriodError::EncodeFailed);
+        assert!(msg.contains("encoding"));
+    }
+
+    #[test]
+    fn test_cp_error_display_decode_failed() {
+        let msg = format!("{}", ChallengePeriodError::DecodeFailed);
+        assert!(msg.contains("decoding"));
+    }
+
+    // ── CONSTANTS ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cp_constants() {
+        assert_eq!(CHALLENGE_RECEIPT_HASH_SIZE, 32);
+        assert_eq!(CHALLENGER_ADDRESS_SIZE, 20);
+        assert_eq!(CHALLENGE_WINDOW_SECS, 3600);
     }
 }
