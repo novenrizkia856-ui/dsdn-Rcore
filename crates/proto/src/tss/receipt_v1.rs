@@ -94,6 +94,119 @@ pub const RECEIPT_TYPE_COMPUTE: u8 = 1;
 const ZERO_HASH_32: [u8; 32] = [0u8; 32];
 
 // ════════════════════════════════════════════════════════════════════════════════
+// RECEIPT TYPE ENUM (14C.A — P.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Canonical enum untuk tipe receipt.
+///
+/// `ReceiptTypeProto` adalah representasi type-safe dari `receipt_type` field
+/// di `ReceiptV1Proto`. Menggantikan raw `u8` untuk logic yang membutuhkan
+/// pattern matching dan compile-time safety.
+///
+/// ## Mapping ke Chain
+///
+/// | Proto | Chain (chain/receipt.rs) |
+/// |-------|------------------------|
+/// | `ReceiptTypeProto::Storage` (0) | `ResourceType::Storage` |
+/// | `ReceiptTypeProto::Compute` (1) | `ResourceType::Compute` |
+///
+/// ## Decision Table
+///
+/// | Property | Storage | Compute |
+/// |----------|---------|---------|
+/// | Execution Commitment | Not required (None) | Required (Some) |
+/// | Challenge Period | No | Yes (1 hour) |
+/// | Fraud Proof | Not applicable | Can be challenged |
+/// | Reward Distribution | Immediate | After challenge period cleared |
+///
+/// ## Discriminant Values (consensus-critical)
+///
+/// | Variant | Value |
+/// |---------|-------|
+/// | Storage | 0 |
+/// | Compute | 1 |
+///
+/// Discriminant values TIDAK BOLEH BERUBAH — consensus-critical.
+/// Perubahan = hard-fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ReceiptTypeProto {
+    /// Storage receipt — penyimpanan data.
+    ///
+    /// - Execution commitment: tidak diperlukan (`None`).
+    /// - Challenge period: tidak ada.
+    /// - Reward: immediate setelah validasi.
+    Storage = 0,
+
+    /// Compute receipt — eksekusi workload.
+    ///
+    /// - Execution commitment: wajib (`Some`).
+    /// - Challenge period: 1 jam (3600 detik).
+    /// - Fraud proof: bisa ditantang dalam window.
+    /// - Reward: setelah challenge period cleared.
+    Compute = 1,
+}
+
+impl ReceiptTypeProto {
+    /// Convert dari u8 ke `ReceiptTypeProto`.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(Storage)` jika `v == 0`.
+    /// - `Some(Compute)` jika `v == 1`.
+    /// - `None` jika value lain.
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(ReceiptTypeProto::Storage),
+            1 => Some(ReceiptTypeProto::Compute),
+            _ => None,
+        }
+    }
+
+    /// Convert ke u8 discriminant value.
+    ///
+    /// Menggunakan explicit match — tidak bergantung pada memory layout.
+    #[must_use]
+    #[inline]
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            ReceiptTypeProto::Storage => 0,
+            ReceiptTypeProto::Compute => 1,
+        }
+    }
+
+    /// Returns true jika tipe ini membutuhkan execution commitment.
+    ///
+    /// Hanya `Compute` yang membutuhkan execution commitment.
+    /// `Storage` receipts TIDAK BOLEH memiliki execution commitment.
+    #[must_use]
+    #[inline]
+    pub fn requires_execution_commitment(&self) -> bool {
+        matches!(self, ReceiptTypeProto::Compute)
+    }
+
+    /// Returns true jika tipe ini membutuhkan challenge period.
+    ///
+    /// Hanya `Compute` yang membutuhkan challenge period (1 jam).
+    /// `Storage` receipts mendapat reward langsung tanpa challenge.
+    #[must_use]
+    #[inline]
+    pub fn requires_challenge_period(&self) -> bool {
+        matches!(self, ReceiptTypeProto::Compute)
+    }
+}
+
+impl fmt::Display for ReceiptTypeProto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReceiptTypeProto::Storage => write!(f, "Storage"),
+            ReceiptTypeProto::Compute => write!(f, "Compute"),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // ERROR TYPE
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -1874,5 +1987,83 @@ mod tests {
         assert_eq!(CHALLENGE_RECEIPT_HASH_SIZE, 32);
         assert_eq!(CHALLENGER_ADDRESS_SIZE, 20);
         assert_eq!(CHALLENGE_WINDOW_SECS, 3600);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.7 — RECEIPT TYPE PROTO TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_receipt_type_from_u8_storage() {
+        assert_eq!(
+            ReceiptTypeProto::from_u8(0),
+            Some(ReceiptTypeProto::Storage)
+        );
+    }
+
+    #[test]
+    fn test_receipt_type_from_u8_compute() {
+        assert_eq!(
+            ReceiptTypeProto::from_u8(1),
+            Some(ReceiptTypeProto::Compute)
+        );
+    }
+
+    #[test]
+    fn test_receipt_type_from_u8_invalid() {
+        assert_eq!(ReceiptTypeProto::from_u8(2), None);
+        assert_eq!(ReceiptTypeProto::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_receipt_type_as_u8() {
+        assert_eq!(ReceiptTypeProto::Storage.as_u8(), 0);
+        assert_eq!(ReceiptTypeProto::Compute.as_u8(), 1);
+    }
+
+    #[test]
+    fn test_receipt_type_roundtrip() {
+        for v in 0..=1u8 {
+            let rt = ReceiptTypeProto::from_u8(v).expect("valid");
+            assert_eq!(rt.as_u8(), v);
+        }
+    }
+
+    #[test]
+    fn test_receipt_type_as_u8_matches_constants() {
+        assert_eq!(ReceiptTypeProto::Storage.as_u8(), RECEIPT_TYPE_STORAGE);
+        assert_eq!(ReceiptTypeProto::Compute.as_u8(), RECEIPT_TYPE_COMPUTE);
+    }
+
+    #[test]
+    fn test_receipt_type_requires_execution_commitment() {
+        assert!(!ReceiptTypeProto::Storage.requires_execution_commitment());
+        assert!(ReceiptTypeProto::Compute.requires_execution_commitment());
+    }
+
+    #[test]
+    fn test_receipt_type_requires_challenge_period() {
+        assert!(!ReceiptTypeProto::Storage.requires_challenge_period());
+        assert!(ReceiptTypeProto::Compute.requires_challenge_period());
+    }
+
+    #[test]
+    fn test_receipt_type_display() {
+        assert_eq!(format!("{}", ReceiptTypeProto::Storage), "Storage");
+        assert_eq!(format!("{}", ReceiptTypeProto::Compute), "Compute");
+    }
+
+    #[test]
+    fn test_receipt_type_clone_copy() {
+        let rt = ReceiptTypeProto::Compute;
+        let cloned = rt;
+        assert_eq!(rt, cloned); // Copy semantics
+    }
+
+    #[test]
+    fn test_receipt_type_eq() {
+        assert_eq!(ReceiptTypeProto::Storage, ReceiptTypeProto::Storage);
+        assert_eq!(ReceiptTypeProto::Compute, ReceiptTypeProto::Compute);
+        assert_ne!(ReceiptTypeProto::Storage, ReceiptTypeProto::Compute);
     }
 }
