@@ -129,7 +129,7 @@ pub enum NodeType {
 }
 
 /// Event untuk registrasi node baru dalam sistem DA
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRegisteredEvent {
     /// Unique identifier node
     pub node_id String
@@ -161,7 +161,7 @@ impl From[NodeRegisteredEvent] for DAEvent {
 }
 
 /// Event untuk deklarasi chunk baru dalam sistem DA
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkDeclaredEvent {
     /// SHA256 hex hash dari data chunk
     pub chunk_hash String
@@ -193,7 +193,7 @@ impl From[ChunkDeclaredEvent] for DAEvent {
 }
 
 /// Event untuk penambahan replica ke node
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaAddedEvent {
     /// Identifier chunk
     pub chunk_hash String
@@ -220,7 +220,7 @@ impl From[ReplicaAddedEvent] for DAEvent {
 }
 
 /// Event untuk penghapusan replica dari node
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaRemovedEvent {
     /// Identifier chunk
     pub chunk_hash String
@@ -245,7 +245,7 @@ impl From[ReplicaRemovedEvent] for DAEvent {
 }
 
 /// Event untuk permintaan penghapusan chunk (pointer removal)
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteRequestedEvent {
     /// Identifier chunk yang diminta dihapus
     pub chunk_hash String

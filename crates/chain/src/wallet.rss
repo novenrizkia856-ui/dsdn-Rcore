@@ -1356,7 +1356,7 @@ mod tests {
     fn test_wallet_encrypt_decrypt_file() effects(io, alloc, panic) {
         wallet = Wallet::generate()
         plaintext = b"hello encrypted world"
-        file_id = b"test_file_001"
+        file_id &[u8] = b"test_file_001"
 
         // Encrypt
         mut encrypted = wallet.encrypt_file(plaintext, file_id)
@@ -1382,7 +1382,7 @@ mod tests {
     fn test_wallet_encrypt_decrypt_empty() effects(io, alloc, panic) {
         wallet = Wallet::generate()
         plaintext &[u8] = b""
-        file_id = b"empty_file"
+        file_id &[u8] = b"empty_file"
 
         // Encrypt empty
         mut encrypted = wallet.encrypt_file(plaintext, file_id)
@@ -1403,8 +1403,8 @@ mod tests {
     fn test_wallet_decrypt_wrong_file_id() effects(io, alloc, panic) {
         wallet = Wallet::generate()
         plaintext = b"secret data"
-        file_id = b"correct_id"
-        wrong_id = b"wrong_id"
+        file_id &[u8] = b"correct_id"
+        wrong_id &[u8] = b"wrong_id"
 
         // Encrypt dengan correct_id
         encrypted = wallet.encrypt_file(plaintext, file_id).unwrap()
@@ -1421,7 +1421,7 @@ mod tests {
     fn test_wallet_decrypt_tampered_ciphertext() effects(io, alloc, panic) {
         wallet = Wallet::generate()
         plaintext = b"important data"
-        file_id = b"file_id"
+        file_id &[u8] = b"file_id"
 
         // Encrypt
         mut encrypted = wallet.encrypt_file(plaintext, file_id).unwrap()
@@ -1443,7 +1443,7 @@ mod tests {
     fn test_wallet_decrypt_tampered_tag() effects(io, alloc, panic) {
         wallet = Wallet::generate()
         plaintext = b"important data"
-        file_id = b"file_id"
+        file_id &[u8] = b"file_id"
 
         // Encrypt
         mut encrypted = wallet.encrypt_file(plaintext, file_id).unwrap()
@@ -1466,7 +1466,7 @@ mod tests {
         wallet2 = Wallet::from_secret_key(&secret)
 
         plaintext = b"test message"
-        file_id = b"file_001"
+        file_id &[u8] = b"file_001"
 
         // Encrypt dengan wallet1
         encrypted = wallet1.encrypt_file(plaintext, file_id).unwrap()
@@ -1720,7 +1720,7 @@ mod tests {
         // Wallet dari mnemonic harus bisa encrypt/decrypt
         (wallet, _phrase) = Wallet::generate_with_mnemonic()
         plaintext = b"encrypted with mnemonic wallet"
-        file_id = b"mnemonic_file_001"
+        file_id &[u8] = b"mnemonic_file_001"
 
         encrypted = wallet.encrypt_file(plaintext, file_id).expect("encrypt")
         decrypted = wallet.decrypt_file(&encrypted, file_id).expect("decrypt")
