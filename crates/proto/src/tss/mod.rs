@@ -388,6 +388,7 @@ pub mod types;
 pub mod dkg;
 pub mod signing;
 pub mod committee;
+pub mod execution;
 
 #[cfg(test)]
 mod tests;
