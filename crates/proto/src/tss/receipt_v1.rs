@@ -62,6 +62,7 @@ use sha3::{Digest, Sha3_256};
 use std::fmt;
 
 use super::committee::ReceiptDataProto;
+use super::committee::ThresholdReceiptProto;
 use super::execution::{ExecutionCommitmentError, ExecutionCommitmentProto};
 use super::signing::{compute_aggregate_signature_hash, AggregateSignatureProto};
 
@@ -587,6 +588,142 @@ impl ReceiptV1Proto {
     #[inline]
     pub fn has_execution_commitment(&self) -> bool {
         self.execution_commitment.is_some()
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // BACKWARD COMPATIBILITY BRIDGE (14C.A — P.9)
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Convert dari `ThresholdReceiptProto` (storage-only, backward compat).
+    ///
+    /// Ini adalah migration bridge dari v0 (ThresholdReceiptProto) ke v1
+    /// (ReceiptV1Proto). Hanya menghasilkan **storage receipt** karena
+    /// ThresholdReceiptProto tidak mendukung compute receipts.
+    ///
+    /// ## Field Mapping
+    ///
+    /// | ReceiptV1Proto field | Source |
+    /// |---------------------|--------|
+    /// | `workload_id` | `threshold.receipt_data.workload_id` |
+    /// | `node_id` | parameter `node_id` |
+    /// | `receipt_type` | `0` (Storage) |
+    /// | `usage_proof_hash` | `threshold.receipt_data.blob_hash` |
+    /// | `execution_commitment` | `None` |
+    /// | `coordinator_threshold_signature` | `threshold.signature` |
+    /// | `node_signature` | parameter `node_signature` |
+    /// | `submitter_address` | parameter `submitter_address` |
+    /// | `reward_base` | parameter `reward_base` |
+    /// | `timestamp` | `threshold.receipt_data.timestamp` |
+    /// | `epoch` | `threshold.receipt_data.epoch` |
+    ///
+    /// ## Migration Path
+    ///
+    /// ```text
+    /// ThresholdReceiptProto (v0) → ReceiptV1Proto (v1, storage-only)
+    /// ```
+    ///
+    /// Fields yang tidak ada di ThresholdReceiptProto (`node_id`,
+    /// `node_signature`, `submitter_address`, `reward_base`) disediakan
+    /// melalui parameter.
+    ///
+    /// ## Notes
+    ///
+    /// - Tidak ada re-hashing.
+    /// - Tidak ada field baru yang di-generate.
+    /// - `receipt_data.blob_hash` digunakan sebagai `usage_proof_hash`.
+    /// - Struct yang dihasilkan belum tentu valid — caller HARUS memanggil
+    ///   `validate()` jika perlu memastikan semua field sesuai ukuran.
+    #[must_use]
+    pub fn from_threshold_receipt(
+        threshold: &ThresholdReceiptProto,
+        node_id: Vec<u8>,
+        node_signature: Vec<u8>,
+        submitter_address: Vec<u8>,
+        reward_base: u128,
+    ) -> Self {
+        Self {
+            workload_id: threshold.receipt_data.workload_id.clone(),
+            node_id,
+            receipt_type: RECEIPT_TYPE_STORAGE,
+            usage_proof_hash: threshold.receipt_data.blob_hash.clone(),
+            execution_commitment: None,
+            coordinator_threshold_signature: threshold.signature.clone(),
+            node_signature,
+            submitter_address,
+            reward_base,
+            timestamp: threshold.receipt_data.timestamp,
+            epoch: threshold.receipt_data.epoch,
+        }
+    }
+
+    /// Convert ke `ThresholdReceiptProto` (lossy — drops execution_commitment).
+    ///
+    /// Ini adalah reverse bridge dari v1 (ReceiptV1Proto) ke v0
+    /// (ThresholdReceiptProto). Hanya **storage receipts** bisa dikonversi.
+    ///
+    /// ## Returns
+    ///
+    /// - `Some(ThresholdReceiptProto)` jika `receipt_type == Storage (0)`.
+    /// - `None` jika `receipt_type == Compute (1)` atau tidak valid.
+    ///
+    /// ## Lossy Conversion
+    ///
+    /// Fields berikut **hilang** (tidak tersedia di ThresholdReceiptProto):
+    /// - `node_signature`
+    /// - `submitter_address`
+    /// - `reward_base`
+    /// - `execution_commitment` (di-drop, always None for storage)
+    ///
+    /// Fields berikut menggunakan **lossy defaults** karena tidak tersedia
+    /// di ReceiptV1Proto:
+    /// - `receipt_data.placement` → empty `Vec`
+    /// - `receipt_data.sequence` → `0`
+    /// - `committee_hash` → `[0u8; 32]` (zero hash placeholder)
+    ///
+    /// ## Field Mapping
+    ///
+    /// | ThresholdReceiptProto field | Source |
+    /// |---------------------------|--------|
+    /// | `receipt_data.workload_id` | `self.workload_id` |
+    /// | `receipt_data.blob_hash` | `self.usage_proof_hash` |
+    /// | `receipt_data.placement` | `Vec::new()` (lossy) |
+    /// | `receipt_data.timestamp` | `self.timestamp` |
+    /// | `receipt_data.sequence` | `0` (lossy) |
+    /// | `receipt_data.epoch` | `self.epoch` |
+    /// | `signature` | `self.coordinator_threshold_signature` |
+    /// | `signer_ids` | `self.coordinator_threshold_signature.signer_ids` |
+    /// | `epoch` | `self.epoch` |
+    /// | `committee_hash` | `[0u8; 32]` (lossy — not tracked in V1) |
+    ///
+    /// ## Migration Path
+    ///
+    /// ```text
+    /// ReceiptV1Proto (v1, storage-only) → ThresholdReceiptProto (v0)
+    /// ```
+    #[must_use]
+    pub fn to_threshold_receipt(&self) -> Option<ThresholdReceiptProto> {
+        if self.receipt_type != RECEIPT_TYPE_STORAGE {
+            return None;
+        }
+
+        let receipt_data = ReceiptDataProto {
+            workload_id: self.workload_id.clone(),
+            blob_hash: self.usage_proof_hash.clone(),
+            placement: Vec::new(),
+            timestamp: self.timestamp,
+            sequence: 0,
+            epoch: self.epoch,
+        };
+
+        let signer_ids = self.coordinator_threshold_signature.signer_ids.clone();
+
+        Some(ThresholdReceiptProto {
+            receipt_data,
+            signature: self.coordinator_threshold_signature.clone(),
+            signer_ids,
+            epoch: self.epoch,
+            committee_hash: vec![0u8; 32],
+        })
     }
 
     /// Encode ke bytes via bincode (little-endian, deterministic).
@@ -2170,5 +2307,200 @@ mod tests {
             let re_encoded = decoded.encode().expect("enc");
             assert_eq!(reference, re_encoded);
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P.9 — BACKWARD COMPATIBILITY BRIDGE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper: build valid ThresholdReceiptProto for testing.
+    fn make_threshold_receipt() -> ThresholdReceiptProto {
+        ThresholdReceiptProto {
+            receipt_data: ReceiptDataProto {
+                workload_id: vec![0x01; 32],
+                blob_hash: vec![0x02; 32],
+                placement: vec![vec![0x03; 32]],
+                timestamp: 1_700_000_000,
+                sequence: 5,
+                epoch: 42,
+            },
+            signature: make_aggregate_sig(),
+            signer_ids: vec![vec![0x01; 32], vec![0x02; 32]],
+            epoch: 42,
+            committee_hash: vec![0xCC; 32],
+        }
+    }
+
+    // ── from_threshold_receipt ───────────────────────────────────────────
+
+    #[test]
+    fn test_p9_from_threshold_receipt_type_storage() {
+        let threshold = make_threshold_receipt();
+        let v1 = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            vec![0xDD; 32],
+            vec![0xEE; 64],
+            vec![0xFF; 20],
+            1_000_000,
+        );
+        assert_eq!(v1.receipt_type, RECEIPT_TYPE_STORAGE);
+    }
+
+    #[test]
+    fn test_p9_from_threshold_receipt_no_execution_commitment() {
+        let threshold = make_threshold_receipt();
+        let v1 = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            vec![0xDD; 32],
+            vec![0xEE; 64],
+            vec![0xFF; 20],
+            1_000_000,
+        );
+        assert!(v1.execution_commitment.is_none());
+    }
+
+    #[test]
+    fn test_p9_from_threshold_receipt_field_mapping() {
+        let threshold = make_threshold_receipt();
+        let node_id = vec![0xDD; 32];
+        let node_sig = vec![0xEE; 64];
+        let submitter = vec![0xFF; 20];
+        let reward = 999_999u128;
+
+        let v1 = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            node_id.clone(),
+            node_sig.clone(),
+            submitter.clone(),
+            reward,
+        );
+
+        // From threshold.receipt_data
+        assert_eq!(v1.workload_id, threshold.receipt_data.workload_id);
+        assert_eq!(v1.usage_proof_hash, threshold.receipt_data.blob_hash);
+        assert_eq!(v1.timestamp, threshold.receipt_data.timestamp);
+        assert_eq!(v1.epoch, threshold.receipt_data.epoch);
+
+        // From threshold.signature
+        assert_eq!(v1.coordinator_threshold_signature, threshold.signature);
+
+        // From parameters
+        assert_eq!(v1.node_id, node_id);
+        assert_eq!(v1.node_signature, node_sig);
+        assert_eq!(v1.submitter_address, submitter);
+        assert_eq!(v1.reward_base, reward);
+    }
+
+    #[test]
+    fn test_p9_from_threshold_receipt_does_not_modify_threshold() {
+        let threshold = make_threshold_receipt();
+        let threshold_clone = threshold.clone();
+
+        let _v1 = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            vec![0xDD; 32],
+            vec![0xEE; 64],
+            vec![0xFF; 20],
+            0,
+        );
+
+        assert_eq!(threshold, threshold_clone, "threshold must not be modified");
+    }
+
+    #[test]
+    fn test_p9_from_threshold_receipt_deterministic() {
+        let threshold = make_threshold_receipt();
+        let v1a = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            vec![0xDD; 32],
+            vec![0xEE; 64],
+            vec![0xFF; 20],
+            1_000,
+        );
+        let v1b = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            vec![0xDD; 32],
+            vec![0xEE; 64],
+            vec![0xFF; 20],
+            1_000,
+        );
+        assert_eq!(v1a, v1b);
+    }
+
+    // ── to_threshold_receipt ────────────────────────────────────────────
+
+    #[test]
+    fn test_p9_to_threshold_storage_returns_some() {
+        let receipt = make_storage_receipt();
+        assert!(receipt.to_threshold_receipt().is_some());
+    }
+
+    #[test]
+    fn test_p9_to_threshold_compute_returns_none() {
+        let receipt = make_compute_receipt();
+        assert!(receipt.to_threshold_receipt().is_none());
+    }
+
+    #[test]
+    fn test_p9_to_threshold_invalid_type_returns_none() {
+        let mut receipt = make_storage_receipt();
+        receipt.receipt_type = 99;
+        assert!(receipt.to_threshold_receipt().is_none());
+    }
+
+    #[test]
+    fn test_p9_to_threshold_field_mapping() {
+        let receipt = make_storage_receipt();
+        let threshold = receipt.to_threshold_receipt().expect("should be Some");
+
+        assert_eq!(threshold.receipt_data.workload_id, receipt.workload_id);
+        assert_eq!(threshold.receipt_data.blob_hash, receipt.usage_proof_hash);
+        assert!(threshold.receipt_data.placement.is_empty());
+        assert_eq!(threshold.receipt_data.timestamp, receipt.timestamp);
+        assert_eq!(threshold.receipt_data.sequence, 0);
+        assert_eq!(threshold.receipt_data.epoch, receipt.epoch);
+        assert_eq!(threshold.signature, receipt.coordinator_threshold_signature);
+        assert_eq!(
+            threshold.signer_ids,
+            receipt.coordinator_threshold_signature.signer_ids
+        );
+        assert_eq!(threshold.epoch, receipt.epoch);
+        assert_eq!(threshold.committee_hash, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn test_p9_to_threshold_deterministic() {
+        let receipt = make_storage_receipt();
+        let t1 = receipt.to_threshold_receipt();
+        let t2 = receipt.to_threshold_receipt();
+        assert_eq!(t1, t2);
+    }
+
+    // ── roundtrip ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_p9_roundtrip_threshold_to_v1_preserves_core_fields() {
+        let threshold = make_threshold_receipt();
+        let v1 = ReceiptV1Proto::from_threshold_receipt(
+            &threshold,
+            vec![0xDD; 32],
+            vec![0xEE; 64],
+            vec![0xFF; 20],
+            1_000_000,
+        );
+        let back = v1.to_threshold_receipt().expect("storage → Some");
+
+        // Core fields preserved
+        assert_eq!(back.receipt_data.workload_id, threshold.receipt_data.workload_id);
+        assert_eq!(back.receipt_data.blob_hash, threshold.receipt_data.blob_hash);
+        assert_eq!(back.receipt_data.timestamp, threshold.receipt_data.timestamp);
+        assert_eq!(back.receipt_data.epoch, threshold.receipt_data.epoch);
+        assert_eq!(back.signature, threshold.signature);
+        assert_eq!(back.epoch, threshold.epoch);
+
+        // Lossy fields differ
+        assert!(back.receipt_data.placement.is_empty());
+        assert_eq!(back.receipt_data.sequence, 0);
+        assert_eq!(back.committee_hash, vec![0u8; 32]);
     }
 }
