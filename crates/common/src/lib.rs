@@ -597,6 +597,9 @@ pub mod execution_commitment;
 // Receipt V1 native type (C.2)
 pub mod receipt_v1;
 
+// Economic constants & challenge period (C.3)
+pub mod economic_constants;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -641,6 +644,9 @@ pub use execution_commitment::ExecutionCommitment;
 
 // Receipt V1 native type (C.2)
 pub use receipt_v1::{ReceiptV1, ReceiptType};
+
+// Economic constants & challenge period (C.3)
+pub use economic_constants::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
