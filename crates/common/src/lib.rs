@@ -600,6 +600,9 @@ pub mod receipt_v1;
 // Economic constants & challenge period (C.3)
 pub mod economic_constants;
 
+// Anti-self-dealing helper (C.4)
+pub mod anti_self_dealing;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -647,6 +650,9 @@ pub use receipt_v1::{ReceiptV1, ReceiptType};
 
 // Economic constants & challenge period (C.3)
 pub use economic_constants::*;
+
+// Anti-self-dealing helper (C.4)
+pub use anti_self_dealing::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
