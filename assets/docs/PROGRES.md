@@ -1,8 +1,8 @@
 1 - 14.2b.2 = Finished
-14B = Execution
-
 focus on stage which is being worked on
 
+
+[Active_stage]
 ## Tahap 14C.A — Receipt Foundation & Chain Validation
 
 **Tujuan:** Mendefinisikan struktur data ekonomi (ExecutionCommitment, ReceiptV1),
