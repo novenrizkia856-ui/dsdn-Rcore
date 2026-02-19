@@ -612,6 +612,9 @@ pub mod claim_validation;
 // Challenge period state types (C.7)
 pub mod challenge_state;
 
+// Receipt dedup helper (C.8)
+pub mod receipt_dedup;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -671,6 +674,9 @@ pub use claim_validation::*;
 
 // Challenge period state types (C.7)
 pub use challenge_state::*;
+
+// Receipt dedup helper (C.8)
+pub use receipt_dedup::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
