@@ -609,6 +609,9 @@ pub mod receipt_hash;
 // ClaimReward validation types (C.6)
 pub mod claim_validation;
 
+// Challenge period state types (C.7)
+pub mod challenge_state;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -665,6 +668,9 @@ pub use receipt_hash::*;
 
 // ClaimReward validation types (C.6)
 pub use claim_validation::*;
+
+// Challenge period state types (C.7)
+pub use challenge_state::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
