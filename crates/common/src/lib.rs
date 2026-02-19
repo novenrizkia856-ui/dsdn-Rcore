@@ -606,6 +606,9 @@ pub mod anti_self_dealing;
 // Receipt hashing utilities (C.5)
 pub mod receipt_hash;
 
+// ClaimReward validation types (C.6)
+pub mod claim_validation;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -659,6 +662,9 @@ pub use anti_self_dealing::*;
 
 // Receipt hashing utilities (C.5)
 pub use receipt_hash::*;
+
+// ClaimReward validation types (C.6)
+pub use claim_validation::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
