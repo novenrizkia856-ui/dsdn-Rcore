@@ -603,6 +603,9 @@ pub mod economic_constants;
 // Anti-self-dealing helper (C.4)
 pub mod anti_self_dealing;
 
+// Receipt hashing utilities (C.5)
+pub mod receipt_hash;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -653,6 +656,9 @@ pub use economic_constants::*;
 
 // Anti-self-dealing helper (C.4)
 pub use anti_self_dealing::*;
+
+// Receipt hashing utilities (C.5)
+pub use receipt_hash::*;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
