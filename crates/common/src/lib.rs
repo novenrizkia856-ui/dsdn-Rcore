@@ -615,6 +615,9 @@ pub mod challenge_state;
 // Receipt dedup helper (C.8)
 pub mod receipt_dedup;
 
+// Proto ↔ Native conversion layer (C.9)
+pub mod receipt_v1_convert;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -677,6 +680,19 @@ pub use challenge_state::*;
 
 // Receipt dedup helper (C.8)
 pub use receipt_dedup::*;
+
+// Proto ↔ Native conversion layer (C.9)
+pub use receipt_v1_convert::{
+    ConversionError,
+    ClaimReward,
+    ExecutionCommitmentProto,
+    AggregateSignatureProto,
+    ReceiptV1Proto,
+    ClaimRewardProto,
+    compute_aggregate_signature_hash,
+    compute_receipt_hash_proto_compatible,
+    compute_receipt_hash_from_proto,
+};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
