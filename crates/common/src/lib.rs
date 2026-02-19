@@ -594,6 +594,9 @@ pub mod gating;
 // Execution commitment native type (C.1)
 pub mod execution_commitment;
 
+// Receipt V1 native type (C.2)
+pub mod receipt_v1;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -635,6 +638,9 @@ pub use gating::{IdentityChallenge, IdentityProof};
 
 // Execution commitment native type (C.1)
 pub use execution_commitment::ExecutionCommitment;
+
+// Receipt V1 native type (C.2)
+pub use receipt_v1::{ReceiptV1, ReceiptType};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
