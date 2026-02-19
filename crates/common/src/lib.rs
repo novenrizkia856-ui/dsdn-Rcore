@@ -591,6 +591,9 @@ pub mod coordinator;
 // Gating system (14B)
 pub mod gating;
 
+// Execution commitment native type (C.1)
+pub mod execution_commitment;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -629,6 +632,9 @@ pub use gating::GatingPolicy;
 pub use gating::{GatingDecision, CheckResult, GatingReport};
 pub use gating::NodeRegistryEntry;
 pub use gating::{IdentityChallenge, IdentityProof};
+
+// Execution commitment native type (C.1)
+pub use execution_commitment::ExecutionCommitment;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
