@@ -565,6 +565,101 @@
 //! All steps are deterministic. No system clock is accessed internally.
 //! No implicit trust is granted. A valid identity proof only confirms
 //! private key possession — it does not bypass stake or TLS checks.
+//!
+//! ## Economic Flow V1 (C.1 — C.9)
+//!
+//! The economic flow defines how service nodes earn rewards for work performed.
+//! Every reward claim follows a strict pipeline that ensures correctness,
+//! prevents self-dealing, and enforces single-claim semantics.
+//!
+//! ### Pipeline
+//!
+//! ```text
+//! Node performs work
+//!     │
+//!     ▼
+//! ReceiptV1 created (Storage or Compute)
+//!     │
+//!     ├── coordinator_threshold_signature (FROST aggregate)
+//!     ├── node_signature (Ed25519)
+//!     └── submitter_address (20-byte wallet)
+//!     │
+//!     ▼
+//! ClaimReward transaction submitted
+//!     │
+//!     ▼
+//! Validation pipeline:
+//!     ├── receipt_dedup: reject if receipt_hash already claimed
+//!     ├── anti_self_dealing: detect node_addr == submitter_addr
+//!     ├── signature verification (coordinator + node)
+//!     ├── receipt_expired check (MAX_RECEIPT_AGE_SECS = 86400)
+//!     └── reward_base range check
+//!     │
+//!     ▼
+//! ┌────────────────────────────────────────────────┐
+//! │ Storage path              │ Compute path       │
+//! │ ImmediateReward           │ ChallengePeriodStart│
+//! │ 70% node / 20% val / 10% │ PendingChallenge    │
+//! │ treasury                  │ (3600s window)      │
+//! │                           │     │               │
+//! │                           │     ├─ no fraud ──▶ Cleared → 70/20/10 │
+//! │                           │     └─ fraud ────▶ Challenged → Slashed│
+//! └────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Reward Distribution
+//!
+//! Normal split: 70% node, 20% validator, 10% treasury.
+//! Anti-self-dealing split: 0% node, 20% validator, 80% treasury.
+//! Integer division with remainder allocated to treasury.
+//!
+//! ### Hash Canonicalization
+//!
+//! Two hash algorithms exist for `ReceiptV1`:
+//!
+//! - **Native hash** (`ReceiptV1::compute_receipt_hash`): feeds raw
+//!   `coordinator_threshold_signature` bytes and concatenated `signer_ids`
+//!   directly into SHA3-256. Used for internal dedup and state tracking.
+//!
+//! - **Proto hash** (`compute_receipt_hash_from_proto`): computes a 32-byte
+//!   `aggregate_signature_hash` from the full `AggregateSignatureProto`
+//!   (including `message_hash` and `aggregated_at`), then feeds that digest
+//!   into the receipt hash. Used for cross-layer (DA ↔ chain) verification.
+//!
+//! The bridge function `compute_receipt_hash_proto_compatible` computes the
+//! proto hash from native data plus the original `AggregateSignatureProto`,
+//! enabling: `proto_hash == native_proto_compatible_hash`.
+//!
+//! ### Proto ↔ Native Boundary
+//!
+//! Proto types are the wire format transmitted via Celestia DA layer.
+//! Native types are validated, typed representations used in chain logic.
+//! Conversion is via `from_proto()` / `to_proto()` on each type.
+//!
+//! Lossy field: `AggregateSignatureProto.message_hash` and `.aggregated_at`
+//! are not stored in native `ReceiptV1`. `to_proto()` sets these to zero.
+//! Hash consistency is maintained via `compute_receipt_hash_proto_compatible`.
+//!
+//! ### Dedup Tracking
+//!
+//! `ReceiptDedupTracker` is a `HashSet<[u8; 32]>` that records claimed
+//! receipt hashes. `mark_claimed()` returns `ReceiptAlreadyClaimed` error
+//! on duplicate. `prune_before()` removes specified hashes for garbage
+//! collection across epoch boundaries.
+//!
+//! ### Module Catalog (C.1 — C.9)
+//!
+//! | Module | Task | Description |
+//! |--------|------|-------------|
+//! | `execution_commitment` | C.1 | 6-field commitment with SHA3-256 hash |
+//! | `receipt_v1` | C.2 | ReceiptV1 with Storage/Compute variants |
+//! | `economic_constants` | C.3 | Reward percentages, time limits, boundaries |
+//! | `anti_self_dealing` | C.4 | Direct match + owner match detection |
+//! | `receipt_hash` | C.5 | Standalone hash functions for receipt/EC/claim |
+//! | `claim_validation` | C.6 | RewardDistribution + ClaimValidationResult |
+//! | `challenge_state` | C.7 | PendingChallenge state machine |
+//! | `receipt_dedup` | C.8 | HashSet-based duplicate tracker |
+//! | `receipt_v1_convert` | C.9 | Proto ↔ Native conversion + hash bridge |
 
 // ════════════════════════════════════════════════════════════════════════════════
 // MODULE DECLARATIONS
@@ -700,3 +795,10 @@ pub use receipt_v1_convert::{
 
 /// Common Result type untuk crate ini.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// ════════════════════════════════════════════════════════════════════════════════
+// INTEGRATION TESTS
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests;
