@@ -218,6 +218,7 @@
 //! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
 //! | `rejoin_manager`    | Re-join eligibility, request building, and coordinator response handling (14B.46) |
 //! | `status_notification`| Status notification processing, DA gating event handling, and lifecycle transitions (14B.49) |
+//! | `bootstrap`          | P2P bootstrap foundation: config, peer store, scoring, handshake, PEX, service discovery (Pre-28.1) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -712,6 +713,39 @@
 //! - On error, no state is changed (atomic: success or no-op).
 //! - Quarantine metadata is cleared on transition away from Quarantined.
 //!
+//! ## Bootstrap Network System (Pre-28.1 Foundation)
+//!
+//! The `bootstrap` module provides the complete P2P discovery
+//! foundation that will be fully activated in Tahap 28.1.
+//! All network I/O is trait-abstracted (`DnsResolver`,
+//! `PeerConnector`) so the system is testable now and
+//! replaceable with real implementations at mainnet time.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                    PeerManager                           │
+//! │  BootstrapConfig ── PeerStore ── BootstrapMetrics       │
+//! │                                                         │
+//! │  Fallback: peers.dat → static IP → DNS seed → retry    │
+//! │                                                         │
+//! │  dyn DnsResolver ────── dyn PeerConnector               │
+//! │  (mock now, real@28)    (mock now, real@28)             │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Service Type Discovery
+//!
+//! Every node advertises its `ServiceType` during handshake
+//! (Storage, Coordinator, Validator, Chain, Ingress, Bootstrap).
+//! PEX responses include service types, enabling targeted
+//! discovery (e.g., validators find chain nodes only).
+//!
+//! ### Peer Scoring
+//!
+//! Peers are ranked by a deterministic scoring formula:
+//! `score = base + success×2 − failure×3 + recency − staleness`.
+//! Highest-score peers are tried first during bootstrap.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -743,6 +777,7 @@ pub mod state_sync;
 pub mod status_notification;
 pub mod status_tracker;
 pub mod tls_manager;
+pub mod bootstrap;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -774,3 +809,15 @@ pub use rejoin_manager::RejoinManager;
 pub use status_tracker::NodeStatusTracker;
 pub use status_notification::{StatusNotificationHandler, StatusNotification};
 pub use tls_manager::{TLSCertManager, TLSError};
+
+// Bootstrap Network System (Pre-28.1 Foundation)
+pub use bootstrap::{
+    BootstrapConfig, BootstrapMetrics, BootstrapResult, BootstrapSummary,
+    ServiceType, NetworkId, PeerSource,
+    PeerInfo, PeerStore, PeerStoreStats, PeerStoreError,
+    PeerManager,
+    HandshakeMessage, HandshakeError,
+    PexRequest, PexResponse, PexPeerEntry,
+    DnsResolver, MockDnsResolver, NullDnsResolver,
+    PeerConnector, MockPeerConnector,
+};
