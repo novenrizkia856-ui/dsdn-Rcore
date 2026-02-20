@@ -5200,6 +5200,18 @@ pub struct ChainState {
     /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
     #[serde(default)]
     pub total_fraud_slashed: u128,
+
+    /// Coordinator group public key for FROST threshold signature verification.
+    ///
+    /// - Updated by: coordinator key rotation (governance or bootstrap).
+    /// - `None` during initial bootstrap before coordinator is configured.
+    /// - When `Some`, all ReceiptV1 threshold signatures are verified against
+    ///   this key.
+    /// - When `None`, threshold signature verification is skipped (bootstrap
+    ///   mode only — production MUST have this set).
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub coordinator_group_pubkey: Option<[u8; 32]>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5310,6 +5322,7 @@ impl ChainState {
             total_rewards_distributed: 0,
             total_challenges_submitted: 0,
             total_fraud_slashed: 0,
+            coordinator_group_pubkey: None,
 
         }
     }

@@ -424,6 +424,75 @@ impl ReceiptV1 {
     // HELPER METHODS
     // ────────────────────────────────────────────────────────────────────────
 
+    /// Menghitung SHA3-256 hash dari receipt content TANPA signatures.
+    ///
+    /// Digunakan sebagai **message** untuk verifikasi:
+    /// - Node Ed25519 signature
+    /// - Coordinator threshold signature (FROST aggregate)
+    ///
+    /// ## Perbedaan dengan `compute_receipt_hash()`
+    ///
+    /// | Method | Includes signatures | Use case |
+    /// |--------|:------------------:|----------|
+    /// | `compute_receipt_hash()` | Yes | Receipt ID, dedup key |
+    /// | `compute_signable_hash()` | No | Signature verification message |
+    ///
+    /// ## Hash Order (FIXED — consensus-critical)
+    ///
+    /// 1. `workload_id` (32 bytes)
+    /// 2. `node_id` (32 bytes)
+    /// 3. `receipt_type` (1 byte: 0=Storage, 1=Compute)
+    /// 4. `usage_proof_hash` (32 bytes)
+    /// 5. execution_commitment hash (32 bytes) — or 32 zero bytes if None
+    /// 6. `submitter_address` (20 bytes)
+    /// 7. `reward_base` (16 bytes, big-endian)
+    /// 8. `timestamp` (8 bytes, big-endian)
+    /// 9. `epoch` (8 bytes, big-endian)
+    ///
+    /// Excluded: `coordinator_threshold_signature`, `signer_ids`, `node_signature`
+    /// (karena field-field ini adalah signatures yang akan diverifikasi
+    /// terhadap hash ini — tidak boleh circular).
+    #[must_use]
+    pub fn compute_signable_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+
+        // 1. workload_id (32 bytes)
+        hasher.update(self.workload_id.as_bytes());
+
+        // 2. node_id (32 bytes)
+        hasher.update(&self.node_id);
+
+        // 3. receipt_type (1 byte)
+        hasher.update([self.receipt_type.as_u8()]);
+
+        // 4. usage_proof_hash (32 bytes)
+        hasher.update(&self.usage_proof_hash);
+
+        // 5. execution_commitment hash (32 bytes or zero)
+        let ec_hash = match &self.execution_commitment {
+            Some(ec) => ec.compute_hash(),
+            None => ZERO_HASH_32,
+        };
+        hasher.update(&ec_hash);
+
+        // 6. submitter_address (20 bytes)
+        hasher.update(&self.submitter_address);
+
+        // 7. reward_base (16 bytes, big-endian)
+        hasher.update(self.reward_base.to_be_bytes());
+
+        // 8. timestamp (8 bytes, big-endian)
+        hasher.update(self.timestamp.to_be_bytes());
+
+        // 9. epoch (8 bytes, big-endian)
+        hasher.update(self.epoch.to_be_bytes());
+
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
     /// Return `true` jika receipt_type == Compute.
     ///
     /// Compute receipt memerlukan challenge period sebelum reward
