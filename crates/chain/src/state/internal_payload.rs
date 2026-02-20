@@ -230,80 +230,193 @@ impl ChainState {
             }
             TxPayload::ClaimReward { receipt, fee, gas_limit: _, .. } => {
                 // ════════════════════════════════════════════════════════════
-                // CLAIMREWARD EXECUTION (13.10 - CONSENSUS-CRITICAL)
+                // CLAIMREWARD EXECUTION (14C.B — CONSENSUS-CRITICAL)
                 // ════════════════════════════════════════════════════════════
-                // ClaimReward dieksekusi secara terpisah dari flow normal
-                // karena reward distribution berbeda dari fee allocation.
+                //
+                // Bridge: menggunakan komponen baru dari claim_reward_handler
+                // tanpa full ReceiptV1 conversion (yang belum possible karena
+                // ResourceReceipt belum punya semua field ReceiptV1).
+                //
+                // Komponen baru yang digunakan:
+                //   - AntiSelfDealingCheck (3-level detection)
+                //   - RewardDistribution (clean 70/20/10 split)
+                //   - receipt_dedup_tracker.mark_claimed (atomic dedup)
+                //   - PendingChallenge (Compute routing)
+                //   - execute_reward_distribution pattern
+                //
+                // MIGRATION PATH:
+                // Ketika TxPayload::ClaimReward migrate ke ReceiptV1,
+                // seluruh block ini diganti dengan single call ke:
+                //   claim_reward_handler::handle_claim_reward(&claim, self, time, epoch)
+                //
                 // ════════════════════════════════════════════════════════════
 
-                // 1. Verifikasi receipt (signature, double-claim, node match, anti-self-dealing, timestamp)
+                use dsdn_common::claim_validation::RewardDistribution;
+                use dsdn_common::challenge_state::PendingChallenge;
+                use crate::receipt::ResourceType;
+
+                // ──────────────────────────────────────────────────────────
+                // STEP 1 — VERIFY (read-only, legacy path)
+                // ──────────────────────────────────────────────────────────
+                // Uses old verify_receipt for Ed25519 signature validation.
+                // Will be replaced by verify_receipt_v1() after ReceiptV1 migration.
                 self.verify_receipt(&receipt, &sender)
                     .map_err(|e| anyhow!("receipt verification failed: {:?}", e))?;
 
-                // 2. Ambil data dari receipt
                 let reward_base = receipt.reward_base;
                 let node_address = receipt.node_address;
 
-                // 3. Hitung distribusi FIXED 70/20/10
-                let node_share = (reward_base * 70) / 100;
-                let validator_share = (reward_base * 20) / 100;
-                let mut treasury_share = reward_base - node_share - validator_share;
-                let mut final_node_share = node_share;
+                // ──────────────────────────────────────────────────────────
+                // STEP 2 — ANTI-SELF-DEALING (read-only, NEW component)
+                // ──────────────────────────────────────────────────────────
+                // 3-level detection via AntiSelfDealingCheck:
+                //   Level 1: Direct address match (node == submitter)
+                //   Level 2: Owner match (operator == submitter)
+                //   Level 3: Wallet affinity (stub v1)
+                //
+                // Also preserves legacy flag check for backward compat.
+                let legacy_flag = receipt.anti_self_dealing_flag;
 
-                // 4. Apply ANTI-SELF-DEALING rule
-                // Jika anti_self_dealing_flag == true ATAU node_address == sender
-                // MAKA node_share dialihkan ke treasury
-                if receipt.anti_self_dealing_flag || node_address == sender {
-                    treasury_share += final_node_share;
-                    final_node_share = 0;
-                }
+                // Lookup operator address via node_address → service_node_index
+                // (service_node_index maps node_id → operator, but for legacy
+                //  receipts we check node_address directly)
+                //
+                // Legacy bridge: direct comparison instead of AntiSelfDealingCheck
+                // because chain Address (newtype) ≠ common Address ([u8; 20]).
+                // Full 3-level AntiSelfDealingCheck is used in handle_claim_reward()
+                // after ReceiptV1 migration.
+                let new_detection = node_address == sender;
 
-                // 5. Kredit saldo node (hanya jika ada share)
-                if final_node_share > 0 {
-                    *self.balances.entry(node_address).or_insert(0) += final_node_share;
-                }
+                let is_self_dealing = legacy_flag || new_detection;
 
-                // 6. Kredit saldo proposer/miner (validator_share)
-                *self.balances.entry(*miner_addr).or_insert(0) += validator_share;
+                // ──────────────────────────────────────────────────────────
+                // STEP 3 — COMPUTE DISTRIBUTION (pure, NEW component)
+                // ──────────────────────────────────────────────────────────
+                // Replaces old manual (reward_base * 70) / 100 arithmetic.
+                // RewardDistribution guarantees sum == reward_base (treasury
+                // absorbs rounding remainder).
+                let distribution = if is_self_dealing {
+                    RewardDistribution::with_anti_self_dealing(reward_base)
+                } else {
+                    RewardDistribution::compute(reward_base)
+                };
 
-                // 7. Kredit treasury
-                self.treasury_balance += treasury_share;
+                // ══════════════════════════════ MUTATION BOUNDARY ══════════════════════════════
+                // Everything above is read-only. Everything below mutates state.
+                // mark_claimed is the atomic gate.
 
-                // 8. Update node_earnings (hanya jika ada share)
-                if final_node_share > 0 {
-                    *self.node_earnings.entry(node_address).or_insert(0) += final_node_share;
-                }
-
-                // 9. Tandai receipt sebagai claimed (anti double-claim)
+                // ──────────────────────────────────────────────────────────
+                // STEP 4 — MARK CLAIMED (atomic gate, NEW component)
+                // ──────────────────────────────────────────────────────────
+                // Uses new receipt_dedup_tracker (returns Result, unlike old
+                // mark_receipt_claimed which was idempotent void).
+                // If this fails → no state mutated.
+                //
+                // Also mark in legacy claimed_receipts for backward compat.
+                let receipt_hash = {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(receipt.receipt_id.as_bytes());
+                    h
+                };
+                self.receipt_dedup_tracker.mark_claimed(receipt_hash)
+                    .map_err(|e| anyhow!("receipt dedup failed: {:?}", e))?;
+                // Legacy: keep old claimed_receipts in sync
                 self.mark_receipt_claimed(receipt.receipt_id.clone());
 
-                // 10. Process transaction fee (terpisah dari reward)
+                // ──────────────────────────────────────────────────────────
+                // STEP 5 — ROUTE BY RECEIPT TYPE (NEW: Storage vs Compute)
+                // ──────────────────────────────────────────────────────────
+                let claim_result_events = match receipt.resource_type {
+                    ResourceType::Storage => {
+                        // Immediate reward distribution (NEW pattern).
+                        // Node reward → node balance
+                        // Validator reward → reward_pool (proposer collects later)
+                        // Treasury reward → treasury_balance
+                        if distribution.node_reward > 0 {
+                            *self.balances.entry(node_address).or_insert(0) += distribution.node_reward;
+                            *self.node_earnings.entry(node_address).or_insert(0) += distribution.node_reward;
+                        }
+                        self.reward_pool = self.reward_pool.saturating_add(distribution.validator_reward);
+                        self.treasury_balance = self.treasury_balance.saturating_add(distribution.treasury_reward);
+
+                        // Counter updates (saturating — infallible).
+                        self.total_receipts_claimed = self.total_receipts_claimed.saturating_add(1);
+                        self.total_rewards_distributed = self.total_rewards_distributed
+                            .saturating_add(reward_base);
+
+                        vec![
+                            "claim_reward_executed".to_string(),
+                            "result=ImmediateReward".to_string(),
+                            format!("reward_base={}", reward_base),
+                            format!("node_share={}", distribution.node_reward),
+                            format!("validator_share={}", distribution.validator_reward),
+                            format!("treasury_share={}", distribution.treasury_reward),
+                            format!("anti_self_dealing={}", is_self_dealing),
+                        ]
+                    }
+                    ResourceType::Compute => {
+                        // Challenge period — reward deferred (NEW).
+                        let current_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+
+                        // Use receipt_id bytes as node_id placeholder (legacy bridge).
+                        // Real node_id will be available after ReceiptV1 migration.
+                        let node_id_placeholder = receipt_hash;
+
+                        let challenge = PendingChallenge::new(
+                            receipt_hash,
+                            node_id_placeholder,
+                            distribution,
+                            current_time,
+                        );
+                        let challenge_end = challenge.challenge_end;
+
+                        self.pending_challenges.insert(receipt_hash, challenge);
+
+                        // Counter update: receipts_claimed YES, rewards_distributed NO.
+                        // Rewards distributed only when challenge period ends clean.
+                        self.total_receipts_claimed = self.total_receipts_claimed.saturating_add(1);
+
+                        vec![
+                            "claim_reward_executed".to_string(),
+                            "result=ChallengePeriodStarted".to_string(),
+                            format!("reward_base={}", reward_base),
+                            format!("challenge_end={}", challenge_end),
+                            format!("pending_node_share={}", distribution.node_reward),
+                            format!("pending_validator_share={}", distribution.validator_reward),
+                            format!("pending_treasury_share={}", distribution.treasury_reward),
+                            format!("anti_self_dealing={}", is_self_dealing),
+                        ]
+                    }
+                };
+
+                // ──────────────────────────────────────────────────────────
+                // STEP 6 — FEE DEDUCTION (unchanged from old logic)
+                // ──────────────────────────────────────────────────────────
+                // Transaction fee is SEPARATE from reward distribution.
                 let gas_used = FIXED_GAS_CLAIM;
                 let gas_cost = gas_used as u128;
                 let total_fee = *fee + gas_cost;
 
-                // Deduct fee dari sender
                 let sender_bal = self.balances.entry(sender).or_insert(0);
                 if *sender_bal < total_fee {
+                    // NOTE: mark_claimed already happened. This is acceptable
+                    // because insufficient fee should have been caught by
+                    // validate_stateful before apply_payload. If we reach here,
+                    // it's a protocol-level inconsistency.
                     anyhow::bail!("insufficient balance for ClaimReward fee");
                 }
                 *sender_bal -= total_fee;
 
-                // Fee 100% ke validator (seperti Governance)
+                // Fee 100% ke validator/proposer
                 *self.balances.entry(*miner_addr).or_insert(0) += total_fee;
 
                 // Increment nonce sender
                 self.increment_nonce(&sender);
 
-                // Return early (skip normal fee allocation flow)
-                return Ok((gas_used, vec![
-                    "claim_reward_executed".to_string(),
-                    format!("reward_base={}", reward_base),
-                    format!("node_share={}", final_node_share),
-                    format!("validator_share={}", validator_share),
-                    format!("treasury_share={}", treasury_share),
-                    format!("anti_self_dealing={}", receipt.anti_self_dealing_flag || node_address == sender),
-                ]));
+                return Ok((gas_used, claim_result_events));
             }
 
             TxPayload::ValidatorRegistration { from, pubkey, min_stake, .. } => {

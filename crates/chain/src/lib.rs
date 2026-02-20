@@ -30,6 +30,7 @@
 //! | `coordinator` | Coordinator committee: epoch, DKG, disputes, accountability | 14A.2B.2 |
 //! | `gating` | Service node on-chain state: ServiceNodeRecord, query API, RPC, CLI, tests | 14B.11–14B.20 |
 //! |  `receipt_v1_verify` | Verify ReceiptV1 before reward distribution (signature, stake, structure). | 14C.A |
+//! |  `claim_reward_handler` | ClaimReward transaction handler: verify → anti-self-dealing → distribute/challenge. | 14C.B |
 //!
 //! ## 14B — Stake & Identity Gating
 //!
@@ -787,6 +788,7 @@ pub mod gating;
 pub mod mnemonic;
 pub mod p2p;
 pub mod receipt_v1_verify;
+pub mod claim_reward_handler;
 use crate::types::{Address, Hash};
 use std::str::FromStr;
 
