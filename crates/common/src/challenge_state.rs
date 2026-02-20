@@ -48,7 +48,7 @@ use crate::receipt_v1::Address;
 /// Pending → Cleared
 /// Pending → Challenged → Slashed
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChallengeStatus {
     /// Challenge period aktif, belum ada fraud proof.
     Pending,
@@ -75,7 +75,7 @@ pub enum ChallengeStatus {
 /// - `status` hanya dapat bertransisi sesuai state machine
 /// - `challenger` hanya di-set saat transisi Pending → Challenged
 /// - `reward_distribution` tidak berubah setelah konstruksi
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingChallenge {
     /// Hash dari receipt yang sedang di-challenge.
     pub receipt_hash: [u8; 32],

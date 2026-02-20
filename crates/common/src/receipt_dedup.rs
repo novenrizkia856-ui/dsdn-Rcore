@@ -39,7 +39,7 @@ use crate::claim_validation::ClaimValidationError;
 /// - `mark_claimed()` menambah size tepat 1 jika sukses.
 /// - `mark_claimed()` tidak mengubah size jika duplicate.
 /// - Tidak ada silent overwrite.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReceiptDedupTracker {
     claimed: HashSet<[u8; 32]>,
 }

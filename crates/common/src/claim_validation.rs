@@ -165,7 +165,7 @@ impl std::error::Error for ClaimValidationError {}
 /// - Node: 0% (penalty: reward dialihkan)
 /// - Validator: 20% (`REWARD_VALIDATOR_PERCENT`)
 /// - Treasury: 80% (`REWARD_NODE_PERCENT + REWARD_TREASURY_PERCENT`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RewardDistribution {
     /// Reward untuk node yang melakukan kerja.
     pub node_reward: u128,

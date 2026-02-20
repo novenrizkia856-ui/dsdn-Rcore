@@ -4436,6 +4436,8 @@ use crate::types::{Address, Hash};
 use crate::gating::ServiceNodeRecord;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
+use dsdn_common::receipt_dedup::ReceiptDedupTracker;
+use dsdn_common::challenge_state::PendingChallenge;
 use crate::slashing::{
     LivenessRecord,
     NodeLivenessRecord,
@@ -5122,6 +5124,82 @@ pub struct ChainState {
     /// - MUST be kept in sync with service_nodes at all times
     /// - CONSENSUS-CRITICAL: termasuk dalam state_root
     pub service_node_index: HashMap<[u8; 32], Address>,
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // RECEIPT CLAIM STATE (14C.A)
+    // ════════════════════════════════════════════════════════════════════════════
+    // Tracking receipt claims, challenge periods, dan economic counters.
+    //
+    // receipt_dedup_tracker: Anti double-claim (CONSENSUS-CRITICAL, in state_root)
+    // pending_challenges: Challenge period tracking (CONSENSUS-CRITICAL, in state_root)
+    // Counters: Economic statistics v1 (CONSENSUS-CRITICAL, in state_root)
+    //
+    // Thread safety: HashMap/ReceiptDedupTracker are NOT thread-safe.
+    // Concurrency is controlled at the executor layer (single-threaded chain execution).
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Dedup tracker for receipt claims (prevents double-claim).
+    ///
+    /// - Updated by: `internal_receipt` module during ClaimReward execution.
+    /// - Invariant: every claimed receipt hash appears exactly once.
+    /// - If corrupt: double-claim attacks become possible, economic loss.
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub receipt_dedup_tracker: ReceiptDedupTracker,
+
+    /// Pending challenges for compute receipts.
+    ///
+    /// Key: `receipt_hash` (`[u8; 32]`).
+    ///
+    /// - Updated by: `internal_receipt` during ClaimReward (compute)
+    ///   and during challenge resolution (fraud proof submit / clear / slash).
+    /// - Invariant: entry exists only while challenge period is active
+    ///   (`Pending`) or being disputed (`Challenged`). Cleared/Slashed
+    ///   entries are removed after resolution.
+    /// - If corrupt: rewards may be distributed before challenge period
+    ///   ends, or fraud proofs may be lost.
+    /// - Thread safety: `HashMap` is NOT thread-safe; concurrency
+    ///   controlled at executor layer.
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub pending_challenges: HashMap<[u8; 32], PendingChallenge>,
+
+    /// Counter: total receipts claimed across all time.
+    ///
+    /// - Updated by: `internal_receipt` on successful ClaimReward.
+    /// - Invariant: monotonically increasing, never decremented.
+    /// - If corrupt: economic statistics inaccurate (non-critical for consensus
+    ///   correctness, but included in state_root for auditability).
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub total_receipts_claimed: u64,
+
+    /// Counter: total rewards distributed (in base units) across all time.
+    ///
+    /// - Updated by: `internal_receipt` on reward distribution.
+    /// - Invariant: monotonically increasing, never decremented.
+    /// - If corrupt: economic statistics inaccurate.
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub total_rewards_distributed: u128,
+
+    /// Counter: total challenges submitted across all time.
+    ///
+    /// - Updated by: `internal_receipt` on fraud proof submission.
+    /// - Invariant: monotonically increasing, never decremented.
+    /// - If corrupt: economic statistics inaccurate.
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub total_challenges_submitted: u64,
+
+    /// Counter: total amount slashed from fraud proofs across all time.
+    ///
+    /// - Updated by: `internal_receipt` on successful fraud proof resolution.
+    /// - Invariant: monotonically increasing, never decremented.
+    /// - If corrupt: economic statistics inaccurate.
+    /// - CONSENSUS-CRITICAL: termasuk dalam state_root.
+    #[serde(default)]
+    pub total_fraud_slashed: u128,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5225,9 +5303,63 @@ impl ChainState {
             service_nodes: HashMap::new(),
             service_node_index: HashMap::new(),
 
+            // RECEIPT CLAIM STATE (14C.A)
+            receipt_dedup_tracker: ReceiptDedupTracker::new(),
+            pending_challenges: HashMap::new(),
+            total_receipts_claimed: 0,
+            total_rewards_distributed: 0,
+            total_challenges_submitted: 0,
+            total_fraud_slashed: 0,
+
         }
     }
     
+    // ════════════════════════════════════════════════════════════════════
+    // RECEIPT STATE HELPERS (14C.A)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Checks whether a receipt hash has an active pending challenge.
+    ///
+    /// ## Complexity
+    ///
+    /// O(1) — single `HashMap::contains_key` lookup.
+    ///
+    /// ## Determinism
+    ///
+    /// Deterministic. No side effects, no mutation, no allocation.
+    #[must_use]
+    #[inline]
+    pub fn has_pending_challenge(&self, receipt_hash: &[u8; 32]) -> bool {
+        self.pending_challenges.contains_key(receipt_hash)
+    }
+
+    /// Returns all receipt hashes whose challenge period has expired.
+    ///
+    /// Iterates `pending_challenges` and collects entries where
+    /// `PendingChallenge::is_expired(now)` returns `true`.
+    ///
+    /// ## Complexity
+    ///
+    /// O(n) iteration + O(n log n) sort, where n = `pending_challenges.len()`.
+    ///
+    /// ## Determinism
+    ///
+    /// **Deterministic.** Results are sorted lexicographically by
+    /// `receipt_hash` bytes to guarantee identical output regardless
+    /// of `HashMap` iteration order. All validators produce the same
+    /// result for the same state and `now` value.
+    #[must_use]
+    pub fn get_expired_challenges(&self, now: u64) -> Vec<[u8; 32]> {
+        let mut expired: Vec<[u8; 32]> = self
+            .pending_challenges
+            .iter()
+            .filter(|(_, challenge)| challenge.is_expired(now))
+            .map(|(hash, _)| *hash)
+            .collect();
+        expired.sort();
+        expired
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // DELEGATED METHODS
     // ════════════════════════════════════════════════════════════════════
