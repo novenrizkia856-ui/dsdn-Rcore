@@ -32,6 +32,7 @@
 //! |  `receipt_v1_verify` | Verify ReceiptV1 before reward distribution (signature, stake, structure). | 14C.A |
 //! |  `claim_reward_handler` | ClaimReward transaction handler: verify → anti-self-dealing → distribute/challenge. | 14C.B |
 //! |  `reward_executor` | Reward distribution execution: atomic credit, rollback, challenge release. | 14C.C |
+//! |  `anti_self_dealing_check` | Anti-self-dealing chain validation: detect → redirect, never reject. | 14C.D |
 //!
 //! ## 14B — Stake & Identity Gating
 //!
@@ -791,6 +792,7 @@ pub mod p2p;
 pub mod receipt_v1_verify;
 pub mod claim_reward_handler;
 pub mod reward_executor;
+pub mod anti_self_dealing_check;
 use crate::types::{Address, Hash};
 use std::str::FromStr;
 
