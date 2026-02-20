@@ -1,0 +1,22 @@
+[bootstrap]
+# DNS seeds (founder/community maintained)
+dns_seeds = [
+    # "seed1.dsdn.network",
+    # "seed2.dsdn.network",
+    # "seed3.dsdn.network",
+]
+
+# Static IP peers (community maintained)
+static_peers = [
+    # "203.0.113.50:30303",
+    # "198.51.100.10:30303",
+]
+
+# Local peer cache
+peers_file = "peers.dat"
+
+# Connection settings
+max_outbound_connections = 8
+max_inbound_connections = 125
+dns_resolve_timeout_secs = 10
+peer_connect_timeout_secs = 5

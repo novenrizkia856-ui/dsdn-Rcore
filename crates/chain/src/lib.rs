@@ -784,7 +784,7 @@ pub mod encryption;
 pub mod coordinator;
 pub mod gating;
 pub mod mnemonic;
-
+pub mod p2p;
 use crate::types::{Address, Hash};
 use std::str::FromStr;
 
@@ -805,6 +805,17 @@ pub use economic::{
     BurnEvent,
     EconomicSnapshot,
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// p2p RE-EXPORTS 
+// ════════════════════════════════════════════════════════════════════════════
+pub use p2p::{
+     NetworkId, NodeId, ProtocolVersion, CURRENT_PROTOCOL_VERSION,
+     PeerEntry, PeerStatus, ServiceType, PeerSource,
+     BootstrapConfig, PeerManager,
+     HandshakeMessage, HandshakeResult,
+     PexRequest, PexResponse,
+ };
 
 // ════════════════════════════════════════════════════════════════════════════
 // WALLET RE-EXPORTS (13.17)
@@ -988,6 +999,9 @@ pub struct Chain {
     /// Snapshot configuration untuk automatic checkpoint
     /// Menentukan interval, path, dan retention policy
     pub snapshot_config: crate::state::SnapshotConfig,
+
+    /// P2P peer manager for bootstrap, discovery, and peer lifecycle
+    pub peer_manager: Arc<RwLock<p2p::PeerManager>>,
 }
 
 impl Chain {
@@ -1012,6 +1026,37 @@ impl Chain {
         let dummy_priv = vec![0u8; 32];  // Dummy secret key; replace with real
         let miner = Arc::new(Miner::new(dummy_proposer, dummy_priv));
         let broadcast_manager = Arc::new(crate::rpc::BroadcastManager::new());
+
+        // ════════════════════════════════════════════════════════════════════════
+        // P2P PEER MANAGER INITIALIZATION
+        // ════════════════════════════════════════════════════════════════════════
+        // Load config dari dsdn.toml (jika ada) atau fallback ke development defaults.
+        // Config dibaca dari:
+        //   1. ./dsdn.toml (working directory)
+        //   2. db_path/../dsdn.toml (project root)
+        //   3. db_path/dsdn.toml
+        // Jika tidak ditemukan → BootstrapConfig::development() (semua manual).
+        // ════════════════════════════════════════════════════════════════════════
+        let p2p_config = p2p::BootstrapConfig::load_from_project(db_path.as_ref())?;
+
+        // Node identity: derive dari wallet keypair jika tersedia, else zero (placeholder)
+        // Zero NodeId berarti node belum bisa melakukan handshake dengan peer lain.
+        // Saat wallet/keystore di-integrate, ganti ini dengan:
+        //   let node_id = p2p::NodeId::from_ed25519_pubkey(&wallet.pubkey())?;
+        let node_id = p2p::NodeId::zero();
+
+        // Network ID: saat ini hardcoded Devnet.
+        // Di masa depan, baca dari dsdn.toml [network] section atau CLI flag.
+        let network_id = p2p::NetworkId::Devnet;
+
+        let mut peer_mgr = p2p::PeerManager::new(
+            network_id,
+            node_id,
+            p2p_config,
+            p2p::ServiceType::Chain,
+        );
+        peer_mgr.initialize()?;
+        let peer_manager = Arc::new(RwLock::new(peer_mgr));
         
         Ok(Chain {
             db: Arc::new(db),
@@ -1024,6 +1069,7 @@ impl Chain {
             last_celestia_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Initialize snapshot config with defaults (13.18.6)
             snapshot_config: crate::state::SnapshotConfig::default(),
+            peer_manager,
         })
     }
 
@@ -2166,27 +2212,172 @@ impl Chain {
     }
 
     // ============================================================
-    // PEER MANAGEMENT (13.7.N)
+    // PEER MANAGEMENT (P2P + Legacy Bridge)
+    // ============================================================
+    //
+    // Dual-layer peer management:
+    // - PeerManager (p2p module): scoring, lifecycle, persistence, bootstrap
+    // - BroadcastManager (rpc.rs): actual block broadcasting via HTTP
+    //
+    // Semua peer method baru menggunakan PeerManager sebagai source of truth.
+    // Legacy add_peer/remove_peer tetap bekerja untuk backward compatibility.
     // ============================================================
 
-    /// Add a peer for block broadcasting
+    /// Add peer via P2P system (recommended).
+    /// Peer akan ditrack di PeerManager DAN di-bridge ke BroadcastManager.
+    ///
+    /// Format addr_str: "IP:PORT" (contoh: "192.168.1.100:30303")
+    pub fn add_peer_p2p(&self, addr_str: &str) -> anyhow::Result<()> {
+        // Add ke PeerManager (persistent, scored)
+        let mut mgr = self.peer_manager.write();
+        mgr.add_peer_manual(addr_str)?;
+
+        // Bridge ke legacy BroadcastManager agar broadcast_block tetap jalan
+        if let Some(entry) = mgr.store.get(addr_str) {
+            let peer_info = crate::rpc::PeerInfo {
+                id: addr_str.to_string(),
+                address: entry.to_broadcast_url(),
+                is_validator: false,
+            };
+            self.broadcast_manager.add_peer(peer_info);
+        }
+
+        Ok(())
+    }
+
+    /// Add a peer for block broadcasting (legacy interface, backward compatible)
     pub fn add_peer(&self, peer: crate::rpc::PeerInfo) {
         self.broadcast_manager.add_peer(peer);
     }
 
-    /// Remove a peer from broadcast list
+    /// Remove a peer from broadcast list (legacy)
     pub fn remove_peer(&self, peer_id: &str) {
         self.broadcast_manager.remove_peer(peer_id);
     }
 
-    /// Get count of connected peers
+    /// Get count of connected peers (legacy BroadcastManager count)
     pub fn peer_count(&self) -> usize {
         self.broadcast_manager.peer_count()
     }
 
-    /// Get all connected peers
+    /// Get all connected peers (legacy BroadcastManager list)
     pub fn get_peers(&self) -> Vec<crate::rpc::PeerInfo> {
         self.broadcast_manager.get_peers()
+    }
+
+    // ── P2P-AWARE PEER METHODS ─────────────────────────────────────────
+
+    /// Get P2P peer count (from PeerManager, more accurate than legacy)
+    pub fn p2p_peer_count(&self) -> usize {
+        self.peer_manager.read().connected_count()
+    }
+
+    /// Get P2P total known peers (termasuk yang belum connected)
+    pub fn p2p_known_count(&self) -> usize {
+        self.peer_manager.read().known_count()
+    }
+
+    /// Get bootstrap peer candidates dan mulai connecting.
+    /// Mengikuti fallback chain: peers.dat → static IP → DNS seed.
+    pub fn bootstrap_peers(&self) -> Vec<p2p::PeerEntry> {
+        self.peer_manager.write().get_bootstrap_peers()
+    }
+
+    /// Build handshake Hello message untuk kirim ke peer baru.
+    pub fn build_handshake(&self) -> p2p::HandshakeMessage {
+        let height = self.get_chain_tip()
+            .map(|(h, _)| h)
+            .unwrap_or(0);
+        self.peer_manager.read().build_hello(height)
+    }
+
+    /// Validate incoming Hello message dari peer.
+    pub fn validate_handshake(&self, msg: &p2p::HandshakeMessage) -> p2p::HandshakeResult {
+        self.peer_manager.read().validate_hello(msg)
+    }
+
+    /// Notify: peer berhasil connect dan handshake selesai.
+    /// Update PeerManager + bridge ke BroadcastManager.
+    pub fn on_peer_connected(
+        &self,
+        addr: std::net::SocketAddr,
+        node_id: p2p::NodeId,
+        service_type: p2p::ServiceType,
+        chain_height: u64,
+    ) {
+        // Update PeerManager
+        self.peer_manager.write().on_handshake_success(
+            addr, node_id, service_type, chain_height,
+        );
+
+        // Bridge ke BroadcastManager
+        let rpc_port = addr.port() + 1;
+        let peer_info = crate::rpc::PeerInfo {
+            id: addr.to_string(),
+            address: format!("http://{}:{}", addr.ip(), rpc_port),
+            is_validator: matches!(service_type, p2p::ServiceType::Validator),
+        };
+        self.broadcast_manager.add_peer(peer_info);
+    }
+
+    /// Notify: peer disconnected.
+    /// Cleanup dari PeerManager + BroadcastManager.
+    pub fn on_peer_disconnected_p2p(&self, addr: &std::net::SocketAddr) {
+        self.peer_manager.write().on_peer_disconnected(addr);
+        self.broadcast_manager.remove_peer(&addr.to_string());
+    }
+
+    /// Ban a peer (untuk misbehaving peers).
+    pub fn ban_peer(&self, addr: &std::net::SocketAddr, duration_secs: u64) {
+        self.peer_manager.write().ban_peer(addr, duration_secs);
+        self.broadcast_manager.remove_peer(&addr.to_string());
+    }
+
+    /// Build PEX request untuk kirim ke connected peer.
+    pub fn build_pex_request(&self, service_filter: Option<p2p::ServiceType>) -> p2p::PexRequest {
+        self.peer_manager.read().build_pex_request(service_filter)
+    }
+
+    /// Handle incoming PEX request dari peer.
+    pub fn handle_pex_request(
+        &self,
+        request: &p2p::PexRequest,
+        requester_addr: &str,
+    ) -> p2p::PexResponse {
+        self.peer_manager.write().handle_pex_request(request, requester_addr)
+    }
+
+    /// Process PEX response — add newly discovered peers.
+    /// Returns jumlah peer baru yang ditambahkan.
+    pub fn process_pex_response(&self, response: &p2p::PexResponse) -> usize {
+        self.peer_manager.write().process_pex_response(response)
+    }
+
+    /// Get best N peers untuk outbound sync/connection.
+    pub fn get_best_peers(&self, n: usize) -> Vec<p2p::PeerEntry> {
+        self.peer_manager.read()
+            .get_best_peers(n)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Get P2P status summary string (untuk monitoring/debugging).
+    pub fn p2p_status(&self) -> String {
+        self.peer_manager.read().status_summary()
+    }
+
+    /// Run periodic P2P maintenance (call every ~60s dari node runtime).
+    /// - Recompute peer scores
+    /// - Garbage collect stale peers
+    /// - Save peers.dat
+    pub fn p2p_maintenance(&self) -> anyhow::Result<()> {
+        self.peer_manager.write().maintenance_tick()
+    }
+
+    /// Force save peers.dat (untuk graceful shutdown).
+    pub fn p2p_save(&self) -> anyhow::Result<()> {
+        self.peer_manager.write().save()
     }
 
     // ============================================================

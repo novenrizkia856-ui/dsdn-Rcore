@@ -34,6 +34,7 @@ ed25519-dalek = "1.0"
 aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 bip39 = "2"
+toml = "0.9.8"
 
 # dev dependency for tests
 [dev-dependencies]

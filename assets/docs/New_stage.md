@@ -61,7 +61,7 @@ Aturan IP statis:
 - Tidak ada batas jumlah (1, 2, 3, ... 50, bahkan lebih).
 - IP yang invalid atau unreachable akan di-skip otomatis.
 
-#### 3. Bootstrap Config File (`bootstrap.toml` atau bagian dari `dsdn.toml`)
+#### 3. Bootstrap Config File (`root_dsdn/dsdn.toml`)
 
 Format konfigurasi yang bisa diedit user:
 ```toml
