@@ -31,6 +31,7 @@
 //! | `gating` | Service node on-chain state: ServiceNodeRecord, query API, RPC, CLI, tests | 14B.11–14B.20 |
 //! |  `receipt_v1_verify` | Verify ReceiptV1 before reward distribution (signature, stake, structure). | 14C.A |
 //! |  `claim_reward_handler` | ClaimReward transaction handler: verify → anti-self-dealing → distribute/challenge. | 14C.B |
+//! |  `reward_executor` | Reward distribution execution: atomic credit, rollback, challenge release. | 14C.C |
 //!
 //! ## 14B — Stake & Identity Gating
 //!
@@ -789,6 +790,7 @@ pub mod mnemonic;
 pub mod p2p;
 pub mod receipt_v1_verify;
 pub mod claim_reward_handler;
+pub mod reward_executor;
 use crate::types::{Address, Hash};
 use std::str::FromStr;
 
