@@ -135,6 +135,7 @@ mod optimistic;
 mod coordinator;
 pub mod receipt_signing;
 pub mod receipt_trigger;
+pub mod receipt_assembler;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -297,4 +298,16 @@ pub use receipt_trigger::{
 
     // Error type
     ReceiptTriggerError,
+};
+
+// Re-export all public types from receipt_assembler module (CO.5)
+pub use receipt_assembler::{
+    // Assembly function
+    assemble_signed_receipt,
+
+    // Validation function
+    validate_receipt_proto,
+
+    // Error type
+    AssemblyError,
 };

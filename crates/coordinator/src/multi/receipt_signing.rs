@@ -364,6 +364,20 @@ impl ReceiptSigningSession {
         self.inner.is_terminal()
     }
 
+    /// Returns the aggregated signature bytes if aggregation is complete.
+    #[must_use]
+    #[inline]
+    pub fn aggregated_signature(&self) -> Option<&[u8]> {
+        self.inner.aggregated_signature()
+    }
+
+    /// Returns the list of signers who contributed to the aggregation.
+    #[must_use]
+    #[inline]
+    pub fn signers(&self) -> &[CoordinatorId] {
+        self.inner.signers()
+    }
+
     /// Returns the session creation timestamp.
     #[must_use]
     #[inline]
