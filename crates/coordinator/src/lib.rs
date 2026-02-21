@@ -532,6 +532,9 @@ pub mod gatekeeper;
 // Execution commitment builder (CO.2)
 pub mod execution;
 
+// Receipt DA publication (CO.6)
+pub mod receipt_publisher;
+
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
 pub use state_machine::{
