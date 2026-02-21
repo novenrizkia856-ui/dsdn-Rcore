@@ -488,6 +488,157 @@ The following components are consensus-critical and require a hard fork to modif
 - Coordinator public key (`receipt.rs`)
 - Claimed receipts (state_root position #25)
 - Storage contracts (state_root position #35)
+- Challenge period duration (`economic_constants::CHALLENGE_PERIOD_SECS`)
+- Minimum challenger stake (`fraud_proof_handler::MIN_CHALLENGER_STAKE`)
+- Pending challenges map (included in state_root)
+
+## Receipt & Challenge Lifecycle (CH.6–CH.10)
+
+### Receipt Flow Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     ClaimReward Transaction                          │
+│                                                                      │
+│  ReceiptV1 submitted via TxPayload::ClaimReward                     │
+│  │                                                                   │
+│  ├── verify_receipt_v1()                                            │
+│  │   ├── Threshold signature check                                  │
+│  │   ├── Node signature check                                      │
+│  │   ├── Dedup check (receipt_dedup_tracker)                       │
+│  │   └── Node registration check (service_node_index)              │
+│  │                                                                   │
+│  ├── anti_self_dealing_check()                                      │
+│  │   └── If node == sender → redirect node_share to treasury       │
+│  │                                                                   │
+│  └── Route by receipt_type:                                         │
+│      │                                                               │
+│      ├── Storage ──▶ distribute immediately (70/20/10)              │
+│      │   └── execute_reward_distribution(state, distribution, addr) │
+│      │                                                               │
+│      └── Compute ──▶ start_challenge_period()                       │
+│          └── Hold reward in pending_challenges                      │
+│              └── Wait for challenge period to expire                │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Reward Math
+
+```
+Storage/Compute fee split (13.8.E + 13.9 Blueprint):
+
+  reward_base = total reward amount
+  node_share       = reward_base × 70 / 100
+  validator_share  = reward_base × 20 / 100
+  treasury_share   = reward_base - node_share - validator_share  (remainder)
+
+Anti-self-dealing (node == sender):
+  node_share       = 0
+  validator_share  = reward_base × 20 / 100
+  treasury_share   = reward_base - validator_share  (70% + 10%)
+
+Transfer/Governance:
+  validator_share  = 100%
+  node_share       = 0%
+  treasury_share   = 0%
+```
+
+### Challenge State Machine
+
+```
+                        ┌─────────┐
+                        │ Pending │
+                        └────┬────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+         (expired,      (fraud proof   (fraud proof
+          no fraud)      submitted,     submitted,
+              │          proven)        not proven)
+              ▼              │              │
+        ┌─────────┐         │              │
+        │ Cleared │         │              ▼
+        └────┬────┘         │        ┌────────────┐
+             │              │        │ Challenged │
+        distribute          │        └────────────┘
+        reward              │              │
+             │              │         (future CH.8+
+        remove entry        │          resolution)
+                            ▼
+                      ┌──────────┐
+                      │ Slashed  │
+                      └──────────┘
+                       (terminal)
+
+Valid transitions:
+  Pending → Cleared      (challenge period expired, no fraud proof)
+  Pending → Challenged   (fraud proof submitted via mark_challenged)
+  Challenged → Slashed   (fraud proven via mark_slashed)
+
+Invalid transitions (no-op):
+  Cleared → anything     (terminal)
+  Slashed → anything     (terminal)
+  Challenged → Cleared   (rejected by state machine)
+  Pending → Slashed      (must go through Challenged first)
+```
+
+### Failure Modes
+
+| Failure | Behavior | Recovery |
+|---------|----------|----------|
+| Receipt not in pending_challenges | `FraudProofError::ReceiptNotPending` | None needed (invalid input) |
+| Challenge period expired | `FraudProofError::ChallengePeriodExpired` | Challenge proceeds to clear on next block |
+| Insufficient challenger stake | `FraudProofError::InsufficientChallengerStake` | Challenger must stake more |
+| Double challenge on same receipt | `FraudProofError::ChallengeNotPending` | First challenge stands |
+| Node not in service_node_index | Challenge skipped, stays Pending | Retry on next block expiry cycle |
+| Reward distribution overflow | Challenge stays, no partial credit | Degenerate case (u128 overflow) |
+| Empty fraud proof data | `fraud_proven = false`, marked Challenged | Dispute via future mechanism |
+
+### Idempotency Guarantee
+
+`process_expired_challenges(state, time)` is idempotent:
+
+1. Cleared entries are removed from `pending_challenges` after distribution.
+   Second call finds nothing → empty result.
+2. Terminal entries (Cleared, Slashed) are skipped.
+   Calling again produces no additional state changes.
+3. Challenged entries produce `PendingResolution` without mutation.
+   Multiple calls return same result without side effects.
+
+### Audit Checklist
+
+```
+[x] No panic in production code (zero panic!, unreachable!, unwrap, expect)
+[x] No partial state update (mutations after validation boundary only)
+[x] No double reward (cleared entries removed; idempotent)
+[x] No double challenge (Pending status check rejects second submission)
+[x] Deterministic (sorted iteration, no randomness, no IO)
+[x] Overflow safe (saturating_add throughout)
+[x] Thread safe (ChainState protected by RwLock; functions require &mut)
+[x] Consensus-critical (pending_challenges included in state_root)
+[x] Block pipeline consistent (miner + full node call at same position)
+[x] Backward compatible (ResourceReceipt V0 still functional)
+```
+
+### Migration Strategy: ResourceReceipt (V0) → ReceiptV1 (V1)
+
+```
+Phase 1 (Current):
+  - Both V0 and V1 receipts accepted by chain
+  - V0 can convert to V1 via to_receipt_v1() (lossy, Storage only)
+  - V1 is the canonical format for new receipts
+  - node_class deprecated in V1
+
+Phase 2 (Future):
+  - V0 receipt acceptance deprecated
+  - All nodes generate V1 receipts
+  - to_receipt_v1() bridge unused
+
+Phase 3 (Final):
+  - V0 code paths removed
+  - ResourceReceipt struct removed
+  - Only ReceiptV1 remains
+```
 
 ## Integration with DSDN Ecosystem
 

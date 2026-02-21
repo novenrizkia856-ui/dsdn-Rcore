@@ -504,7 +504,108 @@
 //! |       |   - 14B.20: Chain Gating Tests & Final Documentation | ✅ IMPLEMENTED |
 //! | CH.6  | Challenge Period State Management | ✅ IMPLEMENTED |
 //! | CH.7  | Fraud Proof Challenge Handler | ✅ IMPLEMENTED |
+//! | CH.8  | Integration with Existing tokenomics.rs | ✅ IMPLEMENTED |
+//! | CH.9  | Extend Existing receipt.rs Compatibility | ✅ IMPLEMENTED |
+//! | CH.10 | Chain Tests & Integration Documentation | ✅ IMPLEMENTED |
 //! ```
+//!
+//! ## Receipt & Challenge Lifecycle (CH.6–CH.10)
+//!
+//! ### Receipt Types
+//!
+//! ```text
+//! Storage Receipt:
+//!   ClaimReward TX → verify → distribute immediately (70/20/10)
+//!   No challenge period. No execution commitment.
+//!
+//! Compute Receipt:
+//!   ClaimReward TX → verify → start_challenge_period → wait
+//!   Challenge period active. Execution commitment required (V1).
+//! ```
+//!
+//! ### Challenge Period State Machine
+//!
+//! ```text
+//! Pending ──(no challenge + expired)──▶ Cleared ──▶ distribute reward ──▶ remove
+//! Pending ──(fraud proof submitted)───▶ Challenged
+//!                                        ├──(fraud proven)───▶ Slashed (terminal)
+//!                                        └──(fraud not proven)──▶ PendingResolution
+//! ```
+//!
+//! ### Fraud Proof Flow (V1 Stub)
+//!
+//! ```text
+//! FraudProofChallenge {receipt_hash, challenger_address, fraud_proof_data}
+//!   │
+//!   ├── STEP 1: Validate receipt exists in pending_challenges
+//!   ├── STEP 2: Validate status == Pending
+//!   ├── STEP 3: Validate can_be_challenged(current_time)
+//!   ├── STEP 4: Verify challenger locked stake >= MIN_CHALLENGER_STAKE
+//!   ├── STEP 5: verify_fraud_proof_stub (V1: non-empty → proven)
+//!   │   ════════════ MUTATION BOUNDARY ════════════
+//!   ├── STEP 6: mark_challenged(addr) + total_challenges_submitted++
+//!   └── STEP 7: If proven → mark_slashed() + total_fraud_slashed += amount
+//!               If not   → status stays Challenged
+//! ```
+//!
+//! ### Block Finalization Hook Integration
+//!
+//! ```text
+//! apply_block_without_mining / mine_block pipeline:
+//!   1. Execute transactions (including ClaimReward)
+//!   2. Automatic slashing (13.14.6)
+//!   3. Economic job (13.15.6) [full node only]
+//!   4. Challenge period processing (CH.6)  ← process_expired_challenges
+//!   5. compute_state_root()
+//!   6. Atomic commit
+//! ```
+//!
+//! ### Reward Distribution Integration (CH.8)
+//!
+//! ```text
+//! calculate_receipt_v1_reward(reward_base, receipt_type, node_address, submitter)
+//!   └── delegates to calculate_fee_by_resource_class()
+//!       └── single source of truth for 70/20/10 constants
+//!
+//! verify_distribution_consistency(fee_split, reward_distribution)
+//!   └── cross-checks FeeSplit vs RewardDistribution field-by-field
+//! ```
+//!
+//! ### Migration Path: ResourceReceipt → ReceiptV1 (CH.9)
+//!
+//! ```text
+//! ResourceReceipt (V0)              ReceiptV1 (V1)
+//! ─────────────────                 ──────────────
+//! receipt_id [64B]          ──▶     workload_id [32B] (first 32 bytes)
+//! node_address [20B]        ──▶     node_id [32B] (zero-padded)
+//! node_class                ──▶     (dropped, deprecated in V1)
+//! resource_type             ──▶     receipt_type (From trait)
+//! measured_usage            ──▶     usage_proof_hash (SHA3-512 first 32)
+//! (none)                    ──▶     execution_commitment (None → Compute fails)
+//! coordinator_signature     ──▶     node_signature (semantic shift)
+//! (param)                   ──▶     coordinator_threshold_signature
+//! (param)                   ──▶     signer_ids
+//! node_address              ──▶     submitter_address
+//! reward_base               ──▶     reward_base (direct)
+//! timestamp                 ──▶     timestamp (direct)
+//! (param)                   ──▶     epoch
+//! ```
+//!
+//! ### Determinism Guarantee
+//!
+//! All operations in the receipt/challenge pipeline are deterministic:
+//! - `get_expired_challenges()` returns sorted `Vec<[u8; 32]>` (lexicographic).
+//! - `process_expired_challenges` iterates in that fixed order.
+//! - All arithmetic uses `saturating_add` (no overflow panic).
+//! - No randomness, no IO, no system calls in state mutation paths.
+//! - Same block timestamp + same state → identical state root.
+//!
+//! ### Anti-Self-Dealing Logic
+//!
+//! If `service_node == sender` in a Storage/Compute fee split:
+//! - `node_share` (70%) is redirected to `treasury_share`.
+//! - Result: 0% node, 20% validator, 80% treasury.
+//! - Prevents reward manipulation by self-submitting workloads.
 //!
 //! ## Chain Struct
 //! `Chain` adalah top-level struct yang menggabungkan:
