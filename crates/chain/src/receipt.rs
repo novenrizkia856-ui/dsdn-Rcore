@@ -59,6 +59,50 @@ pub enum ResourceType {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// CH.9 — RECEIPT TYPE CONVERSION TRAITS
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Bidirectional conversion between ResourceType (V0) and ReceiptType (V1).
+// Both enums have exactly two variants: Storage and Compute.
+// The mapping is exact (1:1), not lossy.
+//
+// These traits enable seamless interop between the legacy receipt pipeline
+// (ResourceReceipt + ResourceType) and the new pipeline (ReceiptV1 + ReceiptType)
+// during the migration period.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Convert `ResourceType` (V0) → `ReceiptType` (V1).
+///
+/// | `ResourceType` | `ReceiptType` |
+/// |-----------------|---------------|
+/// | `Storage` | `Storage` |
+/// | `Compute` | `Compute` |
+impl From<ResourceType> for dsdn_common::receipt_v1::ReceiptType {
+    fn from(rt: ResourceType) -> Self {
+        match rt {
+            ResourceType::Storage => Self::Storage,
+            ResourceType::Compute => Self::Compute,
+        }
+    }
+}
+
+/// Convert `ReceiptType` (V1) → `ResourceType` (V0).
+///
+/// | `ReceiptType` | `ResourceType` |
+/// |---------------|-----------------|
+/// | `Storage` | `Storage` |
+/// | `Compute` | `Compute` |
+impl From<dsdn_common::receipt_v1::ReceiptType> for ResourceType {
+    fn from(rt: dsdn_common::receipt_v1::ReceiptType) -> Self {
+        use dsdn_common::receipt_v1::ReceiptType;
+        match rt {
+            ReceiptType::Storage => Self::Storage,
+            ReceiptType::Compute => Self::Compute,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MEASURED USAGE
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -257,6 +301,163 @@ impl ResourceReceipt {
     pub fn refresh_receipt_id(&mut self) {
         self.receipt_id = self.compute_receipt_id();
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // CH.9 — RECEIPT V1 MIGRATION BRIDGE
+    // ════════════════════════════════════════════════════════════════════
+    //
+    // ## Migration Strategy
+    //
+    // ReceiptV1 is the target format for all new receipts.
+    // ResourceReceipt (V0) remains supported during the migration period.
+    //
+    // `to_receipt_v1()` provides a one-way, lossy conversion from V0 to V1.
+    // It is lossy because:
+    //
+    // 1. `workload_id` is derived from receipt_id (first 32 of 64 bytes).
+    // 2. `node_id` is zero-padded from 20-byte address to 32-byte NodeId.
+    // 3. `node_class` is dropped (deprecated in V1).
+    // 4. `execution_commitment` is always None (V0 does not carry this).
+    //    This means Compute receipts will FAIL conversion because V1
+    //    requires `execution_commitment = Some(...)` for Compute type.
+    // 5. `node_signature` is mapped from `coordinator_signature` (different
+    //    semantic — V0 has single coordinator sig, V1 separates node sig
+    //    from coordinator threshold sig).
+    // 6. `submitter_address` is set to `node_address` (in V0, the node
+    //    itself submits the claim).
+    //
+    // ## Deprecation Plan
+    //
+    // After all nodes migrate to V1 receipt generation:
+    // 1. `to_receipt_v1()` becomes unused.
+    // 2. `ResourceReceipt` is marked `#[deprecated]`.
+    // 3. V0 processing pipeline is removed after full chain migration.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Checks whether this ResourceReceipt meets minimum requirements
+    /// for conversion to ReceiptV1.
+    ///
+    /// Requirements:
+    /// - Must have a coordinator signature (`has_signature() == true`).
+    /// - Must have a non-zero reward base (`reward_base > 0`).
+    ///
+    /// This is a necessary but NOT sufficient condition for successful
+    /// conversion. `to_receipt_v1()` may still fail for other reasons
+    /// (e.g., Compute receipts lack execution_commitment in V1).
+    ///
+    /// ## Guarantees
+    ///
+    /// - Pure function. No mutation. No side effects.
+    /// - Deterministic.
+    /// - No panic.
+    #[must_use]
+    pub fn can_upgrade_to_v1(&self) -> bool {
+        self.has_signature() && self.reward_base > 0
+    }
+
+    /// Convert this `ResourceReceipt` to a `ReceiptV1`.
+    ///
+    /// This is a **one-way, lossy** conversion for backward compatibility
+    /// during the V0 → V1 migration period. See module-level documentation
+    /// for details on what is lost.
+    ///
+    /// ## Parameters
+    ///
+    /// - `threshold_signature` — Coordinator aggregate threshold signature
+    ///   (FROST). In V0 there is only `coordinator_signature`; in V1 the
+    ///   coordinator threshold sig and node sig are separate. This parameter
+    ///   provides the threshold signature for the V1 format.
+    /// - `signer_ids` — IDs of signers who participated in threshold signing.
+    /// - `epoch` — Epoch number. V0 does not track epoch; caller must provide.
+    ///
+    /// ## Field Mapping
+    ///
+    /// | V1 Field | Source | Notes |
+    /// |----------|--------|-------|
+    /// | `workload_id` | `receipt_id[..32]` | First 32 bytes of 64-byte hash |
+    /// | `node_id` | `node_address` zero-padded | 20 bytes → 32 bytes |
+    /// | `receipt_type` | `resource_type` via `From` | Exact mapping |
+    /// | `usage_proof_hash` | SHA3-512(`measured_usage`)[..32] | Derived hash |
+    /// | `execution_commitment` | `None` | V0 has no EC; Compute will error |
+    /// | `coordinator_threshold_signature` | `threshold_signature` param | Caller provides |
+    /// | `signer_ids` | `signer_ids` param | Caller provides |
+    /// | `node_signature` | `coordinator_signature` | Semantic mismatch (lossy) |
+    /// | `submitter_address` | `node_address` bytes | V0: node = submitter |
+    /// | `reward_base` | `self.reward_base` | Direct copy |
+    /// | `timestamp` | `self.timestamp` | Direct copy |
+    /// | `epoch` | `epoch` param | Caller provides |
+    ///
+    /// ## Errors
+    ///
+    /// Returns `ReceiptError` if ReceiptV1 invariants are violated:
+    /// - `MissingExecutionCommitment` — Compute receipt (V0 has no EC).
+    /// - `EmptyCoordinatorSignature` — `threshold_signature` is empty.
+    /// - `EmptyNodeSignature` — `coordinator_signature` is empty.
+    ///
+    /// ## Guarantees
+    ///
+    /// - No panic. No unwrap.
+    /// - No mutation of `self`.
+    /// - Deterministic: same inputs → same output.
+    pub fn to_receipt_v1(
+        &self,
+        threshold_signature: Vec<u8>,
+        signer_ids: Vec<[u8; 32]>,
+        epoch: u64,
+    ) -> Result<dsdn_common::receipt_v1::ReceiptV1, dsdn_common::receipt_v1::ReceiptError> {
+        use dsdn_common::coordinator::WorkloadId;
+
+        // 1. workload_id: first 32 bytes of receipt_id (64-byte SHA3-512 hash).
+        let id_bytes = self.receipt_id.as_bytes();
+        let mut wid_bytes = [0u8; 32];
+        let copy_len = id_bytes.len().min(32);
+        wid_bytes[..copy_len].copy_from_slice(&id_bytes[..copy_len]);
+        let workload_id = WorkloadId::new(wid_bytes);
+
+        // 2. node_id: zero-padded from 20-byte Address to 32-byte NodeId.
+        let addr_bytes = self.node_address.as_bytes();
+        let mut node_id = [0u8; 32];
+        let addr_copy_len = addr_bytes.len().min(32);
+        node_id[..addr_copy_len].copy_from_slice(&addr_bytes[..addr_copy_len]);
+
+        // 3. receipt_type: From<ResourceType> for ReceiptType.
+        let receipt_type: dsdn_common::receipt_v1::ReceiptType = self.resource_type.into();
+
+        // 4. usage_proof_hash: SHA3-512 of measured_usage bytes, take first 32.
+        let usage_full_hash = crypto::sha3_512(&self.measured_usage.to_bytes());
+        let mut usage_proof_hash = [0u8; 32];
+        let hash_bytes = usage_full_hash.as_bytes();
+        let hash_copy_len = hash_bytes.len().min(32);
+        usage_proof_hash[..hash_copy_len].copy_from_slice(&hash_bytes[..hash_copy_len]);
+
+        // 5. execution_commitment: V0 does not have this field.
+        //    Storage → None (correct). Compute → None (will fail at ReceiptV1::new).
+        let execution_commitment = None;
+
+        // 6. node_signature: mapped from coordinator_signature (lossy).
+        let node_signature = self.coordinator_signature.clone();
+
+        // 7. submitter_address: in V0, node submits its own claim.
+        let mut submitter_address = [0u8; 20];
+        let sub_copy_len = addr_bytes.len().min(20);
+        submitter_address[..sub_copy_len].copy_from_slice(&addr_bytes[..sub_copy_len]);
+
+        // Delegate to ReceiptV1::new() which enforces all invariants.
+        dsdn_common::receipt_v1::ReceiptV1::new(
+            workload_id,
+            node_id,
+            receipt_type,
+            usage_proof_hash,
+            execution_commitment,
+            threshold_signature,
+            signer_ids,
+            node_signature,
+            submitter_address,
+            self.reward_base,
+            self.timestamp,
+            epoch,
+        )
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -375,5 +576,382 @@ mod tests {
 
         // verifikasi harus gagal
         assert!(!receipt.verify_coordinator_signature());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // CH.9 — RECEIPT V1 MIGRATION BRIDGE TESTS
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── From<ResourceType> for ReceiptType ──────────────────────────────
+
+    #[test]
+    fn test_resource_type_to_receipt_type_storage() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        let rt: ReceiptType = ResourceType::Storage.into();
+        assert_eq!(rt, ReceiptType::Storage);
+    }
+
+    #[test]
+    fn test_resource_type_to_receipt_type_compute() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        let rt: ReceiptType = ResourceType::Compute.into();
+        assert_eq!(rt, ReceiptType::Compute);
+    }
+
+    // ── From<ReceiptType> for ResourceType ──────────────────────────────
+
+    #[test]
+    fn test_receipt_type_to_resource_type_storage() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        let rt: ResourceType = ReceiptType::Storage.into();
+        assert_eq!(rt, ResourceType::Storage);
+    }
+
+    #[test]
+    fn test_receipt_type_to_resource_type_compute() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        let rt: ResourceType = ReceiptType::Compute.into();
+        assert_eq!(rt, ResourceType::Compute);
+    }
+
+    // ── Roundtrip: ResourceType → ReceiptType → ResourceType ────────────
+
+    #[test]
+    fn test_type_conversion_roundtrip() {
+        use dsdn_common::receipt_v1::ReceiptType;
+
+        let original_storage = ResourceType::Storage;
+        let intermediate: ReceiptType = original_storage.into();
+        let roundtrip: ResourceType = intermediate.into();
+        assert_eq!(original_storage, roundtrip);
+
+        let original_compute = ResourceType::Compute;
+        let intermediate: ReceiptType = original_compute.into();
+        let roundtrip: ResourceType = intermediate.into();
+        assert_eq!(original_compute, roundtrip);
+    }
+
+    // ── can_upgrade_to_v1 ───────────────────────────────────────────────
+
+    #[test]
+    fn test_can_upgrade_with_signature_and_reward() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1_000_000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x01; 64]);
+        assert!(receipt.can_upgrade_to_v1());
+    }
+
+    #[test]
+    fn test_cannot_upgrade_without_signature() {
+        let receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1_000_000,
+            false,
+            1700000000,
+        );
+        // No signature set.
+        assert!(!receipt.can_upgrade_to_v1());
+    }
+
+    #[test]
+    fn test_cannot_upgrade_with_zero_reward() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            0, // Zero reward.
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x01; 64]);
+        assert!(!receipt.can_upgrade_to_v1());
+    }
+
+    #[test]
+    fn test_cannot_upgrade_no_sig_no_reward() {
+        let receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::zero(),
+            0,
+            false,
+            1700000000,
+        );
+        assert!(!receipt.can_upgrade_to_v1());
+    }
+
+    // ── to_receipt_v1: Storage (success path) ───────────────────────────
+
+    #[test]
+    fn test_to_receipt_v1_storage_success() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1_000_000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let threshold_sig = vec![0x04; 64];
+        let signer_ids = vec![[0x05; 32], [0x06; 32]];
+        let epoch = 42u64;
+
+        let result = receipt.to_receipt_v1(threshold_sig, signer_ids.clone(), epoch);
+        assert!(result.is_ok());
+
+        let v1 = result.unwrap();
+        // receipt_type preserved.
+        assert_eq!(
+            v1.receipt_type(),
+            dsdn_common::receipt_v1::ReceiptType::Storage
+        );
+        // reward_base preserved.
+        assert_eq!(v1.reward_base(), 1_000_000);
+        // timestamp preserved.
+        assert_eq!(v1.timestamp(), 1700000000);
+        // epoch from parameter.
+        assert_eq!(v1.epoch(), epoch);
+        // execution_commitment is None for Storage.
+        assert!(v1.execution_commitment().is_none());
+        // signer_ids from parameter.
+        assert_eq!(v1.signer_ids(), signer_ids.as_slice());
+        // node_signature from coordinator_signature.
+        assert_eq!(v1.node_signature(), &[0x07; 64]);
+        // coordinator_threshold_signature from parameter.
+        assert_eq!(v1.coordinator_threshold_signature(), &[0x04; 64]);
+    }
+
+    // ── to_receipt_v1: Compute (fails — no execution_commitment) ────────
+
+    #[test]
+    fn test_to_receipt_v1_compute_fails_missing_ec() {
+        use dsdn_common::receipt_v1::ReceiptError;
+
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Datacenter,
+            ResourceType::Compute,
+            MeasuredUsage::new(500, 1000, 0, 200),
+            2_000_000,
+            true,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let result = receipt.to_receipt_v1(vec![0x04; 64], vec![[0x05; 32]], 10);
+
+        // Compute requires execution_commitment = Some(...), but V0 has None.
+        assert_eq!(result, Err(ReceiptError::MissingExecutionCommitment));
+    }
+
+    // ── to_receipt_v1: Empty threshold signature fails ──────────────────
+
+    #[test]
+    fn test_to_receipt_v1_empty_threshold_sig_fails() {
+        use dsdn_common::receipt_v1::ReceiptError;
+
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::zero(),
+            1000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let result = receipt.to_receipt_v1(
+            vec![], // Empty threshold signature.
+            vec![[0x05; 32]],
+            1,
+        );
+
+        assert_eq!(result, Err(ReceiptError::EmptyCoordinatorSignature));
+    }
+
+    // ── to_receipt_v1: Empty node signature (coordinator_sig) fails ─────
+
+    #[test]
+    fn test_to_receipt_v1_empty_node_sig_fails() {
+        use dsdn_common::receipt_v1::ReceiptError;
+
+        // Receipt without coordinator_signature → node_signature empty → fail.
+        let receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::zero(),
+            1000,
+            false,
+            1700000000,
+        );
+        // No set_signature → coordinator_signature is empty Vec.
+
+        let result = receipt.to_receipt_v1(
+            vec![0x04; 64],
+            vec![[0x05; 32]],
+            1,
+        );
+
+        assert_eq!(result, Err(ReceiptError::EmptyNodeSignature));
+    }
+
+    // ── to_receipt_v1: Deterministic ────────────────────────────────────
+
+    #[test]
+    fn test_to_receipt_v1_deterministic() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1_000_000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let v1a = receipt
+            .to_receipt_v1(vec![0x04; 64], vec![[0x05; 32]], 42)
+            .unwrap();
+        let v1b = receipt
+            .to_receipt_v1(vec![0x04; 64], vec![[0x05; 32]], 42)
+            .unwrap();
+
+        // Same input → same output.
+        assert_eq!(v1a, v1b);
+        assert_eq!(v1a.compute_receipt_hash(), v1b.compute_receipt_hash());
+    }
+
+    // ── to_receipt_v1: node_id zero-padding ─────────────────────────────
+
+    #[test]
+    fn test_to_receipt_v1_node_id_zero_padded() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::zero(),
+            1000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let v1 = receipt
+            .to_receipt_v1(vec![0x04; 64], vec![], 1)
+            .unwrap();
+
+        // node_id: first 20 bytes from address, remaining 12 bytes = 0.
+        let node_id = v1.node_id();
+        let addr_bytes = receipt.node_address.as_bytes();
+        assert_eq!(&node_id[..20], addr_bytes);
+        assert_eq!(&node_id[20..], &[0u8; 12]);
+    }
+
+    // ── to_receipt_v1: submitter_address equals node_address ────────────
+
+    #[test]
+    fn test_to_receipt_v1_submitter_is_node() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::zero(),
+            1000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let v1 = receipt
+            .to_receipt_v1(vec![0x04; 64], vec![], 1)
+            .unwrap();
+
+        // submitter_address == node_address bytes.
+        assert_eq!(v1.submitter_address(), receipt.node_address.as_bytes());
+    }
+
+    // ── to_receipt_v1: node_class is dropped (lossy) ────────────────────
+
+    #[test]
+    fn test_to_receipt_v1_node_class_irrelevant() {
+        let mut receipt_regular = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1000,
+            false,
+            1700000000,
+        );
+        receipt_regular.set_signature(vec![0x07; 64]);
+
+        let mut receipt_dc = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Datacenter,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1000,
+            false,
+            1700000000,
+        );
+        receipt_dc.set_signature(vec![0x07; 64]);
+
+        let v1_regular = receipt_regular
+            .to_receipt_v1(vec![0x04; 64], vec![[0x05; 32]], 42)
+            .unwrap();
+        let v1_dc = receipt_dc
+            .to_receipt_v1(vec![0x04; 64], vec![[0x05; 32]], 42)
+            .unwrap();
+
+        // V1 does not carry node_class → both produce identical V1 receipts.
+        // However receipt_id differs (node_class affects it), so workload_id
+        // and usage_proof_hash may differ. What IS identical:
+        assert_eq!(v1_regular.receipt_type(), v1_dc.receipt_type());
+        assert_eq!(v1_regular.reward_base(), v1_dc.reward_base());
+        assert_eq!(v1_regular.timestamp(), v1_dc.timestamp());
+        assert_eq!(v1_regular.epoch(), v1_dc.epoch());
+        assert_eq!(v1_regular.submitter_address(), v1_dc.submitter_address());
+        assert_eq!(v1_regular.node_id(), v1_dc.node_id());
+    }
+
+    // ── to_receipt_v1: does not mutate self ──────────────────────────────
+
+    #[test]
+    fn test_to_receipt_v1_no_mutation() {
+        let mut receipt = ResourceReceipt::new(
+            test_address(),
+            NodeClass::Regular,
+            ResourceType::Storage,
+            MeasuredUsage::new(100, 200, 10, 500),
+            1_000_000,
+            false,
+            1700000000,
+        );
+        receipt.set_signature(vec![0x07; 64]);
+
+        let before = receipt.clone();
+
+        let _ = receipt.to_receipt_v1(vec![0x04; 64], vec![[0x05; 32]], 42);
+
+        // self unchanged after conversion.
+        assert_eq!(receipt, before);
     }
 }
