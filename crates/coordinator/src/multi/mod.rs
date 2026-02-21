@@ -133,6 +133,7 @@ mod handlers;
 mod signing;
 mod optimistic;
 mod coordinator;
+pub mod receipt_signing;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -270,4 +271,17 @@ pub use coordinator::{
     // Error types
     MultiCoordinatorError,
     ConfigError,
+};
+
+// Re-export all public types from receipt_signing module (CO.1)
+pub use receipt_signing::{
+    // Session
+    ReceiptSigningSession,
+
+    // Type alias
+    ReceiptTypeProto,
+
+    // Constants
+    RECEIPT_TYPE_STORAGE,
+    RECEIPT_TYPE_COMPUTE,
 };
