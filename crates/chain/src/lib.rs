@@ -34,6 +34,7 @@
 //! |  `reward_executor` | Reward distribution execution: atomic credit, rollback, challenge release. | 14C.C |
 //! |  `anti_self_dealing_check` | Anti-self-dealing chain validation: detect → redirect, never reject. | 14C.D |
 //! |  `challenge_manager` | Challenge period lifecycle: start, expire, clear, resolve. | CH.6 |
+//! |  `fraud_proof_handler` | Fraud proof challenge submission and verification. | CH.7 |
 //!
 //! ## 14B — Stake & Identity Gating
 //!
@@ -502,6 +503,7 @@
 //! |       |   - 14B.19: CLI Gating Commands (register, info, stake, status, list) | ✅ IMPLEMENTED |
 //! |       |   - 14B.20: Chain Gating Tests & Final Documentation | ✅ IMPLEMENTED |
 //! | CH.6  | Challenge Period State Management | ✅ IMPLEMENTED |
+//! | CH.7  | Fraud Proof Challenge Handler | ✅ IMPLEMENTED |
 //! ```
 //!
 //! ## Chain Struct
@@ -796,6 +798,7 @@ pub mod claim_reward_handler;
 pub mod reward_executor;
 pub mod anti_self_dealing_check;
 pub mod challenge_manager;
+pub mod fraud_proof_handler;
 use crate::types::{Address, Hash};
 use std::str::FromStr;
 
