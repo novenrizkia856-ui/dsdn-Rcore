@@ -31,9 +31,13 @@
 
 pub mod commitment_builder;
 pub mod usage_verifier;
+pub mod self_dealing_precheck;
 
 pub use commitment_builder::{compute_trace_merkle_root, CommitmentBuilder};
 pub use usage_verifier::{
     build_signing_message, calculate_reward_base, verify_usage_proof,
     UsageProof, UsageVerificationResult,
+};
+pub use self_dealing_precheck::{
+    precheck_self_dealing, Address, NodeId, NodeOwnerLookup, PreCheckResult,
 };
