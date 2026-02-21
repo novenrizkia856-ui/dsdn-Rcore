@@ -46,6 +46,7 @@ use super::{
     MessageVote, ReceiptConsensus, SessionId, Vote, WorkloadId,
 };
 use super::signing::{SigningError, SigningSession, SigningState, validate_commitment, validate_partial};
+use super::receipt_signing::ReceiptSigningSession;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // VALIDATION ERROR
@@ -283,6 +284,9 @@ pub struct MultiCoordinatorState {
     /// Map dari SessionId ke SigningSession (14A.2B.2.18).
     signing_sessions: HashMap<SessionId, SigningSession>,
 
+    /// Map dari SessionId ke ReceiptSigningSession (CO.1/CO.4).
+    receipt_signing_sessions: HashMap<SessionId, ReceiptSigningSession>,
+
     /// Committee members untuk validasi voter.
     committee_members: HashSet<CoordinatorId>,
 
@@ -319,6 +323,7 @@ impl MultiCoordinatorState {
             consensus_map: HashMap::new(),
             session_map: HashMap::new(),
             signing_sessions: HashMap::new(),
+            receipt_signing_sessions: HashMap::new(),
             committee_members,
             threshold,
             consensus_timeout_ms,
@@ -417,6 +422,60 @@ impl MultiCoordinatorState {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
+    // RECEIPT SIGNING SESSION ACCESS (CO.4)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Registers a new receipt signing session.
+    ///
+    /// Returns `true` if the session was inserted successfully.
+    /// Returns `false` if a session with the same `session_id` already exists
+    /// (no mutation occurs in this case).
+    ///
+    /// This is the ONLY way to add a receipt signing session.
+    /// No partial registration: either fully inserted or not at all.
+    pub fn register_receipt_signing(
+        &mut self,
+        session_id: SessionId,
+        session: ReceiptSigningSession,
+    ) -> bool {
+        if self.receipt_signing_sessions.contains_key(&session_id) {
+            return false;
+        }
+        self.receipt_signing_sessions.insert(session_id, session);
+        true
+    }
+
+    /// Memeriksa apakah receipt signing session sudah ada.
+    #[must_use]
+    pub fn has_receipt_signing_session(&self, session_id: &SessionId) -> bool {
+        self.receipt_signing_sessions.contains_key(session_id)
+    }
+
+    /// Mendapatkan receipt signing session untuk session_id.
+    #[must_use]
+    pub fn get_receipt_signing_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<&ReceiptSigningSession> {
+        self.receipt_signing_sessions.get(session_id)
+    }
+
+    /// Mendapatkan mutable receipt signing session untuk session_id.
+    #[must_use]
+    pub fn get_receipt_signing_session_mut(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Option<&mut ReceiptSigningSession> {
+        self.receipt_signing_sessions.get_mut(session_id)
+    }
+
+    /// Mengembalikan jumlah receipt signing sessions aktif.
+    #[must_use]
+    pub fn receipt_signing_session_count(&self) -> usize {
+        self.receipt_signing_sessions.len()
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
     // INTERNAL MUTATIONS
     // ────────────────────────────────────────────────────────────────────────────
 
@@ -451,6 +510,7 @@ impl fmt::Debug for MultiCoordinatorState {
             .field("self_id", &self.self_id)
             .field("consensus_count", &self.consensus_map.len())
             .field("signing_session_count", &self.signing_sessions.len())
+            .field("receipt_signing_session_count", &self.receipt_signing_sessions.len())
             .field("committee_size", &self.committee_members.len())
             .field("threshold", &self.threshold)
             .field("consensus_timeout_ms", &self.consensus_timeout_ms)

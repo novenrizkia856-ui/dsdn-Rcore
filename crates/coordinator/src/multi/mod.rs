@@ -134,6 +134,7 @@ mod signing;
 mod optimistic;
 mod coordinator;
 pub mod receipt_signing;
+pub mod receipt_trigger;
 
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
@@ -284,4 +285,16 @@ pub use receipt_signing::{
     // Constants
     RECEIPT_TYPE_STORAGE,
     RECEIPT_TYPE_COMPUTE,
+};
+
+// Re-export all public types from receipt_trigger module (CO.4)
+pub use receipt_trigger::{
+    // Trigger function
+    trigger_receipt_signing,
+
+    // Context struct
+    ReceiptContext,
+
+    // Error type
+    ReceiptTriggerError,
 };
