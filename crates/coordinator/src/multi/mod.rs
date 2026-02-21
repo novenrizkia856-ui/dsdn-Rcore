@@ -214,7 +214,7 @@ pub use consensus::{
     AddVoteResult,
 };
 
-// Re-export all public types from handlers module (14A.2B.2.17)
+// Re-export all public types from handlers module (14A.2B.2.17, CO.8)
 pub use handlers::{
     // State
     MultiCoordinatorState,
@@ -222,6 +222,10 @@ pub use handlers::{
     // Error types
     HandlerError,
     ValidationError,
+
+    // Receipt signing lifecycle errors (CO.8)
+    RegisterError,
+    CompleteError,
 
     // Handler functions
     handle_propose_receipt,

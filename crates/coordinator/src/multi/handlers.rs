@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use dsdn_common::coordinator::ReceiptData;
+use dsdn_common::receipt_v1_convert::ReceiptV1Proto;
 use dsdn_proto::tss::signing::{PartialSignatureProto, SigningCommitmentProto};
 
 use super::{
@@ -47,6 +48,7 @@ use super::{
 };
 use super::signing::{SigningError, SigningSession, SigningState, validate_commitment, validate_partial};
 use super::receipt_signing::ReceiptSigningSession;
+use super::receipt_assembler::assemble_signed_receipt;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // VALIDATION ERROR
@@ -250,6 +252,53 @@ impl From<SigningError> for HandlerError {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// RECEIPT SIGNING LIFECYCLE ERRORS (CO.8)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error type for receipt signing session registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterError {
+    /// A session with this ID already exists.
+    SessionAlreadyExists,
+}
+
+impl fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegisterError::SessionAlreadyExists => {
+                write!(f, "receipt signing session already exists")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegisterError {}
+
+/// Error type for receipt signing session completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompleteError {
+    /// No session found for the given session ID.
+    SessionNotFound,
+    /// Receipt assembly failed (session remains in map).
+    AssemblyFailed(String),
+}
+
+impl fmt::Display for CompleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompleteError::SessionNotFound => {
+                write!(f, "receipt signing session not found")
+            }
+            CompleteError::AssemblyFailed(reason) => {
+                write!(f, "receipt assembly failed: {}", reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompleteError {}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // MULTI COORDINATOR STATE
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -286,6 +335,23 @@ pub struct MultiCoordinatorState {
 
     /// Map dari SessionId ke ReceiptSigningSession (CO.1/CO.4).
     receipt_signing_sessions: HashMap<SessionId, ReceiptSigningSession>,
+
+    /// Completed receipts ready for DA publication (CO.8).
+    ///
+    /// After `complete_receipt_signing`, the assembled receipt is moved here.
+    /// This serves as a staging area before DA publication. Once published,
+    /// entries can be drained by the caller.
+    ///
+    /// Stored in insertion order (Vec). The caller must not rely on HashMap
+    /// iteration order — Vec preserves chronological completion order.
+    completed_receipts: Vec<(SessionId, ReceiptV1Proto)>,
+
+    /// Total number of receipts successfully signed (CO.8).
+    ///
+    /// Monotonically increasing. Uses `saturating_add` to prevent overflow.
+    /// Separate from `completed_receipts.len()` because completed_receipts
+    /// may be drained after DA publication while the counter persists.
+    total_receipts_signed: u64,
 
     /// Committee members untuk validasi voter.
     committee_members: HashSet<CoordinatorId>,
@@ -324,6 +390,8 @@ impl MultiCoordinatorState {
             session_map: HashMap::new(),
             signing_sessions: HashMap::new(),
             receipt_signing_sessions: HashMap::new(),
+            completed_receipts: Vec::new(),
+            total_receipts_signed: 0,
             committee_members,
             threshold,
             consensus_timeout_ms,
@@ -422,14 +490,27 @@ impl MultiCoordinatorState {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // RECEIPT SIGNING SESSION ACCESS (CO.4)
+    // RECEIPT SIGNING SESSION LIFECYCLE (CO.4, CO.8)
     // ────────────────────────────────────────────────────────────────────────────
+    //
+    // Lifecycle: register → progress (via mutable access) → complete → remove
+    //
+    // - register: inserts session into receipt_signing_sessions map.
+    // - progress: caller uses get_receipt_signing_session_mut to drive signing.
+    // - complete: assembles receipt, removes session, moves to completed_receipts.
+    //
+    // After completion, the session is removed from the active map. The assembled
+    // receipt is stored in completed_receipts for DA publication. The
+    // total_receipts_signed counter is incremented.
+    //
+    // Invariant: no session exists in both receipt_signing_sessions AND
+    // completed_receipts simultaneously.
 
     /// Registers a new receipt signing session.
     ///
-    /// Returns `true` if the session was inserted successfully.
-    /// Returns `false` if a session with the same `session_id` already exists
-    /// (no mutation occurs in this case).
+    /// Returns `Ok(())` if the session was inserted successfully.
+    /// Returns `Err(RegisterError::SessionAlreadyExists)` if a session
+    /// with the same `session_id` already exists (no mutation occurs).
     ///
     /// This is the ONLY way to add a receipt signing session.
     /// No partial registration: either fully inserted or not at all.
@@ -437,12 +518,12 @@ impl MultiCoordinatorState {
         &mut self,
         session_id: SessionId,
         session: ReceiptSigningSession,
-    ) -> bool {
+    ) -> Result<(), RegisterError> {
         if self.receipt_signing_sessions.contains_key(&session_id) {
-            return false;
+            return Err(RegisterError::SessionAlreadyExists);
         }
         self.receipt_signing_sessions.insert(session_id, session);
-        true
+        Ok(())
     }
 
     /// Memeriksa apakah receipt signing session sudah ada.
@@ -469,10 +550,90 @@ impl MultiCoordinatorState {
         self.receipt_signing_sessions.get_mut(session_id)
     }
 
-    /// Mengembalikan jumlah receipt signing sessions aktif.
+    /// Mengembalikan jumlah active receipt signing sessions.
     #[must_use]
     pub fn receipt_signing_session_count(&self) -> usize {
         self.receipt_signing_sessions.len()
+    }
+
+    /// Completes a receipt signing session and moves the assembled receipt
+    /// to the completed queue.
+    ///
+    /// ## Atomicity
+    ///
+    /// This method is logically atomic:
+    ///
+    /// - If assembly **fails**: session remains in the map, no state changes.
+    /// - If assembly **succeeds**: session is removed, receipt is stored,
+    ///   counter is incremented. All three mutations happen together.
+    ///
+    /// There is no intermediate state where the session is removed but
+    /// the receipt is not recorded, or vice versa.
+    ///
+    /// ## Steps
+    ///
+    /// 1. Look up session (immutable borrow, scoped).
+    /// 2. Call `assemble_signed_receipt(&session)`.
+    /// 3. If Err → return `CompleteError::AssemblyFailed`, session untouched.
+    /// 4. If Ok → remove session, push to `completed_receipts`,
+    ///    increment `total_receipts_signed`.
+    ///
+    /// ## Returns
+    ///
+    /// * `Ok(ReceiptV1Proto)` — The assembled, validated receipt.
+    /// * `Err(CompleteError::SessionNotFound)` — No session with this ID.
+    /// * `Err(CompleteError::AssemblyFailed)` — Assembly or validation failed.
+    pub fn complete_receipt_signing(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<ReceiptV1Proto, CompleteError> {
+        // Step 1+2: Assemble with immutable borrow (scoped to drop before mutation).
+        let receipt = {
+            let session = self.receipt_signing_sessions.get(session_id)
+                .ok_or(CompleteError::SessionNotFound)?;
+            assemble_signed_receipt(session)
+                .map_err(|e| CompleteError::AssemblyFailed(format!("{}", e)))?
+        };
+        // Immutable borrow is now dropped.
+
+        // Step 4: Atomic state mutation — all three happen together.
+        self.receipt_signing_sessions.remove(session_id);
+        self.completed_receipts.push((session_id.clone(), receipt.clone()));
+        self.total_receipts_signed = self.total_receipts_signed.saturating_add(1);
+
+        Ok(receipt)
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // COMPLETED RECEIPTS ACCESS (CO.8)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Returns the list of completed receipts (ready for DA publication).
+    #[must_use]
+    pub fn completed_receipts(&self) -> &[(SessionId, ReceiptV1Proto)] {
+        &self.completed_receipts
+    }
+
+    /// Returns the number of completed receipts.
+    #[must_use]
+    pub fn completed_receipts_count(&self) -> usize {
+        self.completed_receipts.len()
+    }
+
+    /// Drains all completed receipts, returning them to the caller.
+    ///
+    /// After this call, `completed_receipts` is empty.
+    /// Used by the DA publisher to take ownership of receipts for publication.
+    pub fn drain_completed_receipts(&mut self) -> Vec<(SessionId, ReceiptV1Proto)> {
+        std::mem::take(&mut self.completed_receipts)
+    }
+
+    /// Returns the total number of receipts signed since creation.
+    ///
+    /// Monotonically increasing. Not affected by `drain_completed_receipts`.
+    #[must_use]
+    pub fn total_receipts_signed(&self) -> u64 {
+        self.total_receipts_signed
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -511,6 +672,8 @@ impl fmt::Debug for MultiCoordinatorState {
             .field("consensus_count", &self.consensus_map.len())
             .field("signing_session_count", &self.signing_sessions.len())
             .field("receipt_signing_session_count", &self.receipt_signing_sessions.len())
+            .field("completed_receipts_count", &self.completed_receipts.len())
+            .field("total_receipts_signed", &self.total_receipts_signed)
             .field("committee_size", &self.committee_members.len())
             .field("threshold", &self.threshold)
             .field("consensus_timeout_ms", &self.consensus_timeout_ms)
@@ -2008,5 +2171,264 @@ mod tests {
         );
 
         assert!(matches!(result, Err(HandlerError::SigningError { .. })));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CO.8 — COORDINATOR STATE EXTENSION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    use dsdn_common::receipt_v1_convert::{
+        AggregateSignatureProto, ReceiptV1Proto,
+    };
+    use super::super::receipt_signing::ReceiptSigningSession;
+
+    fn make_agg_sig_empty() -> AggregateSignatureProto {
+        AggregateSignatureProto {
+            signature: vec![],
+            signer_ids: vec![],
+            message_hash: vec![],
+            aggregated_at: 0,
+        }
+    }
+
+    fn make_storage_receipt_proto() -> ReceiptV1Proto {
+        ReceiptV1Proto {
+            workload_id: vec![0x01; 32],
+            node_id: vec![0x02; 32],
+            receipt_type: 0,
+            usage_proof_hash: vec![0x03; 32],
+            execution_commitment: None,
+            coordinator_threshold_signature: make_agg_sig_empty(),
+            node_signature: vec![0x07; 64],
+            submitter_address: vec![0x08; 20],
+            reward_base: 1000,
+            timestamp: 1_700_000_000,
+            epoch: 42,
+        }
+    }
+
+    fn make_co8_commitment(byte: u8) -> SigningCommitmentProto {
+        SigningCommitmentProto {
+            session_id: vec![byte; 32],
+            signer_id: vec![byte; 32],
+            hiding: vec![byte; 32],
+            binding: vec![byte; 32],
+            timestamp: 0,
+        }
+    }
+
+    fn make_co8_partial(byte: u8) -> PartialSignatureProto {
+        PartialSignatureProto {
+            session_id: vec![byte; 32],
+            signer_id: vec![byte; 32],
+            commitment: make_co8_commitment(byte),
+            signature_share: vec![byte; 32],
+        }
+    }
+
+    /// Create a completed ReceiptSigningSession (threshold=2, 2 signers).
+    fn make_completed_session(sid_seed: u8) -> (SessionId, ReceiptSigningSession) {
+        let sid = make_session_id(sid_seed);
+        let wid = make_workload_id(sid_seed);
+
+        let mut session = ReceiptSigningSession::new_storage(
+            sid.clone(),
+            wid,
+            2,
+            make_storage_receipt_proto(),
+        );
+
+        let _ = session.add_commitment(make_coord_id(0x0A), make_co8_commitment(0x0A));
+        let _ = session.add_commitment(make_coord_id(0x0B), make_co8_commitment(0x0B));
+        let _ = session.add_partial(make_coord_id(0x0A), make_co8_partial(0x0A));
+        let _ = session.add_partial(make_coord_id(0x0B), make_co8_partial(0x0B));
+        let _ = session.try_aggregate();
+
+        (sid, session)
+    }
+
+    /// Create an incomplete session (not yet aggregated).
+    fn make_incomplete_session(sid_seed: u8) -> (SessionId, ReceiptSigningSession) {
+        let sid = make_session_id(sid_seed);
+        let wid = make_workload_id(sid_seed);
+        let session = ReceiptSigningSession::new_storage(
+            sid.clone(),
+            wid,
+            2,
+            make_storage_receipt_proto(),
+        );
+        (sid, session)
+    }
+
+    // ── register_receipt_signing ─────────────────────────────────────────
+
+    #[test]
+    fn co8_register_success() {
+        let mut state = make_state();
+        let (sid, session) = make_completed_session(0x01);
+        let result = state.register_receipt_signing(sid, session);
+        assert!(result.is_ok());
+        assert_eq!(state.receipt_signing_session_count(), 1);
+    }
+
+    #[test]
+    fn co8_register_duplicate_rejected() {
+        let mut state = make_state();
+        let (sid, session) = make_completed_session(0x01);
+        let _ = state.register_receipt_signing(sid.clone(), session);
+
+        // Create a second session with the same session_id.
+        let (_, session2) = make_completed_session(0x01);
+        let result = state.register_receipt_signing(sid, session2);
+        assert_eq!(result, Err(RegisterError::SessionAlreadyExists));
+        assert_eq!(state.receipt_signing_session_count(), 1);
+    }
+
+    // ── complete_receipt_signing ─────────────────────────────────────────
+
+    #[test]
+    fn co8_complete_success() {
+        let mut state = make_state();
+        let (sid, session) = make_completed_session(0x01);
+        let _ = state.register_receipt_signing(sid.clone(), session);
+
+        let result = state.complete_receipt_signing(&sid);
+        assert!(result.is_ok());
+
+        // Session removed from active map.
+        assert_eq!(state.receipt_signing_session_count(), 0);
+        assert!(!state.has_receipt_signing_session(&sid));
+
+        // Receipt in completed queue.
+        assert_eq!(state.completed_receipts_count(), 1);
+        assert_eq!(state.completed_receipts()[0].0, sid);
+
+        // Counter incremented.
+        assert_eq!(state.total_receipts_signed(), 1);
+    }
+
+    #[test]
+    fn co8_complete_not_found() {
+        let mut state = make_state();
+        let sid = make_session_id(0xFF);
+        let result = state.complete_receipt_signing(&sid);
+        assert_eq!(result, Err(CompleteError::SessionNotFound));
+    }
+
+    #[test]
+    fn co8_complete_assembly_failed_session_preserved() {
+        let mut state = make_state();
+        let (sid, session) = make_incomplete_session(0x01); // Not aggregated.
+        let _ = state.register_receipt_signing(sid.clone(), session);
+
+        let result = state.complete_receipt_signing(&sid);
+        assert!(matches!(result, Err(CompleteError::AssemblyFailed(_))));
+
+        // Session still in map (not removed on failure).
+        assert!(state.has_receipt_signing_session(&sid));
+        assert_eq!(state.receipt_signing_session_count(), 1);
+
+        // Nothing in completed.
+        assert_eq!(state.completed_receipts_count(), 0);
+        assert_eq!(state.total_receipts_signed(), 0);
+    }
+
+    #[test]
+    fn co8_double_completion_rejected() {
+        let mut state = make_state();
+        let (sid, session) = make_completed_session(0x01);
+        let _ = state.register_receipt_signing(sid.clone(), session);
+
+        // First completion succeeds.
+        let r1 = state.complete_receipt_signing(&sid);
+        assert!(r1.is_ok());
+
+        // Second completion fails: session already removed.
+        let r2 = state.complete_receipt_signing(&sid);
+        assert_eq!(r2, Err(CompleteError::SessionNotFound));
+
+        // Counter only incremented once.
+        assert_eq!(state.total_receipts_signed(), 1);
+        assert_eq!(state.completed_receipts_count(), 1);
+    }
+
+    // ── completed_receipts access ───────────────────────────────────────
+
+    #[test]
+    fn co8_multiple_completions() {
+        let mut state = make_state();
+
+        let (sid1, s1) = make_completed_session(0x01);
+        let (sid2, s2) = make_completed_session(0x02);
+
+        let _ = state.register_receipt_signing(sid1.clone(), s1);
+        let _ = state.register_receipt_signing(sid2.clone(), s2);
+
+        let _ = state.complete_receipt_signing(&sid1);
+        let _ = state.complete_receipt_signing(&sid2);
+
+        assert_eq!(state.total_receipts_signed(), 2);
+        assert_eq!(state.completed_receipts_count(), 2);
+        assert_eq!(state.receipt_signing_session_count(), 0);
+    }
+
+    #[test]
+    fn co8_drain_completed() {
+        let mut state = make_state();
+        let (sid, session) = make_completed_session(0x01);
+        let _ = state.register_receipt_signing(sid.clone(), session);
+        let _ = state.complete_receipt_signing(&sid);
+
+        assert_eq!(state.completed_receipts_count(), 1);
+
+        let drained = state.drain_completed_receipts();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, sid);
+
+        // Queue now empty, counter preserved.
+        assert_eq!(state.completed_receipts_count(), 0);
+        assert_eq!(state.total_receipts_signed(), 1);
+    }
+
+    #[test]
+    fn co8_drain_empty() {
+        let mut state = make_state();
+        let drained = state.drain_completed_receipts();
+        assert!(drained.is_empty());
+    }
+
+    // ── Initial state ───────────────────────────────────────────────────
+
+    #[test]
+    fn co8_initial_state() {
+        let state = make_state();
+        assert_eq!(state.receipt_signing_session_count(), 0);
+        assert_eq!(state.completed_receipts_count(), 0);
+        assert_eq!(state.total_receipts_signed(), 0);
+        assert!(state.completed_receipts().is_empty());
+    }
+
+    // ── Error Display ───────────────────────────────────────────────────
+
+    #[test]
+    fn co8_register_error_display() {
+        let e = RegisterError::SessionAlreadyExists;
+        assert!(format!("{}", e).contains("already exists"));
+    }
+
+    #[test]
+    fn co8_complete_error_display() {
+        let e1 = CompleteError::SessionNotFound;
+        assert!(format!("{}", e1).contains("not found"));
+
+        let e2 = CompleteError::AssemblyFailed("reason".to_string());
+        assert!(format!("{}", e2).contains("reason"));
+    }
+
+    #[test]
+    fn co8_error_implements_std_error() {
+        fn assert_error<E: std::error::Error>() {}
+        assert_error::<RegisterError>();
+        assert_error::<CompleteError>();
     }
 }

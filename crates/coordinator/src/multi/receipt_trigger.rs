@@ -241,17 +241,13 @@ pub fn trigger_receipt_signing(
 
     // ── Step 6: Register session ─────────────────────────────────────────
     //
-    // register_receipt_signing returns false if session_id already exists.
-    // No partial registration: either fully inserted or not at all.
+    // register_receipt_signing returns Err(RegisterError::SessionAlreadyExists)
+    // if session_id already exists. No partial registration.
 
-    let registered = coordinator_state.register_receipt_signing(
+    coordinator_state.register_receipt_signing(
         session_id.clone(),
         session,
-    );
-
-    if !registered {
-        return Err(ReceiptTriggerError::SessionAlreadyExists);
-    }
+    ).map_err(|_| ReceiptTriggerError::SessionAlreadyExists)?;
 
     Ok(session_id)
 }
