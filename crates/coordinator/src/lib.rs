@@ -529,6 +529,9 @@ pub mod multi;
 // GateKeeper module (14B.31–40)
 pub mod gatekeeper;
 
+// Execution commitment builder (CO.2)
+pub mod execution;
+
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
 pub use state_machine::{
