@@ -278,6 +278,134 @@ pub fn calculate_slash_allocation(
 }
 
 
+// ════════════════════════════════════════════════════════════════════════════
+// CH.8 — RECEIPT V1 TOKENOMICS INTEGRATION
+// ════════════════════════════════════════════════════════════════════════════
+//
+// These functions bridge the ReceiptV1 claim pipeline to the existing
+// fee split infrastructure. They delegate to calculate_fee_by_resource_class()
+// to maintain a single source of truth for percentage constants (70/20/10).
+//
+// WHY DELEGATION (NOT DUPLICATION):
+//
+// calculate_fee_by_resource_class() is the canonical fee split function
+// (13.8.E + 13.9 Blueprint). RewardDistribution::compute() in dsdn_common
+// uses the same constants (70/20/10) independently. These CH.8 functions
+// provide the bridge so that:
+//
+// 1. ReceiptV1 rewards are computed via the same code path as transaction fees.
+// 2. Any future change to percentage constants only needs to happen in one place.
+// 3. Cross-verification between RewardDistribution and FeeSplit is possible.
+//
+// If the percentages ever diverge between dsdn_common::RewardDistribution
+// and tokenomics::calculate_fee_by_resource_class, verify_distribution_consistency
+// will detect the mismatch.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Computes a ReceiptV1 reward distribution using the existing fee split engine.
+///
+/// ## Delegation
+///
+/// This function does NOT reimplement the 70/20/10 split. It delegates
+/// to [`calculate_fee_by_resource_class`] by mapping:
+///
+/// | `ReceiptType` | `ResourceClass` |
+/// |---------------|-----------------|
+/// | `Storage` | `ResourceClass::Storage` |
+/// | `Compute` | `ResourceClass::Compute` |
+///
+/// This ensures a **single source of truth** for tokenomics constants.
+/// If fee percentages change, the change propagates automatically to
+/// ReceiptV1 reward calculations.
+///
+/// ## Anti-Self-Dealing
+///
+/// The `node_address` and `submitter` parameters are forwarded directly
+/// to `calculate_fee_by_resource_class`, which applies the anti-self-dealing
+/// rule: if `node_address == submitter`, `node_share` is redirected to
+/// `treasury_share`.
+///
+/// ## Parameters
+///
+/// - `reward_base` — Total reward amount (maps to `total_fee`).
+/// - `receipt_type` — `ReceiptType::Storage` or `ReceiptType::Compute`.
+/// - `node_address` — Service node address (maps to `service_node`).
+///   `None` if node is unknown (anti-self-dealing check skipped).
+/// - `submitter` — Transaction sender address.
+///
+/// ## Returns
+///
+/// `FeeSplit` with `node_share`, `validator_share`, `treasury_share`
+/// summing to `reward_base`.
+///
+/// ## Guarantees
+///
+/// - Pure function. No mutation. No side effects.
+/// - Deterministic: same inputs → same outputs.
+/// - No panic. No unwrap.
+/// - `split.total() == reward_base` (invariant from `calculate_fee_by_resource_class`).
+#[must_use]
+pub fn calculate_receipt_v1_reward(
+    reward_base: u128,
+    receipt_type: &dsdn_common::receipt_v1::ReceiptType,
+    node_address: Option<crate::types::Address>,
+    submitter: &crate::types::Address,
+) -> FeeSplit {
+    use dsdn_common::receipt_v1::ReceiptType;
+
+    // Map ReceiptType → ResourceClass.
+    //
+    // This is the ONLY place where the ReceiptType ↔ ResourceClass mapping
+    // is defined. Both Storage and Compute receipts use the same 70/20/10
+    // split as their corresponding ResourceClass.
+    let resource_class = match receipt_type {
+        ReceiptType::Storage => crate::tx::ResourceClass::Storage,
+        ReceiptType::Compute => crate::tx::ResourceClass::Compute,
+    };
+
+    // Delegate to the canonical fee split function.
+    // All percentage logic lives in calculate_fee_by_resource_class.
+    calculate_fee_by_resource_class(reward_base, &resource_class, node_address, submitter)
+}
+
+/// Cross-checks a `FeeSplit` against a `RewardDistribution` for consistency.
+///
+/// ## Purpose
+///
+/// `RewardDistribution` (from `dsdn_common::claim_validation`) and `FeeSplit`
+/// (from `tokenomics.rs`) compute the same 70/20/10 split independently.
+/// This function verifies that both produce identical results for the same
+/// input, detecting any drift between the two implementations.
+///
+/// ## Field Mapping
+///
+/// | `FeeSplit` | `RewardDistribution` |
+/// |------------|----------------------|
+/// | `node_share` | `node_reward` |
+/// | `validator_share` | `validator_reward` |
+/// | `treasury_share` | `treasury_reward` |
+///
+/// ## Returns
+///
+/// `true` if ALL three fields match exactly. `false` otherwise.
+///
+/// ## Guarantees
+///
+/// - Pure function. No mutation. No side effects.
+/// - Deterministic.
+/// - No panic. No unwrap.
+/// - Compares ALL fields (no partial comparison).
+#[must_use]
+pub fn verify_distribution_consistency(
+    fee_split: &FeeSplit,
+    distribution: &dsdn_common::claim_validation::RewardDistribution,
+) -> bool {
+    fee_split.node_share == distribution.node_reward
+        && fee_split.validator_share == distribution.validator_reward
+        && fee_split.treasury_share == distribution.treasury_reward
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,4 +616,247 @@ mod tests {
         assert_eq!(burn, 1000);
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // CH.8 — RECEIPT V1 TOKENOMICS INTEGRATION TESTS
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_receipt_v1_storage_normal() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use crate::types::Address;
+
+        let submitter = Address::from_bytes([0x01; 20]);
+        let node = Address::from_bytes([0x02; 20]); // Different from submitter
+
+        let split = calculate_receipt_v1_reward(
+            1000,
+            &ReceiptType::Storage,
+            Some(node),
+            &submitter,
+        );
+
+        // Same as ResourceClass::Storage: 70/20/10.
+        assert_eq!(split.node_share, 700);
+        assert_eq!(split.validator_share, 200);
+        assert_eq!(split.treasury_share, 100);
+        assert_eq!(split.total(), 1000);
+    }
+
+    #[test]
+    fn test_receipt_v1_compute_normal() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use crate::types::Address;
+
+        let submitter = Address::from_bytes([0x01; 20]);
+        let node = Address::from_bytes([0x02; 20]);
+
+        let split = calculate_receipt_v1_reward(
+            1000,
+            &ReceiptType::Compute,
+            Some(node),
+            &submitter,
+        );
+
+        assert_eq!(split.node_share, 700);
+        assert_eq!(split.validator_share, 200);
+        assert_eq!(split.treasury_share, 100);
+        assert_eq!(split.total(), 1000);
+    }
+
+    #[test]
+    fn test_receipt_v1_anti_self_dealing() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use crate::types::Address;
+
+        let addr = Address::from_bytes([0x01; 20]);
+        // node == submitter → anti-self-dealing.
+        let split = calculate_receipt_v1_reward(
+            1000,
+            &ReceiptType::Compute,
+            Some(addr),
+            &addr,
+        );
+
+        assert_eq!(split.node_share, 0);
+        assert_eq!(split.validator_share, 200);
+        assert_eq!(split.treasury_share, 800);
+        assert_eq!(split.total(), 1000);
+    }
+
+    #[test]
+    fn test_receipt_v1_no_node_address() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use crate::types::Address;
+
+        let submitter = Address::from_bytes([0x01; 20]);
+        let split = calculate_receipt_v1_reward(
+            1000,
+            &ReceiptType::Storage,
+            None, // No node address → anti-self-dealing skipped.
+            &submitter,
+        );
+
+        // Normal 70/20/10 (no anti-self-dealing without node).
+        assert_eq!(split.node_share, 700);
+        assert_eq!(split.validator_share, 200);
+        assert_eq!(split.treasury_share, 100);
+    }
+
+    #[test]
+    fn test_receipt_v1_zero_reward_base() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use crate::types::Address;
+
+        let submitter = Address::from_bytes([0x01; 20]);
+        let split = calculate_receipt_v1_reward(
+            0,
+            &ReceiptType::Storage,
+            None,
+            &submitter,
+        );
+
+        assert_eq!(split.node_share, 0);
+        assert_eq!(split.validator_share, 0);
+        assert_eq!(split.treasury_share, 0);
+        assert_eq!(split.total(), 0);
+    }
+
+    #[test]
+    fn test_receipt_v1_matches_resource_class_exactly() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use crate::tx::ResourceClass;
+        use crate::types::Address;
+
+        let submitter = Address::from_bytes([0x01; 20]);
+        let node = Address::from_bytes([0x02; 20]);
+
+        // ReceiptV1 path.
+        let receipt_split = calculate_receipt_v1_reward(
+            12345,
+            &ReceiptType::Storage,
+            Some(node),
+            &submitter,
+        );
+
+        // Direct ResourceClass path.
+        let resource_split = calculate_fee_by_resource_class(
+            12345,
+            &ResourceClass::Storage,
+            Some(node),
+            &submitter,
+        );
+
+        // Must be identical — same code path.
+        assert_eq!(receipt_split.node_share, resource_split.node_share);
+        assert_eq!(receipt_split.validator_share, resource_split.validator_share);
+        assert_eq!(receipt_split.treasury_share, resource_split.treasury_share);
+    }
+
+    #[test]
+    fn test_verify_distribution_consistency_match() {
+        use dsdn_common::claim_validation::RewardDistribution;
+
+        let split = FeeSplit {
+            node_share: 700,
+            validator_share: 200,
+            treasury_share: 100,
+        };
+        let dist = RewardDistribution::compute(1000);
+
+        assert!(verify_distribution_consistency(&split, &dist));
+    }
+
+    #[test]
+    fn test_verify_distribution_consistency_mismatch_node() {
+        use dsdn_common::claim_validation::RewardDistribution;
+
+        let split = FeeSplit {
+            node_share: 699, // Wrong!
+            validator_share: 200,
+            treasury_share: 100,
+        };
+        let dist = RewardDistribution::compute(1000);
+
+        assert!(!verify_distribution_consistency(&split, &dist));
+    }
+
+    #[test]
+    fn test_verify_distribution_consistency_mismatch_validator() {
+        use dsdn_common::claim_validation::RewardDistribution;
+
+        let split = FeeSplit {
+            node_share: 700,
+            validator_share: 199, // Wrong!
+            treasury_share: 100,
+        };
+        let dist = RewardDistribution::compute(1000);
+
+        assert!(!verify_distribution_consistency(&split, &dist));
+    }
+
+    #[test]
+    fn test_verify_distribution_consistency_mismatch_treasury() {
+        use dsdn_common::claim_validation::RewardDistribution;
+
+        let split = FeeSplit {
+            node_share: 700,
+            validator_share: 200,
+            treasury_share: 99, // Wrong!
+        };
+        let dist = RewardDistribution::compute(1000);
+
+        assert!(!verify_distribution_consistency(&split, &dist));
+    }
+
+    #[test]
+    fn test_verify_distribution_consistency_anti_self_dealing() {
+        use dsdn_common::claim_validation::RewardDistribution;
+
+        let split = FeeSplit {
+            node_share: 0,
+            validator_share: 200,
+            treasury_share: 800,
+        };
+        let dist = RewardDistribution::with_anti_self_dealing(1000);
+
+        assert!(verify_distribution_consistency(&split, &dist));
+    }
+
+    #[test]
+    fn test_verify_distribution_consistency_zero() {
+        use dsdn_common::claim_validation::RewardDistribution;
+
+        let split = FeeSplit {
+            node_share: 0,
+            validator_share: 0,
+            treasury_share: 0,
+        };
+        let dist = RewardDistribution::compute(0);
+
+        assert!(verify_distribution_consistency(&split, &dist));
+    }
+
+    #[test]
+    fn test_receipt_v1_and_distribution_agree() {
+        use dsdn_common::receipt_v1::ReceiptType;
+        use dsdn_common::claim_validation::RewardDistribution;
+        use crate::types::Address;
+
+        let submitter = Address::from_bytes([0x01; 20]);
+        let node = Address::from_bytes([0x02; 20]);
+
+        // ReceiptV1 via tokenomics.
+        let split = calculate_receipt_v1_reward(
+            1000,
+            &ReceiptType::Storage,
+            Some(node),
+            &submitter,
+        );
+
+        // RewardDistribution via dsdn_common.
+        let dist = RewardDistribution::compute(1000);
+
+        // Both must agree (single source of truth verification).
+        assert!(verify_distribution_consistency(&split, &dist));
+    }
 }
