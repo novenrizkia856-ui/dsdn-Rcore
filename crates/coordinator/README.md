@@ -580,6 +580,85 @@ When primary DA fails:
 
 ---
 
+## Receipt Signing Pipeline (CO.1–CO.9)
+
+The coordinator orchestrates receipt signing as proof that a node performed
+work. Receipts flow through a deterministic pipeline before reaching the chain.
+
+### End-to-End Flow
+
+```
+1. Usage Proof Verification (CO.3)
+   │  Node submits UsageProof with Ed25519 signature.
+   │  Coordinator verifies signature + range checks.
+   │  Computes reward_base from resource metrics.
+   │
+   ▼
+2. Anti-Self-Dealing Pre-Check (CO.9) [advisory only]
+   │  Checks if submitter_address == node owner.
+   │  Returns PreCheckResult::Clean or SuspectedSelfDealing.
+   │  NEVER blocks signing — monitoring/alerting only.
+   │  Chain performs authoritative enforcement.
+   │
+   ▼
+3. Execution Commitment (CO.2) [compute workloads only]
+   │  CommitmentBuilder computes Merkle root over execution trace.
+   │  Produces ExecutionCommitment with input/output/state hashes.
+   │
+   ▼
+4. Receipt Signing Session (CO.1, CO.4)
+   │  ReceiptSigningSession wraps SigningSession.
+   │  Tracks receipt_data, execution_commitment, receipt_type.
+   │  Registered in MultiCoordinatorState (CO.8).
+   │
+   ▼
+5. Threshold Signing (CO.1, CO.7 mock for tests)
+   │  State: CollectingCommitments → CollectingSignatures → Completed
+   │  Collect threshold commitments from coordinators.
+   │  Collect threshold partial signatures.
+   │  Aggregate into final threshold signature.
+   │
+   ▼
+6. Receipt Assembly (CO.5)
+   │  assemble_signed_receipt() validates + assembles final ReceiptV1Proto.
+   │  13 structural checks (field lengths, type consistency, ranges).
+   │  Session removed from active map, receipt added to completed queue.
+   │
+   ▼
+7. DA Publication (CO.6)
+   │  Deterministic binary encoding (magic + version + fields).
+   │  Published to DA layer via DAClient trait.
+   │  Retrievable and decodable with validation on retrieval.
+   │
+   ▼
+8. Chain Handoff
+   Chain processes ClaimReward transaction with the published receipt.
+   Authoritative anti-self-dealing enforcement occurs here.
+```
+
+### Session Lifecycle
+
+Sessions are managed atomically in `MultiCoordinatorState`:
+
+| Phase | Method | State Change |
+|-------|--------|-------------|
+| Register | `register_receipt_signing()` | Session added to active map |
+| Progress | `get_receipt_signing_session_mut()` | Caller drives signing |
+| Complete | `complete_receipt_signing()` | Session removed, receipt queued, counter++ |
+| Drain | `drain_completed_receipts()` | Receipts taken for DA publication |
+
+Completion is logically atomic: if assembly fails, no state changes.
+If assembly succeeds, removal + storage + counter increment happen together.
+
+### Defense-in-Depth
+
+| Layer | Module | Authority | Behavior |
+|-------|--------|-----------|----------|
+| Coordinator | `precheck_self_dealing` (CO.9) | Advisory | Flags suspicious receipts, never blocks |
+| Chain | `ClaimReward` validation | Authoritative | Rejects self-dealing with on-chain proof |
+
+---
+
 ## Module Structure
 
 ```
@@ -587,28 +666,41 @@ crates/coordinator/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   ├── lib.rs              # Crate root, Coordinator struct, exports
-│   ├── main.rs             # HTTP server, DARouter, AppState
-│   ├── handlers.rs         # Extended HTTP handlers
-│   ├── scheduler.rs        # Workload scheduling & scoring
-│   ├── da_consumer.rs      # DA event consumption
-│   ├── state_machine.rs    # Deterministic event processing
-│   ├── state_rebuild.rs    # State reconstruction from DA
-│   ├── event_publisher.rs  # Event batching and publishing
-│   ├── reconciliation.rs   # Fallback blob reconciliation
-│   └── multi/              # Multi-coordinator consensus
+│   ├── lib.rs                        # Crate root, Coordinator struct, exports
+│   ├── main.rs                       # HTTP server, DARouter, AppState
+│   ├── handlers.rs                   # Extended HTTP handlers
+│   ├── scheduler.rs                  # Workload scheduling & scoring
+│   ├── da_consumer.rs                # DA event consumption
+│   ├── state_machine.rs              # Deterministic event processing
+│   ├── state_rebuild.rs              # State reconstruction from DA
+│   ├── event_publisher.rs            # Event batching and publishing
+│   ├── reconciliation.rs             # Fallback blob reconciliation
+│   ├── receipt_publisher.rs          # DA publication + retrieval (CO.6)
+│   ├── execution/                    # Execution verification
+│   │   ├── mod.rs
+│   │   ├── commitment_builder.rs     # ExecutionCommitment + Merkle (CO.2)
+│   │   ├── usage_verifier.rs         # Usage proof verification (CO.3)
+│   │   └── self_dealing_precheck.rs  # Anti-self-dealing pre-check (CO.9)
+│   └── multi/                        # Multi-coordinator consensus
 │       ├── mod.rs
-│       ├── types.rs        # CoordinatorId, KeyShare, etc.
-│       ├── peer.rs         # PeerManager, connections
-│       ├── message.rs      # Wire protocol messages
-│       ├── network.rs      # CoordinatorNetwork trait
-│       ├── consensus.rs    # ReceiptConsensus state machine
-│       ├── handlers.rs     # Message handlers
-│       ├── signing.rs      # Threshold signing
-│       ├── optimistic.rs   # Optimistic receipts
-│       └── coordinator.rs  # MultiCoordinator orchestrator
+│       ├── types.rs                  # CoordinatorId, KeyShare, etc.
+│       ├── peer.rs                   # PeerManager, connections
+│       ├── message.rs                # Wire protocol messages
+│       ├── network.rs                # CoordinatorNetwork trait
+│       ├── consensus.rs              # ReceiptConsensus state machine
+│       ├── handlers.rs               # Message handlers + state (CO.8)
+│       ├── signing.rs                # Threshold signing
+│       ├── optimistic.rs             # Optimistic receipts
+│       ├── coordinator.rs            # MultiCoordinator orchestrator
+│       ├── receipt_signing.rs        # Receipt signing session (CO.1)
+│       ├── receipt_trigger.rs        # Signing trigger (CO.4)
+│       ├── receipt_assembler.rs      # Receipt assembly (CO.5)
+│       └── mock_tss.rs              # Mock TSS [test/feature only] (CO.7)
 └── tests/
-    └── da_integration.rs   # Integration tests
+    ├── da_integration.rs             # DA integration tests
+    ├── receipt_signing_tests.rs      # Signing lifecycle tests (CO.10)
+    ├── execution_tests.rs            # Execution + usage tests (CO.10)
+    └── da_publish_tests.rs           # DA publication + E2E tests (CO.10)
 ```
 
 ---
@@ -617,18 +709,25 @@ crates/coordinator/
 
 ### Unit Tests
 ```bash
-cargo rustsp test -p dsdn-coordinator
+cargo test -p dsdn-coordinator
 ```
 
 ### Integration Tests
 ```bash
-cargo rustsp est -p dsdn-coordinator --test da_integration
+cargo test -p dsdn-coordinator --test receipt_signing_tests
+cargo test -p dsdn-coordinator --test execution_tests
+cargo test -p dsdn-coordinator --test da_publish_tests
+```
+
+### With Mock TSS Feature
+```bash
+cargo test -p dsdn-coordinator --features mock-tss
 ```
 
 ### Manual API Testing
 ```bash
 # Start coordinator
-USE_MOCK_DA=true cargo rustsp run -p dsdn-coordinator
+USE_MOCK_DA=true cargo run -p dsdn-coordinator
 
 # Run test script (see COORDINATOR_API_USAGE.md)
 ./test_coordinator.sh
@@ -636,7 +735,7 @@ USE_MOCK_DA=true cargo rustsp run -p dsdn-coordinator
 
 ### Test Coverage
 ```bash
-cargo rustsp tarpaulin -p dsdn-coordinator --out Html
+cargo tarpaulin -p dsdn-coordinator --out Html
 ```
 
 ---
@@ -665,6 +764,16 @@ cargo rustsp tarpaulin -p dsdn-coordinator --out Html
 | 14A.1A.35-39 | DA Fallback System |
 | 14A.2B.2.11-20 | Multi-Coordinator Consensus |
 | 14A.3 | Extended HTTP API |
+| CO.1 | Receipt Signing Session |
+| CO.2 | Execution Commitment Builder |
+| CO.3 | Usage Proof Verification |
+| CO.4 | Receipt Signing Trigger |
+| CO.5 | Receipt Assembly |
+| CO.6 | DA Publication |
+| CO.7 | Mock TSS Interface |
+| CO.8 | Coordinator State Extension |
+| CO.9 | Anti-Self-Dealing Pre-Check |
+| CO.10 | Integration Tests & Documentation |
 
 ---
 
