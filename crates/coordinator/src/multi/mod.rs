@@ -137,6 +137,11 @@ pub mod receipt_signing;
 pub mod receipt_trigger;
 pub mod receipt_assembler;
 
+// Mock TSS for testing only (CO.7)
+// NEVER available in default production build.
+#[cfg(any(test, feature = "mock-tss"))]
+pub mod mock_tss;
+
 // Re-export all public types from types module (14A.2B.2.11)
 pub use types::{
     // Identity types
