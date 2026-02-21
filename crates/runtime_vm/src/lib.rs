@@ -1,5 +1,36 @@
-﻿//! runtime_vm public API
-//! Defines the MicroVM trait and common types used by mock_vm and future real VM implementations.
+﻿//! runtime_vm
+//!
+//! This crate defines a generic abstraction layer for running isolated
+//! execution environments ("micro VMs") in a uniform and async-friendly way.
+//!
+//! The goal of this module is to decouple higher-level runtime logic
+//! (e.g. task orchestration, sandbox execution, untrusted code handling)
+//! from the underlying virtualization or process implementation.
+//!
+//! Instead of depending directly on a specific backend (Firecracker,
+//! mock process, WASM runtime, etc.), the system interacts only with
+//! the `MicroVM` trait defined here.
+//!
+//! Implementations:
+//! - `MockVMController`
+//!     A lightweight process-based implementation used for testing,
+//!     development, and environments where real virtualization is not available.
+//!
+//! - `FirecrackerVM`
+//!     A skeleton for a production-grade Linux microVM backend.
+//!     Intended to wrap Firecracker via its API socket and vsock interface.
+//!
+//! This design enables:
+//! - Backend-agnostic VM orchestration
+//! - Clean separation of concerns
+//! - Easy testing using MockVM
+//! - Future extension to additional isolation technologies
+//!   (e.g. WASM sandbox, container runtime, microVM variants)
+//!
+//! All VM implementations must follow the lifecycle contract defined
+//! by the `MicroVM` trait below.
+
+pub mod firecracker_vm;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -18,10 +49,12 @@ pub enum MicroVmError {
     #[error("process error: {0}")]
     Process(String),
 
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+
     #[error("other error: {0}")]
     Other(String),
 }
-
 pub type MicroVmResult<T> = Result<T, MicroVmError>;
 
 #[async_trait]
