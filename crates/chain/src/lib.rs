@@ -33,6 +33,7 @@
 //! |  `claim_reward_handler` | ClaimReward transaction handler: verify → anti-self-dealing → distribute/challenge. | 14C.B |
 //! |  `reward_executor` | Reward distribution execution: atomic credit, rollback, challenge release. | 14C.C |
 //! |  `anti_self_dealing_check` | Anti-self-dealing chain validation: detect → redirect, never reject. | 14C.D |
+//! |  `challenge_manager` | Challenge period lifecycle: start, expire, clear, resolve. | CH.6 |
 //!
 //! ## 14B — Stake & Identity Gating
 //!
@@ -500,6 +501,7 @@
 //! |       |   - 14B.18: RPC Gating Endpoints (read-only query) | ✅ IMPLEMENTED |
 //! |       |   - 14B.19: CLI Gating Commands (register, info, stake, status, list) | ✅ IMPLEMENTED |
 //! |       |   - 14B.20: Chain Gating Tests & Final Documentation | ✅ IMPLEMENTED |
+//! | CH.6  | Challenge Period State Management | ✅ IMPLEMENTED |
 //! ```
 //!
 //! ## Chain Struct
@@ -793,6 +795,7 @@ pub mod receipt_v1_verify;
 pub mod claim_reward_handler;
 pub mod reward_executor;
 pub mod anti_self_dealing_check;
+pub mod challenge_manager;
 use crate::types::{Address, Hash};
 use std::str::FromStr;
 
@@ -1183,6 +1186,23 @@ impl Chain {
         // Capture proposer balance before mining (untuk fee tracking)
         let proposer_balance_before = state_guard.get_balance(&proposer_address);
         
+        // ════════════════════════════════════════════════════════════════
+        // CH.6 — MINER INTEGRATION NOTE
+        // ════════════════════════════════════════════════════════════════
+        // miner.mine_block() MUST call challenge_manager::process_expired_challenges()
+        // at the same pipeline position as apply_block_without_mining step 5.7:
+        //   after process_economic_job(), BEFORE compute_state_root().
+        //
+        // This ensures that producer and full-node paths produce identical
+        // state roots. pending_challenges is CONSENSUS-CRITICAL (in state_root).
+        //
+        // If mine_block does NOT include this step, state_root mismatch
+        // will occur between producer and full nodes.
+        //
+        // Required change in miner.rs / block execution pipeline:
+        //   let block_time = /* block timestamp as u64 */;
+        //   crate::challenge_manager::process_expired_challenges(state, block_time);
+        // ════════════════════════════════════════════════════════════════
         let block = miner.mine_block(
             txs.clone(),
             &mut *state_guard,
@@ -1511,6 +1531,46 @@ impl Chain {
 
         if let Some(event) = &burn_event {
             println!("   🔥 Treasury burn: {} tokens", event.amount_burned);
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // 5.7) CHALLENGE PERIOD PROCESSING (CH.6)
+        // ─────────────────────────────────────────────────────────
+        // POSISI WAJIB: Setelah economic job, SEBELUM state_root.
+        //
+        // Processes expired challenge periods:
+        // - Pending + expired → mark cleared, distribute reward, remove
+        // - Challenged + expired → report PendingResolution (no mutation)
+        // - Terminal (Cleared/Slashed) → skip
+        //
+        // CONSENSUS-CRITICAL: pending_challenges termasuk dalam state_root.
+        // Semua node HARUS memanggil ini pada posisi yang sama dalam
+        // pipeline block execution untuk menghasilkan state_root identik.
+        //
+        // Idempotent: memanggil dua kali pada block yang sama tidak
+        // mengubah state tambahan.
+        // ─────────────────────────────────────────────────────────
+        let block_timestamp = block.header.timestamp.timestamp() as u64;
+        let challenge_resolutions = crate::challenge_manager::process_expired_challenges(
+            &mut *state_guard,
+            block_timestamp,
+        );
+
+        if !challenge_resolutions.is_empty() {
+            println!("   🔔 Challenge resolutions: {} processed", challenge_resolutions.len());
+            for resolution in &challenge_resolutions {
+                match resolution {
+                    crate::challenge_manager::ChallengeResolution::Cleared { .. } => {
+                        println!("      └─ Cleared (reward released)");
+                    }
+                    crate::challenge_manager::ChallengeResolution::PendingResolution { .. } => {
+                        println!("      └─ PendingResolution (awaiting dispute)");
+                    }
+                    crate::challenge_manager::ChallengeResolution::Slashed { amount, .. } => {
+                        println!("      └─ Slashed (amount={})", amount);
+                    }
+                }
+            }
         }
 
         // ─────────────────────────────────────────────────────────

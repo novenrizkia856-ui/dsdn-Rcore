@@ -166,10 +166,17 @@ impl Miner {
         // Block producer HARUS menjalankan slashing di titik yang sama
         // dengan full node untuk menjaga determinisme
         // -------------------------------------------------------------
-        let slashing_events = state.process_automatic_slashing(height, std::time::SystemTime::now()
+        //
+        // Capture block timestamp ONCE for all post-TX hooks.
+        // This ensures slashing and challenge processing use the
+        // same time value, matching what full nodes see in
+        // block.header.timestamp after the block is built.
+        let block_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0));
+            .unwrap_or(0);
+
+        let slashing_events = state.process_automatic_slashing(height, block_time);
         
         if !slashing_events.is_empty() {
             println!("⚔️ SLASHING EXECUTED IN BLOCK:");
@@ -181,6 +188,46 @@ impl Miner {
                     event.amount_to_treasury,
                     event.amount_burned
                 );
+            }
+        }
+
+        // -------------------------------------------------------------
+        // 2.6) CHALLENGE PERIOD PROCESSING (CH.6)
+        // -------------------------------------------------------------
+        // POSISI WAJIB: Setelah slashing, SEBELUM state_root.
+        //
+        // Processes expired challenge periods for compute receipts:
+        // - Pending + expired → mark cleared, distribute reward, remove
+        // - Challenged + expired → report PendingResolution (no mutation)
+        // - Terminal (Cleared/Slashed) → skip (idempotent)
+        //
+        // CONSENSUS-CRITICAL: pending_challenges termasuk dalam state_root.
+        // Block producer HARUS memanggil ini pada posisi yang SAMA dengan
+        // full node (apply_block_without_mining step 5.7) untuk menghasilkan
+        // state_root identik.
+        //
+        // Idempotent: memanggil dua kali pada block yang sama tidak
+        // mengubah state tambahan.
+        // -------------------------------------------------------------
+        let challenge_resolutions = crate::challenge_manager::process_expired_challenges(
+            state,
+            block_time,
+        );
+
+        if !challenge_resolutions.is_empty() {
+            println!("🔔 CHALLENGE RESOLUTIONS IN BLOCK:");
+            for resolution in &challenge_resolutions {
+                match resolution {
+                    crate::challenge_manager::ChallengeResolution::Cleared { .. } => {
+                        println!("   └─ Cleared (reward released)");
+                    }
+                    crate::challenge_manager::ChallengeResolution::PendingResolution { .. } => {
+                        println!("   └─ PendingResolution (awaiting dispute)");
+                    }
+                    crate::challenge_manager::ChallengeResolution::Slashed { amount, .. } => {
+                        println!("   └─ Slashed (amount={})", amount);
+                    }
+                }
             }
         }
 
