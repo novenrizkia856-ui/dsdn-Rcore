@@ -50,6 +50,7 @@
 //! | `merkle` | Deterministic binary Merkle tree over execution traces (14C.B.1) |
 //! | `state_capture` | Domain-separated SHA3-256 hashing for input, output, memory (14C.B.2) |
 //! | `trace_recorder` | Incremental execution trace recorder with finalize-time Merkle (14C.B.3) |
+//! | `committed_execution` | `run_wasm_committed` wrapper with state capture and commitment (14C.B.4) |
 //!
 //! ## Merkle Tree — Cross-Crate Compatibility
 //!
@@ -126,10 +127,36 @@ pub mod state_capture;
 /// finalization — no dangling state, no double-finalize.
 pub mod trace_recorder;
 
+/// Committed WASM execution wrapper (14C.B.4).
+///
+/// [`run_wasm_committed`] wraps [`run_wasm`](crate::run_wasm) without
+/// modifying it. It adds state capture (input/output hashing, state root
+/// computation), V1 minimal execution trace, Merkle root computation,
+/// and resource usage estimation. Returns [`WasmExecutionResult`] with
+/// all data needed to construct an [`ExecutionCommitment`].
+///
+/// ## V1 Proxy Rules
+///
+/// - `state_root_before`: `hash_memory_snapshot(module_bytes)` — proxy for
+///   post-instantiation linear memory (determined by module data segments).
+/// - `state_root_after`: `hash_memory_snapshot(stdout)` — proxy for
+///   post-execution state (V2: full memory page dump via wasmtime Store).
+/// - Execution trace: `[input_bytes, stdout_bytes]` — V2: instruction-level
+///   tracing via wasmtime epoch instrumentation.
+/// - Resource usage: wall-clock time × 1M for CPU cycles estimate.
+///   V2: wasmtime fuel consumption metering.
+///
+/// ## Determinism
+///
+/// All commitment-critical fields are deterministic. `execution_time_ms`
+/// is wall-clock (non-deterministic) but does not affect commitment hash.
+pub mod committed_execution;
+
 pub use execution_result::{WasmExecutionResult, ResourceUsage};
 pub use merkle::compute_trace_merkle_root;
 pub use state_capture::{hash_input, hash_output, hash_memory_snapshot};
 pub use trace_recorder::ExecutionTraceRecorder;
+pub use committed_execution::run_wasm_committed;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLimits {
