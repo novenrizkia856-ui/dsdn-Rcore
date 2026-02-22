@@ -508,7 +508,7 @@ sleep 5
 # Start nodes
 echo "Starting nodes..."
 cargo run -p dsdn-node --bin dsdn-node --release -- \
-    node-1 "$DA_RPC_URL" ./data/node1 8081 &
+    node-1 "$DA_RPC_URL" ./data/node1 8080 &
 NODE1_PID=$!
 
 cargo run -p dsdn-node --bin dsdn-node --release -- \
@@ -2531,7 +2531,7 @@ Daftar IP publik statis sebagai alternatif DNS seed. IP ini bisa dari:
 - Founder-operated seed node.
 - Operator data center yang menyediakan entry point.
 
-Format: `IP:Port` (contoh: `203.0.113.50:30303`).
+Format: `IP:Port` (`203.0.113.50:8080`).
 
 Aturan IP statis:
 - Bisa ditambah siapa saja melalui config file atau CLI.
@@ -2553,8 +2553,8 @@ dns_seeds = [
 
 # Static IP peers (community maintained)
 static_peers = [
-    # "203.0.113.50:30303",
-    # "198.51.100.10:30303",
+    # "203.0.113.50:8080",
+    # "198.51.100.10:8080",
 ]
 
 # Local peer cache
@@ -2812,7 +2812,7 @@ Founder dan komunitas bisa menjalankan dedicated bootstrap node yang hanya melay
 
 Cara menjalankan:
 ```bash
-dsdn-node --mode bootstrap --listen 0.0.0.0:30303 --network mainnet
+dsdn-node --mode bootstrap --listen 0.0.0.0:8080 --network mainnet
 ```
 
 ### 4. Network Partition Recovery
@@ -2869,7 +2869,7 @@ Agent mendapat command baru untuk manajemen bootstrap:
 dsdn-agent peers list
 
 # Tambah static peer manual
-dsdn-agent peers add 203.0.113.50:30303
+dsdn-agent peers add 203.0.113.50:8080
 
 # Tambah DNS seed manual
 dsdn-agent peers add-seed seed4.dsdn.network

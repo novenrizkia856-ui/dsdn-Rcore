@@ -218,7 +218,7 @@ mod tests {
     use std::str::FromStr;
 
     fn make_test_peer(source: PeerSource) -> PeerEntry {
-        let addr = SocketAddr::from_str("10.0.0.1:30303").unwrap();
+        let addr = SocketAddr::from_str("10.0.0.1:8080").unwrap();
         PeerEntry::new(addr, NetworkId::Devnet, source)
     }
 

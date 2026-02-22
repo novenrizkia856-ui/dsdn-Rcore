@@ -218,7 +218,7 @@
 //! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
 //! | `rejoin_manager`    | Re-join eligibility, request building, and coordinator response handling (14B.46) |
 //! | `status_notification`| Status notification processing, DA gating event handling, and lifecycle transitions (14B.49) |
-//! | `bootstrap`          | P2P bootstrap foundation: config, peer store, scoring, handshake, PEX, service discovery (Pre-28.1) |
+//! | `bootstrap`          | P2P bootstrap foundation: config, peer store, scoring, handshake, PEX, service discovery (Pre-21.1) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -713,10 +713,10 @@
 //! - On error, no state is changed (atomic: success or no-op).
 //! - Quarantine metadata is cleared on transition away from Quarantined.
 //!
-//! ## Bootstrap Network System (Pre-28.1 Foundation)
+//! ## Bootstrap Network System (Pre-21.1 Foundation)
 //!
 //! The `bootstrap` module provides the complete P2P discovery
-//! foundation that will be fully activated in Tahap 28.1.
+//! foundation that will be fully activated in Tahap 21.1.
 //! All network I/O is trait-abstracted (`DnsResolver`,
 //! `PeerConnector`) so the system is testable now and
 //! replaceable with real implementations at mainnet time.
@@ -810,7 +810,7 @@ pub use status_tracker::NodeStatusTracker;
 pub use status_notification::{StatusNotificationHandler, StatusNotification};
 pub use tls_manager::{TLSCertManager, TLSError};
 
-// Bootstrap Network System (Pre-28.1 Foundation)
+// Bootstrap Network System (Pre-21.1 Foundation)
 pub use bootstrap::{
     BootstrapConfig, BootstrapMetrics, BootstrapResult, BootstrapSummary,
     ServiceType, NetworkId, PeerSource,

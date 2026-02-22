@@ -8,8 +8,8 @@ dns_seeds = [
 
 # Static IP peers (community maintained)
 static_peers = [
-    # "203.0.113.50:30303",
-    # "198.51.100.10:30303",
+    # "203.0.113.50:8080",
+    # "198.51.100.10:8080",
 ]
 
 # Local peer cache

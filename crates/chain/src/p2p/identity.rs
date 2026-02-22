@@ -66,9 +66,9 @@ impl NetworkId {
 
     pub fn default_port(&self) -> u16 {
         match self {
-            NetworkId::Mainnet => 30303,
-            NetworkId::Testnet => 30304,
-            NetworkId::Devnet  => 30305,
+            NetworkId::Mainnet => 8080,
+            NetworkId::Testnet => 8081,
+            NetworkId::Devnet  => 8082,
         }
     }
 

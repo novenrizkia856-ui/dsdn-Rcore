@@ -245,17 +245,17 @@ mod tests {
     #[test]
     fn test_pex_rate_limiter() {
         let mut rl = PexRateLimiter::new(900);
-        assert!(rl.is_allowed("10.0.0.1:30303"));
-        rl.record_request("10.0.0.1:30303");
-        assert!(!rl.is_allowed("10.0.0.1:30303"));
-        assert!(rl.retry_after("10.0.0.1:30303") > 0);
+        assert!(rl.is_allowed("10.0.0.1:8080"));
+        rl.record_request("10.0.0.1:8080");
+        assert!(!rl.is_allowed("10.0.0.1:8080"));
+        assert!(rl.retry_after("10.0.0.1:8080") > 0);
     }
 
     #[test]
     fn test_pex_response_filters_banned() {
-        let mut banned = make_peer("10.0.0.1:30303", true);
+        let mut banned = make_peer("10.0.0.1:8080", true);
         banned.ban(3600);
-        let good = make_peer("10.0.0.2:30303", true);
+        let good = make_peer("10.0.0.2:8080", true);
 
         let peers = vec![banned, good];
         let request = PexRequest::GetPeers {
@@ -264,10 +264,10 @@ mod tests {
             max_count: 100,
         };
 
-        let response = build_pex_response(&peers, &request, "10.0.0.3:30303", &PexConfig::default());
+        let response = build_pex_response(&peers, &request, "10.0.0.3:8080", &PexConfig::default());
         if let PexResponse::Peers { peers: result, .. } = response {
             assert_eq!(result.len(), 1);
-            assert_eq!(result[0].addr.to_string(), "10.0.0.2:30303");
+            assert_eq!(result[0].addr.to_string(), "10.0.0.2:8080");
         } else {
             panic!("expected Peers response");
         }
@@ -275,8 +275,8 @@ mod tests {
 
     #[test]
     fn test_pex_response_filters_requester() {
-        let me = make_peer("10.0.0.1:30303", true);
-        let other = make_peer("10.0.0.2:30303", true);
+        let me = make_peer("10.0.0.1:8080", true);
+        let other = make_peer("10.0.0.2:8080", true);
 
         let peers = vec![me, other];
         let request = PexRequest::GetPeers {
@@ -285,19 +285,19 @@ mod tests {
             max_count: 100,
         };
 
-        let response = build_pex_response(&peers, &request, "10.0.0.1:30303", &PexConfig::default());
+        let response = build_pex_response(&peers, &request, "10.0.0.1:8080", &PexConfig::default());
         if let PexResponse::Peers { peers: result, .. } = response {
             // Should not include the requester
-            assert!(result.iter().all(|p| p.addr.to_string() != "10.0.0.1:30303"));
+            assert!(result.iter().all(|p| p.addr.to_string() != "10.0.0.1:8080"));
         }
     }
 
     #[test]
     fn test_pex_service_type_filter() {
-        let mut chain = make_peer("10.0.0.1:30303", true);
+        let mut chain = make_peer("10.0.0.1:8080", true);
         chain.service_type = ServiceType::Chain;
 
-        let mut storage = make_peer("10.0.0.2:30303", true);
+        let mut storage = make_peer("10.0.0.2:8080", true);
         storage.service_type = ServiceType::Storage;
 
         let peers = vec![chain, storage];
@@ -307,7 +307,7 @@ mod tests {
             max_count: 100,
         };
 
-        let response = build_pex_response(&peers, &request, "10.0.0.3:30303", &PexConfig::default());
+        let response = build_pex_response(&peers, &request, "10.0.0.3:8080", &PexConfig::default());
         if let PexResponse::Peers { peers: result, .. } = response {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].service_type, ServiceType::Chain);
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn test_pex_response_respects_max_count() {
         let peers: Vec<PeerEntry> = (1..=50)
-            .map(|i| make_peer(&format!("10.0.0.{}:30303", i), true))
+            .map(|i| make_peer(&format!("10.0.0.{}:8080", i), true))
             .collect();
 
         let request = PexRequest::GetPeers {
@@ -326,7 +326,7 @@ mod tests {
             max_count: 5,
         };
 
-        let response = build_pex_response(&peers, &request, "10.0.0.100:30303", &PexConfig::default());
+        let response = build_pex_response(&peers, &request, "10.0.0.100:8080", &PexConfig::default());
         if let PexResponse::Peers { peers: result, .. } = response {
             assert_eq!(result.len(), 5);
         }

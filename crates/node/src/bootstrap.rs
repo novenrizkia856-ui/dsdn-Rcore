@@ -1,8 +1,8 @@
-//! # Bootstrap Network System (Pre-28.1 Foundation)
+//! # Bootstrap Network System (Pre-21 Foundation)
 //!
 //! Provides the complete P2P bootstrap foundation for DSDN storage nodes.
 //! This module is designed to be **immediately functional** while preparing
-//! the full integration surface for Tahap 28.1 (DNS Seed + Peer Discovery).
+//! the full integration surface for Tahap 21 (DNS Seed + Peer Discovery).
 //!
 //! ## Design Philosophy
 //!
@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Default DSDN P2P port.
-pub const DEFAULT_P2P_PORT: u16 = 30303;
+pub const DEFAULT_P2P_PORT: u16 = 8080;
 
 /// Default maximum outbound peer connections.
 pub const DEFAULT_MAX_OUTBOUND: usize = 8;
@@ -321,8 +321,8 @@ pub const CONFIG_SEARCH_PATHS: &[&str] = &[
 ///
 /// # Static IP peers (community maintained)
 /// static_peers = [
-///     # "203.0.113.50:30303",
-///     # "198.51.100.10:30303",
+///     # "203.0.113.50:8080",
+///     # "198.51.100.10:8080",
 /// ]
 ///
 /// # Local peer cache
@@ -335,7 +335,7 @@ pub const CONFIG_SEARCH_PATHS: &[&str] = &[
 /// peer_connect_timeout_secs = 5
 ///
 /// # Network settings
-/// p2p_port = 30303
+/// p2p_port = 8080
 /// network_id = "mainnet"
 /// service_type = "storage"
 /// ```
@@ -391,7 +391,7 @@ pub struct DsdnToml {
 /// ```text
 /// 1. Environment variables     (BOOTSTRAP_DNS_SEEDS, etc.)
 /// 2. dsdn.toml [bootstrap]     (project root or search paths)
-/// 3. Compiled defaults         (empty seeds, port 30303, etc.)
+/// 3. Compiled defaults         (empty seeds, port 8080, etc.)
 /// ```
 ///
 /// Environment variables **override** dsdn.toml values per-field.
@@ -420,7 +420,7 @@ pub struct DsdnToml {
 /// | `BOOTSTRAP_MAX_INBOUND` | `max_inbound_connections` | 125 |
 /// | `BOOTSTRAP_DNS_TIMEOUT` | `dns_resolve_timeout_secs` | 10 |
 /// | `BOOTSTRAP_CONNECT_TIMEOUT` | `peer_connect_timeout_secs` | 5 |
-/// | `BOOTSTRAP_P2P_PORT` | `p2p_port` | 30303 |
+/// | `BOOTSTRAP_P2P_PORT` | `p2p_port` | 8080 |
 /// | `BOOTSTRAP_NETWORK_ID` | `network_id` | mainnet |
 /// | `BOOTSTRAP_SERVICE_TYPE` | `service_type` | storage |
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,7 +429,7 @@ pub struct BootstrapConfig {
     /// Empty is valid for development; at least 1 recommended for mainnet.
     pub dns_seeds: Vec<String>,
 
-    /// Static IP:Port peers (e.g., `["203.0.113.50:30303"]`).
+    /// Static IP:Port peers (e.g., `["203.0.113.50:8080"]`).
     /// Parsed into `SocketAddr` at resolve time.
     pub static_peers: Vec<String>,
 
@@ -795,8 +795,8 @@ impl BootstrapConfig {
         };
 
         let static_entries: String = if self.static_peers.is_empty() {
-            "    # \"203.0.113.50:30303\",\n    \
-             # \"198.51.100.10:30303\","
+            "    # \"203.0.113.50:8080\",\n    \
+             # \"198.51.100.10:8080\","
                 .to_string()
         } else {
             self.static_peers
@@ -1540,7 +1540,7 @@ impl PexResponse {
 ///
 /// Abstracted to allow mock implementations for testing and
 /// development. Real implementation (using `trust-dns` or
-/// `hickory-dns`) will be provided in Tahap 28.1.B.
+/// `hickory-dns`) will be provided in Tahap 21.1.B.
 pub trait DnsResolver: Send + Sync {
     /// Resolve a DNS hostname to a list of IP addresses.
     ///
@@ -1593,7 +1593,7 @@ impl DnsResolver for NullDnsResolver {
 /// Trait for establishing P2P connections to peers.
 ///
 /// Abstracted for testability. Real implementation (TCP + noise
-/// protocol or TLS) will be provided in Tahap 28.1.B.
+/// protocol or TLS) will be provided in Tahap 21.1.B.
 pub trait PeerConnector: Send + Sync {
     /// Attempt to connect and perform a handshake with a remote peer.
     ///
@@ -2235,13 +2235,13 @@ mod tests {
     const TS: u64 = 1_700_000_000;
 
     fn test_addr(last_octet: u8) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, last_octet)), 30303)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, last_octet)), 8080)
     }
 
     fn make_peer(last_octet: u8, source: PeerSource) -> PeerInfo {
         PeerInfo::new(
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, last_octet)),
-            30303,
+            8080,
             source,
             NetworkId::Testnet,
         )
@@ -2252,7 +2252,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             network_id: NetworkId::Testnet,
             node_id,
-            listen_port: 30303,
+            listen_port: 8080,
             service_type: ServiceType::Storage,
             user_agent: "test-peer/1.0".to_string(),
         }
@@ -2361,7 +2361,7 @@ mod tests {
     #[test]
     fn test_peer_info_new() {
         let peer = make_peer(1, PeerSource::DnsSeed);
-        assert_eq!(peer.port, 30303);
+        assert_eq!(peer.port, 8080);
         assert!(peer.node_id.is_none());
         assert_eq!(peer.success_count, 0);
         assert_eq!(peer.failure_count, 0);
@@ -2589,7 +2589,7 @@ mod tests {
         let hs = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Mainnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         assert_eq!(hs.protocol_version, PROTOCOL_VERSION);
@@ -2603,7 +2603,7 @@ mod tests {
         let local = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Testnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         let remote = make_remote_handshake(REMOTE_NODE_ID);
@@ -2615,7 +2615,7 @@ mod tests {
         let local = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Mainnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         let remote = make_remote_handshake(REMOTE_NODE_ID); // Testnet
@@ -2631,7 +2631,7 @@ mod tests {
         let local = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Testnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         let mut remote = make_remote_handshake(TEST_NODE_ID); // Same node_id
@@ -2648,7 +2648,7 @@ mod tests {
         let local = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Testnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         let mut remote = make_remote_handshake(REMOTE_NODE_ID);
@@ -2802,7 +2802,7 @@ mod tests {
         let local_hs = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Testnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         let result = connector.connect_and_handshake(addr, &local_hs);
@@ -2816,7 +2816,7 @@ mod tests {
         let local_hs = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Testnet,
-            30303,
+            8080,
             ServiceType::Storage,
         );
         let result = connector.connect_and_handshake(addr, &local_hs);
@@ -2830,13 +2830,13 @@ mod tests {
     fn test_config() -> BootstrapConfig {
         BootstrapConfig {
             dns_seeds: vec!["seed1.test".to_string()],
-            static_peers: vec!["192.168.1.100:30303".to_string()],
+            static_peers: vec!["192.168.1.100:8080".to_string()],
             peers_file: PathBuf::from("/dev/null"),
             max_outbound: 4,
             max_inbound: 10,
             dns_timeout_secs: 1,
             connect_timeout_secs: 1,
-            p2p_port: 30303,
+            p2p_port: 8080,
             network_id: NetworkId::Testnet,
             service_type: ServiceType::Storage,
             loaded_from: None,
@@ -2846,7 +2846,7 @@ mod tests {
     #[test]
     fn test_peer_manager_bootstrap_from_static() {
         let config = test_config();
-        let addr: SocketAddr = "192.168.1.100:30303".parse().unwrap();
+        let addr: SocketAddr = "192.168.1.100:8080".parse().unwrap();
 
         let mut connector = MockPeerConnector::new();
         connector.add_reachable(addr, make_remote_handshake(REMOTE_NODE_ID));
@@ -2912,7 +2912,7 @@ mod tests {
     fn test_peer_manager_bootstrap_all_fail() {
         let config = BootstrapConfig {
             dns_seeds: vec!["bad-seed.test".to_string()],
-            static_peers: vec!["192.168.1.200:30303".to_string()],
+            static_peers: vec!["192.168.1.200:8080".to_string()],
             peers_file: PathBuf::from("/dev/null"),
             network_id: NetworkId::Testnet,
             ..BootstrapConfig::default()
@@ -2938,7 +2938,7 @@ mod tests {
         // Static peer unreachable, DNS peer reachable
         let config = BootstrapConfig {
             dns_seeds: vec!["seed.test".to_string()],
-            static_peers: vec!["192.168.1.200:30303".to_string()],
+            static_peers: vec!["192.168.1.200:8080".to_string()],
             peers_file: PathBuf::from("/dev/null"),
             network_id: NetworkId::Testnet,
             ..BootstrapConfig::default()
@@ -2982,14 +2982,14 @@ mod tests {
             peers: vec![
                 PexPeerEntry {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-                    port: 30303,
+                    port: 8080,
                     node_id: Some(REMOTE_NODE_ID),
                     service_type: Some(ServiceType::Storage),
                     last_connected: now_secs(),
                 },
                 PexPeerEntry {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-                    port: 30303,
+                    port: 8080,
                     node_id: Some(REMOTE_NODE_ID_2),
                     service_type: Some(ServiceType::Coordinator),
                     last_connected: now_secs(),
@@ -3015,7 +3015,7 @@ mod tests {
             Box::new(connector),
         );
 
-        let addr: SocketAddr = "10.0.0.99:30303".parse().unwrap();
+        let addr: SocketAddr = "10.0.0.99:8080".parse().unwrap();
         mgr.add_manual_peer(addr);
         assert_eq!(mgr.store().len(), 1);
         assert!(mgr.store().get(&addr).is_some());
@@ -3094,7 +3094,7 @@ mod tests {
         let peer = make_peer(42, PeerSource::DnsSeed);
         let addr = peer.socket_addr();
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)));
-        assert_eq!(addr.port(), 30303);
+        assert_eq!(addr.port(), 8080);
     }
 
     #[test]
@@ -3160,13 +3160,13 @@ mod tests {
 
         store.upsert(PeerInfo::new(
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            30303,
+            8080,
             PeerSource::DnsSeed,
             NetworkId::Mainnet,
         ));
         store.upsert(PeerInfo::new(
             IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
-            30303,
+            8080,
             PeerSource::DnsSeed,
             NetworkId::Testnet,
         ));
@@ -3182,7 +3182,7 @@ mod tests {
     fn test_config_from_env() {
         // Clean state
         std::env::set_var("BOOTSTRAP_DNS_SEEDS", "seed1.test,seed2.test");
-        std::env::set_var("BOOTSTRAP_STATIC_PEERS", "1.2.3.4:30303");
+        std::env::set_var("BOOTSTRAP_STATIC_PEERS", "1.2.3.4:8080");
         std::env::set_var("BOOTSTRAP_NETWORK_ID", "testnet");
         std::env::set_var("BOOTSTRAP_SERVICE_TYPE", "coordinator");
         std::env::set_var("BOOTSTRAP_P2P_PORT", "31313");
@@ -3232,8 +3232,8 @@ mod tests {
     #[test]
     fn test_peer_manager_active_peers_by_service() {
         let config = test_config();
-        let addr1: SocketAddr = "192.168.1.100:30303".parse().unwrap();
-        let addr2: SocketAddr = "192.168.1.101:30303".parse().unwrap();
+        let addr1: SocketAddr = "192.168.1.100:8080".parse().unwrap();
+        let addr2: SocketAddr = "192.168.1.101:8080".parse().unwrap();
 
         let mut connector = MockPeerConnector::new();
         connector.add_reachable(addr1, make_remote_handshake(REMOTE_NODE_ID));
@@ -3244,8 +3244,8 @@ mod tests {
 
         let mut config = test_config();
         config.static_peers = vec![
-            "192.168.1.100:30303".to_string(),
-            "192.168.1.101:30303".to_string(),
+            "192.168.1.100:8080".to_string(),
+            "192.168.1.101:8080".to_string(),
         ];
 
         let mut mgr = PeerManager::new(
@@ -3277,15 +3277,15 @@ dns_seeds = [
     "seed3.dsdn.network",
 ]
 static_peers = [
-    "203.0.113.50:30303",
-    "198.51.100.10:30303",
+    "203.0.113.50:8080",
+    "198.51.100.10:8080",
 ]
 peers_file = "peers.dat"
 max_outbound_connections = 8
 max_inbound_connections = 125
 dns_resolve_timeout_secs = 10
 peer_connect_timeout_secs = 5
-p2p_port = 30303
+p2p_port = 8080
 network_id = "mainnet"
 service_type = "storage"
 "#;
@@ -3293,13 +3293,13 @@ service_type = "storage"
         assert_eq!(cfg.dns_seeds.len(), 3);
         assert_eq!(cfg.dns_seeds[0], "seed1.dsdn.network");
         assert_eq!(cfg.static_peers.len(), 2);
-        assert_eq!(cfg.static_peers[0], "203.0.113.50:30303");
+        assert_eq!(cfg.static_peers[0], "203.0.113.50:8080");
         assert_eq!(cfg.peers_file, PathBuf::from("peers.dat"));
         assert_eq!(cfg.max_outbound, 8);
         assert_eq!(cfg.max_inbound, 125);
         assert_eq!(cfg.dns_timeout_secs, 10);
         assert_eq!(cfg.connect_timeout_secs, 5);
-        assert_eq!(cfg.p2p_port, 30303);
+        assert_eq!(cfg.p2p_port, 8080);
         assert_eq!(cfg.network_id, NetworkId::Mainnet);
         assert_eq!(cfg.service_type, ServiceType::Storage);
     }
@@ -3395,7 +3395,7 @@ max_capacity_gb = 100
 
 [bootstrap]
 dns_seeds = ["seed1.dsdn.network"]
-p2p_port = 30303
+p2p_port = 8080
 network_id = "testnet"
 
 [chain]
@@ -3404,7 +3404,7 @@ rpc_endpoint = "http://localhost:26657"
         let cfg = BootstrapConfig::from_toml_str(toml).expect("parse with other sections");
         assert_eq!(cfg.dns_seeds.len(), 1);
         assert_eq!(cfg.dns_seeds[0], "seed1.dsdn.network");
-        assert_eq!(cfg.p2p_port, 30303);
+        assert_eq!(cfg.p2p_port, 8080);
         assert_eq!(cfg.network_id, NetworkId::Testnet);
     }
 
@@ -3413,14 +3413,14 @@ rpc_endpoint = "http://localhost:26657"
     fn test_toml_env_override_priority() {
         let toml = r#"
 [bootstrap]
-p2p_port = 30303
+p2p_port = 8080
 network_id = "mainnet"
 max_outbound_connections = 8
 dns_seeds = ["seed1.dsdn.network"]
 "#;
         // Parse TOML first
         let mut cfg = BootstrapConfig::from_toml_str(toml).expect("parse base");
-        assert_eq!(cfg.p2p_port, 30303);
+        assert_eq!(cfg.p2p_port, 8080);
         assert_eq!(cfg.network_id, NetworkId::Mainnet);
         assert_eq!(cfg.dns_seeds.len(), 1);
 
@@ -3483,7 +3483,7 @@ max_outbound_connections = 16
             "seed1.dsdn.network".to_string(),
             "seed2.dsdn.network".to_string(),
         ];
-        original.static_peers = vec!["203.0.113.50:30303".to_string()];
+        original.static_peers = vec!["203.0.113.50:8080".to_string()];
         original.p2p_port = 31313;
         original.network_id = NetworkId::Testnet;
         original.service_type = ServiceType::Coordinator;
@@ -3514,7 +3514,7 @@ max_outbound_connections = 16
         assert!(toml_str.contains("peers_file"));
         assert!(toml_str.contains("max_outbound_connections = 8"));
         assert!(toml_str.contains("max_inbound_connections = 125"));
-        assert!(toml_str.contains("p2p_port = 30303"));
+        assert!(toml_str.contains("p2p_port = 8080"));
         assert!(toml_str.contains("network_id = \"mainnet\""));
         assert!(toml_str.contains("service_type = \"storage\""));
     }
@@ -3534,8 +3534,8 @@ dns_seeds = [
 
 # Static IP peers (community maintained)
 static_peers = [
-    "203.0.113.50:30303",
-    "198.51.100.10:30303",
+    "203.0.113.50:8080",
+    "198.51.100.10:8080",
 ]
 
 # Local peer cache

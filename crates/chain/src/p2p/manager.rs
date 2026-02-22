@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn test_add_peer_manual() {
         let mut mgr = make_manager();
-        mgr.add_peer_manual("10.0.0.1:30303").unwrap();
+        mgr.add_peer_manual("10.0.0.1:8080").unwrap();
         assert_eq!(mgr.known_count(), 1);
     }
 
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn test_handshake_lifecycle() {
         let mut mgr = make_manager();
-        let addr: SocketAddr = "10.0.0.1:30303".parse().unwrap();
+        let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
         let peer_node = NodeId::from_bytes([0xBBu8; 32]);
 
         // Handshake success
@@ -583,14 +583,14 @@ mod tests {
 
         // Add some peers
         for i in 1..=5 {
-            let addr: SocketAddr = format!("10.0.0.{}:30303", i).parse().unwrap();
+            let addr: SocketAddr = format!("10.0.0.{}:8080", i).parse().unwrap();
             let node = NodeId::from_bytes([i; 32]);
             mgr.on_handshake_success(addr, node, ServiceType::Chain, 100);
         }
 
         // Build and handle PEX request
         let request = mgr.build_pex_request(None);
-        let response = mgr.handle_pex_request(&request, "10.0.0.99:30303");
+        let response = mgr.handle_pex_request(&request, "10.0.0.99:8080");
 
         if let PexResponse::Peers { peers, .. } = &response {
             assert!(!peers.is_empty());
@@ -606,19 +606,19 @@ mod tests {
         let request = mgr.build_pex_request(None);
 
         // First request: OK
-        let r1 = mgr.handle_pex_request(&request, "10.0.0.1:30303");
+        let r1 = mgr.handle_pex_request(&request, "10.0.0.1:8080");
         assert!(matches!(r1, PexResponse::Peers { .. }));
 
         // Second request: rate limited
-        let r2 = mgr.handle_pex_request(&request, "10.0.0.1:30303");
+        let r2 = mgr.handle_pex_request(&request, "10.0.0.1:8080");
         assert!(matches!(r2, PexResponse::Rejected { .. }));
     }
 
     #[test]
     fn test_bootstrap_with_static_peers() {
         let mut config = BootstrapConfig::development();
-        config.add_static_peer("10.0.0.1:30303").unwrap();
-        config.add_static_peer("10.0.0.2:30303").unwrap();
+        config.add_static_peer("10.0.0.1:8080").unwrap();
+        config.add_static_peer("10.0.0.2:8080").unwrap();
 
         let node_id = NodeId::from_bytes([0xAAu8; 32]);
         let mut mgr = PeerManager::new(
@@ -654,7 +654,7 @@ mod tests {
         let mgr = make_manager();
         let peer_id = NodeId::from_bytes([0xBBu8; 32]);
         let hello = handshake::build_hello(
-            NetworkId::Mainnet, peer_id, 30303, ServiceType::Chain, 50,
+            NetworkId::Mainnet, peer_id, 8080, ServiceType::Chain, 50,
         );
         let result = mgr.validate_hello(&hello);
         assert!(!result.is_accepted());
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn test_ban_peer() {
         let mut mgr = make_manager();
-        let addr: SocketAddr = "10.0.0.1:30303".parse().unwrap();
+        let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
         let peer_node = NodeId::from_bytes([0xBBu8; 32]);
 
         mgr.on_handshake_success(addr, peer_node, ServiceType::Chain, 100);
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut mgr = make_manager();
-        mgr.add_peer_manual("10.0.0.1:30303").unwrap();
+        mgr.add_peer_manual("10.0.0.1:8080").unwrap();
         assert_eq!(mgr.known_count(), 1);
 
         mgr.reset().unwrap();
@@ -695,13 +695,13 @@ mod tests {
         let response = PexResponse::Peers {
             peers: vec![
                 PexPeerInfo {
-                    addr: "10.0.0.1:30303".parse().unwrap(),
+                    addr: "10.0.0.1:8080".parse().unwrap(),
                     node_id: NodeId::from_bytes([0x11u8; 32]),
                     service_type: ServiceType::Chain,
                     last_success: current_unix_time(),
                 },
                 PexPeerInfo {
-                    addr: "10.0.0.2:30303".parse().unwrap(),
+                    addr: "10.0.0.2:8080".parse().unwrap(),
                     node_id: NodeId::from_bytes([0x22u8; 32]),
                     service_type: ServiceType::Storage,
                     last_success: current_unix_time(),

@@ -112,8 +112,8 @@ Query status dari node yang sedang berjalan via HTTP `/status` endpoint.
 
 ```bash
 dsdn-node status              # Default port dari NODE_HTTP_PORT atau 8080
-dsdn-node status --port 9090  # Custom port
-dsdn-node status -p 9090      # Shorthand
+dsdn-node status --port 8080  # Custom port
+dsdn-node status -p 8080      # Shorthand
 ```
 
 ### `dsdn-node health`
@@ -122,7 +122,7 @@ Query health dari node yang sedang berjalan via HTTP `/health` endpoint.
 
 ```bash
 dsdn-node health              # Default port
-dsdn-node health --port 9090  # Custom port
+dsdn-node health --port 8080  # Custom port
 ```
 
 ### `dsdn-node info`

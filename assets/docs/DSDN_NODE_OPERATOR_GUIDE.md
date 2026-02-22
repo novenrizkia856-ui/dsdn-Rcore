@@ -316,7 +316,7 @@ NODE_ID=my-dsdn-node-01
 NODE_STORAGE_PATH=./data/node
 
 # HTTP port untuk health check dan metrics
-NODE_HTTP_PORT=8081
+NODE_HTTP_PORT=8080
 
 # ─────────────────────────────────────────────────────────────
 # WALLET CONFIGURATION (untuk menerima reward)
@@ -379,7 +379,7 @@ set +a
 # Set node-specific variables
 export NODE_ID="my-node-01"
 export NODE_STORAGE_PATH="./data/node1"
-export NODE_HTTP_PORT="8081"
+export NODE_HTTP_PORT="8080"
 
 # Jalankan DSDN node
 ./target/release/dsdn-node env
@@ -405,7 +405,7 @@ Get-Content .env.mainnet | ForEach-Object {
 # Set node-specific variables
 $env:NODE_ID = "my-node-01"
 $env:NODE_STORAGE_PATH = ".\data\node1"
-$env:NODE_HTTP_PORT = "8081"
+$env:NODE_HTTP_PORT = "8080"
 
 # Jalankan DSDN node
 .\target\release\dsdn-node.exe env
@@ -424,7 +424,7 @@ Config Mode:  env
 DA Network:   mainnet
 DA Endpoint:  http://localhost:26658
 Storage Path: ./data/node
-HTTP Port:    8081
+HTTP Port:    8080
 ═══════════════════════════════════════════════════════════════
 Connecting to Celestia DA...
 🔍 DA health check (attempt 1/3)
@@ -432,7 +432,7 @@ health check completed status=Healthy network_height=9369597 local_height=0 late
 ✅ DA layer healthy
 Initializing storage at ./data/node
 🚀 Starting DA follower...
-🏥 Health endpoint available at http://0.0.0.0:8081/health
+🏥 Health endpoint available at http://0.0.0.0:8080/health
 ╔═══════════════════════════════════════════════════════════════╗
 ║  INVARIANT: Node receives ALL commands via DA events ONLY    ║
 ║  Node does NOT accept instructions from Coordinator via RPC  ║
@@ -477,7 +477,7 @@ WorkingDirectory=/opt/dsdn
 EnvironmentFile=/opt/dsdn/.env.mainnet
 Environment="NODE_ID=my-node-01"
 Environment="NODE_STORAGE_PATH=/var/lib/dsdn/data"
-Environment="NODE_HTTP_PORT=8081"
+Environment="NODE_HTTP_PORT=8080"
 ExecStart=/opt/dsdn/dsdn-node env
 Restart=on-failure
 RestartSec=10
@@ -502,7 +502,7 @@ sudo systemctl start dsdn-node
 
 **Node Health:**
 ```bash
-curl http://localhost:8081/health
+curl http://localhost:8080/health
 ```
 
 **Expected Response:**

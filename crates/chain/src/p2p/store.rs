@@ -388,38 +388,38 @@ mod tests {
     #[test]
     fn test_store_upsert_and_get() {
         let mut store = make_store();
-        let entry = make_entry("10.0.0.1:30303");
+        let entry = make_entry("10.0.0.1:8080");
         store.upsert(entry.clone());
 
         assert_eq!(store.count(), 1);
-        assert!(store.contains("10.0.0.1:30303"));
-        assert!(store.get("10.0.0.1:30303").is_some());
+        assert!(store.contains("10.0.0.1:8080"));
+        assert!(store.get("10.0.0.1:8080").is_some());
     }
 
     #[test]
     fn test_store_upsert_merges_counters() {
         let mut store = make_store();
 
-        let mut entry1 = make_entry("10.0.0.1:30303");
+        let mut entry1 = make_entry("10.0.0.1:8080");
         entry1.success_count = 10;
         store.upsert(entry1);
 
-        let mut entry2 = make_entry("10.0.0.1:30303");
+        let mut entry2 = make_entry("10.0.0.1:8080");
         entry2.success_count = 5; // lower
         store.upsert(entry2);
 
         // Should preserve higher count
-        let peer = store.get("10.0.0.1:30303").unwrap();
+        let peer = store.get("10.0.0.1:8080").unwrap();
         assert_eq!(peer.success_count, 10);
     }
 
     #[test]
     fn test_store_remove() {
         let mut store = make_store();
-        store.upsert(make_entry("10.0.0.1:30303"));
+        store.upsert(make_entry("10.0.0.1:8080"));
         assert_eq!(store.count(), 1);
 
-        store.remove("10.0.0.1:30303");
+        store.remove("10.0.0.1:8080");
         assert_eq!(store.count(), 0);
     }
 
@@ -427,17 +427,17 @@ mod tests {
     fn test_store_get_connectable_excludes_banned() {
         let mut store = make_store();
 
-        let mut good = make_entry("10.0.0.1:30303");
+        let mut good = make_entry("10.0.0.1:8080");
         good.status = PeerStatus::Disconnected;
         store.upsert(good);
 
-        let mut banned = make_entry("10.0.0.2:30303");
+        let mut banned = make_entry("10.0.0.2:8080");
         banned.ban(3600);
         store.upsert(banned);
 
         let connectable = store.get_connectable();
         assert_eq!(connectable.len(), 1);
-        assert_eq!(connectable[0].addr.to_string(), "10.0.0.1:30303");
+        assert_eq!(connectable[0].addr.to_string(), "10.0.0.1:8080");
     }
 
     #[test]
@@ -452,7 +452,7 @@ mod tests {
         );
 
         for i in 1..=5 {
-            store.upsert(make_entry(&format!("10.0.0.{}:30303", i)));
+            store.upsert(make_entry(&format!("10.0.0.{}:8080", i)));
         }
 
         // Should be capped at 3
@@ -470,7 +470,7 @@ mod tests {
             NetworkId::Devnet, limits,
         );
 
-        let mut entry = make_entry("10.0.0.1:30303");
+        let mut entry = make_entry("10.0.0.1:8080");
         entry.last_seen = 1; // very old
         store.upsert(entry);
 
@@ -487,14 +487,14 @@ mod tests {
 
         let tmp_str = tmp.to_str().unwrap();
         let mut store1 = PeerStore::new(tmp_str, NetworkId::Devnet, ConnectionLimits::default());
-        store1.upsert(make_entry("10.0.0.1:30303"));
-        store1.upsert(make_entry("10.0.0.2:30303"));
+        store1.upsert(make_entry("10.0.0.1:8080"));
+        store1.upsert(make_entry("10.0.0.2:8080"));
         store1.save().unwrap();
 
         let mut store2 = PeerStore::new(tmp_str, NetworkId::Devnet, ConnectionLimits::default());
         let loaded = store2.load().unwrap();
         assert_eq!(loaded, 2);
-        assert!(store2.contains("10.0.0.1:30303"));
+        assert!(store2.contains("10.0.0.1:8080"));
 
         // Cleanup
         let _ = std::fs::remove_file(&tmp);
@@ -504,12 +504,12 @@ mod tests {
     fn test_store_stats() {
         let mut store = make_store();
 
-        let mut p1 = make_entry("10.0.0.1:30303");
+        let mut p1 = make_entry("10.0.0.1:8080");
         p1.status = PeerStatus::Connected;
         p1.source = PeerSource::DnsSeed;
         store.upsert(p1);
 
-        let mut p2 = make_entry("10.0.0.2:30303");
+        let mut p2 = make_entry("10.0.0.2:8080");
         p2.source = PeerSource::PeerExchange;
         store.upsert(p2);
 
