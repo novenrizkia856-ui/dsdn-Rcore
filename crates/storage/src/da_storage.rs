@@ -2083,6 +2083,18 @@ impl Storage for DAStorage {
         // WAJIB cek inner, BUKAN metadata
         self.inner.has_chunk(hash)
     }
+
+    fn delete_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
+        let deleted = self.inner.delete_chunk(hash)?;
+        if deleted {
+            self.chunk_metadata.write().remove(hash);
+        }
+        Ok(deleted)
+    }
+
+    fn list_chunks(&self) -> dsdn_common::Result<Vec<(String, u64)>> {
+        self.inner.list_chunks()
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2127,6 +2139,16 @@ mod tests {
         fn has_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
             Ok(self.chunks.read().contains_key(hash))
         }
+
+        fn delete_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
+            Ok(self.chunks.write().remove(hash).is_some())
+        }
+
+        fn list_chunks(&self) -> dsdn_common::Result<Vec<(String, u64)>> {
+            Ok(self.chunks.read().iter()
+                .map(|(k, v)| (k.clone(), v.len() as u64))
+                .collect())
+        }
     }
 
     /// Mock storage yang selalu error.
@@ -2143,6 +2165,14 @@ mod tests {
         }
 
         fn has_chunk(&self, _hash: &str) -> dsdn_common::Result<bool> {
+            Err("mock storage error".into())
+        }
+
+        fn delete_chunk(&self, _hash: &str) -> dsdn_common::Result<bool> {
+            Err("mock storage error".into())
+        }
+
+        fn list_chunks(&self) -> dsdn_common::Result<Vec<(String, u64)>> {
             Err("mock storage error".into())
         }
     }

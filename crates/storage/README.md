@@ -48,9 +48,10 @@ Crate ini digunakan oleh dua binary:
 
 | Module | File | Deskripsi |
 |--------|------|-----------|
-| `store` | `store.rs` | `Storage` trait abstraction — `put_chunk`, `get_chunk`, `has_chunk` |
+| `store` | `store.rs` | `Storage` trait abstraction — `put_chunk`, `get_chunk`, `has_chunk`, `delete_chunk`, `list_chunks` |
 | `localfs` | `localfs.rs` | `LocalFsStorage` — content-addressed filesystem backend dengan atomic writes |
 | `chunker` | `chunker.rs` | File chunking utility — split file menjadi chunks (default 16 MiB) |
+| `cli` | `cli.rs` | CLI module — command parsing, handlers, dan semua operasi native tanpa OS dependency |
 | `rpc` | `rpc.rs` | gRPC service (`DsdnStorageService`) — server & client helpers untuk chunk transfer |
 | `da_storage` | `da_storage.rs` | DA-aware storage wrapper — metadata derivation dari DA events |
 | `storage_proof` | `storage_proof.rs` | Proof generation untuk challenge-response verification |
@@ -76,6 +77,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
 
     /// Cek apakah chunk dengan hash tertentu sudah tersimpan.
     fn has_chunk(&self, hash: &str) -> Result<bool>;
+
+    /// Delete chunk by hash. Returns Ok(true) if deleted, Ok(false) if not found.
+    fn delete_chunk(&self, hash: &str) -> Result<bool>;
+
+    /// List all chunk hashes in store. Returns (hash, size_bytes) pairs.
+    fn list_chunks(&self) -> Result<Vec<(String, u64)>>;
 }
 ```
 
@@ -106,6 +113,12 @@ let retrieved = store.get_chunk(&hash)?; // Some(Vec<u8>)
 
 // Cek keberadaan
 let exists = store.has_chunk(&hash)?; // true
+
+// List semua chunks — returns Vec<(hash, size_bytes)>
+let chunks = store.list_chunks()?;
+
+// Delete chunk — returns true jika berhasil dihapus
+let deleted = store.delete_chunk(&hash)?; // true
 ```
 
 **Struktur disk:**
@@ -257,7 +270,19 @@ DA_NETWORK=mainnet
 
 Binary standalone untuk operasi storage tanpa menjalankan full node.
 
-**Semua operasi lokal menggunakan `./data` sebagai storage directory.**
+CLI logic ada di module `cli.rs` — semua operasi native tanpa dependency pada OS commands (tidak perlu `ls`, `rm`, dsb dari shell). Argument parsing menggunakan enum-based parser bawaan (tanpa clap/structopt).
+
+**Global options:**
+
+| Option | Default | Deskripsi |
+|--------|---------|-----------|
+| `--data-dir <path>` | `./data` | Storage directory, bisa diletakkan sebelum atau sesudah command |
+
+```bash
+# Contoh penggunaan --data-dir
+dsdn-storage --data-dir /mnt/storage list
+dsdn-storage --data-dir=/var/dsdn/data info
+```
 
 #### Server Mode
 
@@ -269,8 +294,10 @@ dsdn-storage server 127.0.0.1:50051
 
 Output:
 ```
-🚀 Starting DSDN Storage gRPC server at 127.0.0.1:50051
-Press Ctrl+C to stop.
+🚀 DSDN Storage gRPC server
+   addr     : 127.0.0.1:50051
+   data_dir : ./data
+   Press Ctrl+C to stop.
 ```
 
 #### Put (lokal)
@@ -287,11 +314,22 @@ dsdn-storage put myfile.dat 4194304
 
 Output:
 ```
-📦 Uploading 3 chunks (chunk_size = 16777216)
-  chunk    0: a1b2c3d4e5f6... (16777216 bytes)
-  chunk    1: f7e8d9c0b1a2... (16777216 bytes)
-  chunk    2: 9876543210ab... (1234567 bytes)
-✅ Done storing locally in ./data
+📦 Storing file: "myfile.dat"
+   file_size  : 35000000 bytes
+   chunk_size : 16777216 bytes
+   chunks     : 3
+   data_dir   : ./data
+
+  [   0] a1b2c3d4e5f6... (16777216 bytes)
+  [   1] f7e8d9c0b1a2... (16777216 bytes)
+  [   2] 9876543210ab... (1445568 bytes)
+
+✅ Stored 3 chunks in ./data
+
+─── Chunk Manifest (untuk export/reassembly) ───
+  a1b2c3d4e5f6...
+  f7e8d9c0b1a2...
+  9876543210ab...
 ```
 
 #### Get (lokal)
@@ -315,6 +353,97 @@ dsdn-storage has a1b2c3d4e5f6...
 # ✅ Chunk exists: a1b2c3d4e5f6...
 ```
 
+#### List
+
+List semua chunks di storage lokal:
+
+```bash
+dsdn-storage list
+# alias: dsdn-storage ls
+```
+
+Output:
+```
+📋 Chunks in ./data
+   total: 3 chunks, 35000000 bytes
+
+  a1b2c3d4e5f6... (16777216 bytes)
+  9876543210ab... (1445568 bytes)
+  f7e8d9c0b1a2... (16777216 bytes)
+```
+
+#### Info
+
+Tampilkan statistik storage:
+
+```bash
+dsdn-storage info
+# alias: dsdn-storage status
+```
+
+Output:
+```
+📊 DSDN Storage Info
+   version  : 0.1.0
+   data_dir : ./data
+   status   : ✅ ok
+   chunks   : 1247
+   total    : 20100200448 bytes (19168.40 MB)
+   avg_size : 16119247 bytes
+   min_size : 1445568 bytes
+   max_size : 16777216 bytes
+```
+
+#### Delete
+
+Hapus chunk dari storage lokal:
+
+```bash
+dsdn-storage delete a1b2c3d4e5f6...
+# alias: dsdn-storage rm a1b2c3d4e5f6...
+# 🗑  Deleted chunk: a1b2c3d4e5f6...
+```
+
+#### Verify
+
+Verifikasi integritas chunk (recompute hash dan compare):
+
+```bash
+dsdn-storage verify a1b2c3d4e5f6...
+```
+
+Output (success):
+```
+✅ Chunk verified: a1b2c3d4e5f6...
+   size : 16777216 bytes
+   hash : ✅ matches
+```
+
+Output (corrupted):
+```
+❌ verification failed: chunk a1b2c3d4e5f6... has hash 0000aabb... — DATA CORRUPTED
+```
+
+#### Export
+
+Reassemble chunks menjadi file utuh (urutan hash menentukan urutan data):
+
+```bash
+dsdn-storage export restored.dat a1b2c3d4e5f6... f7e8d9c0b1a2... 9876543210ab...
+```
+
+Output:
+```
+📦 Exporting 3 chunks → "restored.dat"
+  [   0] a1b2c3d4e5f6... (16777216 bytes)
+  [   1] f7e8d9c0b1a2... (16777216 bytes)
+  [   2] 9876543210ab... (1445568 bytes)
+
+✅ Exported 35000000 bytes to "restored.dat"
+```
+
+Setiap chunk diverifikasi hash-nya sebelum ditulis ke output — jika ada chunk corrupt, export dibatalkan.
+
 #### Send (remote)
 
 Kirim file ke remote gRPC server:
@@ -325,16 +454,20 @@ dsdn-storage send 192.168.1.10:50051 myfile.dat
 
 Output:
 ```
-📤 Sending 3 chunks to 192.168.1.10:50051
-  chunk    0: sent → a1b2c3d4e5f6...
-  chunk    1: sent → f7e8d9c0b1a2...
-  chunk    2: sent → 9876543210ab...
-✅ File transfer done.
+📤 Sending file: "myfile.dat"
+   endpoint : http://192.168.1.10:50051
+   chunks   : 3
+
+  [   0] ✅ a1b2c3d4e5f6... → a1b2c3d4e5f6...
+  [   1] ✅ f7e8d9c0b1a2... → f7e8d9c0b1a2...
+  [   2] ✅ 9876543210ab... → 9876543210ab...
+
+📊 Transfer complete: 3 sent, 0 failed
 ```
 
 #### Fetch (remote)
 
-Ambil chunk dari remote gRPC server:
+Ambil chunk dari remote gRPC server (dengan auto hash verification setelah download):
 
 ```bash
 # Tampilkan info
@@ -342,6 +475,15 @@ dsdn-storage fetch 192.168.1.10:50051 a1b2c3d4e5f6...
 
 # Simpan ke file
 dsdn-storage fetch 192.168.1.10:50051 a1b2c3d4e5f6... output.bin
+```
+
+#### Version & Help
+
+```bash
+dsdn-storage version
+dsdn-storage help
+dsdn-storage --help
+dsdn-storage -h
 ```
 
 ### dsdn-node store (Node CLI)
@@ -410,10 +552,13 @@ dsdn-node store fetch 192.168.1.10:9080 a1b2c3d4e5f6... output.bin
 
 | Aspek | `dsdn-storage` | `dsdn-node store` |
 |-------|---------------|-------------------|
-| Storage path | Hardcoded `./data` | Dari `NODE_STORAGE_PATH` env |
+| Storage path | Default `./data`, configurable via `--data-dir` | Dari `NODE_STORAGE_PATH` env |
 | Dependency | Standalone, hanya butuh `dsdn-storage` | Butuh full node dependencies |
-| Gunakan untuk | Development, debugging, testing | Operasi pada node yang sudah deploy |
+| CLI parsing | Native enum-based parser di `cli.rs` | Integrated dalam node CLI |
+| Gunakan untuk | Development, debugging, testing, manual ops | Operasi pada node yang sudah deploy |
+| Native commands | `list`, `info`, `delete`, `verify`, `export` | Via `store stats` |
 | gRPC server | Mode `server` terpisah | Otomatis jalan saat `dsdn-node run` |
+| OS dependency | Tidak ada — semua operasi native Rust | Tidak ada |
 
 ## HTTP Storage Endpoints
 
@@ -651,6 +796,9 @@ Crate ini menjamin invariant berikut:
 8. **Recovery Safety** — recovery hanya untuk assigned chunks dengan verifikasi
 9. **GC Safety** — GC hanya menghapus chunks yang eligible via DA events
 10. **Event Isolation** — events tidak mempengaruhi correctness storage
+11. **Native CLI Operations** — semua operasi CLI berjalan native (Rust) tanpa dependency pada OS shell commands
+12. **Fetch Integrity** — setiap chunk yang di-fetch dari remote diverifikasi hash-nya sebelum digunakan
+13. **Export Integrity** — setiap chunk diverifikasi sebelum ditulis ke output file saat export/reassembly
 
 ## Quick Start
 
@@ -713,12 +861,30 @@ Untuk testing atau deploy storage terpisah tanpa full node:
 # Jalankan gRPC server standalone
 cargo run --bin dsdn-storage -- server 0.0.0.0:50051
 
-# Di terminal lain — kirim file
+# Di terminal lain — simpan file
 cargo run --bin dsdn-storage -- put myfile.dat
+
+# List dan inspect
+cargo run --bin dsdn-storage -- list
+cargo run --bin dsdn-storage -- info
+
+# Verify integritas chunk
+cargo run --bin dsdn-storage -- verify a1b2c3d4e5f6...
+
+# Export / reassemble chunks ke file
+cargo run --bin dsdn-storage -- export restored.dat hash1 hash2 hash3
+
+# Kirim ke remote
 cargo run --bin dsdn-storage -- send 127.0.0.1:50051 myfile.dat
 
-# Fetch dari remote
+# Fetch dari remote (auto-verify hash setelah download)
 cargo run --bin dsdn-storage -- fetch 127.0.0.1:50051 abc123... output.bin
+
+# Hapus chunk
+cargo run --bin dsdn-storage -- delete abc123...
+
+# Gunakan custom data directory
+cargo run --bin dsdn-storage -- --data-dir /mnt/storage list
 ```
 
 ## Endpoint Summary
@@ -753,11 +919,18 @@ cargo run --bin dsdn-storage -- fetch 127.0.0.1:50051 abc123... output.bin
 | `store send <addr> <file>` | `dsdn-node` | Kirim file via gRPC |
 | `store fetch <addr> <hash> [out]` | `dsdn-node` | Fetch chunk dari remote |
 | `server <addr>` | `dsdn-storage` | Jalankan gRPC server standalone |
-| `put <file> [size]` | `dsdn-storage` | Chunk file & simpan ke `./data` |
-| `get <hash> [out]` | `dsdn-storage` | Ambil chunk dari `./data` |
-| `has <hash>` | `dsdn-storage` | Cek chunk di `./data` |
-| `send <addr> <file>` | `dsdn-storage` | Kirim file ke remote gRPC |
-| `fetch <addr> <hash> [out]` | `dsdn-storage` | Fetch chunk dari remote gRPC |
+| `put <file> [size]` | `dsdn-storage` | Chunk file & simpan lokal |
+| `get <hash> [out]` | `dsdn-storage` | Ambil chunk dari store |
+| `has <hash>` | `dsdn-storage` | Cek chunk ada |
+| `send <addr> <file> [size]` | `dsdn-storage` | Kirim file ke remote gRPC |
+| `fetch <addr> <hash> [out]` | `dsdn-storage` | Fetch chunk dari remote gRPC (auto-verify) |
+| `list` / `ls` | `dsdn-storage` | List semua chunks di store |
+| `info` / `status` | `dsdn-storage` | Statistik storage (count, size, avg/min/max) |
+| `delete <hash>` / `rm <hash>` | `dsdn-storage` | Hapus chunk dari store |
+| `verify <hash>` | `dsdn-storage` | Verifikasi integritas chunk (hash check) |
+| `export <out> <h1> [h2] ...` | `dsdn-storage` | Reassemble chunks ke file |
+| `version` | `dsdn-storage` | Tampilkan versi |
+| `help` | `dsdn-storage` | Tampilkan bantuan |
 
 ## Testing
 
@@ -776,8 +949,9 @@ cargo test --package dsdn-storage -- rpc
 
 Tests yang tersedia:
 
-- **localfs** — put/get/has, atomic write idempotency, chunking + store integration
+- **localfs** — put/get/has/delete/list, atomic write idempotency, chunking + store integration
 - **chunker** — small files, exact multiples, streaming
+- **cli** — argument parsing, command enum dispatch, flag extraction, address normalization, utility functions
 - **rpc** — hash validation, mismatch detection, client helpers
 - **da_integration** — DA → metadata derivation, recovery roundtrip, GC safety, metrics consistency, event emission
 

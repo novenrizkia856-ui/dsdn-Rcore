@@ -110,6 +110,49 @@ impl Storage for LocalFsStorage {
         let path = self.object_path(hash)?;
         Ok(path.exists())
     }
+
+    fn delete_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
+        let path = self.object_path(hash)?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&path).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        Ok(true)
+    }
+
+    fn list_chunks(&self) -> dsdn_common::Result<Vec<(String, u64)>> {
+        let mut result = Vec::new();
+        if !self.objects_dir.exists() {
+            return Ok(result);
+        }
+        // Structure: objects/<prefix2>/<hash>
+        for prefix_entry in fs::read_dir(&self.objects_dir)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
+        {
+            let prefix_entry = prefix_entry.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            if !prefix_entry.path().is_dir() {
+                continue;
+            }
+            for file_entry in fs::read_dir(prefix_entry.path())
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
+            {
+                let file_entry = file_entry.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                if !file_entry.path().is_file() {
+                    continue;
+                }
+                let name = file_entry.file_name().to_string_lossy().to_string();
+                // Skip temp files dari atomic_write
+                if name.contains(".tmp.") {
+                    continue;
+                }
+                let size = file_entry.metadata()
+                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
+                    .len();
+                result.push((name, size));
+            }
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
