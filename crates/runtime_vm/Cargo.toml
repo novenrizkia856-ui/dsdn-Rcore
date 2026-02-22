@@ -9,12 +9,14 @@ name = "dsdn_runtime_vm"
 path = "src/lib.rs"
 
 [dependencies]
+dsdn-common = { path = "../common" }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
 tracing = "0.1"
 anyhow = "1.0"
+sha3 = "0.10.3"
 
 [dev-dependencies]
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
