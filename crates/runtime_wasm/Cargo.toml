@@ -4,6 +4,8 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
+dsdn-common = { path = "../common" }
+sha3 = "0.10.8"
 wasmtime = "15"
 wasmtime-wasi = "15"
 wat = "1.0"

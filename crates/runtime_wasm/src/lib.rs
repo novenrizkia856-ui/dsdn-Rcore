@@ -1,9 +1,74 @@
-//! runtime_wasm
+//! # runtime_wasm — WASM Runtime with Execution Commitment (14C.B)
 //!
-//! A thin wrapper around wasmtime to run WASM/WASI modules under resource limits.
+//! A wrapper around wasmtime to run WASM/WASI modules under resource limits,
+//! with deterministic execution commitment production for fraud-proof
+//! reproducibility.
 //!
-//! API:
-//! - run_wasm(module_bytes, input_bytes, limits, host_io_callback) -> Result<Output>
+//! ## Core API
+//!
+//! - `run_wasm(module_bytes, input_bytes, limits, host_io_callback)` → `Result<Output>`
+//!   Low-level WASM execution with resource limits and host I/O callback.
+//!
+//! ## Execution Commitment Pipeline
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │                WASM EXECUTION COMMITMENT PIPELINE                   │
+//! │                                                                     │
+//! │  module_bytes + input_bytes                                         │
+//! │       │                                                             │
+//! │       ▼                                                             │
+//! │  ┌─────────────────┐                                               │
+//! │  │   run_wasm()    │──── wasmtime execution                        │
+//! │  └────────┬────────┘                                               │
+//! │           │ stdout, resource usage                                  │
+//! │           ▼                                                         │
+//! │  ┌─────────────────────────────────────────────────────┐           │
+//! │  │            WasmExecutionResult                       │           │
+//! │  │  input_hash ── SHA3-256(input)                      │           │
+//! │  │  output_hash ── SHA3-256(output)                    │           │
+//! │  │  state_root_before ── hash(pre-exec state)          │           │
+//! │  │  state_root_after ── hash(post-exec state)          │           │
+//! │  │  execution_trace_merkle_root ── binary Merkle tree  │           │
+//! │  │  resource_usage ── cpu, memory, time                │           │
+//! │  └────────────────────┬────────────────────────────────┘           │
+//! │                       │                                             │
+//! │                       ▼                                             │
+//! │              ExecutionCommitment                                    │
+//! │              (dsdn_common native type)                              │
+//! │                       │                                             │
+//! │                       ▼                                             │
+//! │              Coordinator receipt signing                            │
+//! └─────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Modules
+//!
+//! | Module | Description |
+//! |--------|-------------|
+//! | `execution_result` | `WasmExecutionResult` and `ResourceUsage` types (14C.B.1) |
+//! | `merkle` | Deterministic binary Merkle tree over execution traces (14C.B.1) |
+//!
+//! ## Merkle Tree — Cross-Crate Compatibility
+//!
+//! `merkle::compute_trace_merkle_root` implements the **exact same algorithm**
+//! as `coordinator::execution::compute_trace_merkle_root`:
+//!
+//! - Leaf: `SHA3-256(step_bytes)`
+//! - Parent: `SHA3-256(left ‖ right)`
+//! - Odd count: duplicate last node
+//! - Empty: `[0u8; 32]`
+//!
+//! This is consensus-critical. Any byte-level divergence between the runtime
+//! and coordinator Merkle implementations breaks fraud-proof reproducibility.
+//!
+//! ## Determinism Requirements
+//!
+//! For fraud-proof verification, WASM execution must be deterministic:
+//! same module + same input → same `WasmExecutionResult` → same
+//! `ExecutionCommitment`. All hash functions use SHA3-256 with fixed
+//! domain separators. No randomness, no system time dependency in
+//! commitment-critical paths.
 
 use anyhow::Result as AnyResult;
 use std::sync::{Arc, Mutex};
@@ -14,6 +79,20 @@ use thiserror::Error;
 use wasmtime::{Engine, Module, Store, Linker, Caller, Extern};
 use wasmtime_wasi::{WasiCtxBuilder, WasiCtx};
 use serde::{Serialize, Deserialize};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// EXECUTION COMMITMENT MODULES (14C.B.1)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Execution result types for committed WASM execution.
+pub mod execution_result;
+
+/// Deterministic binary Merkle tree (SHA3-256).
+/// Algorithm identical to coordinator's `compute_trace_merkle_root`.
+pub mod merkle;
+
+pub use execution_result::{WasmExecutionResult, ResourceUsage};
+pub use merkle::compute_trace_merkle_root;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLimits {
