@@ -68,6 +68,28 @@
 //! coordinator verifies it. This separation ensures each layer owns only
 //! the data it needs.
 //!
+//! ## Determinism Verification (14C.B.6)
+//!
+//! The critical fraud-proof invariant is verified by 16 integration tests
+//! in `tests/determinism_tests.rs`:
+//!
+//! **Commitment-critical fields are fully deterministic:**
+//! - `input_hash` — `hash_input` (SHA3-256, domain-separated)
+//! - `output_hash` — `hash_output` (SHA3-256, domain-separated)
+//! - `state_root_before` — `hash_memory_snapshot` (module bytes, V1)
+//! - `state_root_after` — `hash_memory_snapshot` (stdout bytes, V1)
+//! - `execution_trace_merkle_root` — `compute_trace_merkle_root` (binary SHA3-256)
+//! - `commitment_hash()` — `ExecutionCommitment::compute_hash` (SHA3-256 of 192 bytes)
+//!
+//! **Operational fields are NOT commitment-critical:**
+//! - `execution_time_ms` — wall-clock, varies between runs
+//! - `cpu_cycles_estimate` — derived from wall-clock
+//!
+//! These operational fields do not affect `commitment_hash()` and are
+//! excluded from `ExecutionCommitment`. A byte-identical commitment
+//! from the same module + input is the foundational guarantee that
+//! enables fraud-proof challenges.
+//!
 //! ## Merkle Tree — Cross-Crate Compatibility
 //!
 //! `merkle::compute_trace_merkle_root` implements the **exact same algorithm**
