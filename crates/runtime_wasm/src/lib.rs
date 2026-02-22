@@ -52,6 +52,22 @@
 //! | `trace_recorder` | Incremental execution trace recorder with finalize-time Merkle (14C.B.3) |
 //! | `committed_execution` | `run_wasm_committed` wrapper with state capture and commitment (14C.B.4) |
 //!
+//! ## ExecutionCommitment Bridge (14C.B.5)
+//!
+//! `WasmExecutionResult` provides two bridge methods to the coordinator's
+//! `ExecutionCommitment` type (defined in `dsdn_common`):
+//!
+//! - `to_execution_commitment()` — 1:1 field mapping, no transformation.
+//! - `commitment_hash()` — shortcut for `to_execution_commitment().compute_hash()`.
+//!
+//! The runtime does not directly expose `ExecutionCommitment` because
+//! the result carries additional operational data (trace, stdout, resource
+//! usage) that the commitment does not include. The bridge methods provide
+//! a clean conversion boundary: the runtime produces `WasmExecutionResult`,
+//! the node extracts `ExecutionCommitment` via the bridge, and the
+//! coordinator verifies it. This separation ensures each layer owns only
+//! the data it needs.
+//!
 //! ## Merkle Tree — Cross-Crate Compatibility
 //!
 //! `merkle::compute_trace_merkle_root` implements the **exact same algorithm**

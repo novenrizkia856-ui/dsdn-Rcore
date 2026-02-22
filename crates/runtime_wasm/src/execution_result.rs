@@ -39,6 +39,7 @@
 //! - Struct is Send + Sync (all fields are owned, no interior mutability).
 
 use dsdn_common::coordinator::WorkloadId;
+use dsdn_common::execution_commitment::ExecutionCommitment;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // RESOURCE USAGE
@@ -119,6 +120,59 @@ pub struct WasmExecutionResult {
 
     /// Resource usage measurements from execution.
     pub resource_usage: ResourceUsage,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// EXECUTION COMMITMENT BRIDGE (14C.B.5)
+// ════════════════════════════════════════════════════════════════════════════════
+
+impl WasmExecutionResult {
+    /// Constructs an [`ExecutionCommitment`] from this execution result.
+    ///
+    /// Maps fields 1:1 with no transformation:
+    ///
+    /// | WasmExecutionResult field | ExecutionCommitment parameter |
+    /// |---------------------------|-------------------------------|
+    /// | `workload_id` | `workload_id` |
+    /// | `input_hash` | `input_hash` |
+    /// | `output_hash` | `output_hash` |
+    /// | `state_root_before` | `state_root_before` |
+    /// | `state_root_after` | `state_root_after` |
+    /// | `execution_trace_merkle_root` | `execution_trace_merkle_root` |
+    ///
+    /// Fields not included in the commitment: `execution_trace`, `stdout`,
+    /// `resource_usage` — these are operational data, not commitment data.
+    ///
+    /// # Determinism
+    ///
+    /// All mapped fields are `Copy`. No allocation, no hashing, no
+    /// transformation. Same `WasmExecutionResult` → same `ExecutionCommitment`.
+    #[must_use]
+    pub fn to_execution_commitment(&self) -> ExecutionCommitment {
+        ExecutionCommitment::new(
+            self.workload_id,
+            self.input_hash,
+            self.output_hash,
+            self.state_root_before,
+            self.state_root_after,
+            self.execution_trace_merkle_root,
+        )
+    }
+
+    /// Computes the SHA3-256 commitment hash.
+    ///
+    /// Shortcut for `self.to_execution_commitment().compute_hash()`.
+    ///
+    /// The hash is computed over all 6 commitment fields in consensus-critical
+    /// order (see [`ExecutionCommitment::compute_hash`]).
+    ///
+    /// # Determinism
+    ///
+    /// Same `WasmExecutionResult` → same 32-byte hash, always.
+    #[must_use]
+    pub fn commitment_hash(&self) -> [u8; 32] {
+        self.to_execution_commitment().compute_hash()
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -224,5 +278,72 @@ mod tests {
         assert_sync::<WasmExecutionResult>();
         assert_send::<ResourceUsage>();
         assert_sync::<ResourceUsage>();
+    }
+
+    // ── Commitment Bridge (14C.B.5) ─────────────────────────────────────
+
+    #[test]
+    fn commitment_construction_valid() {
+        let result = make_result();
+        let ec = result.to_execution_commitment();
+        // All 6 fields must map correctly
+        assert_eq!(*ec.workload_id(), result.workload_id);
+        assert_eq!(*ec.input_hash(), result.input_hash);
+        assert_eq!(*ec.output_hash(), result.output_hash);
+        assert_eq!(*ec.state_root_before(), result.state_root_before);
+        assert_eq!(*ec.state_root_after(), result.state_root_after);
+        assert_eq!(
+            *ec.execution_trace_merkle_root(),
+            result.execution_trace_merkle_root
+        );
+    }
+
+    #[test]
+    fn commitment_hash_matches_manual() {
+        let result = make_result();
+        let manual = result.to_execution_commitment().compute_hash();
+        let shortcut = result.commitment_hash();
+        assert_eq!(manual, shortcut);
+    }
+
+    #[test]
+    fn commitment_determinism_repeat_100x() {
+        let result = make_result();
+        let reference = result.commitment_hash();
+        for _ in 0..100 {
+            assert_eq!(result.commitment_hash(), reference);
+        }
+    }
+
+    #[test]
+    fn field_mapping_exact() {
+        let r = make_result();
+        let ec = r.to_execution_commitment();
+
+        // Verify via direct ExecutionCommitment::new with same fields
+        let direct = ExecutionCommitment::new(
+            WorkloadId::new([0x01; 32]),
+            [0x02; 32],
+            [0x03; 32],
+            [0x04; 32],
+            [0x05; 32],
+            [0x06; 32],
+        );
+        assert_eq!(ec, direct);
+        assert_eq!(ec.compute_hash(), direct.compute_hash());
+    }
+
+    #[test]
+    fn commitment_hash_not_zero() {
+        let result = make_result();
+        assert_ne!(result.commitment_hash(), [0u8; 32]);
+    }
+
+    #[test]
+    fn different_results_different_commitment() {
+        let r1 = make_result();
+        let mut r2 = make_result();
+        r2.input_hash = [0xFF; 32];
+        assert_ne!(r1.commitment_hash(), r2.commitment_hash());
     }
 }
