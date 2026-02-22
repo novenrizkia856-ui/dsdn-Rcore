@@ -49,6 +49,7 @@
 //! | `execution_result` | `WasmExecutionResult` and `ResourceUsage` types (14C.B.1) |
 //! | `merkle` | Deterministic binary Merkle tree over execution traces (14C.B.1) |
 //! | `state_capture` | Domain-separated SHA3-256 hashing for input, output, memory (14C.B.2) |
+//! | `trace_recorder` | Incremental execution trace recorder with finalize-time Merkle (14C.B.3) |
 //!
 //! ## Merkle Tree — Cross-Crate Compatibility
 //!
@@ -109,9 +110,26 @@ pub mod merkle;
 /// and must be deterministic for fraud-proof reproducibility.
 pub mod state_capture;
 
+/// Incremental execution trace recorder (14C.B.3).
+///
+/// [`ExecutionTraceRecorder`] collects raw execution steps during WASM
+/// execution without performing any hashing. At `finalize()` time, it
+/// computes the Merkle root via [`compute_trace_merkle_root`] and returns
+/// both the raw steps and the root.
+///
+/// Hashing is deferred to finalize because the binary Merkle tree algorithm
+/// requires all leaves to be known upfront (the duplicate-last rule depends
+/// on total leaf count). Incremental hashing would require a different
+/// algorithm that would diverge from the coordinator's batch algorithm.
+///
+/// `finalize(self)` consumes the recorder to prevent reuse after
+/// finalization — no dangling state, no double-finalize.
+pub mod trace_recorder;
+
 pub use execution_result::{WasmExecutionResult, ResourceUsage};
 pub use merkle::compute_trace_merkle_root;
 pub use state_capture::{hash_input, hash_output, hash_memory_snapshot};
+pub use trace_recorder::ExecutionTraceRecorder;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLimits {
