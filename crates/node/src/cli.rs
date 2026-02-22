@@ -812,12 +812,12 @@ pub fn cmd_info() {
     println!("═══════════════════════════════════════════════════════════════");
 }
 
-/// Parse --port flag from args, default to 8080.
+/// Parse --port flag from args, default to 45831.
 pub fn parse_port_flag(args: &[String]) -> u16 {
     for i in 0..args.len() {
         if args[i] == "--port" || args[i] == "-p" {
             if let Some(port_str) = args.get(i + 1) {
-                return port_str.parse().unwrap_or(8080);
+                return port_str.parse().unwrap_or(45831);
             }
         }
     }
@@ -825,7 +825,7 @@ pub fn parse_port_flag(args: &[String]) -> u16 {
     env::var("NODE_HTTP_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8080)
+        .unwrap_or(45831)
 }
 
 /// Execute `status` subcommand — query a running node's /status endpoint.
@@ -1466,7 +1466,7 @@ mod tests {
             node_id: String::new(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
-            http_port: 8080,
+            http_port: 45831,
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
@@ -1480,7 +1480,7 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: String::new(),
-            http_port: 8080,
+            http_port: 45831,
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
@@ -1508,8 +1508,8 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
-            http_port: 8080,
-            grpc_port: 8080,
+            http_port: 45831,
+            grpc_port: 45831,
             use_mock_da: true,
             config_source: "test".to_string(),
         };
@@ -1522,7 +1522,7 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
-            http_port: 8080,
+            http_port: 45831,
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
@@ -1598,7 +1598,7 @@ mod tests {
         env::set_var("USE_MOCK_DA", "true");
         env::set_var("NODE_ID", "test-grpc");
         env::set_var("NODE_STORAGE_PATH", "./test-grpc");
-        env::set_var("NODE_HTTP_PORT", "8080");
+        env::set_var("NODE_HTTP_PORT", "45831");
         env::set_var("NODE_GRPC_PORT", "5555");
 
         let config = NodeConfig::from_env().unwrap();
@@ -1675,13 +1675,13 @@ mod tests {
             "node-1".to_string(),
             "mock".to_string(),
             "./data/node1".to_string(),
-            "8080".to_string(),
+            "45831".to_string(),
         ];
         let config = NodeConfig::from_run_args(&args).unwrap();
         assert_eq!(config.node_id, "node-1");
         assert!(config.use_mock_da);
         assert_eq!(config.storage_path, "./data/node1");
-        assert_eq!(config.http_port, 8080);
+        assert_eq!(config.http_port, 45831);
         assert_eq!(config.config_source, "cli");
     }
 
@@ -1694,7 +1694,7 @@ mod tests {
         assert_eq!(parse_port_flag(&args), 7777);
 
         let args: Vec<String> = vec![];
-        // Will fall back to NODE_HTTP_PORT env or 8080
+        // Will fall back to NODE_HTTP_PORT env or 45831
         let port = parse_port_flag(&args);
         assert!(port > 0);
     }

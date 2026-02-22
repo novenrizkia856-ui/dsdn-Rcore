@@ -271,7 +271,7 @@ agent health nodes
 |----------|---------|-------------|
 | `DSDN_DA_ENDPOINT` | `http://127.0.0.1:26658` | DA layer endpoint |
 | `DSDN_DA_NAMESPACE` | `dsdn` | DA namespace |
-| `DSDN_COORDINATOR_ENDPOINT` | `http://127.0.0.1:8080` | Coordinator endpoint |
+| `DSDN_COORDINATOR_ENDPOINT` | `http://127.0.0.1:45831` | Coordinator endpoint |
 | `DSDN_CHAIN_RPC` | `http://127.0.0.1:8545` | Chain RPC endpoint for gating commands |
 
 **Chain RPC Resolution Order (gating commands):**

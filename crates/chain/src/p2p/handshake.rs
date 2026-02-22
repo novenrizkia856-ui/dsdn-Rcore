@@ -323,7 +323,7 @@ mod tests {
     fn test_wrong_network_rejected() {
         let hello = build_hello(
             NetworkId::Mainnet, // different!
-            peer_id(), 8080, ServiceType::Chain, 100,
+            peer_id(), 45831, ServiceType::Chain, 100,
         );
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,

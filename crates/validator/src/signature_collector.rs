@@ -432,11 +432,11 @@ mod tests {
     fn test_validator_endpoint_construction() {
         let endpoint = ValidatorEndpoint {
             id: "v1".to_string(),
-            url: "http://localhost:8080".to_string(),
+            url: "http://localhost:45831".to_string(),
             public_key: vec![0xDE, 0xAD],
         };
         assert_eq!(endpoint.id, "v1");
-        assert_eq!(endpoint.url, "http://localhost:8080");
+        assert_eq!(endpoint.url, "http://localhost:45831");
         assert_eq!(endpoint.public_key, vec![0xDE, 0xAD]);
     }
 

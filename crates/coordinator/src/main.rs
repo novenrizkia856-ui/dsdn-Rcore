@@ -38,7 +38,7 @@
 //! - `RECONCILE_PARALLEL`: Enable parallel reconciliation (default: false)
 //!
 //! ### HTTP Server Configuration
-//! - `COORDINATOR_PORT`: HTTP server port (default: 8080)
+//! - `COORDINATOR_PORT`: HTTP server port (default: 45831)
 //! - `COORDINATOR_HOST`: HTTP server host (default: 127.0.0.1)
 //!
 //! ## Startup Flow (14A.1A.36)
@@ -1290,7 +1290,7 @@ impl CoordinatorConfig {
         // Load HTTP server config
         let host = std::env::var("COORDINATOR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port: u16 = std::env::var("COORDINATOR_PORT")
-            .unwrap_or_else(|_| "8080".to_string())
+            .unwrap_or_else(|_| "45831".to_string())
             .parse()
             .map_err(|_| "COORDINATOR_PORT must be a valid port number")?;
 
@@ -2017,7 +2017,7 @@ async fn main() {
             error!("");
             error!("Optional (HTTP Server):");
             error!("  COORDINATOR_HOST - HTTP server host (default: 127.0.0.1)");
-            error!("  COORDINATOR_PORT - HTTP server port (default: 8080)");
+            error!("  COORDINATOR_PORT - HTTP server port (default: 45831)");
             std::process::exit(1);
         }
     };
@@ -2347,7 +2347,7 @@ mod tests {
         let config = CoordinatorConfig::from_env().unwrap();
 
         assert_eq!(config.host, "127.0.0.1");
-        assert_eq!(config.port, 8080);
+        assert_eq!(config.port, 45831);
         assert_eq!(config.reconciliation_config.batch_size, 10);
         assert_eq!(config.reconciliation_config.retry_delay_ms, 1000);
         assert_eq!(config.reconciliation_config.max_retries, 3);
@@ -2368,7 +2368,7 @@ mod tests {
         std::env::set_var("USE_MOCK_DA", "true");
         std::env::set_var("ENABLE_FALLBACK", "true");
         std::env::set_var("FALLBACK_DA_TYPE", "quorum");
-        std::env::set_var("QUORUM_VALIDATORS", "http://v1:8080,http://v2:8080");
+        std::env::set_var("QUORUM_VALIDATORS", "http://v1:45831,http://v2:45831");
         std::env::set_var("QUORUM_THRESHOLD", "75");
 
         let config = CoordinatorConfig::from_env().unwrap();
@@ -2393,7 +2393,7 @@ mod tests {
         std::env::set_var("USE_MOCK_DA", "true");
         std::env::set_var("ENABLE_FALLBACK", "true");
         std::env::set_var("FALLBACK_DA_TYPE", "emergency");
-        std::env::set_var("EMERGENCY_DA_URL", "http://emergency-da:8080");
+        std::env::set_var("EMERGENCY_DA_URL", "http://emergency-da:45831");
 
         let config = CoordinatorConfig::from_env().unwrap();
 
@@ -2401,7 +2401,7 @@ mod tests {
         assert_eq!(config.fallback_da_type, FallbackDAType::Emergency);
         assert!(config.emergency_da_url.is_some());
         assert!(config.is_fallback_ready());
-        assert_eq!(config.emergency_da_url.unwrap(), "http://emergency-da:8080");
+        assert_eq!(config.emergency_da_url.unwrap(), "http://emergency-da:45831");
 
         clear_all_env_vars();
     }
@@ -2480,7 +2480,7 @@ mod tests {
         std::env::set_var("USE_MOCK_DA", "true");
         std::env::set_var("ENABLE_FALLBACK", "true");
         std::env::set_var("FALLBACK_DA_TYPE", "quorum");
-        std::env::set_var("QUORUM_VALIDATORS", "http://v1:8080");
+        std::env::set_var("QUORUM_VALIDATORS", "http://v1:45831");
         std::env::set_var("QUORUM_THRESHOLD", "0");
 
         let result = CoordinatorConfig::from_env();
@@ -2897,7 +2897,7 @@ mod tests {
         std::env::set_var("USE_MOCK_DA", "true");
         std::env::set_var("ENABLE_FALLBACK", "true");
         std::env::set_var("FALLBACK_DA_TYPE", "quorum");
-        std::env::set_var("QUORUM_VALIDATORS", "http://v1:8080,http://v2:8080");
+        std::env::set_var("QUORUM_VALIDATORS", "http://v1:45831,http://v2:45831");
 
         let config = CoordinatorConfig::from_env().unwrap();
 
@@ -2939,7 +2939,7 @@ mod tests {
         std::env::set_var("USE_MOCK_DA", "true");
         std::env::set_var("ENABLE_FALLBACK", "true");
         std::env::set_var("FALLBACK_DA_TYPE", "emergency");
-        std::env::set_var("EMERGENCY_DA_URL", "http://emergency:8080");
+        std::env::set_var("EMERGENCY_DA_URL", "http://emergency:45831");
 
         let config = CoordinatorConfig::from_env().unwrap();
 

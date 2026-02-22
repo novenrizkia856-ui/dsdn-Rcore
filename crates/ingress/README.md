@@ -123,7 +123,7 @@ Returns 200 OK hanya jika:
 ## Configuration
 
 Environment variables:
-- `COORD_BASE_URL`: Coordinator base URL (default: `http://localhost:8080`)
+- `COORD_BASE_URL`: Coordinator base URL (default: `http://localhost:45831`)
 - `DA_ROUTER_TTL_MS`: Cache TTL dalam milliseconds (default: 30000)
 
 ## Apa yang TIDAK Dilakukan Ingress

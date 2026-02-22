@@ -15,8 +15,8 @@
 //!
 //! # Static IP peers (community maintained)
 //! static_peers = [
-//!     # "203.0.113.50:8080",
-//!     # "198.51.100.10:8080",
+//!     # "203.0.113.50:45831",
+//!     # "198.51.100.10:45831",
 //! ]
 //!
 //! # Local peer cache
@@ -87,7 +87,7 @@ impl DnsSeed {
     }
 
     /// Parse dari string "hostname" atau "hostname:port".
-    /// Default port = 8080.
+    /// Default port = 45831.
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
         if let Some((host, port_str)) = s.rsplit_once(':') {
@@ -95,7 +95,7 @@ impl DnsSeed {
                 return Self::new(host, port);
             }
         }
-        Self::new(s, 8080)
+        Self::new(s, 45831)
     }
 }
 
@@ -363,8 +363,8 @@ impl BootstrapConfig {
         Self {
             dns_seeds: vec![
                 // UNCOMMENT saat domain sudah dibeli:
-                // DnsSeed::founder("seed1.dsdn.network", 8080),
-                // DnsSeed::founder("seed2.dsdn.network", 8080),
+                // DnsSeed::founder("seed1.dsdn.network", 45831),
+                // DnsSeed::founder("seed2.dsdn.network", 45831),
             ],
             enable_pex: true,
             enable_rotation: true,
@@ -439,7 +439,7 @@ mod tests {
         let toml = r#"
 [bootstrap]
 dns_seeds = ["seed1.dsdn.network", "seed2.dsdn.network"]
-static_peers = ["203.0.113.50:800", "198.51.100.10:8080"]
+static_peers = ["203.0.113.50:800", "198.51.100.10:45831"]
 peers_file = "my_peers.dat"
 max_outbound_connections = 16
 max_inbound_connections = 250
@@ -449,9 +449,9 @@ peer_connect_timeout_secs = 8
         let c = BootstrapConfig::from_toml_str(toml).unwrap();
         assert_eq!(c.dns_seeds.len(), 2);
         assert_eq!(c.dns_seeds[0].hostname, "seed1.dsdn.network");
-        assert_eq!(c.dns_seeds[0].port, 8080);
+        assert_eq!(c.dns_seeds[0].port, 45831);
         assert_eq!(c.static_peers.len(), 2);
-        assert_eq!(c.static_peers[0].addr.to_string(), "203.0.113.50:8080");
+        assert_eq!(c.static_peers[0].addr.to_string(), "203.0.113.50:45831");
         assert_eq!(c.peers_file, "my_peers.dat");
         assert_eq!(c.limits.max_outbound, 16);
         assert_eq!(c.limits.max_inbound, 250);
@@ -514,9 +514,9 @@ max_outbound_connections = 32
         let toml = r#"
 [bootstrap]
 static_peers = [
-    "203.0.113.50:8080",
+    "203.0.113.50:45831",
     "this-is-not-valid",
-    "198.51.100.10:8080",
+    "198.51.100.10:45831",
 ]
 "#;
         let c = BootstrapConfig::from_toml_str(toml).unwrap();
@@ -533,14 +533,14 @@ static_peers = [
     #[test]
     fn test_dns_seed_parse_default_port() {
         let s = DnsSeed::parse("seed1.dsdn.network");
-        assert_eq!(s.port, 8080);
+        assert_eq!(s.port, 45831);
     }
 
     #[test]
     fn test_auto_enable_pex_when_seeds_present() {
         let toml = r#"
 [bootstrap]
-static_peers = ["10.0.0.1:8080"]
+static_peers = ["10.0.0.1:45831"]
 "#;
         let c = BootstrapConfig::from_toml_str(toml).unwrap();
         assert!(c.enable_pex);
@@ -558,7 +558,7 @@ static_peers = ["10.0.0.1:8080"]
         let tmp = tmp_dir.join("dsdn_test_bootstrap_config.toml");
         let content = r#"
 [bootstrap]
-static_peers = ["10.0.0.1:8080"]
+static_peers = ["10.0.0.1:45831"]
 peers_file = "test_peers.dat"
 max_outbound_connections = 4
 "#;

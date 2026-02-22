@@ -95,7 +95,7 @@
 //!
 //! - `DSDN_DA_ENDPOINT`: DA layer endpoint (default: http://127.0.0.1:26658)
 //! - `DSDN_DA_NAMESPACE`: DA namespace (default: dsdn)
-//! - `DSDN_COORDINATOR_ENDPOINT`: Coordinator endpoint (default: http://127.0.0.1:8080)
+//! - `DSDN_COORDINATOR_ENDPOINT`: Coordinator endpoint (default: http://127.0.0.1:45831)
 //! - `DSDN_CHAIN_RPC`: Chain RPC endpoint for gating queries (default: http://127.0.0.1:8545)
 
 mod sss;

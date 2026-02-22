@@ -45,7 +45,7 @@ Buat file `.env.mainnet` di root directory project:
 # ── Node Identity ──
 NODE_ID=auto
 NODE_STORAGE_PATH=./data/node1
-NODE_HTTP_PORT=8080
+NODE_HTTP_PORT=45831
 
 # ── DA Layer (Celestia) ──
 DA_RPC_URL=http://localhost:26658
@@ -93,8 +93,8 @@ dsdn-node run env
 dsdn-node run <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>
 
 # Contoh:
-dsdn-node run node-1 http://localhost:26658 ./data/node1 8080
-dsdn-node run auto mock ./data/node1 8080
+dsdn-node run node-1 http://localhost:26658 ./data/node1 45831
+dsdn-node run auto mock ./data/node1 45831
 ```
 
 Kalau tidak ada subcommand, `dsdn-node` otomatis menjalankan `run` dalam env mode:
@@ -111,9 +111,9 @@ dsdn-node run env
 Query status dari node yang sedang berjalan via HTTP `/status` endpoint.
 
 ```bash
-dsdn-node status              # Default port dari NODE_HTTP_PORT atau 8080
-dsdn-node status --port 8080  # Custom port
-dsdn-node status -p 8080      # Shorthand
+dsdn-node status              # Default port dari NODE_HTTP_PORT atau 45831
+dsdn-node status --port 45831  # Custom port
+dsdn-node status -p 45831      # Shorthand
 ```
 
 ### `dsdn-node health`
@@ -122,7 +122,7 @@ Query health dari node yang sedang berjalan via HTTP `/health` endpoint.
 
 ```bash
 dsdn-node health              # Default port
-dsdn-node health --port 8080  # Custom port
+dsdn-node health --port 45831  # Custom port
 ```
 
 ### `dsdn-node info`
@@ -145,7 +145,7 @@ Env file:       /path/to/project/.env.mainnet
 ── Current Configuration (from env) ──
 NODE_ID:            auto
 NODE_STORAGE_PATH:  ./data/node1
-NODE_HTTP_PORT:     8080
+NODE_HTTP_PORT:     45831
 DA_RPC_URL:         http://localhost:26658
 DA_NAMESPACE:       000000000000000000000000000000000000000000000000000000000
 DA_NETWORK:         mainnet
@@ -200,7 +200,7 @@ dsdn-node run
 USE_MOCK_DA=true
 NODE_ID=dev-node
 NODE_STORAGE_PATH=./data/dev
-NODE_HTTP_PORT=8080
+NODE_HTTP_PORT=45831
 
 dsdn-node run
 ```
@@ -368,13 +368,13 @@ Command lama tetap berjalan:
 
 ```bash
 # Format lama (masih didukung):
-dsdn-node node-1 http://localhost:26658 ./data/node1 8080
-dsdn-node auto mock ./data/node1 8080
+dsdn-node node-1 http://localhost:26658 ./data/node1 45831
+dsdn-node auto mock ./data/node1 45831
 dsdn-node env
 
 # Format baru (recommended):
-dsdn-node run node-1 http://localhost:26658 ./data/node1 8080
-dsdn-node run auto mock ./data/node1 8080
+dsdn-node run node-1 http://localhost:26658 ./data/node1 45831
+dsdn-node run auto mock ./data/node1 45831
 dsdn-node run env
 dsdn-node run   # default env mode
 ```

@@ -108,7 +108,7 @@ pub enum ConnectionState {
 pub struct PeerConnection {
     /// Identifier unik peer.
     pub id: CoordinatorId,
-    /// Network address peer (e.g., "192.168.1.1:8080").
+    /// Network address peer (e.g., "192.168.1.1:45831").
     pub addr: String,
     /// State koneksi saat ini.
     pub state: ConnectionState,
@@ -455,10 +455,10 @@ mod tests {
     #[test]
     fn test_peer_connection_new() {
         let id = make_coord_id(0x01);
-        let conn = PeerConnection::new(id.clone(), "127.0.0.1:8080".to_string());
+        let conn = PeerConnection::new(id.clone(), "127.0.0.1:45831".to_string());
 
         assert_eq!(conn.id, id);
-        assert_eq!(conn.addr, "127.0.0.1:8080");
+        assert_eq!(conn.addr, "127.0.0.1:45831");
         assert_eq!(conn.state, ConnectionState::Disconnected);
         assert_eq!(conn.last_seen, 0);
         assert_eq!(conn.failed_attempts, 0);
@@ -522,7 +522,7 @@ mod tests {
         let mut manager = PeerManager::new(make_config());
         let id = make_coord_id(0x01);
 
-        manager.add_peer(id.clone(), "127.0.0.1:8080".to_string());
+        manager.add_peer(id.clone(), "127.0.0.1:45831".to_string());
 
         assert_eq!(manager.peer_count(), 1);
         let peer = manager.get_peer(&id).expect("peer exists");

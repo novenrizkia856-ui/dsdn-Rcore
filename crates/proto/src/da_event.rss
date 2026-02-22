@@ -493,7 +493,7 @@ mod tests {
         event = NodeRegisteredEvent {
             node_id = "node-xyz".to_string(),
             zone = "us-west-1".to_string(),
-            addr = "10.0.0.1:8080".to_string(),
+            addr = "10.0.0.1:45831".to_string(),
             capacity_gb = 500,
             node_type = NodeType::Regular,
             public_key = [0u8; 32],

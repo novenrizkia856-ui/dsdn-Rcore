@@ -134,7 +134,7 @@ start_coordinator() {
     # Set coordinator-specific vars
     export DA_NETWORK="${DA_NETWORK:-mainnet}"
     export COORDINATOR_HOST="${COORDINATOR_HOST:-0.0.0.0}"
-    export COORDINATOR_PORT="${COORDINATOR_PORT:-8080}"
+    export COORDINATOR_PORT="${COORDINATOR_PORT:-45831}"
     
     # Start coordinator
     nohup "${PROJECT_ROOT}/target/release/dsdn-coordinator" \
@@ -227,7 +227,7 @@ start_all() {
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "DSDN Mainnet Deployment Complete"
     log_info "═══════════════════════════════════════════════════════════════"
-    log_info "Coordinator: http://${COORDINATOR_HOST:-0.0.0.0}:${COORDINATOR_PORT:-8080}"
+    log_info "Coordinator: http://${COORDINATOR_HOST:-0.0.0.0}:${COORDINATOR_PORT:-45831}"
     for i in $(seq 1 "$num_nodes"); do
         local port=$((${NODE_BASE_PORT:-8090} + i - 1))
         log_info "Node $i:      http://0.0.0.0:${port}"

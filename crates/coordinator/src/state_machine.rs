@@ -2241,7 +2241,7 @@ mod tests {
             payload: DAEventPayload::NodeRegistered(NodeRegisteredPayload {
                 node_id: "node1".to_string(),
                 zone: "zone-a".to_string(),
-                addr: "my-server.example.com:8080".to_string(),
+                addr: "my-server.example.com:45831".to_string(),
                 capacity_gb: 100,
             }),
         };

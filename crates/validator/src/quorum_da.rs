@@ -1884,7 +1884,7 @@ mod tests {
             quorum_fraction: 0.8,
             signature_timeout_ms: 5000,
             max_blob_size: 1024,
-            validator_endpoints: vec!["http://localhost:8080".to_string()],
+            validator_endpoints: vec!["http://localhost:45831".to_string()],
             retry_count: 5,
         };
         let cloned = config.clone();

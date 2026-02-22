@@ -222,7 +222,7 @@ Node menjalankan dua server secara bersamaan:
 
 | Server | Port | Fungsi |
 |--------|------|--------|
-| **HTTP (Axum)** | `NODE_HTTP_PORT` (default: 8080) | Observability + storage data plane |
+| **HTTP (Axum)** | `NODE_HTTP_PORT` (default: 45831) | Observability + storage data plane |
 | **gRPC (Tonic)** | `NODE_GRPC_PORT` (default: HTTP + 1000) | Inter-node chunk transfer |
 
 ### Konfigurasi Node Storage
@@ -241,7 +241,7 @@ Contoh `.env.mainnet`:
 ```env
 NODE_ID=node-jakarta-01
 NODE_STORAGE_PATH=/var/dsdn/data
-NODE_HTTP_PORT=8080
+NODE_HTTP_PORT=45831
 NODE_GRPC_PORT=9080
 NODE_STORAGE_CAPACITY_GB=500
 
@@ -426,7 +426,7 @@ Saat `dsdn-node run`, node menyediakan storage endpoints di HTTP server yang sam
 Ambil raw chunk data berdasarkan hash.
 
 ```bash
-curl http://localhost:8080/storage/chunk/a1b2c3d4e5f6...
+curl http://localhost:45831/storage/chunk/a1b2c3d4e5f6...
 # → binary chunk data (application/octet-stream)
 ```
 
@@ -441,7 +441,7 @@ Simpan chunk. Hash dihitung otomatis dari body data.
 
 ```bash
 curl -X PUT \
-  http://localhost:8080/storage/chunk \
+  http://localhost:45831/storage/chunk \
   --data-binary @myfile.chunk0
 ```
 
@@ -464,7 +464,7 @@ Response codes:
 Cek apakah chunk ada.
 
 ```bash
-curl http://localhost:8080/storage/has/a1b2c3d4e5f6...
+curl http://localhost:45831/storage/has/a1b2c3d4e5f6...
 ```
 
 Response (`200`):
@@ -480,7 +480,7 @@ Response (`200`):
 Statistik storage.
 
 ```bash
-curl http://localhost:8080/storage/stats
+curl http://localhost:45831/storage/stats
 ```
 
 Response (`200`):
@@ -661,7 +661,7 @@ Crate ini menjamin invariant berikut:
 echo 'USE_MOCK_DA=true' >> .env
 echo 'NODE_ID=dev-node-1' >> .env
 echo 'NODE_STORAGE_PATH=./data' >> .env
-echo 'NODE_HTTP_PORT=8080' >> .env
+echo 'NODE_HTTP_PORT=45831' >> .env
 
 # Start node (includes storage gRPC on port 9080)
 cargo run --bin dsdn-node -- run
@@ -673,8 +673,8 @@ cargo run --bin dsdn-node -- store put testfile.dat
 cargo run --bin dsdn-node -- store stats
 
 # Ambil chunk via HTTP
-curl http://localhost:8080/storage/has/abc123...
-curl http://localhost:8080/storage/chunk/abc123... -o chunk.bin
+curl http://localhost:45831/storage/has/abc123...
+curl http://localhost:45831/storage/chunk/abc123... -o chunk.bin
 
 # Transfer ke node lain via gRPC
 cargo run --bin dsdn-node -- store send 127.0.0.1:9080 testfile.dat
@@ -687,7 +687,7 @@ cargo run --bin dsdn-node -- store send 127.0.0.1:9080 testfile.dat
 cat > .env.mainnet << EOF
 NODE_ID=node-jakarta-01
 NODE_STORAGE_PATH=/var/dsdn/data
-NODE_HTTP_PORT=8080
+NODE_HTTP_PORT=45831
 NODE_GRPC_PORT=9080
 NODE_STORAGE_CAPACITY_GB=500
 DA_RPC_URL=http://localhost:26658
@@ -700,9 +700,9 @@ EOF
 cargo run --release --bin dsdn-node -- run
 
 # Monitor storage
-curl http://localhost:8080/storage/stats
-curl http://localhost:8080/status
-curl http://localhost:8080/metrics/prometheus | grep storage
+curl http://localhost:45831/storage/stats
+curl http://localhost:45831/status
+curl http://localhost:45831/metrics/prometheus | grep storage
 ```
 
 ### Standalone Storage Server

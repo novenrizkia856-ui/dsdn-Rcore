@@ -92,7 +92,7 @@ The Coordinator is the central orchestration component of DSDN (Decentralized St
 # Run coordinator with mock DA (no Celestia required)
 USE_MOCK_DA=true cargo rustsp run -p dsdn-coordinator
 
-# Coordinator listens on http://127.0.0.1:8080
+# Coordinator listens on http://127.0.0.1:45831
 ```
 
 ### Production Mode (Celestia)
@@ -112,18 +112,18 @@ cargo rustsp run -p dsdn-coordinator --release
 
 ```bash
 # Register a node
-curl -X POST http://127.0.0.1:8080/register \
+curl -X POST http://127.0.0.1:45831/register \
   -H "Content-Type: application/json" \
   -d '{"id":"node-1","zone":"zone-a","addr":"10.0.0.1:50051","capacity_gb":100}'
 
 # List nodes
-curl http://127.0.0.1:8080/nodes
+curl http://127.0.0.1:45831/nodes
 
 # Check system info
-curl http://127.0.0.1:8080/system/info
+curl http://127.0.0.1:45831/system/info
 
 # Health check
-curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:45831/health
 ```
 
 ---
@@ -172,7 +172,7 @@ curl http://127.0.0.1:8080/health
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `COORDINATOR_HOST` | No | `127.0.0.1` | HTTP server bind address |
-| `COORDINATOR_PORT` | No | `8080` | HTTP server port |
+| `COORDINATOR_PORT` | No | `45831` | HTTP server port |
 
 ---
 

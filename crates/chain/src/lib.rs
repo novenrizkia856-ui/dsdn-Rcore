@@ -2398,7 +2398,7 @@ impl Chain {
     /// Add peer via P2P system (recommended).
     /// Peer akan ditrack di PeerManager DAN di-bridge ke BroadcastManager.
     ///
-    /// Format addr_str: "IP:PORT" (contoh: "192.168.1.100:8080")
+    /// Format addr_str: "IP:PORT" (contoh: "192.168.1.100:45831")
     pub fn add_peer_p2p(&self, addr_str: &str) -> anyhow::Result<()> {
         // Add ke PeerManager (persistent, scored)
         let mut mgr = self.peer_manager.write();

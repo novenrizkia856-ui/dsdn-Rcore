@@ -689,7 +689,7 @@ pub async fn fetch_coordinator_state(config: &DAConfig) -> Result<DSDNState> {
 
     // Coordinator state endpoint (assumed API)
     let coord_url =
-        std::env::var("COORD_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        std::env::var("COORD_BASE_URL").unwrap_or_else(|_| "http://localhost:45831".to_string());
 
     let url = format!("{}/state", coord_url);
 
@@ -1038,7 +1038,7 @@ mod tests {
     fn test_node_address_validation() {
         // Valid addresses
         assert!(validate_node_address("127.0.0.1:9000").is_ok());
-        assert!(validate_node_address("localhost:8080").is_ok());
+        assert!(validate_node_address("localhost:45831").is_ok());
         assert!(validate_node_address("node1.example.com:9001").is_ok());
 
         // Invalid addresses

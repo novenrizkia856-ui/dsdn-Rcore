@@ -102,7 +102,7 @@
 //! // Setup peer management
 //! let config = PeerConfig::new(5000, 3, 1000)?;
 //! let mut manager = PeerManager::new(config);
-//! manager.add_peer(coord_id.clone(), "192.168.1.1:8080".to_string());
+//! manager.add_peer(coord_id.clone(), "192.168.1.1:45831".to_string());
 //! manager.mark_seen(&coord_id);
 //!
 //! // Send messages via network

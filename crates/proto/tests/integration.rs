@@ -186,7 +186,7 @@ fn test_version_field_preserved() {
         timestamp_ms: 1704067200000,
         node_id: "node-version-test".to_string(),
         zone: "zone-1".to_string(),
-        addr: "127.0.0.1:8080".to_string(),
+        addr: "127.0.0.1:45831".to_string(),
         capacity_gb: 100,
     };
 
@@ -381,7 +381,7 @@ fn test_batch_determinism() {
             timestamp_ms: 1704067200000,
             node_id: "determinism-node".to_string(),
             zone: "determinism-zone".to_string(),
-            addr: "192.168.1.1:8080".to_string(),
+            addr: "192.168.1.1:45831".to_string(),
             capacity_gb: 250,
         },
         DAEvent::ChunkDeclared {

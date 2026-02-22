@@ -894,8 +894,8 @@ mod tests {
 
     #[test]
     fn test_webhook_handler_construction() {
-        let handler = WebhookAlertHandler::new("http://localhost:8080/webhook", None);
-        assert_eq!(handler.endpoint, "http://localhost:8080/webhook");
+        let handler = WebhookAlertHandler::new("http://localhost:45831/webhook", None);
+        assert_eq!(handler.endpoint, "http://localhost:45831/webhook");
         assert_eq!(handler.timeout, Duration::from_secs(5));
 
         let handler_custom = WebhookAlertHandler::new(

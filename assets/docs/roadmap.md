@@ -508,7 +508,7 @@ sleep 5
 # Start nodes
 echo "Starting nodes..."
 cargo run -p dsdn-node --bin dsdn-node --release -- \
-    node-1 "$DA_RPC_URL" ./data/node1 8080 &
+    node-1 "$DA_RPC_URL" ./data/node1 45831 &
 NODE1_PID=$!
 
 cargo run -p dsdn-node --bin dsdn-node --release -- \
@@ -556,13 +556,13 @@ Updated CLI untuk support environment variables:
 
 ```bash
 # Option 1: CLI arguments (development)
-cargo run -p dsdn-node --bin dsdn-node -- node-1 mock ./data/node1 8080
+cargo run -p dsdn-node --bin dsdn-node -- node-1 mock ./data/node1 45831
 
 # Option 2: Environment variables (production)
 export DA_RPC_URL=http://localhost:26658
 export DA_AUTH_TOKEN=xxx
 export DA_NAMESPACE=xxx
-cargo run -p dsdn-node --bin dsdn-node -- node-1 env ./data/node1 8080
+cargo run -p dsdn-node --bin dsdn-node -- node-1 env ./data/node1 45831
 
 # "env" keyword = load DA config from environment
 ```
@@ -2531,7 +2531,7 @@ Daftar IP publik statis sebagai alternatif DNS seed. IP ini bisa dari:
 - Founder-operated seed node.
 - Operator data center yang menyediakan entry point.
 
-Format: `IP:Port` (`203.0.113.50:8080`).
+Format: `IP:Port` (`203.0.113.50:45831`).
 
 Aturan IP statis:
 - Bisa ditambah siapa saja melalui config file atau CLI.
@@ -2553,8 +2553,8 @@ dns_seeds = [
 
 # Static IP peers (community maintained)
 static_peers = [
-    # "203.0.113.50:8080",
-    # "198.51.100.10:8080",
+    # "203.0.113.50:45831",
+    # "198.51.100.10:45831",
 ]
 
 # Local peer cache
@@ -2812,7 +2812,7 @@ Founder dan komunitas bisa menjalankan dedicated bootstrap node yang hanya melay
 
 Cara menjalankan:
 ```bash
-dsdn-node --mode bootstrap --listen 0.0.0.0:8080 --network mainnet
+dsdn-node --mode bootstrap --listen 0.0.0.0:45831 --network mainnet
 ```
 
 ### 4. Network Partition Recovery
@@ -2869,7 +2869,7 @@ Agent mendapat command baru untuk manajemen bootstrap:
 dsdn-agent peers list
 
 # Tambah static peer manual
-dsdn-agent peers add 203.0.113.50:8080
+dsdn-agent peers add 203.0.113.50:45831
 
 # Tambah DNS seed manual
 dsdn-agent peers add-seed seed4.dsdn.network

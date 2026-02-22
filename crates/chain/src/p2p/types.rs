@@ -340,7 +340,7 @@ mod tests {
     use std::str::FromStr;
 
     fn make_peer() -> PeerEntry {
-        let addr = SocketAddr::from_str("192.168.1.1:8080").unwrap();
+        let addr = SocketAddr::from_str("192.168.1.1:45831").unwrap();
         PeerEntry::new(addr, NetworkId::Devnet, PeerSource::Manual)
     }
 

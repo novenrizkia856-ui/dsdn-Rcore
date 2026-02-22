@@ -343,7 +343,7 @@ pub async fn check_coordinator_health() -> ComponentHealth {
     
     // Get coordinator endpoint from environment
     let coordinator_endpoint = std::env::var("DSDN_COORDINATOR_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:45831".to_string());
     
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

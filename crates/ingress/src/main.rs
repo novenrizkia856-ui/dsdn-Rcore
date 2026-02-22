@@ -114,7 +114,7 @@
 //!
 //! | Variable            | Default                   | Description                    |
 //! |---------------------|---------------------------|--------------------------------|
-//! | `COORDINATOR_BASE`  | `http://127.0.0.1:8080`   | Coordinator service URL        |
+//! | `COORDINATOR_BASE`  | `http://127.0.0.1:45831`   | Coordinator service URL        |
 //! | `DA_ROUTER_TTL_MS`  | `30000`                   | DA router cache TTL (ms)       |
 //!
 //! ### Fallback Thresholds (Compile-time Constants)
@@ -943,7 +943,7 @@ fn current_timestamp_ms() -> u64 {
 
 /// Simple config via env
 fn coordinator_base_from_env() -> String {
-    env::var("COORDINATOR_BASE").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    env::var("COORDINATOR_BASE").unwrap_or_else(|_| "http://127.0.0.1:45831".to_string())
 }
 
 /// DA router TTL config via env (default 30 seconds)
@@ -1455,7 +1455,7 @@ mod tests {
 
     #[test]
     fn test_da_connected_vs_disconnected() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
 
         // Without DA router
         let state = AppState::new(coord.clone());
@@ -1479,7 +1479,7 @@ mod tests {
     //
     // #[tokio::test]
     // async fn test_cache_empty_vs_filled() {
-    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
     //     let mock_ds = Arc::new(MockDataSource::new());
     //     let router = Arc::new(DARouter::new(mock_ds.clone()));
     //     let state = AppState::with_da_router(coord.clone(), router.clone());
@@ -1502,7 +1502,7 @@ mod tests {
     //
     // #[tokio::test]
     // async fn test_health_returns_all_fields_valid() {
-    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
     //     let mock_ds = Arc::new(MockDataSource::new());
     //     mock_ds.add_node("node-1", "127.0.0.1:9001", true);
     //     mock_ds.add_node("node-2", "127.0.0.1:9002", false);
@@ -1544,7 +1544,7 @@ mod tests {
     //
     // #[test]
     // fn test_ready_cache_empty_check() {
-    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
     //     let mock_ds = Arc::new(MockDataSource::new());
     //     let router = Arc::new(DARouter::new(mock_ds));
     //     let state = AppState::with_da_router(coord, router);
@@ -1560,7 +1560,7 @@ mod tests {
     //
     // #[test]
     // fn test_ready_success_invariants() {
-    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
     //     let mock_ds = Arc::new(MockDataSource::new());
     //     mock_ds.add_node("node-1", "127.0.0.1:9001", true);
     //     let router = Arc::new(DARouter::new(mock_ds));
@@ -1582,7 +1582,7 @@ mod tests {
     // #[test]
     // fn test_thread_safe_health_state() {
     //     use std::thread;
-    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+    //     let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
     //     let mock_ds = Arc::new(MockDataSource::new());
     //     for i in 0..5 {
     //         mock_ds.add_node(&format!("node-{}", i), &format!("127.0.0.1:900{}", i), true);
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_metrics_in_app_state() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Metrics should be accessible
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[test]
     fn test_metrics_prometheus_output() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         state.metrics.record_request();
@@ -1844,7 +1844,7 @@ mod tests {
     #[test]
     fn test_gather_fallback_status_none_when_no_da_router() {
         // Setup: AppState WITHOUT da_router
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Precondition: da_router is None
@@ -1873,7 +1873,7 @@ mod tests {
     fn test_gather_fallback_status_with_da_router_no_panic() {
         // Setup: AppState WITHOUT da_router (simplified test)
         // Full integration test requires new DARouter API
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Action: Should not panic
@@ -1892,7 +1892,7 @@ mod tests {
     #[tokio::test]
     async fn test_gather_health_fallback_fields_default_values() {
         // Setup: AppState WITHOUT da_router
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Action
@@ -1932,7 +1932,7 @@ mod tests {
     async fn test_gather_health_with_da_router_integration() {
         // Setup: AppState WITHOUT da_router (simplified test)
         // Full integration test requires new DARouter API
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Action: Should not panic
@@ -1953,7 +1953,7 @@ mod tests {
     /// Test that gather_fallback_status returns consistent results.
     #[test]
     fn test_gather_fallback_status_deterministic() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Multiple calls should return the same result (None in this case)
@@ -1978,7 +1978,7 @@ mod tests {
 
         // Setup: AppState WITHOUT da_router (simplified test)
         // Full integration test requires new DARouter API
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = Arc::new(AppState::new(coord));
 
         let mut handles = vec![];
@@ -2238,7 +2238,7 @@ mod tests {
     /// so da_status and warning should both be None.
     #[tokio::test]
     async fn test_gather_health_populates_new_fields() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         let health = state.gather_health().await;
@@ -2415,7 +2415,7 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_status_returns_404_when_no_da_router() {
         // Setup: AppState WITHOUT da_router
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Precondition: da_router is None
@@ -2440,7 +2440,7 @@ mod tests {
     /// Test that fallback_status returns consistent results.
     #[tokio::test]
     async fn test_fallback_status_deterministic() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Multiple calls should return the same status code
@@ -2842,7 +2842,7 @@ mod tests {
     /// Test that metrics endpoint includes all fallback metrics.
     #[tokio::test]
     async fn test_metrics_endpoint_includes_fallback_metrics() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Set some fallback metrics values
@@ -2889,7 +2889,7 @@ mod tests {
     /// Test that metrics endpoint returns correct content type.
     #[tokio::test]
     async fn test_metrics_endpoint_content_type() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         let response = metrics_endpoint(State(state)).await;
@@ -2983,7 +2983,7 @@ mod tests {
     /// Test that AppState includes AlertDispatcher.
     #[test]
     fn test_app_state_has_alert_dispatcher() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Default state should have logging handler
@@ -2997,7 +2997,7 @@ mod tests {
     /// Test that AlertDispatcher notify methods do not panic.
     #[test]
     fn test_alert_dispatcher_notify_no_panic() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Create test FallbackHealthInfo
@@ -3028,7 +3028,7 @@ mod tests {
     /// Test that custom AlertDispatcher can be set.
     #[test]
     fn test_custom_alert_dispatcher() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let dispatcher = AlertDispatcher::new(); // Empty dispatcher
         let state = AppState::with_alert_dispatcher(coord, dispatcher);
 
@@ -3060,7 +3060,7 @@ mod tests {
     /// Test that AlertDispatcher can be cloned (for use in handlers).
     #[test]
     fn test_alert_dispatcher_clone_for_handlers() {
-        let coord = Arc::new(CoordinatorClient::new("http://localhost:8080".to_string()));
+        let coord = Arc::new(CoordinatorClient::new("http://localhost:45831".to_string()));
         let state = AppState::new(coord);
 
         // Clone state (which includes dispatcher)

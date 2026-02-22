@@ -2,9 +2,9 @@
 cargo rustsp run -p dsdn-coordinator
 
 //run node
-cargo rustsp run -p dsdn-node --bin dsdn-node -- auto zone-a 50051 http://127.0.0.1:8080 ./data/nodeA
-cargo rustsp run -p dsdn-node --bin dsdn-node -- auto zone-b 50052 http://127.0.0.1:8080 ./data/nodeB
-cargo rustsp run -p dsdn-node --bin dsdn-node -- auto zone-c 50053 http://127.0.0.1:8080 ./data/nodeC
+cargo rustsp run -p dsdn-node --bin dsdn-node -- auto zone-a 50051 http://127.0.0.1:45831 ./data/nodeA
+cargo rustsp run -p dsdn-node --bin dsdn-node -- auto zone-b 50052 http://127.0.0.1:45831 ./data/nodeB
+cargo rustsp run -p dsdn-node --bin dsdn-node -- auto zone-c 50053 http://127.0.0.1:45831 ./data/nodeC
 
 //run a wasm
 cargo rustsp run -p runtime-cli -- 127.0.0.1:xxxxx <hash>
