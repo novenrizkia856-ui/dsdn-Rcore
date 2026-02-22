@@ -48,6 +48,7 @@
 //! |--------|-------------|
 //! | `execution_result` | `WasmExecutionResult` and `ResourceUsage` types (14C.B.1) |
 //! | `merkle` | Deterministic binary Merkle tree over execution traces (14C.B.1) |
+//! | `state_capture` | Domain-separated SHA3-256 hashing for input, output, memory (14C.B.2) |
 //!
 //! ## Merkle Tree — Cross-Crate Compatibility
 //!
@@ -91,8 +92,26 @@ pub mod execution_result;
 /// Algorithm identical to coordinator's `compute_trace_merkle_root`.
 pub mod merkle;
 
+/// Domain-separated SHA3-256 hashing for WASM execution state (14C.B.2).
+///
+/// Provides three pure hashing functions with distinct domain prefixes:
+/// - `hash_input`: prefix `DSDN:wasm_input:v1:` — hash workload input before execution
+/// - `hash_output`: prefix `DSDN:wasm_output:v1:` — hash captured stdout after execution
+/// - `hash_memory_snapshot`: prefix `DSDN:wasm_memory:v1:` — hash WASM linear memory
+///
+/// Domain separation prevents cross-context collisions: identical bytes
+/// hashed as "input" vs "output" produce different digests. The `v1`
+/// version tag enables future scheme changes without breaking existing
+/// commitments.
+///
+/// These hashes feed directly into [`WasmExecutionResult`] fields
+/// (`input_hash`, `output_hash`, `state_root_before`, `state_root_after`)
+/// and must be deterministic for fraud-proof reproducibility.
+pub mod state_capture;
+
 pub use execution_result::{WasmExecutionResult, ResourceUsage};
 pub use merkle::compute_trace_merkle_root;
+pub use state_capture::{hash_input, hash_output, hash_memory_snapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLimits {
