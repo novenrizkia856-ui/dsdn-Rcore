@@ -10,21 +10,23 @@
 //! lifecycle management (start, stop, exec). Implementations include
 //! [`MockVMController`] for testing and `FirecrackerVM` for production.
 //!
-//! ## Execution Commitment Pipeline (14C.B.8)
+//! ## Execution Commitment Pipeline (14C.B.8–14C.B.9)
 //!
-//! For committed execution, the VM runtime produces [`VmExecutionResult`]
-//! containing all data needed to construct an `ExecutionCommitment`:
+//! For committed execution, [`exec_committed`] wraps [`MicroVM::exec`] to
+//! produce [`VmExecutionResult`] with all data for `ExecutionCommitment`:
 //!
 //! ```text
-//! ┌─── VM Committed Execution ──────────────────────────────────────┐
+//! ┌─── exec_committed() ────────────────────────────────────────────┐
 //! │                                                                   │
 //! │  input_bytes ──► hash_input()    [DSDN:wasm_input:v1:]          │
-//! │  vm_image    ──► hash_memory_snapshot()  → state_root_before    │
+//! │  input_bytes ──► SHA3-256(vm_state:v1:before: || input)         │
+//! │                   → state_root_before                            │
 //! │                                                                   │
-//! │  MicroVM::exec() → stdout, stderr, exit_code                     │
+//! │  MicroVM::exec(cmd, timeout) → ExecOutput                        │
 //! │                                                                   │
 //! │  stdout      ──► hash_output()   [DSDN:wasm_output:v1:]         │
-//! │  stdout      ──► hash_memory_snapshot()  → state_root_after     │
+//! │  stdout      ──► SHA3-256(vm_state:v1:after: || stdout)          │
+//! │                   → state_root_after                             │
 //! │  trace       ──► compute_trace_merkle_root()                     │
 //! │                                                                   │
 //! │  VmExecutionResult                                                │
@@ -58,6 +60,7 @@
 //! | [`execution_result`] | [`VmExecutionResult`], [`VmResourceUsage`] types + commitment bridge |
 //! | [`merkle`] | `compute_trace_merkle_root` — byte-identical to WASM/coordinator |
 //! | [`state_capture`] | `hash_input`, `hash_output`, `hash_memory_snapshot` — identical domain separators |
+//! | [`committed_execution`] | `exec_committed` — async wrapper producing [`VmExecutionResult`] (14C.B.9) |
 //! | [`firecracker_vm`] | Firecracker microVM backend (skeleton) |
 //! | [`mock_vm`] | Process-based mock VM for testing |
 
@@ -86,6 +89,30 @@ pub mod merkle;
 /// `DSDN:wasm_input:v1:`, `DSDN:wasm_output:v1:`, `DSDN:wasm_memory:v1:`.
 pub mod state_capture;
 
+/// Committed VM execution wrapper (14C.B.9).
+///
+/// [`exec_committed`] wraps [`MicroVM::exec`] without modifying it. It adds
+/// state capture (input/output hashing, VM-specific state root computation),
+/// V1 minimal execution trace, Merkle root computation, and resource usage
+/// estimation. Returns [`VmExecutionResult`] with all data needed to construct
+/// an `ExecutionCommitment`.
+///
+/// ## State Root Design (V1)
+///
+/// VM state roots use VM-specific domain prefixes distinct from WASM:
+/// - `state_root_before`: `SHA3-256(b"DSDN:vm_state:v1:before:" || input_bytes)`
+/// - `state_root_after`: `SHA3-256(b"DSDN:vm_state:v1:after:" || stdout)`
+///
+/// `hash_input` and `hash_output` still use cross-runtime prefixes
+/// (`DSDN:wasm_input:v1:`, `DSDN:wasm_output:v1:`) for commitment format
+/// compatibility.
+///
+/// ## Determinism
+///
+/// All commitment-critical fields are deterministic. `execution_time_ms`
+/// is wall-clock (non-deterministic) but does not affect commitment hash.
+pub mod committed_execution;
+
 /// Re-exported from [`execution_result`].
 pub use execution_result::{VmExecutionResult, VmResourceUsage};
 
@@ -95,6 +122,10 @@ pub use merkle::compute_trace_merkle_root;
 
 /// Re-exported from [`state_capture`]. Domain-separated SHA3-256 hashing.
 pub use state_capture::{hash_input, hash_output, hash_memory_snapshot};
+
+/// Re-exported from [`committed_execution`]: commitment-producing VM
+/// execution wrapper that calls [`MicroVM::exec`] internally.
+pub use committed_execution::exec_committed;
 
 use async_trait::async_trait;
 use thiserror::Error;
