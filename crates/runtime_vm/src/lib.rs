@@ -61,9 +61,16 @@
 //! | [`merkle`] | `compute_trace_merkle_root` — byte-identical to WASM/coordinator |
 //! | [`state_capture`] | `hash_input`, `hash_output`, `hash_memory_snapshot` — identical domain separators |
 //! | [`committed_execution`] | `exec_committed` — async wrapper producing [`VmExecutionResult`] (14C.B.9) |
-//! | [`firecracker_vm`] | Firecracker microVM backend (skeleton) |
+//! | [`firecracker_vm`] | Firecracker microVM backend (skeleton + committed execution placeholder, 14C.B.10) |
 //! | [`mock_vm`] | Process-based mock VM for testing |
 
+/// Firecracker microVM backend (skeleton).
+///
+/// `FirecrackerVM` implements [`MicroVM`] with `NotImplemented` stubs for
+/// start/stop/exec. Also provides `exec_committed()` placeholder (14C.B.10)
+/// with matching signature to [`exec_committed`] free function, returning
+/// `MicroVmError::NotImplemented`. Full implementation requires kernel image,
+/// rootfs, vsock agent, and API socket integration.
 pub mod firecracker_vm;
 
 // ════════════════════════════════════════════════════════════════════════════════

@@ -1,4 +1,6 @@
 use crate::{MicroVM, MicroVmError, MicroVmResult, ExecOutput};
+use crate::execution_result::VmExecutionResult;
+use dsdn_common::coordinator::WorkloadId;
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
@@ -39,8 +41,47 @@ pub struct FirecrackerVM {
 }
 
 impl FirecrackerVM {
+    /// Creates a new `FirecrackerVM` with the given configuration.
     pub fn new(cfg: FirecrackerConfig) -> Self {
         Self { cfg }
+    }
+
+    /// Committed execution placeholder for Firecracker backend (14C.B.10).
+    ///
+    /// Returns `MicroVmError::NotImplemented` unconditionally. This method
+    /// exists to maintain interface parity with the `exec_committed` free
+    /// function used by `MockVMController`. When Firecracker integration is
+    /// complete, this will wrap `exec()` with state capture identical to
+    /// [`crate::committed_execution::exec_committed`]:
+    ///
+    /// - `hash_input` / `hash_output` with cross-runtime domain separators
+    /// - VM-specific state roots (`DSDN:vm_state:v1:before/after:`)
+    /// - `compute_trace_merkle_root` for execution trace
+    /// - `VmExecutionResult` → `ExecutionCommitment` bridge
+    ///
+    /// ## V1 Status
+    ///
+    /// Not implemented. Firecracker requires kernel image, rootfs, vsock
+    /// agent, and API socket integration before committed execution can
+    /// produce meaningful commitment data.
+    ///
+    /// ## Signature Parity
+    ///
+    /// Parameters match `exec_committed(vm, workload_id, cmd, input_bytes,
+    /// timeout_ms)` with `&self` replacing the `vm: &dyn MicroVM` parameter.
+    #[allow(unused_variables)]
+    pub async fn exec_committed(
+        &self,
+        workload_id: WorkloadId,
+        cmd: Vec<String>,
+        input_bytes: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> MicroVmResult<VmExecutionResult> {
+        Err(MicroVmError::NotImplemented(
+            "FirecrackerVM committed execution not implemented yet. \
+             Requires full Firecracker integration (kernel, rootfs, vsock agent)."
+                .into(),
+        ))
     }
 }
 
