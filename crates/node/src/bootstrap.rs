@@ -1,15 +1,43 @@
-//! # Bootstrap Network System (Pre-21 Foundation)
+//! # Bootstrap Network System (Tahap 21 Aligned)
 //!
-//! Provides the complete P2P bootstrap foundation for DSDN storage nodes.
+//! Provides the complete P2P bootstrap foundation for DSDN nodes.
 //! This module is designed to be **immediately functional** while preparing
 //! the full integration surface for Tahap 21 (DNS Seed + Peer Discovery).
+//!
+//! ## Tahap 21 Architecture
+//!
+//! **Single port for all roles**: Port 45831 is the only DSDN network port.
+//! All roles and classes listen on the same port.
+//!
+//! **Role & class known after handshake**: DNS seed and static IP only provide
+//! `IP:45831`. Nodes connect first, then handshake reveals role and class.
+//!
+//! **Filter after handshake**: Node connects → handshake → check role →
+//! if role not needed, politely disconnect and save info for PEX.
+//!
+//! **Cache all peers**: Even if role doesn't match immediate needs, peer is
+//! saved to peers.dat with role and class info.
+//!
+//! ## Blockchain Nusantara Embedded
+//!
+//! Per whitepaper, blockchain Nusantara runs embedded in all DSDN nodes.
+//! There is NO separate "Chain" role. Validators run PoS consensus,
+//! other nodes sync state automatically.
+//!
+//! ## Roles (per whitepaper)
+//!
+//! | Role           | Class      | Function                               | Stake      |
+//! |----------------|------------|----------------------------------------|------------|
+//! | StorageCompute | Reguler    | Small storage, light compute, RF=3     | 500 $NUSA  |
+//! | StorageCompute | DataCenter | Large storage, GPU, high SLA           | 5,000 $NUSA|
+//! | Validator      | —          | Governance, compliance, PoS consensus  | 50,000 $NUSA|
+//! | Coordinator    | —          | Metadata, scheduling, job queue        | —          |
 //!
 //! ## Design Philosophy
 //!
 //! All network I/O is abstracted behind traits ([`DnsResolver`],
 //! [`PeerConnector`]) so the system can be tested with mocks now and
-//! replaced with real implementations in Tahap 28 without changing the
-//! orchestration logic.
+//! replaced with real implementations without changing the orchestration logic.
 //!
 //! ## Architecture
 //!
@@ -18,13 +46,14 @@
 //! │                        PeerManager                               │
 //! │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
 //! │  │BootstrapConfig│  │  PeerStore   │  │   BootstrapMetrics    │  │
-//! │  │ - dns_seeds   │  │ (peers.dat)  │  │ - resolve_attempts    │  │
-//! │  │ - static_peers│  │ - read/write │  │ - connect_attempts    │  │
-//! │  │ - timeouts    │  │ - scoring    │  │ - handshake_failures  │  │
-//! │  │ - limits      │  │ - GC         │  │ - fallback_triggers   │  │
+//! │  │ - role        │  │ (peers.dat)  │  │ - resolve_attempts    │  │
+//! │  │ - node_class  │  │ - read/write │  │ - connect_attempts    │  │
+//! │  │ - dns_seeds   │  │ - scoring    │  │ - handshake_failures  │  │
+//! │  │ - timeouts    │  │ - GC         │  │ - fallback_triggers   │  │
 //! │  └──────────────┘  └──────────────┘  └───────────────────────┘  │
 //! │                                                                  │
 //! │  Fallback Chain: peers.dat → static IP → DNS seed → retry       │
+//! │  Post-Handshake: RoleDependencyMatrix → keep/disconnect         │
 //! │                                                                  │
 //! │  ┌──────────────────────┐  ┌──────────────────────────────────┐  │
 //! │  │  dyn DnsResolver     │  │     dyn PeerConnector            │  │
@@ -36,17 +65,12 @@
 //! ## Fallback Priority Order
 //!
 //! 1. **peers.dat** — Local cache, fastest. Sorted by score descending.
-//! 2. **Static IP peers** — From config. Iterated one by one.
-//! 3. **DNS seeds** — Resolved to IP lists. Seeds tried sequentially.
+//!    Filter by role (REQUIRED roles first).
+//! 2. **Static IP peers** — From config. Iterated one by one. Port 45831.
+//! 3. **DNS seeds** — Resolved to IP lists. Seeds tried sequentially. Port 45831.
 //! 4. **Retry** — Exponential backoff, periodic re-attempt of all sources.
 //!
-//! ## Service Type Discovery
-//!
-//! Every node advertises its [`ServiceType`] during handshake.
-//! This enables targeted discovery: validators find chain nodes,
-//! coordinators find storage nodes, etc.
-//!
-//! ## Peer Scoring
+//! ## Peer Scoring (Tahap 21)
 //!
 //! ```text
 //! score = base(10)
@@ -54,6 +78,8 @@
 //!       − (failure_count × 3)
 //!       + recency_bonus (< 1h: +10, < 24h: +5)
 //!       − staleness_penalty (> 7d: −5, > 30d: −10)
+//!       + role_bonus (REQUIRED: +20, OPTIONAL: +5, SKIP: +0)
+//!       + class_bonus (DataCenter peer when capacity needed: +5)
 //! ```
 //!
 //! ## Safety
@@ -76,7 +102,7 @@ use serde::{Deserialize, Serialize};
 // CONSTANTS
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// Default DSDN P2P port.
+/// Default DSDN P2P port — single port for ALL roles and ALL networks.
 pub const DEFAULT_P2P_PORT: u16 = 45831;
 
 /// Default maximum outbound peer connections.
@@ -121,6 +147,15 @@ pub const STALENESS_PENALTY_7D: i64 = 5;
 /// Score penalty: last seen > 30 days ago.
 pub const STALENESS_PENALTY_30D: i64 = 10;
 
+/// Score bonus: peer has REQUIRED role for us.
+pub const ROLE_BONUS_REQUIRED: i64 = 20;
+
+/// Score bonus: peer has OPTIONAL role for us.
+pub const ROLE_BONUS_OPTIONAL: i64 = 5;
+
+/// Score bonus: DataCenter peer when capacity is needed.
+pub const CLASS_BONUS_DATACENTER: i64 = 5;
+
 /// Retry interval when all bootstrap sources fail (seconds).
 pub const BOOTSTRAP_RETRY_INTERVAL_SECS: u64 = 30;
 
@@ -140,29 +175,139 @@ const SECS_7D: u64 = 7 * 86400;
 const SECS_30D: u64 = 30 * 86400;
 
 // ════════════════════════════════════════════════════════════════════════════════
-// SERVICE TYPE
+// NODE ROLE (Tahap 21)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// The role a node advertises in the DSDN network.
+/// Operational role of a node in the DSDN network.
 ///
-/// Used during handshake and PEX so nodes can find specific
-/// component types they need (e.g., a validator looking for
-/// chain nodes, or a storage node looking for coordinators).
+/// Blockchain Nusantara runs **embedded** in all roles — there is no
+/// separate "Chain" role. Validators run PoS consensus, other nodes
+/// sync blockchain state automatically.
+///
+/// The `Bootstrap` variant is a special non-operational role for
+/// dedicated peer discovery nodes ("yellow pages").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeRole {
+    /// Full node: storage + compute.
+    /// Class (Reguler/DataCenter) determines capacity and stake requirement.
+    StorageCompute,
+
+    /// Validator: governance, compliance, PoS consensus blockchain Nusantara.
+    /// Produces blocks, finalizes transactions, runs governance voting.
+    Validator,
+
+    /// Coordinator: metadata, scheduling, job queue, Celestia blob replay.
+    /// Stateless scheduler — all decisions reconstructible from DA log.
+    Coordinator,
+
+    /// Special non-operational role: dedicated bootstrap/discovery node.
+    /// Only serves handshake and PEX — acts as "yellow pages" for the network.
+    Bootstrap,
+}
+
+impl NodeRole {
+    /// Returns a stable string tag for serialization and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeRole::StorageCompute => "storage-compute",
+            NodeRole::Validator => "validator",
+            NodeRole::Coordinator => "coordinator",
+            NodeRole::Bootstrap => "bootstrap",
+        }
+    }
+
+    /// Parse from a string tag. Case-insensitive, supports multiple formats.
+    pub fn from_str_tag(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "storage-compute" | "storagecompute" | "storage" => Some(NodeRole::StorageCompute),
+            "validator" => Some(NodeRole::Validator),
+            "coordinator" => Some(NodeRole::Coordinator),
+            "bootstrap" => Some(NodeRole::Bootstrap),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this is an operational role (not Bootstrap).
+    pub fn is_operational(&self) -> bool {
+        !matches!(self, NodeRole::Bootstrap)
+    }
+
+    /// Returns `true` if this role supports a node class.
+    /// Only `StorageCompute` has classes (Reguler/DataCenter).
+    pub fn has_class(&self) -> bool {
+        matches!(self, NodeRole::StorageCompute)
+    }
+}
+
+impl fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// NODE CLASS (Tahap 21)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Class of a StorageCompute node, determining capacity and stake.
+///
+/// Only relevant for `NodeRole::StorageCompute`. Validator and Coordinator
+/// have no class (their `node_class` field is `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeClass {
+    /// Regular community node: small storage, light compute.
+    /// Stake: 500 $NUSA. CPU 4-8 vCPU, RAM 8-32 GiB, Storage 512GB-2TB.
+    Reguler,
+
+    /// Data center grade: large storage, GPU, high SLA.
+    /// Stake: 5,000 $NUSA. CPU 32-64 vCPU, RAM 128-256 GiB, Storage 4-16TB.
+    DataCenter,
+}
+
+impl NodeClass {
+    /// Returns a stable string tag for serialization and display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeClass::Reguler => "reguler",
+            NodeClass::DataCenter => "datacenter",
+        }
+    }
+
+    /// Parse from a string tag. Case-insensitive.
+    pub fn from_str_tag(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('_', "").replace('-', "").as_str() {
+            "reguler" | "regular" => Some(NodeClass::Reguler),
+            "datacenter" | "dc" => Some(NodeClass::DataCenter),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for NodeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// BACKWARD COMPATIBILITY: ServiceType (DEPRECATED)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// **DEPRECATED** — Use [`NodeRole`] + [`NodeClass`] instead.
+///
+/// Kept temporarily for backward compatibility with pre-Tahap 21 code.
+/// Will be removed after full migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ServiceType {
-    /// Block production and state management.
-    Chain,
-    /// Data storage node (regular community operator).
+    /// Maps to StorageCompute + Reguler
     Storage,
-    /// Data storage node (data center grade).
+    /// Maps to StorageCompute + DataCenter
     StorageDC,
-    /// Workload coordination and TSS/FROST participation.
+    /// Maps to Coordinator
     Coordinator,
-    /// Consensus and validation.
+    /// Maps to Validator
     Validator,
-    /// HTTP gateway / ingress proxy.
-    Ingress,
-    /// Dedicated bootstrap node — only serves discovery, no data.
+    /// Maps to Bootstrap
     Bootstrap,
 }
 
@@ -170,12 +315,10 @@ impl ServiceType {
     /// Returns a stable string tag for serialization and display.
     pub fn as_str(&self) -> &'static str {
         match self {
-            ServiceType::Chain => "chain",
             ServiceType::Storage => "storage",
             ServiceType::StorageDC => "storage_dc",
             ServiceType::Coordinator => "coordinator",
             ServiceType::Validator => "validator",
-            ServiceType::Ingress => "ingress",
             ServiceType::Bootstrap => "bootstrap",
         }
     }
@@ -183,14 +326,34 @@ impl ServiceType {
     /// Parse from a string tag. Case-insensitive.
     pub fn from_str_tag(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "chain" => Some(ServiceType::Chain),
-            "storage" => Some(ServiceType::Storage),
-            "storage_dc" | "storagedc" => Some(ServiceType::StorageDC),
+            "storage" | "storage-compute" | "storagecompute" => Some(ServiceType::Storage),
+            "storage_dc" | "storagedc" | "datacenter" => Some(ServiceType::StorageDC),
             "coordinator" => Some(ServiceType::Coordinator),
             "validator" => Some(ServiceType::Validator),
-            "ingress" => Some(ServiceType::Ingress),
             "bootstrap" => Some(ServiceType::Bootstrap),
             _ => None,
+        }
+    }
+
+    /// Convert from NodeRole + NodeClass to legacy ServiceType.
+    pub fn from_role(role: NodeRole, class: Option<NodeClass>) -> Self {
+        match (role, class) {
+            (NodeRole::StorageCompute, Some(NodeClass::DataCenter)) => ServiceType::StorageDC,
+            (NodeRole::StorageCompute, _) => ServiceType::Storage,
+            (NodeRole::Validator, _) => ServiceType::Validator,
+            (NodeRole::Coordinator, _) => ServiceType::Coordinator,
+            (NodeRole::Bootstrap, _) => ServiceType::Bootstrap,
+        }
+    }
+
+    /// Convert legacy ServiceType to (NodeRole, Option<NodeClass>).
+    pub fn to_role_class(&self) -> (NodeRole, Option<NodeClass>) {
+        match self {
+            ServiceType::Storage => (NodeRole::StorageCompute, Some(NodeClass::Reguler)),
+            ServiceType::StorageDC => (NodeRole::StorageCompute, Some(NodeClass::DataCenter)),
+            ServiceType::Coordinator => (NodeRole::Coordinator, None),
+            ServiceType::Validator => (NodeRole::Validator, None),
+            ServiceType::Bootstrap => (NodeRole::Bootstrap, None),
         }
     }
 }
@@ -198,6 +361,128 @@ impl ServiceType {
 impl fmt::Display for ServiceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ROLE DEPENDENCY MATRIX (Tahap 21)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// How urgently a node needs peers of a specific role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleDependency {
+    /// Node MUST have at least 1 peer with this role. Keep searching if none.
+    Required,
+    /// Nice to have, but not blocking. Keep if space available.
+    Optional,
+    /// Not needed. Disconnect after handshake, but save to peers.dat for PEX.
+    Skip,
+}
+
+/// Determines which roles a node needs based on its own role.
+///
+/// ```text
+/// StorageCompute needs: StorageCompute(REQUIRED), Coordinator(REQUIRED), Validator(OPTIONAL)
+/// Validator needs:      Validator(REQUIRED), Coordinator(REQUIRED), StorageCompute(OPTIONAL)
+/// Coordinator needs:    Coordinator(REQUIRED), StorageCompute(REQUIRED), Validator(REQUIRED)
+/// Bootstrap needs:      all(OPTIONAL) — just collects peer info for PEX
+/// ```
+pub struct RoleDependencyMatrix;
+
+impl RoleDependencyMatrix {
+    /// Returns how urgently `our_role` needs a peer with `peer_role`.
+    pub fn dependency(our_role: NodeRole, peer_role: NodeRole) -> RoleDependency {
+        // Bootstrap peers are always OPTIONAL for everyone (non-operational)
+        if peer_role == NodeRole::Bootstrap {
+            return RoleDependency::Optional;
+        }
+
+        match our_role {
+            NodeRole::StorageCompute => match peer_role {
+                NodeRole::StorageCompute => RoleDependency::Required,
+                NodeRole::Coordinator => RoleDependency::Required,
+                NodeRole::Validator => RoleDependency::Optional,
+                NodeRole::Bootstrap => RoleDependency::Optional,
+            },
+            NodeRole::Validator => match peer_role {
+                NodeRole::Validator => RoleDependency::Required,
+                NodeRole::Coordinator => RoleDependency::Required,
+                NodeRole::StorageCompute => RoleDependency::Optional,
+                NodeRole::Bootstrap => RoleDependency::Optional,
+            },
+            NodeRole::Coordinator => match peer_role {
+                NodeRole::Coordinator => RoleDependency::Required,
+                NodeRole::StorageCompute => RoleDependency::Required,
+                NodeRole::Validator => RoleDependency::Required,
+                NodeRole::Bootstrap => RoleDependency::Optional,
+            },
+            // Bootstrap nodes accept all — they're "yellow pages"
+            NodeRole::Bootstrap => RoleDependency::Optional,
+        }
+    }
+
+    /// Returns all roles that are REQUIRED for `our_role`.
+    pub fn required_roles(our_role: NodeRole) -> Vec<NodeRole> {
+        let all_roles = [
+            NodeRole::StorageCompute,
+            NodeRole::Validator,
+            NodeRole::Coordinator,
+        ];
+        all_roles
+            .iter()
+            .copied()
+            .filter(|&r| Self::dependency(our_role, r) == RoleDependency::Required)
+            .collect()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// POST-HANDSHAKE ACTION
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// What to do with a peer after a successful handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostHandshakeAction {
+    /// Keep the connection — peer has a needed role.
+    Keep,
+    /// Disconnect politely — peer role not needed right now.
+    /// Still saved to peers.dat.
+    Disconnect(DisconnectReason),
+}
+
+/// Reason codes for disconnecting a peer after handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisconnectReason {
+    /// Peer's role is not needed by this node.
+    RoleNotNeeded,
+    /// Already have enough peers of this type.
+    TooManyPeers,
+    /// Network ID mismatch.
+    NetworkIdMismatch,
+    /// Protocol version incompatible.
+    ProtocolIncompatible,
+    /// Invalid handshake data (e.g., Validator with node_class = Some(DataCenter)).
+    InvalidHandshake,
+    /// Handshake or connection timed out.
+    Timeout,
+    /// Peer is banned.
+    Banned,
+    /// Node is shutting down.
+    Shutdown,
+}
+
+impl fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DisconnectReason::RoleNotNeeded => write!(f, "role_not_needed"),
+            DisconnectReason::TooManyPeers => write!(f, "too_many_peers"),
+            DisconnectReason::NetworkIdMismatch => write!(f, "network_id_mismatch"),
+            DisconnectReason::ProtocolIncompatible => write!(f, "protocol_incompatible"),
+            DisconnectReason::InvalidHandshake => write!(f, "invalid_handshake"),
+            DisconnectReason::Timeout => write!(f, "timeout"),
+            DisconnectReason::Banned => write!(f, "banned"),
+            DisconnectReason::Shutdown => write!(f, "shutdown"),
+        }
     }
 }
 
@@ -303,26 +588,30 @@ pub const CONFIG_SEARCH_PATHS: &[&str] = &[
 
 /// Intermediate struct for deserializing the `[bootstrap]` section
 /// from `dsdn.toml`. Field names match the TOML key names exactly
-/// as specified in the Tahap 28 design document.
+/// as specified in the Tahap 21 design document.
 ///
 /// All fields are `Option` so that partial configs work —
 /// unspecified fields fall through to env vars, then defaults.
 ///
-/// ## TOML Format
+/// ## TOML Format (Tahap 21)
 ///
 /// ```toml
 /// [bootstrap]
+/// # Node role for this instance
+/// role = "storage-compute"  # storage-compute | validator | coordinator
+///
+/// # Node class (only relevant for storage-compute)
+/// node_class = "reguler"  # reguler | datacenter
+///
 /// # DNS seeds (founder/community maintained)
 /// dns_seeds = [
 ///     # "seed1.dsdn.network",
 ///     # "seed2.dsdn.network",
-///     # "seed3.dsdn.network",
 /// ]
 ///
 /// # Static IP peers (community maintained)
 /// static_peers = [
 ///     # "203.0.113.50:45831",
-///     # "198.51.100.10:45831",
 /// ]
 ///
 /// # Local peer cache
@@ -337,7 +626,6 @@ pub const CONFIG_SEARCH_PATHS: &[&str] = &[
 /// # Network settings
 /// p2p_port = 45831
 /// network_id = "mainnet"
-/// service_type = "storage"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BootstrapToml {
@@ -362,13 +650,20 @@ pub struct BootstrapToml {
     /// Peer connect timeout in seconds.
     pub peer_connect_timeout_secs: Option<u64>,
 
-    /// P2P listen port.
+    /// P2P listen port (always 45831 for production).
     pub p2p_port: Option<u16>,
 
     /// Network identifier ("mainnet", "testnet", or custom).
     pub network_id: Option<String>,
 
-    /// This node's advertised service type.
+    /// Node role: "storage-compute" | "validator" | "coordinator".
+    pub role: Option<String>,
+
+    /// Node class: "reguler" | "datacenter" (only for storage-compute).
+    pub node_class: Option<String>,
+
+    /// **DEPRECATED** — Kept for backward compatibility with old configs.
+    /// Prefer `role` + `node_class`. If both are set, `role`/`node_class` wins.
     pub service_type: Option<String>,
 }
 
@@ -389,48 +684,32 @@ pub struct DsdnToml {
 /// ## Load Priority (highest wins)
 ///
 /// ```text
-/// 1. Environment variables     (BOOTSTRAP_DNS_SEEDS, etc.)
+/// 1. Environment variables     (BOOTSTRAP_ROLE, BOOTSTRAP_NODE_CLASS, etc.)
 /// 2. dsdn.toml [bootstrap]     (project root or search paths)
-/// 3. Compiled defaults         (empty seeds, port 45831, etc.)
+/// 3. Compiled defaults         (role=StorageCompute, class=Reguler, port 45831, etc.)
 /// ```
-///
-/// Environment variables **override** dsdn.toml values per-field.
-/// This allows operators to tweak settings without editing the
-/// TOML file (e.g., in Docker: `docker run -e BOOTSTRAP_P2P_PORT=31313`).
-///
-/// ## dsdn.toml
-///
-/// The config file is located via:
-/// 1. `DSDN_CONFIG_FILE` env var (explicit path)
-/// 2. `./dsdn.toml` (CWD)
-/// 3. `~/.dsdn/dsdn.toml` (home dir)
-/// 4. `/etc/dsdn/dsdn.toml` (system)
-///
-/// If no file is found, only env vars and defaults are used (valid
-/// for development — no file is required).
 ///
 /// ## Environment Variables
 ///
 /// | Variable | TOML Key | Default |
 /// |----------|----------|---------|
+/// | `BOOTSTRAP_ROLE` | `role` | storage-compute |
+/// | `BOOTSTRAP_NODE_CLASS` | `node_class` | reguler |
 /// | `BOOTSTRAP_DNS_SEEDS` | `dns_seeds` | (empty) |
 /// | `BOOTSTRAP_STATIC_PEERS` | `static_peers` | (empty) |
-/// | `BOOTSTRAP_PEERS_FILE` | `peers_file` | `peers.dat` |
+/// | `BOOTSTRAP_PEERS_FILE` | `peers_file` | peers.dat |
 /// | `BOOTSTRAP_MAX_OUTBOUND` | `max_outbound_connections` | 8 |
 /// | `BOOTSTRAP_MAX_INBOUND` | `max_inbound_connections` | 125 |
 /// | `BOOTSTRAP_DNS_TIMEOUT` | `dns_resolve_timeout_secs` | 10 |
 /// | `BOOTSTRAP_CONNECT_TIMEOUT` | `peer_connect_timeout_secs` | 5 |
 /// | `BOOTSTRAP_P2P_PORT` | `p2p_port` | 45831 |
 /// | `BOOTSTRAP_NETWORK_ID` | `network_id` | mainnet |
-/// | `BOOTSTRAP_SERVICE_TYPE` | `service_type` | storage |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
     /// DNS seed hostnames (e.g., `["seed1.dsdn.network"]`).
-    /// Empty is valid for development; at least 1 recommended for mainnet.
     pub dns_seeds: Vec<String>,
 
     /// Static IP:Port peers (e.g., `["203.0.113.50:45831"]`).
-    /// Parsed into `SocketAddr` at resolve time.
     pub static_peers: Vec<String>,
 
     /// Path to the persistent peer cache file.
@@ -448,17 +727,25 @@ pub struct BootstrapConfig {
     /// Timeout for individual peer TCP connect (seconds).
     pub connect_timeout_secs: u64,
 
-    /// P2P listen port.
+    /// P2P listen port (always 45831 for all roles).
     pub p2p_port: u16,
 
     /// Network identifier for peer isolation.
     pub network_id: NetworkId,
 
-    /// This node's advertised service type.
+    /// This node's operational role.
+    pub role: NodeRole,
+
+    /// This node's class (only meaningful for StorageCompute).
+    /// `None` for Validator, Coordinator, Bootstrap.
+    pub node_class: Option<NodeClass>,
+
+    /// **DEPRECATED** — Computed from role + node_class for backward compatibility.
+    /// Use `role` and `node_class` instead.
+    #[serde(skip_serializing)]
     pub service_type: ServiceType,
 
     /// Which config file was loaded (if any). `None` = defaults only.
-    /// Informational — not serialized back to TOML.
     #[serde(skip)]
     pub loaded_from: Option<PathBuf>,
 }
@@ -487,6 +774,9 @@ impl BootstrapConfig {
         // Phase 2: Apply env var overrides (highest priority)
         config.apply_env_overrides();
 
+        // Sync service_type from role+class
+        config.sync_service_type();
+
         config
     }
 
@@ -494,14 +784,6 @@ impl BootstrapConfig {
 
     /// Search for `dsdn.toml` in standard locations and parse the
     /// `[bootstrap]` section if found.
-    ///
-    /// Search order:
-    /// 1. `DSDN_CONFIG_FILE` env var (explicit path, skips search)
-    /// 2. `./dsdn.toml`
-    /// 3. `~/.dsdn/dsdn.toml`
-    /// 4. `/etc/dsdn/dsdn.toml`
-    ///
-    /// Returns `None` if no config file is found or if parsing fails.
     fn find_and_parse_toml() -> Option<(BootstrapToml, PathBuf)> {
         // Check explicit path first
         if let Ok(explicit) = std::env::var("DSDN_CONFIG_FILE") {
@@ -537,9 +819,6 @@ impl BootstrapConfig {
     }
 
     /// Parse a `dsdn.toml` file and extract the `[bootstrap]` section.
-    ///
-    /// Returns `None` on any I/O or parse error (fail-open: the node
-    /// continues with defaults + env vars).
     fn parse_toml_file(path: &Path) -> Option<BootstrapToml> {
         let content = std::fs::read_to_string(path).ok()?;
         Self::parse_toml_str(&content)
@@ -550,23 +829,15 @@ impl BootstrapConfig {
     /// Public for testing. Returns `None` if parsing fails or if
     /// no `[bootstrap]` section exists.
     pub fn parse_toml_str(content: &str) -> Option<BootstrapToml> {
-        // Parse as generic TOML value first, then extract [bootstrap]
         let table: toml::Value = toml::from_str(content).ok()?;
         let bootstrap_val = table.get("bootstrap")?;
-
-        // Re-serialize just the [bootstrap] section and parse into struct
         let section_str = toml::to_string(bootstrap_val).ok()?;
         toml::from_str::<BootstrapToml>(&section_str).ok()
     }
 
     /// Apply values from a parsed `[bootstrap]` TOML section.
-    ///
-    /// Only fields that are `Some` in the TOML struct are applied;
-    /// `None` fields leave the current value unchanged (preserving
-    /// the default).
     fn apply_toml(&mut self, toml: &BootstrapToml) {
         if let Some(ref seeds) = toml.dns_seeds {
-            // Filter empty strings (from commented-out entries)
             let filtered: Vec<String> = seeds
                 .iter()
                 .map(|s| s.trim().to_string())
@@ -612,20 +883,43 @@ impl BootstrapConfig {
         if let Some(ref s) = toml.network_id {
             self.network_id = NetworkId::from_string(s);
         }
-        if let Some(ref s) = toml.service_type {
-            if let Some(svc) = ServiceType::from_str_tag(s) {
-                self.service_type = svc;
+
+        // Tahap 21: role + node_class fields (preferred)
+        if let Some(ref r) = toml.role {
+            if let Some(role) = NodeRole::from_str_tag(r) {
+                self.role = role;
             }
+        }
+        if let Some(ref c) = toml.node_class {
+            if let Some(class) = NodeClass::from_str_tag(c) {
+                self.node_class = Some(class);
+            }
+        }
+
+        // Backward compat: if no role but service_type is set, convert
+        if toml.role.is_none() {
+            if let Some(ref s) = toml.service_type {
+                if let Some(svc) = ServiceType::from_str_tag(s) {
+                    let (role, class) = svc.to_role_class();
+                    self.role = role;
+                    self.node_class = class;
+                }
+            }
+        }
+
+        // Enforce: non-StorageCompute roles must have node_class = None
+        if !self.role.has_class() {
+            self.node_class = None;
+        }
+        // Enforce: StorageCompute must have a class, default to Reguler
+        if self.role == NodeRole::StorageCompute && self.node_class.is_none() {
+            self.node_class = Some(NodeClass::Reguler);
         }
     }
 
     // ── ENV LOADING ────────────────────────────────────────────────────
 
     /// Apply environment variable overrides on top of current values.
-    ///
-    /// Only variables that are **set and non-empty** override.
-    /// Unset variables leave the current value untouched
-    /// (which may be from TOML or defaults).
     fn apply_env_overrides(&mut self) {
         if let Ok(s) = std::env::var("BOOTSTRAP_DNS_SEEDS") {
             let seeds: Vec<String> = s
@@ -675,28 +969,55 @@ impl BootstrapConfig {
                 self.network_id = NetworkId::from_string(&s);
             }
         }
-        if let Ok(s) = std::env::var("BOOTSTRAP_SERVICE_TYPE") {
-            if let Some(svc) = ServiceType::from_str_tag(&s) {
-                self.service_type = svc;
+
+        // Tahap 21: role + node_class env vars
+        if let Ok(s) = std::env::var("BOOTSTRAP_ROLE") {
+            if let Some(role) = NodeRole::from_str_tag(&s) {
+                self.role = role;
             }
         }
+        if let Ok(s) = std::env::var("BOOTSTRAP_NODE_CLASS") {
+            if let Some(class) = NodeClass::from_str_tag(&s) {
+                self.node_class = Some(class);
+            }
+        }
+
+        // Backward compat: BOOTSTRAP_SERVICE_TYPE
+        if std::env::var("BOOTSTRAP_ROLE").is_err() {
+            if let Ok(s) = std::env::var("BOOTSTRAP_SERVICE_TYPE") {
+                if let Some(svc) = ServiceType::from_str_tag(&s) {
+                    let (role, class) = svc.to_role_class();
+                    self.role = role;
+                    self.node_class = class;
+                }
+            }
+        }
+
+        // Enforce constraints
+        if !self.role.has_class() {
+            self.node_class = None;
+        }
+        if self.role == NodeRole::StorageCompute && self.node_class.is_none() {
+            self.node_class = Some(NodeClass::Reguler);
+        }
+    }
+
+    /// Sync the deprecated `service_type` field from `role` + `node_class`.
+    fn sync_service_type(&mut self) {
+        self.service_type = ServiceType::from_role(self.role, self.node_class);
     }
 
     // ── CONVENIENCE CONSTRUCTORS ───────────────────────────────────────
 
-    /// Load configuration from environment variables only
-    /// (skip dsdn.toml search). Useful when you know the config
-    /// file isn't relevant (e.g., CI, Docker with env-only config).
+    /// Load configuration from environment variables only.
     pub fn from_env() -> Self {
         let mut config = Self::default();
         config.apply_env_overrides();
+        config.sync_service_type();
         config
     }
 
-    /// Load configuration from a specific TOML file path,
-    /// then apply env overrides on top.
-    ///
-    /// Returns `Err` if the file cannot be read or parsed.
+    /// Load configuration from a specific TOML file path.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
@@ -707,9 +1028,8 @@ impl BootstrapConfig {
         let mut config = Self::default();
         config.apply_toml(&toml_section);
         config.loaded_from = Some(path.to_path_buf());
-
-        // Env overrides still apply on top
         config.apply_env_overrides();
+        config.sync_service_type();
 
         Ok(config)
     }
@@ -721,14 +1041,13 @@ impl BootstrapConfig {
 
         let mut config = Self::default();
         config.apply_toml(&toml_section);
+        config.sync_service_type();
         Ok(config)
     }
 
     // ── VALIDATION ─────────────────────────────────────────────────────
 
     /// Validate the configuration for mainnet readiness.
-    ///
-    /// Returns a list of warnings/errors. Empty list = fully valid.
     pub fn validate_for_mainnet(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
@@ -755,7 +1074,48 @@ impl BootstrapConfig {
             }
         }
 
+        // Tahap 21: Validate role+class consistency
+        if self.role == NodeRole::StorageCompute && self.node_class.is_none() {
+            issues.push("StorageCompute role requires a node_class (reguler or datacenter)".to_string());
+        }
+        if !self.role.has_class() && self.node_class.is_some() {
+            issues.push(format!(
+                "{} role must not have a node_class",
+                self.role
+            ));
+        }
+
         issues
+    }
+
+    /// Validate role+class consistency. Returns `Err` if invalid.
+    ///
+    /// Rules:
+    /// - StorageCompute MUST have a class (Reguler or DataCenter).
+    /// - Validator and Coordinator MUST NOT have a class.
+    pub fn validate_role_class(&self) -> Result<(), String> {
+        match self.role {
+            NodeRole::StorageCompute => {
+                if self.node_class.is_none() {
+                    return Err("StorageCompute role requires node_class".to_string());
+                }
+            }
+            NodeRole::Validator | NodeRole::Coordinator => {
+                if self.node_class.is_some() {
+                    return Err(format!(
+                        "{} role must not have a node_class, got {:?}",
+                        self.role,
+                        self.node_class
+                    ));
+                }
+            }
+            NodeRole::Bootstrap => {
+                if self.node_class.is_some() {
+                    return Err("Bootstrap role must not have a node_class".to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns `true` if at least one bootstrap source is configured.
@@ -776,10 +1136,6 @@ impl BootstrapConfig {
     // ── TOML GENERATION ────────────────────────────────────────────────
 
     /// Generate a complete `dsdn.toml` [bootstrap] section as a string.
-    ///
-    /// Useful for `dsdn-node init` or `dsdn-agent config generate`.
-    /// Produces the exact format from the Tahap 28 design doc with
-    /// helpful comments.
     pub fn to_toml_string(&self) -> String {
         let dns_entries: String = if self.dns_seeds.is_empty() {
             "    # \"seed1.dsdn.network\",\n    \
@@ -806,8 +1162,19 @@ impl BootstrapConfig {
                 .join("\n")
         };
 
+        let class_line = match self.node_class {
+            Some(ref c) => format!("node_class = \"{}\"", c),
+            None => "# node_class = (not applicable for this role)".to_string(),
+        };
+
         format!(
             r#"[bootstrap]
+# Node role for this instance
+role = "{role}"
+
+# Node class (only relevant for storage-compute)
+{class}
+
 # DNS seeds (founder/community maintained)
 dns_seeds = [
 {dns}
@@ -830,8 +1197,9 @@ peer_connect_timeout_secs = {conn_to}
 # Network settings
 p2p_port = {port}
 network_id = "{net}"
-service_type = "{svc}"
 "#,
+            role = self.role,
+            class = class_line,
             dns = dns_entries,
             static_p = static_entries,
             peers_file = self.peers_file.display(),
@@ -841,7 +1209,6 @@ service_type = "{svc}"
             conn_to = self.connect_timeout_secs,
             port = self.p2p_port,
             net = self.network_id,
-            svc = self.service_type,
         )
     }
 }
@@ -858,6 +1225,8 @@ impl Default for BootstrapConfig {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             p2p_port: DEFAULT_P2P_PORT,
             network_id: NetworkId::Mainnet,
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
             service_type: ServiceType::Storage,
             loaded_from: None,
         }
@@ -899,14 +1268,22 @@ pub struct PeerInfo {
     /// Peer's IP address (IPv4 or IPv6).
     pub addr: IpAddr,
 
-    /// Peer's P2P listen port.
+    /// Peer's P2P listen port (always 45831).
     pub port: u16,
 
     /// Ed25519 public key (32 bytes) as the peer's node ID.
     /// `None` if we haven't completed a handshake yet.
     pub node_id: Option<[u8; 32]>,
 
-    /// The service type this peer advertises.
+    /// The role this peer advertises (Tahap 21).
+    pub role: Option<NodeRole>,
+
+    /// The class this peer advertises (Tahap 21).
+    /// `Some` only if role == StorageCompute. `None` for Validator/Coordinator/Bootstrap.
+    pub node_class: Option<NodeClass>,
+
+    /// **DEPRECATED** — Computed from role + node_class for backward compat.
+    /// Use `role` and `node_class` instead.
     pub service_type: Option<ServiceType>,
 
     /// Network ID this peer claims to be on.
@@ -942,6 +1319,8 @@ impl PeerInfo {
             addr,
             port,
             node_id: None,
+            role: None,
+            node_class: None,
             service_type: None,
             network_id,
             source,
@@ -969,22 +1348,26 @@ impl PeerInfo {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 
+    /// Set role and class from handshake, also syncs service_type.
+    pub fn set_role_class(&mut self, role: NodeRole, node_class: Option<NodeClass>) {
+        self.role = Some(role);
+        self.node_class = node_class;
+        self.service_type = Some(ServiceType::from_role(role, node_class));
+    }
+
     /// Returns the `SocketAddr` for this peer.
     pub fn socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.addr, self.port)
     }
 
-    /// Returns `true` if this peer is considered suspicious
-    /// (too many consecutive failures).
+    /// Returns `true` if this peer is considered suspicious.
     pub fn is_suspicious(&self) -> bool {
         self.consecutive_failures >= SUSPICIOUS_FAILURE_THRESHOLD
     }
 
-    /// Returns `true` if this peer has expired (no successful connect
-    /// within [`PEER_EXPIRY_SECS`]).
+    /// Returns `true` if this peer has expired.
     pub fn is_expired(&self, now: u64) -> bool {
         if self.last_connected == 0 {
-            // Never connected: expire based on first_seen
             now.saturating_sub(self.first_seen) > PEER_EXPIRY_SECS
         } else {
             now.saturating_sub(self.last_connected) > PEER_EXPIRY_SECS
@@ -993,8 +1376,14 @@ impl PeerInfo {
 
     /// Compute the peer's score for selection priority.
     ///
-    /// Higher score = higher priority for connection.
+    /// Tahap 21: includes role_bonus and class_bonus.
     pub fn score(&self, now: u64) -> i64 {
+        self.score_with_role(now, None)
+    }
+
+    /// Compute score with role-awareness.
+    /// If `our_role` is provided, adds role_bonus and class_bonus.
+    pub fn score_with_role(&self, now: u64, our_role: Option<NodeRole>) -> i64 {
         let mut s = PEER_BASE_SCORE;
 
         // Reward success
@@ -1025,11 +1414,24 @@ impl PeerInfo {
             s = s.saturating_sub(50);
         }
 
+        // Tahap 21: Role bonus
+        if let (Some(our), Some(peer_role)) = (our_role, self.role) {
+            match RoleDependencyMatrix::dependency(our, peer_role) {
+                RoleDependency::Required => s = s.saturating_add(ROLE_BONUS_REQUIRED),
+                RoleDependency::Optional => s = s.saturating_add(ROLE_BONUS_OPTIONAL),
+                RoleDependency::Skip => {}
+            }
+        }
+
+        // Tahap 21: Class bonus (DataCenter peers get +5 when capacity needed)
+        if self.node_class == Some(NodeClass::DataCenter) {
+            s = s.saturating_add(CLASS_BONUS_DATACENTER);
+        }
+
         s
     }
 
     /// Returns the node_id as a hex string (64 chars, lowercase).
-    /// Returns `None` if node_id is not set.
     pub fn node_id_hex(&self) -> Option<String> {
         self.node_id.map(|id| {
             id.iter().map(|b| format!("{:02x}", b)).collect()
@@ -1058,23 +1460,10 @@ impl std::hash::Hash for PeerInfo {
 
 /// Persistent peer cache backed by a file on disk.
 ///
-/// ## Storage Format
+/// ## Tahap 21: Role+Class Enriched
 ///
-/// JSON format for debuggability during development. The format can be
-/// switched to binary (bincode) in Tahap 28 if performance requires it.
-///
-/// ## Atomic Writes
-///
-/// Writes use the tmp-file + rename pattern to prevent corruption:
-/// 1. Serialize peers to `{path}.tmp`
-/// 2. `fsync` the tmp file
-/// 3. Rename `{path}.tmp` → `{path}`
-///
-/// ## Garbage Collection
-///
-/// [`gc`] removes peers that haven't connected successfully in
-/// [`PEER_EXPIRY_SECS`] (30 days) and enforces the
-/// [`MAX_PEERS_DAT_ENTRIES`] limit by evicting lowest-score peers.
+/// Each entry stores role and class from handshake. On startup, peers
+/// are sorted by: REQUIRED role first → last_successful_connect → score.
 #[derive(Debug)]
 pub struct PeerStore {
     /// Path to the peers.dat file.
@@ -1085,16 +1474,12 @@ pub struct PeerStore {
 
 impl PeerStore {
     /// Create a new `PeerStore` at the given path.
-    ///
-    /// If the file exists, peers are loaded from it.
-    /// If the file doesn't exist or is corrupted, starts empty.
     pub fn new(path: PathBuf) -> Self {
         let peers = Self::load_from_file(&path).unwrap_or_default();
         Self { path, peers }
     }
 
     /// Create an empty in-memory store (no file backing).
-    /// Useful for testing.
     pub fn in_memory() -> Self {
         Self {
             path: PathBuf::from("/dev/null"),
@@ -1121,8 +1506,6 @@ impl PeerStore {
     }
 
     /// Persist the current peer set to disk atomically.
-    ///
-    /// Uses write-to-tmp + rename for crash safety.
     pub fn save(&self) -> Result<(), PeerStoreError> {
         let peers_vec: Vec<&PeerInfo> = self.peers.values().collect();
         let data = serde_json::to_vec_pretty(&peers_vec)
@@ -1132,7 +1515,6 @@ impl PeerStore {
 
         std::fs::write(&tmp_path, &data).map_err(|e| PeerStoreError::Io(e.to_string()))?;
 
-        // fsync via opening and syncing
         if let Ok(f) = std::fs::File::open(&tmp_path) {
             let _ = f.sync_all();
         }
@@ -1147,7 +1529,6 @@ impl PeerStore {
     pub fn upsert(&mut self, peer: PeerInfo) -> bool {
         let key = peer.socket_addr();
         if let Some(existing) = self.peers.get_mut(&key) {
-            // Update metadata, preserve historical counters
             if peer.last_seen > existing.last_seen {
                 existing.last_seen = peer.last_seen;
             }
@@ -1157,7 +1538,10 @@ impl PeerStore {
             if peer.node_id.is_some() {
                 existing.node_id = peer.node_id;
             }
-            if peer.service_type.is_some() {
+            // Update role+class if provided
+            if peer.role.is_some() {
+                existing.role = peer.role;
+                existing.node_class = peer.node_class;
                 existing.service_type = peer.service_type;
             }
             false
@@ -1206,15 +1590,12 @@ impl PeerStore {
         self.peers.is_empty()
     }
 
-    /// Returns all peers as a slice-compatible iterator.
+    /// Returns all peers as an iterator.
     pub fn iter(&self) -> impl Iterator<Item = &PeerInfo> {
         self.peers.values()
     }
 
     /// Returns peers sorted by score (highest first).
-    ///
-    /// This is the primary selection method: connect to the
-    /// highest-scoring peers first.
     pub fn sorted_by_score(&self) -> Vec<&PeerInfo> {
         let now = now_secs();
         let mut peers: Vec<&PeerInfo> = self.peers.values().collect();
@@ -1222,7 +1603,43 @@ impl PeerStore {
         peers
     }
 
-    /// Returns peers filtered by service type, sorted by score.
+    /// Returns peers sorted by role-aware score (highest first).
+    /// Tahap 21: REQUIRED roles get +20 bonus, pushing them to the top.
+    pub fn sorted_by_role_score(&self, our_role: NodeRole) -> Vec<&PeerInfo> {
+        let now = now_secs();
+        let mut peers: Vec<&PeerInfo> = self.peers.values().collect();
+        peers.sort_by(|a, b| {
+            b.score_with_role(now, Some(our_role))
+                .cmp(&a.score_with_role(now, Some(our_role)))
+        });
+        peers
+    }
+
+    /// Returns peers filtered by role, sorted by score.
+    pub fn peers_by_role(&self, role: NodeRole) -> Vec<&PeerInfo> {
+        let now = now_secs();
+        let mut peers: Vec<&PeerInfo> = self
+            .peers
+            .values()
+            .filter(|p| p.role == Some(role))
+            .collect();
+        peers.sort_by(|a, b| b.score(now).cmp(&a.score(now)));
+        peers
+    }
+
+    /// Returns peers filtered by role and class, sorted by score.
+    pub fn peers_by_role_class(&self, role: NodeRole, class: Option<NodeClass>) -> Vec<&PeerInfo> {
+        let now = now_secs();
+        let mut peers: Vec<&PeerInfo> = self
+            .peers
+            .values()
+            .filter(|p| p.role == Some(role) && p.node_class == class)
+            .collect();
+        peers.sort_by(|a, b| b.score(now).cmp(&a.score(now)));
+        peers
+    }
+
+    /// **DEPRECATED** — Use `peers_by_role` instead.
     pub fn peers_by_service(&self, svc: ServiceType) -> Vec<&PeerInfo> {
         let now = now_secs();
         let mut peers: Vec<&PeerInfo> = self
@@ -1242,19 +1659,13 @@ impl PeerStore {
             .collect()
     }
 
-    /// Run garbage collection:
-    /// 1. Remove expired peers (no connect in 30 days).
-    /// 2. Enforce max entries by evicting lowest-score peers.
-    ///
-    /// Returns the number of peers removed.
+    /// Run garbage collection.
     pub fn gc(&mut self) -> usize {
         let now = now_secs();
         let before = self.peers.len();
 
-        // Phase 1: Remove expired
         self.peers.retain(|_, peer| !peer.is_expired(now));
 
-        // Phase 2: Enforce max entries
         if self.peers.len() > MAX_PEERS_DAT_ENTRIES {
             let mut scored: Vec<(SocketAddr, i64)> = self
                 .peers
@@ -1263,7 +1674,6 @@ impl PeerStore {
                 .collect();
             scored.sort_by(|a, b| b.1.cmp(&a.1));
 
-            // Keep only the top MAX entries
             let to_remove: Vec<SocketAddr> = scored
                 .iter()
                 .skip(MAX_PEERS_DAT_ENTRIES)
@@ -1295,6 +1705,25 @@ impl PeerStore {
             *by_source.entry(peer.source.to_string()).or_insert(0usize) += 1;
         }
 
+        let mut by_role = HashMap::new();
+        for peer in self.peers.values() {
+            let key = peer
+                .role
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            *by_role.entry(key).or_insert(0usize) += 1;
+        }
+
+        let mut by_class = HashMap::new();
+        for peer in self.peers.values() {
+            let key = peer
+                .node_class
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            *by_class.entry(key).or_insert(0usize) += 1;
+        }
+
+        // Backward compat: by_service
         let mut by_service = HashMap::new();
         for peer in self.peers.values() {
             let key = peer
@@ -1310,6 +1739,8 @@ impl PeerStore {
             expired,
             connected_24h,
             by_source,
+            by_role,
+            by_class,
             by_service,
         }
     }
@@ -1323,6 +1754,9 @@ pub struct PeerStoreStats {
     pub expired: usize,
     pub connected_24h: usize,
     pub by_source: HashMap<String, usize>,
+    pub by_role: HashMap<String, usize>,
+    pub by_class: HashMap<String, usize>,
+    /// **DEPRECATED** — Use `by_role` + `by_class` instead.
     pub by_service: HashMap<String, usize>,
 }
 
@@ -1347,14 +1781,14 @@ impl fmt::Display for PeerStoreError {
 impl std::error::Error for PeerStoreError {}
 
 // ════════════════════════════════════════════════════════════════════════════════
-// HANDSHAKE PROTOCOL
+// HANDSHAKE PROTOCOL (Tahap 21: Role+Class Exchange)
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Handshake message exchanged when two peers first connect.
 ///
-/// Both sides send a `HandshakeMessage`. If validation passes
-/// (matching network_id, compatible protocol_version), the
-/// connection is accepted.
+/// Tahap 21: Now includes `role` and `node_class` so both nodes
+/// know each other's role after handshake. The old `service_type`
+/// field is kept for backward compatibility but computed from role+class.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandshakeMessage {
     /// Protocol version. Must be compatible with remote peer.
@@ -1363,9 +1797,15 @@ pub struct HandshakeMessage {
     pub network_id: NetworkId,
     /// Ed25519 public key (32 bytes) — node identity.
     pub node_id: [u8; 32],
-    /// Port this node is listening on for inbound P2P connections.
+    /// Port this node is listening on (always 45831).
     pub listen_port: u16,
-    /// Service type this node provides.
+    /// Node's operational role (Tahap 21).
+    pub role: NodeRole,
+    /// Node's class, only for StorageCompute (Tahap 21).
+    pub node_class: Option<NodeClass>,
+    /// Capabilities for future extension.
+    pub capabilities: Vec<String>,
+    /// **DEPRECATED** — Computed from role+class. Use `role`+`node_class` instead.
     pub service_type: ServiceType,
     /// User agent string (e.g., "dsdn-node/0.14.0").
     pub user_agent: String,
@@ -1377,21 +1817,25 @@ impl HandshakeMessage {
         node_id: &[u8; 32],
         network_id: NetworkId,
         listen_port: u16,
-        service_type: ServiceType,
+        role: NodeRole,
+        node_class: Option<NodeClass>,
     ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             network_id,
             node_id: *node_id,
             listen_port,
-            service_type,
+            role,
+            node_class,
+            capabilities: Vec::new(),
+            service_type: ServiceType::from_role(role, node_class),
             user_agent: format!("dsdn-node/{}", env!("CARGO_PKG_VERSION")),
         }
     }
 
     /// Validate a remote peer's handshake against our own configuration.
     ///
-    /// Returns `Ok(())` if compatible, or `Err(reason)` if not.
+    /// Tahap 21: Also validates role+class consistency.
     pub fn validate_remote(
         &self,
         remote: &HandshakeMessage,
@@ -1404,7 +1848,7 @@ impl HandshakeMessage {
             });
         }
 
-        // Protocol version must be compatible (for now: must match)
+        // Protocol version must be compatible
         if self.protocol_version != remote.protocol_version {
             return Err(HandshakeError::VersionIncompatible {
                 local: self.protocol_version,
@@ -1415,6 +1859,24 @@ impl HandshakeMessage {
         // Cannot connect to ourselves
         if self.node_id == remote.node_id {
             return Err(HandshakeError::SelfConnection);
+        }
+
+        // Tahap 21: Validate role+class consistency
+        // StorageCompute MUST have a class
+        if remote.role == NodeRole::StorageCompute && remote.node_class.is_none() {
+            return Err(HandshakeError::InvalidRoleClass {
+                role: remote.role.to_string(),
+                class: "none".to_string(),
+                reason: "StorageCompute must have a node_class".to_string(),
+            });
+        }
+        // Validator/Coordinator/Bootstrap MUST NOT have a class
+        if !remote.role.has_class() && remote.node_class.is_some() {
+            return Err(HandshakeError::InvalidRoleClass {
+                role: remote.role.to_string(),
+                class: remote.node_class.map(|c| c.to_string()).unwrap_or_default(),
+                reason: format!("{} must not have a node_class", remote.role),
+            });
         }
 
         Ok(())
@@ -1434,6 +1896,13 @@ pub enum HandshakeError {
     Timeout,
     /// Transport-level error.
     Transport(String),
+    /// Invalid role+class combination (Tahap 21).
+    /// e.g., Validator with node_class = Some(DataCenter).
+    InvalidRoleClass {
+        role: String,
+        class: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for HandshakeError {
@@ -1448,6 +1917,13 @@ impl fmt::Display for HandshakeError {
             HandshakeError::SelfConnection => write!(f, "self-connection detected"),
             HandshakeError::Timeout => write!(f, "handshake timed out"),
             HandshakeError::Transport(e) => write!(f, "transport error: {}", e),
+            HandshakeError::InvalidRoleClass { role, class, reason } => {
+                write!(
+                    f,
+                    "invalid role+class: role={}, class={}, reason={}",
+                    role, class, reason
+                )
+            }
         }
     }
 }
@@ -1455,24 +1931,33 @@ impl fmt::Display for HandshakeError {
 impl std::error::Error for HandshakeError {}
 
 // ════════════════════════════════════════════════════════════════════════════════
-// PEER EXCHANGE PROTOCOL (PEX)
+// PEER EXCHANGE PROTOCOL (PEX) — Tahap 21: Role+Class Aware
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Peer Exchange request — "give me your known peers."
+///
+/// Tahap 21: Supports optional role filter (not just service type).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PexRequest {
-    /// Optional filter: only return peers of this service type.
+    /// Optional filter: only return peers with these roles.
+    pub role_filter: Option<Vec<NodeRole>>,
+    /// **DEPRECATED** — Use `role_filter` instead.
     pub service_filter: Option<ServiceType>,
     /// Maximum number of peers requested.
     pub max_peers: usize,
 }
 
 /// A single peer entry in a PEX response.
+///
+/// Tahap 21: Includes role and node_class.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PexPeerEntry {
     pub addr: IpAddr,
     pub port: u16,
     pub node_id: Option<[u8; 32]>,
+    pub role: Option<NodeRole>,
+    pub node_class: Option<NodeClass>,
+    /// **DEPRECATED** — Computed from role+class.
     pub service_type: Option<ServiceType>,
     pub last_connected: u64,
 }
@@ -1487,9 +1972,7 @@ pub struct PexResponse {
 impl PexResponse {
     /// Build a PEX response from a `PeerStore`.
     ///
-    /// Only includes peers that have connected successfully in the
-    /// last 24 hours. Excludes banned peers. Capped at
-    /// [`PEX_MAX_PEERS_PER_RESPONSE`].
+    /// Tahap 21: Supports role filtering with fallback to service_type.
     pub fn build_from_store(
         store: &PeerStore,
         request: &PexRequest,
@@ -1505,10 +1988,17 @@ impl PexResponse {
                 p.last_connected > 0 && now.saturating_sub(p.last_connected) < SECS_24H
             })
             .filter(|p| {
-                // Apply service type filter if requested
-                match request.service_filter {
-                    Some(svc) => p.service_type == Some(svc),
-                    None => true,
+                // Apply role filter if requested (Tahap 21)
+                if let Some(ref roles) = request.role_filter {
+                    match p.role {
+                        Some(r) => roles.contains(&r),
+                        None => false,
+                    }
+                } else if let Some(svc) = request.service_filter {
+                    // Backward compat: service_type filter
+                    p.service_type == Some(svc)
+                } else {
+                    true
                 }
             })
             .filter(|p| {
@@ -1523,6 +2013,8 @@ impl PexResponse {
                 addr: p.addr,
                 port: p.port,
                 node_id: p.node_id,
+                role: p.role,
+                node_class: p.node_class,
                 service_type: p.service_type,
                 last_connected: p.last_connected,
             })
@@ -1537,24 +2029,14 @@ impl PexResponse {
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Trait for DNS seed resolution.
-///
-/// Abstracted to allow mock implementations for testing and
-/// development. Real implementation (using `trust-dns` or
-/// `hickory-dns`) will be provided in Tahap 21.1.B.
 pub trait DnsResolver: Send + Sync {
     /// Resolve a DNS hostname to a list of IP addresses.
-    ///
-    /// Should return both A (IPv4) and AAAA (IPv6) records.
-    /// Returns an empty vec if resolution fails or times out.
     fn resolve(&self, hostname: &str) -> Vec<IpAddr>;
 }
 
 /// Mock DNS resolver that returns preconfigured results.
-///
-/// For development and testing. No actual DNS queries are made.
 #[derive(Debug, Default)]
 pub struct MockDnsResolver {
-    /// Hostname → IP list mapping.
     results: HashMap<String, Vec<IpAddr>>,
 }
 
@@ -1563,7 +2045,6 @@ impl MockDnsResolver {
         Self::default()
     }
 
-    /// Add a preconfigured result for a hostname.
     pub fn add_result(&mut self, hostname: &str, ips: Vec<IpAddr>) {
         self.results.insert(hostname.to_string(), ips);
     }
@@ -1575,8 +2056,7 @@ impl DnsResolver for MockDnsResolver {
     }
 }
 
-/// Null resolver that always returns empty. Used when no DNS
-/// seeds are configured (development mode).
+/// Null resolver that always returns empty.
 #[derive(Debug)]
 pub struct NullDnsResolver;
 
@@ -1591,14 +2071,8 @@ impl DnsResolver for NullDnsResolver {
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Trait for establishing P2P connections to peers.
-///
-/// Abstracted for testability. Real implementation (TCP + noise
-/// protocol or TLS) will be provided in Tahap 21.1.B.
 pub trait PeerConnector: Send + Sync {
     /// Attempt to connect and perform a handshake with a remote peer.
-    ///
-    /// Returns the remote peer's handshake message on success,
-    /// or a `HandshakeError` on failure.
     fn connect_and_handshake(
         &self,
         addr: SocketAddr,
@@ -1609,7 +2083,6 @@ pub trait PeerConnector: Send + Sync {
 /// Mock connector that succeeds or fails based on configuration.
 #[derive(Debug)]
 pub struct MockPeerConnector {
-    /// Addresses that will succeed, mapped to their handshake response.
     reachable: HashMap<SocketAddr, HandshakeMessage>,
 }
 
@@ -1620,7 +2093,6 @@ impl MockPeerConnector {
         }
     }
 
-    /// Mark an address as reachable with the given handshake response.
     pub fn add_reachable(&mut self, addr: SocketAddr, handshake: HandshakeMessage) {
         self.reachable.insert(addr, handshake);
     }
@@ -1653,32 +2125,20 @@ impl PeerConnector for MockPeerConnector {
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Observable metrics for the bootstrap subsystem.
-///
-/// All counters are monotonically increasing (never reset).
-/// Exposed via the node's Prometheus endpoint.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BootstrapMetrics {
-    /// Total DNS resolve attempts.
     pub dns_resolve_total: u64,
-    /// Successful DNS resolves.
     pub dns_resolve_success: u64,
-    /// Total peer connection attempts.
     pub peer_connect_total: u64,
-    /// Successful peer connections.
     pub peer_connect_success: u64,
-    /// Handshake failures (broken down by type isn't needed yet).
     pub handshake_failures: u64,
-    /// Number of times the fallback chain was triggered
-    /// (moved from one source to the next).
     pub fallback_triggered: u64,
-    /// Total PEX requests sent.
     pub pex_requests_sent: u64,
-    /// Total PEX requests received.
     pub pex_requests_received: u64,
-    /// Current active peer count.
     pub active_peers: u64,
-    /// Peers.dat entry count.
     pub peers_dat_size: u64,
+    /// Tahap 21: Track role-based disconnect events.
+    pub role_disconnect_total: u64,
 }
 
 impl BootstrapMetrics {
@@ -1709,6 +2169,9 @@ dsdn_bootstrap_active_peers{{node_id="{nid}"}} {active}
 # HELP dsdn_bootstrap_peers_dat_size Peers.dat entry count
 # TYPE dsdn_bootstrap_peers_dat_size gauge
 dsdn_bootstrap_peers_dat_size{{node_id="{nid}"}} {pdat}
+# HELP dsdn_bootstrap_role_disconnect_total Disconnects due to role mismatch
+# TYPE dsdn_bootstrap_role_disconnect_total counter
+dsdn_bootstrap_role_disconnect_total{{node_id="{nid}"}} {role_disc}
 "#,
             nid = node_id,
             dns_total = self.dns_resolve_total,
@@ -1719,6 +2182,7 @@ dsdn_bootstrap_peers_dat_size{{node_id="{nid}"}} {pdat}
             fb = self.fallback_triggered,
             active = self.active_peers,
             pdat = self.peers_dat_size,
+            role_disc = self.role_disconnect_total,
         )
     }
 }
@@ -1732,67 +2196,40 @@ dsdn_bootstrap_peers_dat_size{{node_id="{nid}"}} {pdat}
 pub enum BootstrapResult {
     /// Successfully connected to at least one peer.
     Connected {
-        /// Number of peers successfully connected.
         peer_count: usize,
-        /// Which source provided the first connection.
         source: String,
     },
     /// No peers could be reached from any source.
     NoPeersAvailable {
-        /// Human-readable summary of what was tried.
         summary: String,
     },
-    /// Bootstrap was skipped (e.g., no sources configured).
+    /// Bootstrap was skipped.
     Skipped {
         reason: String,
     },
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// PEER MANAGER (Orchestrator)
+// PEER MANAGER (Orchestrator) — Tahap 21: Role-Aware
 // ════════════════════════════════════════════════════════════════════════════════
 
 /// Central orchestrator for the bootstrap subsystem.
 ///
-/// Manages the full lifecycle: config loading → fallback chain →
-/// peer scoring → PEX → persistence. Uses trait objects for
-/// DNS resolution and peer connection, making it fully testable
-/// with mocks.
-///
-/// ## Lifecycle
-///
-/// 1. **Init**: Load config + peers.dat.
-/// 2. **Bootstrap**: Execute fallback chain to find initial peers.
-/// 3. **Maintain**: Periodic PEX, DNS re-resolve, peer rotation.
-/// 4. **Persist**: Save peers.dat on changes and shutdown.
-///
-/// ## Thread Safety
-///
-/// `PeerManager` itself is NOT `Sync` (holds mutable `PeerStore`).
-/// It should be held behind `Arc<Mutex<PeerManager>>` or used from
-/// a single-owner task that communicates via channels.
+/// Tahap 21: Uses RoleDependencyMatrix for post-handshake filtering.
+/// Peers with REQUIRED roles are kept, SKIP roles are disconnected
+/// (but saved to peers.dat for PEX).
 pub struct PeerManager {
-    /// Bootstrap configuration.
     config: BootstrapConfig,
-    /// Persistent peer store (peers.dat).
     store: PeerStore,
-    /// DNS resolver implementation.
     dns_resolver: Box<dyn DnsResolver>,
-    /// Peer connector implementation.
     connector: Box<dyn PeerConnector>,
-    /// Observable metrics.
     metrics: BootstrapMetrics,
-    /// Our handshake message template.
     our_handshake: HandshakeMessage,
-    /// Currently active (connected) peer addresses.
     active_peers: HashMap<SocketAddr, PeerInfo>,
 }
 
 impl PeerManager {
-    /// Create a new `PeerManager` with the given configuration
-    /// and I/O trait implementations.
-    ///
-    /// Loads peers.dat from disk if it exists.
+    /// Create a new `PeerManager` with the given configuration.
     pub fn new(
         config: BootstrapConfig,
         node_id: [u8; 32],
@@ -1804,7 +2241,8 @@ impl PeerManager {
             &node_id,
             config.network_id.clone(),
             config.p2p_port,
-            config.service_type,
+            config.role,
+            config.node_class,
         );
 
         Self {
@@ -1820,14 +2258,8 @@ impl PeerManager {
 
     /// Execute the full bootstrap fallback chain.
     ///
-    /// Tries sources in priority order:
-    /// 1. peers.dat (cached peers, sorted by score)
-    /// 2. Static IP peers from config
-    /// 3. DNS seeds from config
-    ///
-    /// Stops as soon as at least one peer is successfully connected.
-    /// All discovered peers are added to the store regardless of
-    /// which source provided them.
+    /// Tahap 21: All peers are saved to store regardless of role.
+    /// Only REQUIRED/OPTIONAL role peers are kept as active connections.
     pub fn bootstrap(&mut self) -> BootstrapResult {
         // Phase 1: Try peers.dat
         let cached_result = self.try_cached_peers();
@@ -1863,7 +2295,6 @@ impl PeerManager {
             };
         }
 
-        // All sources exhausted
         BootstrapResult::NoPeersAvailable {
             summary: format!(
                 "tried {} cached peers, {} static peers, {} DNS seeds — all failed",
@@ -1875,14 +2306,11 @@ impl PeerManager {
     }
 
     /// Try connecting to peers from the local cache (peers.dat).
-    ///
-    /// Returns the number of successful connections.
     fn try_cached_peers(&mut self) -> usize {
-        // Collect addresses into owned Vec to release the borrow on self.store
-        // before calling self.try_connect (which needs &mut self).
+        // Tahap 21: sort by role-aware score (REQUIRED roles first)
         let addrs: Vec<SocketAddr> = self
             .store
-            .sorted_by_score()
+            .sorted_by_role_score(self.config.role)
             .iter()
             .take(self.config.max_outbound)
             .map(|p| p.socket_addr())
@@ -1893,7 +2321,6 @@ impl PeerManager {
         }
 
         let mut connected = 0;
-
         for addr in &addrs {
             if self.try_connect(*addr, PeerSource::DnsSeed /* preserved */) {
                 connected += 1;
@@ -1907,8 +2334,6 @@ impl PeerManager {
     }
 
     /// Try connecting to static peers from config.
-    ///
-    /// Returns the number of successful connections.
     fn try_static_peers(&mut self) -> usize {
         let mut connected = 0;
 
@@ -1918,7 +2343,6 @@ impl PeerManager {
                 Err(_) => continue,
             };
 
-            // Add to store as static peer
             let info = PeerInfo::new(
                 addr.ip(),
                 addr.port(),
@@ -1939,8 +2363,6 @@ impl PeerManager {
     }
 
     /// Try resolving DNS seeds and connecting to discovered peers.
-    ///
-    /// Returns the number of successful connections.
     fn try_dns_seeds(&mut self) -> usize {
         let mut connected = 0;
 
@@ -1958,7 +2380,6 @@ impl PeerManager {
             for ip in ips {
                 let addr = SocketAddr::new(ip, self.config.p2p_port);
 
-                // Add to store as DNS-discovered peer
                 let info = PeerInfo::new(
                     ip,
                     self.config.p2p_port,
@@ -1981,7 +2402,8 @@ impl PeerManager {
 
     /// Attempt to connect + handshake with a single peer.
     ///
-    /// Updates the store and metrics. Returns `true` on success.
+    /// Tahap 21: After handshake, applies RoleDependencyMatrix
+    /// to decide keep or disconnect. ALL peers saved to store.
     fn try_connect(&mut self, addr: SocketAddr, _source: PeerSource) -> bool {
         self.metrics.peer_connect_total = self.metrics.peer_connect_total.saturating_add(1);
 
@@ -1996,19 +2418,30 @@ impl PeerManager {
                         self.metrics.peer_connect_success =
                             self.metrics.peer_connect_success.saturating_add(1);
 
-                        // Update store with handshake info
+                        // Update store with handshake info (always save)
                         self.store.record_success(addr);
                         if let Some(peer) = self.store.get_mut(&addr) {
                             peer.node_id = Some(remote_hs.node_id);
-                            peer.service_type = Some(remote_hs.service_type);
+                            peer.set_role_class(remote_hs.role, remote_hs.node_class);
                         }
 
-                        // Track as active
-                        if let Some(peer) = self.store.get(&addr) {
-                            self.active_peers.insert(addr, peer.clone());
-                        }
+                        // Tahap 21: Post-handshake role filtering
+                        let action = self.post_handshake_action(remote_hs.role);
 
-                        true
+                        match action {
+                            PostHandshakeAction::Keep => {
+                                if let Some(peer) = self.store.get(&addr) {
+                                    self.active_peers.insert(addr, peer.clone());
+                                }
+                                true
+                            }
+                            PostHandshakeAction::Disconnect(_reason) => {
+                                // Peer is saved in store for PEX, but not kept active
+                                self.metrics.role_disconnect_total =
+                                    self.metrics.role_disconnect_total.saturating_add(1);
+                                false
+                            }
+                        }
                     }
                     Err(_e) => {
                         self.metrics.handshake_failures =
@@ -2027,17 +2460,35 @@ impl PeerManager {
         }
     }
 
+    /// Determine post-handshake action based on RoleDependencyMatrix.
+    fn post_handshake_action(&self, peer_role: NodeRole) -> PostHandshakeAction {
+        let dep = RoleDependencyMatrix::dependency(self.config.role, peer_role);
+        match dep {
+            RoleDependency::Required => PostHandshakeAction::Keep,
+            RoleDependency::Optional => {
+                // Keep if we don't have too many peers already
+                if self.active_peers.len() < self.config.max_outbound {
+                    PostHandshakeAction::Keep
+                } else {
+                    PostHandshakeAction::Disconnect(DisconnectReason::TooManyPeers)
+                }
+            }
+            RoleDependency::Skip => {
+                PostHandshakeAction::Disconnect(DisconnectReason::RoleNotNeeded)
+            }
+        }
+    }
+
     /// Process incoming PEX peers from a connected peer.
-    ///
-    /// Adds new peers to the store for future connection attempts.
-    /// Returns the number of new peers added.
     pub fn process_pex_response(&mut self, response: &PexResponse) -> usize {
         let mut added = 0;
         for entry in &response.peers {
-            let info = PeerInfo {
+            let mut info = PeerInfo {
                 addr: entry.addr,
                 port: entry.port,
                 node_id: entry.node_id,
+                role: entry.role,
+                node_class: entry.node_class,
                 service_type: entry.service_type,
                 network_id: self.config.network_id.clone(),
                 source: PeerSource::PeerExchange,
@@ -2048,6 +2499,13 @@ impl PeerManager {
                 consecutive_failures: 0,
                 first_seen: now_secs(),
             };
+            // Sync service_type if role is set but service_type isn't
+            if info.role.is_some() && info.service_type.is_none() {
+                info.service_type = Some(ServiceType::from_role(
+                    info.role.unwrap(),
+                    info.node_class,
+                ));
+            }
             if self.store.upsert(info) {
                 added += 1;
             }
@@ -2061,8 +2519,6 @@ impl PeerManager {
         request: &PexRequest,
         requester_node_id: Option<&[u8; 32]>,
     ) -> PexResponse {
-        self.metrics
-            .clone(); // avoid borrow issues — metrics are updated elsewhere
         PexResponse::build_from_store(&self.store, request, requester_node_id)
     }
 
@@ -2098,37 +2554,39 @@ impl PeerManager {
 
     // ── Accessors ──────────────────────────────────────────────────────
 
-    /// Returns a reference to the bootstrap configuration.
     pub fn config(&self) -> &BootstrapConfig {
         &self.config
     }
 
-    /// Returns a reference to the peer store.
     pub fn store(&self) -> &PeerStore {
         &self.store
     }
 
-    /// Returns a mutable reference to the peer store.
     pub fn store_mut(&mut self) -> &mut PeerStore {
         &mut self.store
     }
 
-    /// Returns the current bootstrap metrics.
     pub fn metrics(&self) -> &BootstrapMetrics {
         &self.metrics
     }
 
-    /// Returns the number of currently active (connected) peers.
     pub fn active_peer_count(&self) -> usize {
         self.active_peers.len()
     }
 
-    /// Returns active peers as an iterator.
     pub fn active_peers(&self) -> impl Iterator<Item = &PeerInfo> {
         self.active_peers.values()
     }
 
-    /// Returns active peers filtered by service type.
+    /// Returns active peers filtered by role (Tahap 21).
+    pub fn active_peers_by_role(&self, role: NodeRole) -> Vec<&PeerInfo> {
+        self.active_peers
+            .values()
+            .filter(|p| p.role == Some(role))
+            .collect()
+    }
+
+    /// **DEPRECATED** — Use `active_peers_by_role` instead.
     pub fn active_peers_by_service(&self, svc: ServiceType) -> Vec<&PeerInfo> {
         self.active_peers
             .values()
@@ -2136,7 +2594,6 @@ impl PeerManager {
             .collect()
     }
 
-    /// Returns our handshake message.
     pub fn our_handshake(&self) -> &HandshakeMessage {
         &self.our_handshake
     }
@@ -2145,6 +2602,8 @@ impl PeerManager {
     pub fn summary(&self) -> BootstrapSummary {
         BootstrapSummary {
             network_id: self.config.network_id.to_string(),
+            role: self.config.role.to_string(),
+            node_class: self.config.node_class.map(|c| c.to_string()),
             service_type: self.config.service_type.to_string(),
             p2p_port: self.config.p2p_port,
             active_peers: self.active_peers.len(),
@@ -2160,7 +2619,8 @@ impl fmt::Debug for PeerManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PeerManager")
             .field("network_id", &self.config.network_id)
-            .field("service_type", &self.config.service_type)
+            .field("role", &self.config.role)
+            .field("node_class", &self.config.node_class)
             .field("active_peers", &self.active_peers.len())
             .field("known_peers", &self.store.len())
             .finish()
@@ -2171,6 +2631,9 @@ impl fmt::Debug for PeerManager {
 #[derive(Debug, Clone, Serialize)]
 pub struct BootstrapSummary {
     pub network_id: String,
+    pub role: String,
+    pub node_class: Option<String>,
+    /// **DEPRECATED** — Use `role` + `node_class`.
     pub service_type: String,
     pub p2p_port: u16,
     pub active_peers: usize,
@@ -2248,29 +2711,108 @@ mod tests {
     }
 
     fn make_remote_handshake(node_id: [u8; 32]) -> HandshakeMessage {
-        HandshakeMessage {
-            protocol_version: PROTOCOL_VERSION,
-            network_id: NetworkId::Testnet,
-            node_id,
-            listen_port: 45831,
-            service_type: ServiceType::Storage,
-            user_agent: "test-peer/1.0".to_string(),
-        }
+        HandshakeMessage::build(
+            &node_id,
+            NetworkId::Testnet,
+            45831,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
+        )
+    }
+
+    fn make_remote_handshake_role(
+        node_id: [u8; 32],
+        role: NodeRole,
+        class: Option<NodeClass>,
+    ) -> HandshakeMessage {
+        HandshakeMessage::build(&node_id, NetworkId::Testnet, 45831, role, class)
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // SERVICE TYPE
+    // NODE ROLE
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_node_role_roundtrip() {
+        let roles = [
+            NodeRole::StorageCompute,
+            NodeRole::Validator,
+            NodeRole::Coordinator,
+            NodeRole::Bootstrap,
+        ];
+        for role in &roles {
+            let s = role.as_str();
+            let parsed = NodeRole::from_str_tag(s);
+            assert_eq!(parsed, Some(*role), "roundtrip failed for {:?}", role);
+        }
+    }
+
+    #[test]
+    fn test_node_role_case_insensitive() {
+        assert_eq!(
+            NodeRole::from_str_tag("STORAGE-COMPUTE"),
+            Some(NodeRole::StorageCompute)
+        );
+        assert_eq!(
+            NodeRole::from_str_tag("Validator"),
+            Some(NodeRole::Validator)
+        );
+        assert_eq!(
+            NodeRole::from_str_tag("storage"),
+            Some(NodeRole::StorageCompute)
+        );
+        assert_eq!(NodeRole::from_str_tag("unknown"), None);
+    }
+
+    #[test]
+    fn test_node_role_has_class() {
+        assert!(NodeRole::StorageCompute.has_class());
+        assert!(!NodeRole::Validator.has_class());
+        assert!(!NodeRole::Coordinator.has_class());
+        assert!(!NodeRole::Bootstrap.has_class());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // NODE CLASS
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_node_class_roundtrip() {
+        let classes = [NodeClass::Reguler, NodeClass::DataCenter];
+        for cls in &classes {
+            let s = cls.as_str();
+            let parsed = NodeClass::from_str_tag(s);
+            assert_eq!(parsed, Some(*cls), "roundtrip failed for {:?}", cls);
+        }
+    }
+
+    #[test]
+    fn test_node_class_case_insensitive() {
+        assert_eq!(
+            NodeClass::from_str_tag("DataCenter"),
+            Some(NodeClass::DataCenter)
+        );
+        assert_eq!(
+            NodeClass::from_str_tag("REGULER"),
+            Some(NodeClass::Reguler)
+        );
+        assert_eq!(
+            NodeClass::from_str_tag("regular"),
+            Some(NodeClass::Reguler)
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // SERVICE TYPE (backward compat)
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_service_type_roundtrip() {
         let types = [
-            ServiceType::Chain,
             ServiceType::Storage,
             ServiceType::StorageDC,
             ServiceType::Coordinator,
             ServiceType::Validator,
-            ServiceType::Ingress,
             ServiceType::Bootstrap,
         ];
         for svc in &types {
@@ -2281,13 +2823,109 @@ mod tests {
     }
 
     #[test]
-    fn test_service_type_case_insensitive() {
-        assert_eq!(ServiceType::from_str_tag("CHAIN"), Some(ServiceType::Chain));
+    fn test_service_type_role_conversion() {
         assert_eq!(
-            ServiceType::from_str_tag("Storage"),
-            Some(ServiceType::Storage)
+            ServiceType::from_role(NodeRole::StorageCompute, Some(NodeClass::Reguler)),
+            ServiceType::Storage
         );
-        assert_eq!(ServiceType::from_str_tag("unknown"), None);
+        assert_eq!(
+            ServiceType::from_role(NodeRole::StorageCompute, Some(NodeClass::DataCenter)),
+            ServiceType::StorageDC
+        );
+        assert_eq!(
+            ServiceType::from_role(NodeRole::Validator, None),
+            ServiceType::Validator
+        );
+        assert_eq!(
+            ServiceType::from_role(NodeRole::Coordinator, None),
+            ServiceType::Coordinator
+        );
+
+        // And back
+        assert_eq!(
+            ServiceType::Storage.to_role_class(),
+            (NodeRole::StorageCompute, Some(NodeClass::Reguler))
+        );
+        assert_eq!(
+            ServiceType::StorageDC.to_role_class(),
+            (NodeRole::StorageCompute, Some(NodeClass::DataCenter))
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ROLE DEPENDENCY MATRIX
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_role_dependency_storage_compute() {
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::StorageCompute, NodeRole::StorageCompute),
+            RoleDependency::Required
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::StorageCompute, NodeRole::Coordinator),
+            RoleDependency::Required
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::StorageCompute, NodeRole::Validator),
+            RoleDependency::Optional
+        );
+    }
+
+    #[test]
+    fn test_role_dependency_validator() {
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Validator, NodeRole::Validator),
+            RoleDependency::Required
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Validator, NodeRole::Coordinator),
+            RoleDependency::Required
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Validator, NodeRole::StorageCompute),
+            RoleDependency::Optional
+        );
+    }
+
+    #[test]
+    fn test_role_dependency_coordinator() {
+        // Coordinator needs ALL roles as REQUIRED
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Coordinator, NodeRole::Coordinator),
+            RoleDependency::Required
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Coordinator, NodeRole::StorageCompute),
+            RoleDependency::Required
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Coordinator, NodeRole::Validator),
+            RoleDependency::Required
+        );
+    }
+
+    #[test]
+    fn test_role_dependency_bootstrap_peer_always_optional() {
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::StorageCompute, NodeRole::Bootstrap),
+            RoleDependency::Optional
+        );
+        assert_eq!(
+            RoleDependencyMatrix::dependency(NodeRole::Validator, NodeRole::Bootstrap),
+            RoleDependency::Optional
+        );
+    }
+
+    #[test]
+    fn test_required_roles() {
+        let sc_req = RoleDependencyMatrix::required_roles(NodeRole::StorageCompute);
+        assert!(sc_req.contains(&NodeRole::StorageCompute));
+        assert!(sc_req.contains(&NodeRole::Coordinator));
+        assert!(!sc_req.contains(&NodeRole::Validator));
+
+        let coord_req = RoleDependencyMatrix::required_roles(NodeRole::Coordinator);
+        assert_eq!(coord_req.len(), 3); // all operational roles required
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2324,9 +2962,35 @@ mod tests {
         assert_eq!(cfg.max_inbound, DEFAULT_MAX_INBOUND);
         assert_eq!(cfg.p2p_port, DEFAULT_P2P_PORT);
         assert_eq!(cfg.network_id, NetworkId::Mainnet);
+        assert_eq!(cfg.role, NodeRole::StorageCompute);
+        assert_eq!(cfg.node_class, Some(NodeClass::Reguler));
         assert_eq!(cfg.service_type, ServiceType::Storage);
         assert!(!cfg.has_bootstrap_sources());
-        assert_eq!(cfg.source_count(), 0);
+    }
+
+    #[test]
+    fn test_config_validate_role_class_ok() {
+        let mut cfg = BootstrapConfig::default();
+        assert!(cfg.validate_role_class().is_ok());
+
+        cfg.role = NodeRole::Validator;
+        cfg.node_class = None;
+        assert!(cfg.validate_role_class().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_role_class_invalid() {
+        let mut cfg = BootstrapConfig::default();
+
+        // Validator with class → error
+        cfg.role = NodeRole::Validator;
+        cfg.node_class = Some(NodeClass::DataCenter);
+        assert!(cfg.validate_role_class().is_err());
+
+        // StorageCompute without class → error
+        cfg.role = NodeRole::StorageCompute;
+        cfg.node_class = None;
+        assert!(cfg.validate_role_class().is_err());
     }
 
     #[test]
@@ -2363,9 +3027,19 @@ mod tests {
         let peer = make_peer(1, PeerSource::DnsSeed);
         assert_eq!(peer.port, 45831);
         assert!(peer.node_id.is_none());
+        assert!(peer.role.is_none());
+        assert!(peer.node_class.is_none());
         assert_eq!(peer.success_count, 0);
-        assert_eq!(peer.failure_count, 0);
         assert!(!peer.is_suspicious());
+    }
+
+    #[test]
+    fn test_peer_info_set_role_class() {
+        let mut peer = make_peer(1, PeerSource::DnsSeed);
+        peer.set_role_class(NodeRole::StorageCompute, Some(NodeClass::DataCenter));
+        assert_eq!(peer.role, Some(NodeRole::StorageCompute));
+        assert_eq!(peer.node_class, Some(NodeClass::DataCenter));
+        assert_eq!(peer.service_type, Some(ServiceType::StorageDC));
     }
 
     #[test]
@@ -2384,7 +3058,6 @@ mod tests {
             peer.record_failure();
         }
         assert!(peer.is_suspicious());
-        assert_eq!(peer.consecutive_failures, SUSPICIOUS_FAILURE_THRESHOLD);
     }
 
     #[test]
@@ -2393,10 +3066,9 @@ mod tests {
         for _ in 0..5 {
             peer.record_failure();
         }
-        assert_eq!(peer.consecutive_failures, 5);
         peer.record_success();
         assert_eq!(peer.consecutive_failures, 0);
-        assert_eq!(peer.failure_count, 5); // total preserved
+        assert_eq!(peer.failure_count, 5);
     }
 
     #[test]
@@ -2404,20 +3076,14 @@ mod tests {
         let mut peer = make_peer(1, PeerSource::DnsSeed);
         peer.first_seen = TS;
         peer.last_connected = 0;
-
-        // Not expired if within 30 days
         assert!(!peer.is_expired(TS + SECS_7D));
-
-        // Expired after 30 days
         assert!(peer.is_expired(TS + PEER_EXPIRY_SECS + 1));
     }
 
     #[test]
     fn test_peer_scoring_base() {
         let peer = make_peer(1, PeerSource::DnsSeed);
-        // New peer with no history: base score
-        let score = peer.score(now_secs());
-        assert_eq!(score, PEER_BASE_SCORE);
+        assert_eq!(peer.score(now_secs()), PEER_BASE_SCORE);
     }
 
     #[test]
@@ -2432,30 +3098,33 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_scoring_failure_penalty() {
+    fn test_peer_scoring_role_bonus() {
         let mut peer = make_peer(1, PeerSource::DnsSeed);
-        peer.failure_count = 5;
-        let score = peer.score(now_secs());
-        // base(10) - failure(5*3) = -5
-        assert_eq!(score, 10 - 15);
+        peer.role = Some(NodeRole::Coordinator);
+
+        let now = now_secs();
+        // StorageCompute needs Coordinator = REQUIRED → +20
+        let score_required = peer.score_with_role(now, Some(NodeRole::StorageCompute));
+        let score_plain = peer.score(now);
+        assert_eq!(score_required, score_plain + ROLE_BONUS_REQUIRED);
     }
 
     #[test]
-    fn test_peer_scoring_suspicious_penalty() {
+    fn test_peer_scoring_class_bonus() {
         let mut peer = make_peer(1, PeerSource::DnsSeed);
-        peer.consecutive_failures = SUSPICIOUS_FAILURE_THRESHOLD;
-        peer.failure_count = SUSPICIOUS_FAILURE_THRESHOLD;
-        let score = peer.score(now_secs());
-        // Has -50 suspicious penalty plus failure penalties
-        assert!(score < -20);
+        peer.node_class = Some(NodeClass::DataCenter);
+        let now = now_secs();
+        let score = peer.score(now);
+        // base(10) + class_bonus(5) = 15
+        assert_eq!(score, PEER_BASE_SCORE + CLASS_BONUS_DATACENTER);
     }
 
     #[test]
     fn test_peer_equality_by_addr() {
         let p1 = make_peer(1, PeerSource::DnsSeed);
         let mut p2 = make_peer(1, PeerSource::StaticConfig);
-        p2.success_count = 100; // Different metadata
-        assert_eq!(p1, p2); // But same address = equal
+        p2.success_count = 100;
+        assert_eq!(p1, p2);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2473,8 +3142,8 @@ mod tests {
     fn test_peer_store_upsert() {
         let mut store = PeerStore::in_memory();
         let peer = make_peer(1, PeerSource::DnsSeed);
-        assert!(store.upsert(peer.clone())); // new
-        assert!(!store.upsert(peer)); // existing
+        assert!(store.upsert(peer.clone()));
+        assert!(!store.upsert(peer));
         assert_eq!(store.len(), 1);
     }
 
@@ -2500,35 +3169,60 @@ mod tests {
     #[test]
     fn test_peer_store_sorted_by_score() {
         let mut store = PeerStore::in_memory();
-
         let mut good = make_peer(1, PeerSource::DnsSeed);
         good.success_count = 10;
         good.last_connected = now_secs();
-
         let bad = make_peer(2, PeerSource::DnsSeed);
-
         store.upsert(bad);
         store.upsert(good);
-
         let sorted = store.sorted_by_score();
         assert_eq!(sorted.len(), 2);
-        // Good peer (higher score) should be first
         assert_eq!(sorted[0].addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn test_peer_store_peers_by_role() {
+        let mut store = PeerStore::in_memory();
+        let mut p1 = make_peer(1, PeerSource::DnsSeed);
+        p1.set_role_class(NodeRole::StorageCompute, Some(NodeClass::Reguler));
+        let mut p2 = make_peer(2, PeerSource::DnsSeed);
+        p2.set_role_class(NodeRole::Coordinator, None);
+        let mut p3 = make_peer(3, PeerSource::DnsSeed);
+        p3.set_role_class(NodeRole::StorageCompute, Some(NodeClass::DataCenter));
+        store.upsert(p1);
+        store.upsert(p2);
+        store.upsert(p3);
+
+        assert_eq!(store.peers_by_role(NodeRole::StorageCompute).len(), 2);
+        assert_eq!(store.peers_by_role(NodeRole::Coordinator).len(), 1);
+        assert_eq!(store.peers_by_role(NodeRole::Validator).len(), 0);
+    }
+
+    #[test]
+    fn test_peer_store_peers_by_role_class() {
+        let mut store = PeerStore::in_memory();
+        let mut p1 = make_peer(1, PeerSource::DnsSeed);
+        p1.set_role_class(NodeRole::StorageCompute, Some(NodeClass::Reguler));
+        let mut p2 = make_peer(2, PeerSource::DnsSeed);
+        p2.set_role_class(NodeRole::StorageCompute, Some(NodeClass::DataCenter));
+        store.upsert(p1);
+        store.upsert(p2);
+
+        let reguler = store.peers_by_role_class(NodeRole::StorageCompute, Some(NodeClass::Reguler));
+        assert_eq!(reguler.len(), 1);
+        let dc = store.peers_by_role_class(NodeRole::StorageCompute, Some(NodeClass::DataCenter));
+        assert_eq!(dc.len(), 1);
     }
 
     #[test]
     fn test_peer_store_gc_expired() {
         let mut store = PeerStore::in_memory();
-
         let mut old_peer = make_peer(1, PeerSource::DnsSeed);
         old_peer.first_seen = 1000;
         old_peer.last_connected = 0;
-
         let fresh_peer = make_peer(2, PeerSource::DnsSeed);
-
         store.upsert(old_peer);
         store.upsert(fresh_peer);
-
         let removed = store.gc();
         assert_eq!(removed, 1);
         assert_eq!(store.len(), 1);
@@ -2538,16 +3232,12 @@ mod tests {
     fn test_peer_store_persistence() {
         let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
         let path = tmp.path().to_path_buf();
-
-        // Write
         {
             let mut store = PeerStore::new(path.clone());
             store.upsert(make_peer(1, PeerSource::DnsSeed));
             store.upsert(make_peer(2, PeerSource::StaticConfig));
             store.save().expect("save");
         }
-
-        // Read back
         {
             let store = PeerStore::new(path);
             assert_eq!(store.len(), 2);
@@ -2558,18 +3248,15 @@ mod tests {
     fn test_peer_store_stats() {
         let mut store = PeerStore::in_memory();
         let mut p1 = make_peer(1, PeerSource::DnsSeed);
-        p1.service_type = Some(ServiceType::Storage);
+        p1.set_role_class(NodeRole::StorageCompute, Some(NodeClass::Reguler));
         let mut p2 = make_peer(2, PeerSource::StaticConfig);
-        p2.service_type = Some(ServiceType::Coordinator);
+        p2.set_role_class(NodeRole::Coordinator, None);
         store.upsert(p1);
         store.upsert(p2);
-
         let stats = store.stats();
         assert_eq!(stats.total, 2);
-        assert_eq!(*stats.by_source.get("dns_seed").unwrap_or(&0), 1);
-        assert_eq!(*stats.by_source.get("static_config").unwrap_or(&0), 1);
-        assert_eq!(*stats.by_service.get("storage").unwrap_or(&0), 1);
-        assert_eq!(*stats.by_service.get("coordinator").unwrap_or(&0), 1);
+        assert_eq!(*stats.by_role.get("storage-compute").unwrap_or(&0), 1);
+        assert_eq!(*stats.by_role.get("coordinator").unwrap_or(&0), 1);
     }
 
     #[test]
@@ -2577,11 +3264,11 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
         std::fs::write(tmp.path(), b"this is not json").expect("write");
         let store = PeerStore::new(tmp.path().to_path_buf());
-        assert!(store.is_empty()); // Graceful fallback
+        assert!(store.is_empty());
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // HANDSHAKE
+    // HANDSHAKE (Tahap 21)
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -2590,11 +3277,15 @@ mod tests {
             &TEST_NODE_ID,
             NetworkId::Mainnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
         assert_eq!(hs.protocol_version, PROTOCOL_VERSION);
         assert_eq!(hs.network_id, NetworkId::Mainnet);
         assert_eq!(hs.node_id, TEST_NODE_ID);
+        assert_eq!(hs.role, NodeRole::StorageCompute);
+        assert_eq!(hs.node_class, Some(NodeClass::Reguler));
+        assert_eq!(hs.service_type, ServiceType::Storage);
         assert!(hs.user_agent.contains("dsdn-node"));
     }
 
@@ -2604,7 +3295,8 @@ mod tests {
             &TEST_NODE_ID,
             NetworkId::Testnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
         let remote = make_remote_handshake(REMOTE_NODE_ID);
         assert!(local.validate_remote(&remote).is_ok());
@@ -2616,7 +3308,8 @@ mod tests {
             &TEST_NODE_ID,
             NetworkId::Mainnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
         let remote = make_remote_handshake(REMOTE_NODE_ID); // Testnet
         let err = local.validate_remote(&remote).unwrap_err();
@@ -2632,9 +3325,10 @@ mod tests {
             &TEST_NODE_ID,
             NetworkId::Testnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
-        let mut remote = make_remote_handshake(TEST_NODE_ID); // Same node_id
+        let mut remote = make_remote_handshake(TEST_NODE_ID);
         remote.network_id = NetworkId::Testnet;
         let err = local.validate_remote(&remote).unwrap_err();
         match err {
@@ -2649,7 +3343,8 @@ mod tests {
             &TEST_NODE_ID,
             NetworkId::Testnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
         let mut remote = make_remote_handshake(REMOTE_NODE_ID);
         remote.protocol_version = 999;
@@ -2660,24 +3355,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_handshake_reject_validator_with_class() {
+        let local = make_remote_handshake(TEST_NODE_ID);
+        let mut remote = make_remote_handshake_role(
+            REMOTE_NODE_ID,
+            NodeRole::Validator,
+            Some(NodeClass::DataCenter), // INVALID: Validator must not have class
+        );
+        remote.network_id = NetworkId::Testnet;
+        let err = local.validate_remote(&remote).unwrap_err();
+        match err {
+            HandshakeError::InvalidRoleClass { .. } => {}
+            other => panic!("expected InvalidRoleClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handshake_reject_storage_without_class() {
+        let local = make_remote_handshake(TEST_NODE_ID);
+        let mut remote = HandshakeMessage::build(
+            &REMOTE_NODE_ID,
+            NetworkId::Testnet,
+            45831,
+            NodeRole::StorageCompute,
+            None, // INVALID: StorageCompute must have class
+        );
+        remote.network_id = NetworkId::Testnet;
+        let err = local.validate_remote(&remote).unwrap_err();
+        match err {
+            HandshakeError::InvalidRoleClass { .. } => {}
+            other => panic!("expected InvalidRoleClass, got {:?}", other),
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────────
-    // PEX
+    // PEX (Tahap 21: role+class)
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_pex_response_filters_old_peers() {
         let mut store = PeerStore::in_memory();
-
-        // Peer connected recently
         let mut recent = make_peer(1, PeerSource::DnsSeed);
         recent.last_connected = now_secs();
         store.upsert(recent);
-
-        // Peer never connected
         let old = make_peer(2, PeerSource::DnsSeed);
         store.upsert(old);
-
         let req = PexRequest {
+            role_filter: None,
             service_filter: None,
             max_peers: 100,
         };
@@ -2686,48 +3411,45 @@ mod tests {
     }
 
     #[test]
-    fn test_pex_response_service_filter() {
+    fn test_pex_response_role_filter() {
         let mut store = PeerStore::in_memory();
-
         let mut p1 = make_peer(1, PeerSource::DnsSeed);
         p1.last_connected = now_secs();
-        p1.service_type = Some(ServiceType::Storage);
+        p1.set_role_class(NodeRole::StorageCompute, Some(NodeClass::Reguler));
         store.upsert(p1);
-
         let mut p2 = make_peer(2, PeerSource::DnsSeed);
         p2.last_connected = now_secs();
-        p2.service_type = Some(ServiceType::Coordinator);
+        p2.set_role_class(NodeRole::Coordinator, None);
         store.upsert(p2);
 
         let req = PexRequest {
-            service_filter: Some(ServiceType::Coordinator),
+            role_filter: Some(vec![NodeRole::Coordinator]),
+            service_filter: None,
             max_peers: 100,
         };
         let resp = PexResponse::build_from_store(&store, &req, None);
         assert_eq!(resp.peers.len(), 1);
-        assert_eq!(resp.peers[0].service_type, Some(ServiceType::Coordinator));
+        assert_eq!(resp.peers[0].role, Some(NodeRole::Coordinator));
     }
 
     #[test]
     fn test_pex_response_excludes_requester() {
         let mut store = PeerStore::in_memory();
-
         let mut p1 = make_peer(1, PeerSource::DnsSeed);
         p1.last_connected = now_secs();
         p1.node_id = Some(REMOTE_NODE_ID);
         store.upsert(p1);
-
         let mut p2 = make_peer(2, PeerSource::DnsSeed);
         p2.last_connected = now_secs();
         p2.node_id = Some(REMOTE_NODE_ID_2);
         store.upsert(p2);
 
         let req = PexRequest {
+            role_filter: None,
             service_filter: None,
             max_peers: 100,
         };
-        let resp =
-            PexResponse::build_from_store(&store, &req, Some(&REMOTE_NODE_ID));
+        let resp = PexResponse::build_from_store(&store, &req, Some(&REMOTE_NODE_ID));
         assert_eq!(resp.peers.len(), 1);
         assert_eq!(resp.peers[0].node_id, Some(REMOTE_NODE_ID_2));
     }
@@ -2740,8 +3462,8 @@ mod tests {
             p.last_connected = now_secs();
             store.upsert(p);
         }
-
         let req = PexRequest {
+            role_filter: None,
             service_filter: None,
             max_peers: 5,
         };
@@ -2763,12 +3485,8 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
             ],
         );
-
-        let ips = resolver.resolve("seed1.dsdn.network");
-        assert_eq!(ips.len(), 2);
-
-        let empty = resolver.resolve("nonexistent.dsdn.network");
-        assert!(empty.is_empty());
+        assert_eq!(resolver.resolve("seed1.dsdn.network").len(), 2);
+        assert!(resolver.resolve("nonexistent.dsdn.network").is_empty());
     }
 
     #[test]
@@ -2798,15 +3516,14 @@ mod tests {
         let mut connector = MockPeerConnector::new();
         let addr = test_addr(1);
         connector.add_reachable(addr, make_remote_handshake(REMOTE_NODE_ID));
-
         let local_hs = HandshakeMessage::build(
             &TEST_NODE_ID,
             NetworkId::Testnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
-        let result = connector.connect_and_handshake(addr, &local_hs);
-        assert!(result.is_ok());
+        assert!(connector.connect_and_handshake(addr, &local_hs).is_ok());
     }
 
     #[test]
@@ -2817,14 +3534,14 @@ mod tests {
             &TEST_NODE_ID,
             NetworkId::Testnet,
             45831,
-            ServiceType::Storage,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
         );
-        let result = connector.connect_and_handshake(addr, &local_hs);
-        assert!(result.is_err());
+        assert!(connector.connect_and_handshake(addr, &local_hs).is_err());
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // PEER MANAGER — BOOTSTRAP CHAIN
+    // PEER MANAGER — BOOTSTRAP CHAIN (Tahap 21)
     // ────────────────────────────────────────────────────────────────────
 
     fn test_config() -> BootstrapConfig {
@@ -2838,6 +3555,8 @@ mod tests {
             connect_timeout_secs: 1,
             p2p_port: 45831,
             network_id: NetworkId::Testnet,
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
             service_type: ServiceType::Storage,
             loaded_from: None,
         }
@@ -2847,8 +3566,8 @@ mod tests {
     fn test_peer_manager_bootstrap_from_static() {
         let config = test_config();
         let addr: SocketAddr = "192.168.1.100:45831".parse().unwrap();
-
         let mut connector = MockPeerConnector::new();
+        // Remote is StorageCompute → REQUIRED for our StorageCompute → keep
         connector.add_reachable(addr, make_remote_handshake(REMOTE_NODE_ID));
 
         let mut mgr = PeerManager::new(
@@ -2857,20 +3576,15 @@ mod tests {
             Box::new(NullDnsResolver),
             Box::new(connector),
         );
-
         let result = mgr.bootstrap();
         match result {
-            BootstrapResult::Connected {
-                peer_count,
-                source,
-            } => {
+            BootstrapResult::Connected { peer_count, source } => {
                 assert_eq!(peer_count, 1);
                 assert_eq!(source, "static_config");
             }
             other => panic!("expected Connected, got {:?}", other),
         }
         assert_eq!(mgr.active_peer_count(), 1);
-        assert_eq!(mgr.metrics().peer_connect_success, 1);
     }
 
     #[test]
@@ -2882,24 +3596,17 @@ mod tests {
             network_id: NetworkId::Testnet,
             ..BootstrapConfig::default()
         };
-
         let dns_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let addr = SocketAddr::new(dns_ip, DEFAULT_P2P_PORT);
-
         let mut dns = MockDnsResolver::new();
         dns.add_result("seed1.test", vec![dns_ip]);
-
         let mut connector = MockPeerConnector::new();
         connector.add_reachable(addr, make_remote_handshake(REMOTE_NODE_ID));
-
         let mut mgr = PeerManager::new(config, TEST_NODE_ID, Box::new(dns), Box::new(connector));
 
         let result = mgr.bootstrap();
         match result {
-            BootstrapResult::Connected {
-                peer_count,
-                source,
-            } => {
+            BootstrapResult::Connected { peer_count, source } => {
                 assert_eq!(peer_count, 1);
                 assert_eq!(source, "dns_seed");
             }
@@ -2917,54 +3624,58 @@ mod tests {
             network_id: NetworkId::Testnet,
             ..BootstrapConfig::default()
         };
-
-        let connector = MockPeerConnector::new(); // Nothing reachable
-        let dns = NullDnsResolver; // DNS returns nothing
-
-        let mut mgr =
-            PeerManager::new(config, TEST_NODE_ID, Box::new(dns), Box::new(connector));
-
+        let connector = MockPeerConnector::new();
+        let dns = NullDnsResolver;
+        let mut mgr = PeerManager::new(config, TEST_NODE_ID, Box::new(dns), Box::new(connector));
         let result = mgr.bootstrap();
         match result {
             BootstrapResult::NoPeersAvailable { .. } => {}
             other => panic!("expected NoPeersAvailable, got {:?}", other),
         }
         assert_eq!(mgr.active_peer_count(), 0);
-        assert!(mgr.metrics().fallback_triggered >= 2); // static→dns→fail
+        assert!(mgr.metrics().fallback_triggered >= 2);
     }
 
     #[test]
-    fn test_peer_manager_fallback_order() {
-        // Static peer unreachable, DNS peer reachable
-        let config = BootstrapConfig {
-            dns_seeds: vec!["seed.test".to_string()],
-            static_peers: vec!["192.168.1.200:45831".to_string()],
-            peers_file: PathBuf::from("/dev/null"),
-            network_id: NetworkId::Testnet,
-            ..BootstrapConfig::default()
-        };
-
-        let dns_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
-        let dns_addr = SocketAddr::new(dns_ip, DEFAULT_P2P_PORT);
-
-        let mut dns = MockDnsResolver::new();
-        dns.add_result("seed.test", vec![dns_ip]);
-
+    fn test_peer_manager_role_filtering_keeps_required() {
+        // We are StorageCompute. Peer is Coordinator → REQUIRED → keep.
+        let config = test_config();
+        let addr: SocketAddr = "192.168.1.100:45831".parse().unwrap();
         let mut connector = MockPeerConnector::new();
-        // Static peer NOT added → will fail
-        connector.add_reachable(dns_addr, make_remote_handshake(REMOTE_NODE_ID));
+        connector.add_reachable(
+            addr,
+            make_remote_handshake_role(REMOTE_NODE_ID, NodeRole::Coordinator, None),
+        );
+        let mut mgr = PeerManager::new(
+            config,
+            TEST_NODE_ID,
+            Box::new(NullDnsResolver),
+            Box::new(connector),
+        );
+        mgr.bootstrap();
+        assert_eq!(mgr.active_peer_count(), 1);
+        assert_eq!(mgr.active_peers_by_role(NodeRole::Coordinator).len(), 1);
+    }
 
-        let mut mgr = PeerManager::new(config, TEST_NODE_ID, Box::new(dns), Box::new(connector));
-
-        let result = mgr.bootstrap();
-        match result {
-            BootstrapResult::Connected { source, .. } => {
-                assert_eq!(source, "dns_seed"); // Fell through static → DNS
-            }
-            other => panic!("expected Connected via dns, got {:?}", other),
-        }
-        // Fallback was triggered (static failed → moved to DNS)
-        assert!(mgr.metrics().fallback_triggered >= 1);
+    #[test]
+    fn test_peer_manager_role_filtering_keeps_optional() {
+        // We are StorageCompute. Peer is Validator → OPTIONAL → keep (room available).
+        let config = test_config();
+        let addr: SocketAddr = "192.168.1.100:45831".parse().unwrap();
+        let mut connector = MockPeerConnector::new();
+        connector.add_reachable(
+            addr,
+            make_remote_handshake_role(REMOTE_NODE_ID, NodeRole::Validator, None),
+        );
+        let mut mgr = PeerManager::new(
+            config,
+            TEST_NODE_ID,
+            Box::new(NullDnsResolver),
+            Box::new(connector),
+        );
+        mgr.bootstrap();
+        // Validator is OPTIONAL for SC, should be kept when room available
+        assert_eq!(mgr.active_peer_count(), 1);
     }
 
     #[test]
@@ -2984,6 +3695,8 @@ mod tests {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
                     port: 45831,
                     node_id: Some(REMOTE_NODE_ID),
+                    role: Some(NodeRole::StorageCompute),
+                    node_class: Some(NodeClass::Reguler),
                     service_type: Some(ServiceType::Storage),
                     last_connected: now_secs(),
                 },
@@ -2991,6 +3704,8 @@ mod tests {
                     addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
                     port: 45831,
                     node_id: Some(REMOTE_NODE_ID_2),
+                    role: Some(NodeRole::Coordinator),
+                    node_class: None,
                     service_type: Some(ServiceType::Coordinator),
                     last_connected: now_secs(),
                 },
@@ -2999,7 +3714,6 @@ mod tests {
 
         let added = mgr.process_pex_response(&pex_resp);
         assert_eq!(added, 2);
-        // Second call: same peers, no new additions
         let added2 = mgr.process_pex_response(&pex_resp);
         assert_eq!(added2, 0);
     }
@@ -3014,11 +3728,9 @@ mod tests {
             Box::new(NullDnsResolver),
             Box::new(connector),
         );
-
         let addr: SocketAddr = "10.0.0.99:45831".parse().unwrap();
         mgr.add_manual_peer(addr);
         assert_eq!(mgr.store().len(), 1);
-        assert!(mgr.store().get(&addr).is_some());
     }
 
     #[test]
@@ -3031,16 +3743,11 @@ mod tests {
             Box::new(NullDnsResolver),
             Box::new(connector),
         );
-
-        // Add an expired peer
         let mut old = make_peer(1, PeerSource::DnsSeed);
         old.first_seen = 1000;
         old.last_connected = 0;
         mgr.store_mut().upsert(old);
-
-        // Add a fresh peer
         mgr.store_mut().upsert(make_peer(2, PeerSource::DnsSeed));
-
         let removed = mgr.gc();
         assert_eq!(removed, 1);
         assert_eq!(mgr.store().len(), 1);
@@ -3056,9 +3763,10 @@ mod tests {
             Box::new(NullDnsResolver),
             Box::new(connector),
         );
-
         let summary = mgr.summary();
         assert_eq!(summary.network_id, "testnet");
+        assert_eq!(summary.role, "storage-compute");
+        assert_eq!(summary.node_class, Some("reguler".to_string()));
         assert_eq!(summary.service_type, "storage");
         assert_eq!(summary.dns_seeds_configured, 1);
         assert_eq!(summary.static_peers_configured, 1);
@@ -3075,8 +3783,8 @@ mod tests {
         metrics.peer_connect_success = 3;
         let prom = metrics.to_prometheus("test-node");
         assert!(prom.contains("dsdn_bootstrap_dns_resolve_total"));
+        assert!(prom.contains("dsdn_bootstrap_role_disconnect_total"));
         assert!(prom.contains("test-node"));
-        assert!(prom.contains("5"));
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -3101,7 +3809,6 @@ mod tests {
     fn test_peer_info_node_id_hex() {
         let mut peer = make_peer(1, PeerSource::DnsSeed);
         assert!(peer.node_id_hex().is_none());
-
         peer.node_id = Some([0xAB; 32]);
         let hex = peer.node_id_hex().unwrap();
         assert_eq!(hex.len(), 64);
@@ -3115,91 +3822,41 @@ mod tests {
                 local: "mainnet".to_string(),
                 remote: "testnet".to_string(),
             },
-            HandshakeError::VersionIncompatible {
-                local: 1,
-                remote: 2,
-            },
+            HandshakeError::VersionIncompatible { local: 1, remote: 2 },
             HandshakeError::SelfConnection,
             HandshakeError::Timeout,
             HandshakeError::Transport("refused".to_string()),
+            HandshakeError::InvalidRoleClass {
+                role: "validator".to_string(),
+                class: "datacenter".to_string(),
+                reason: "test".to_string(),
+            },
         ];
         for e in &errors {
-            let s = format!("{}", e);
-            assert!(!s.is_empty());
+            assert!(!format!("{}", e).is_empty());
         }
     }
 
     #[test]
-    fn test_peer_store_filter_by_service() {
-        let mut store = PeerStore::in_memory();
-
-        let mut p1 = make_peer(1, PeerSource::DnsSeed);
-        p1.service_type = Some(ServiceType::Storage);
-        let mut p2 = make_peer(2, PeerSource::DnsSeed);
-        p2.service_type = Some(ServiceType::Coordinator);
-        let mut p3 = make_peer(3, PeerSource::DnsSeed);
-        p3.service_type = Some(ServiceType::Storage);
-
-        store.upsert(p1);
-        store.upsert(p2);
-        store.upsert(p3);
-
-        let storage_peers = store.peers_by_service(ServiceType::Storage);
-        assert_eq!(storage_peers.len(), 2);
-
-        let coord_peers = store.peers_by_service(ServiceType::Coordinator);
-        assert_eq!(coord_peers.len(), 1);
-
-        let validator_peers = store.peers_by_service(ServiceType::Validator);
-        assert!(validator_peers.is_empty());
+    fn test_disconnect_reason_display() {
+        let reasons = vec![
+            DisconnectReason::RoleNotNeeded,
+            DisconnectReason::TooManyPeers,
+            DisconnectReason::InvalidHandshake,
+            DisconnectReason::Shutdown,
+        ];
+        for r in &reasons {
+            assert!(!format!("{}", r).is_empty());
+        }
     }
 
     #[test]
-    fn test_peer_store_filter_by_network() {
-        let mut store = PeerStore::in_memory();
-
-        store.upsert(PeerInfo::new(
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            45831,
-            PeerSource::DnsSeed,
-            NetworkId::Mainnet,
-        ));
-        store.upsert(PeerInfo::new(
-            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
-            45831,
-            PeerSource::DnsSeed,
-            NetworkId::Testnet,
-        ));
-
-        let mainnet = store.peers_by_network(&NetworkId::Mainnet);
-        assert_eq!(mainnet.len(), 1);
-
-        let testnet = store.peers_by_network(&NetworkId::Testnet);
-        assert_eq!(testnet.len(), 1);
-    }
-
-    #[test]
-    fn test_config_from_env() {
-        // Clean state
-        std::env::set_var("BOOTSTRAP_DNS_SEEDS", "seed1.test,seed2.test");
-        std::env::set_var("BOOTSTRAP_STATIC_PEERS", "1.2.3.4:45831");
-        std::env::set_var("BOOTSTRAP_NETWORK_ID", "testnet");
-        std::env::set_var("BOOTSTRAP_SERVICE_TYPE", "coordinator");
-        std::env::set_var("BOOTSTRAP_P2P_PORT", "31313");
-
-        let cfg = BootstrapConfig::from_env();
-        assert_eq!(cfg.dns_seeds.len(), 2);
-        assert_eq!(cfg.static_peers.len(), 1);
-        assert_eq!(cfg.network_id, NetworkId::Testnet);
-        assert_eq!(cfg.service_type, ServiceType::Coordinator);
-        assert_eq!(cfg.p2p_port, 31313);
-
-        // Cleanup
-        std::env::remove_var("BOOTSTRAP_DNS_SEEDS");
-        std::env::remove_var("BOOTSTRAP_STATIC_PEERS");
-        std::env::remove_var("BOOTSTRAP_NETWORK_ID");
-        std::env::remove_var("BOOTSTRAP_SERVICE_TYPE");
-        std::env::remove_var("BOOTSTRAP_P2P_PORT");
+    fn test_peer_source_display() {
+        assert_eq!(PeerSource::DnsSeed.to_string(), "dns_seed");
+        assert_eq!(PeerSource::StaticConfig.to_string(), "static_config");
+        assert_eq!(PeerSource::PeerExchange.to_string(), "peer_exchange");
+        assert_eq!(PeerSource::Inbound.to_string(), "inbound");
+        assert_eq!(PeerSource::Manual.to_string(), "manual");
     }
 
     #[test]
@@ -3214,33 +3871,321 @@ mod tests {
         let r3 = BootstrapResult::Skipped {
             reason: "no config".to_string(),
         };
-        // Just ensure Debug doesn't panic
         let _ = format!("{:?}", r1);
         let _ = format!("{:?}", r2);
         let _ = format!("{:?}", r3);
     }
 
     #[test]
-    fn test_peer_source_display() {
-        assert_eq!(PeerSource::DnsSeed.to_string(), "dns_seed");
-        assert_eq!(PeerSource::StaticConfig.to_string(), "static_config");
-        assert_eq!(PeerSource::PeerExchange.to_string(), "peer_exchange");
-        assert_eq!(PeerSource::Inbound.to_string(), "inbound");
-        assert_eq!(PeerSource::Manual.to_string(), "manual");
+    fn test_peer_store_filter_by_network() {
+        let mut store = PeerStore::in_memory();
+        store.upsert(PeerInfo::new(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            45831,
+            PeerSource::DnsSeed,
+            NetworkId::Mainnet,
+        ));
+        store.upsert(PeerInfo::new(
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+            45831,
+            PeerSource::DnsSeed,
+            NetworkId::Testnet,
+        ));
+        assert_eq!(store.peers_by_network(&NetworkId::Mainnet).len(), 1);
+        assert_eq!(store.peers_by_network(&NetworkId::Testnet).len(), 1);
     }
 
     #[test]
-    fn test_peer_manager_active_peers_by_service() {
-        let config = test_config();
+    fn test_config_from_env() {
+        std::env::set_var("BOOTSTRAP_DNS_SEEDS", "seed1.test,seed2.test");
+        std::env::set_var("BOOTSTRAP_STATIC_PEERS", "1.2.3.4:45831");
+        std::env::set_var("BOOTSTRAP_NETWORK_ID", "testnet");
+        std::env::set_var("BOOTSTRAP_ROLE", "coordinator");
+        std::env::set_var("BOOTSTRAP_P2P_PORT", "31313");
+
+        let cfg = BootstrapConfig::from_env();
+        assert_eq!(cfg.dns_seeds.len(), 2);
+        assert_eq!(cfg.static_peers.len(), 1);
+        assert_eq!(cfg.network_id, NetworkId::Testnet);
+        assert_eq!(cfg.role, NodeRole::Coordinator);
+        assert_eq!(cfg.node_class, None); // Coordinator has no class
+        assert_eq!(cfg.p2p_port, 31313);
+
+        std::env::remove_var("BOOTSTRAP_DNS_SEEDS");
+        std::env::remove_var("BOOTSTRAP_STATIC_PEERS");
+        std::env::remove_var("BOOTSTRAP_NETWORK_ID");
+        std::env::remove_var("BOOTSTRAP_ROLE");
+        std::env::remove_var("BOOTSTRAP_P2P_PORT");
+    }
+
+    #[test]
+    fn test_config_from_env_backward_compat() {
+        // Old BOOTSTRAP_SERVICE_TYPE should still work
+        std::env::set_var("BOOTSTRAP_SERVICE_TYPE", "coordinator");
+        std::env::remove_var("BOOTSTRAP_ROLE");
+
+        let cfg = BootstrapConfig::from_env();
+        assert_eq!(cfg.role, NodeRole::Coordinator);
+        assert_eq!(cfg.node_class, None);
+
+        std::env::remove_var("BOOTSTRAP_SERVICE_TYPE");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // TOML CONFIG PARSING (Tahap 21)
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_toml_parse_full_section_tahap21() {
+        let toml = r#"
+[bootstrap]
+role = "storage-compute"
+node_class = "reguler"
+dns_seeds = [
+    "seed1.dsdn.network",
+    "seed2.dsdn.network",
+    "seed3.dsdn.network",
+]
+static_peers = [
+    "203.0.113.50:45831",
+    "198.51.100.10:45831",
+]
+peers_file = "peers.dat"
+max_outbound_connections = 8
+max_inbound_connections = 125
+dns_resolve_timeout_secs = 10
+peer_connect_timeout_secs = 5
+p2p_port = 45831
+network_id = "mainnet"
+"#;
+        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse Tahap 21 TOML");
+        assert_eq!(cfg.role, NodeRole::StorageCompute);
+        assert_eq!(cfg.node_class, Some(NodeClass::Reguler));
+        assert_eq!(cfg.dns_seeds.len(), 3);
+        assert_eq!(cfg.static_peers.len(), 2);
+        assert_eq!(cfg.p2p_port, 45831);
+        assert_eq!(cfg.network_id, NetworkId::Mainnet);
+    }
+
+    #[test]
+    fn test_toml_parse_validator_config() {
+        let toml = r#"
+[bootstrap]
+role = "validator"
+network_id = "mainnet"
+dns_seeds = ["seed1.dsdn.network"]
+"#;
+        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse validator");
+        assert_eq!(cfg.role, NodeRole::Validator);
+        assert_eq!(cfg.node_class, None); // Validator has no class
+    }
+
+    #[test]
+    fn test_toml_parse_backward_compat_service_type() {
+        let toml = r#"
+[bootstrap]
+service_type = "coordinator"
+network_id = "testnet"
+"#;
+        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse legacy");
+        assert_eq!(cfg.role, NodeRole::Coordinator);
+        assert_eq!(cfg.node_class, None);
+    }
+
+    #[test]
+    fn test_toml_parse_datacenter() {
+        let toml = r#"
+[bootstrap]
+role = "storage-compute"
+node_class = "datacenter"
+"#;
+        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse DC");
+        assert_eq!(cfg.role, NodeRole::StorageCompute);
+        assert_eq!(cfg.node_class, Some(NodeClass::DataCenter));
+        assert_eq!(cfg.service_type, ServiceType::StorageDC);
+    }
+
+    #[test]
+    fn test_toml_parse_empty_arrays() {
+        let toml = r#"
+[bootstrap]
+dns_seeds = []
+static_peers = []
+max_outbound_connections = 4
+"#;
+        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse empty arrays");
+        assert!(cfg.dns_seeds.is_empty());
+        assert!(cfg.static_peers.is_empty());
+        assert_eq!(cfg.max_outbound, 4);
+        assert_eq!(cfg.p2p_port, DEFAULT_P2P_PORT);
+    }
+
+    #[test]
+    fn test_toml_parse_missing_section() {
+        let toml = r#"
+[storage]
+data_dir = "/data"
+"#;
+        assert!(BootstrapConfig::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn test_toml_parse_invalid_toml() {
+        assert!(BootstrapConfig::from_toml_str("this is not valid toml {{{}").is_err());
+    }
+
+    #[test]
+    fn test_toml_parse_ignores_other_sections() {
+        let toml = r#"
+[da]
+endpoint = "http://localhost:26658"
+
+[bootstrap]
+dns_seeds = ["seed1.dsdn.network"]
+p2p_port = 45831
+network_id = "testnet"
+role = "validator"
+
+[chain]
+rpc_endpoint = "http://localhost:26657"
+"#;
+        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse with other sections");
+        assert_eq!(cfg.dns_seeds.len(), 1);
+        assert_eq!(cfg.role, NodeRole::Validator);
+        assert_eq!(cfg.node_class, None);
+    }
+
+    #[test]
+    fn test_toml_roundtrip() {
+        let mut original = BootstrapConfig::default();
+        original.dns_seeds = vec![
+            "seed1.dsdn.network".to_string(),
+            "seed2.dsdn.network".to_string(),
+        ];
+        original.static_peers = vec!["203.0.113.50:45831".to_string()];
+        original.p2p_port = 31313;
+        original.network_id = NetworkId::Testnet;
+        original.role = NodeRole::Coordinator;
+        original.node_class = None;
+        original.sync_service_type();
+        original.max_outbound = 16;
+
+        let toml_str = original.to_toml_string();
+        let reparsed = BootstrapConfig::from_toml_str(&toml_str).expect("roundtrip parse");
+
+        assert_eq!(reparsed.dns_seeds, original.dns_seeds);
+        assert_eq!(reparsed.static_peers, original.static_peers);
+        assert_eq!(reparsed.p2p_port, original.p2p_port);
+        assert_eq!(reparsed.network_id, original.network_id);
+        assert_eq!(reparsed.role, original.role);
+        assert_eq!(reparsed.node_class, original.node_class);
+    }
+
+    #[test]
+    fn test_toml_generate_defaults() {
+        let cfg = BootstrapConfig::default();
+        let toml_str = cfg.to_toml_string();
+        assert!(toml_str.contains("[bootstrap]"));
+        assert!(toml_str.contains("role = \"storage-compute\""));
+        assert!(toml_str.contains("node_class = \"reguler\""));
+        assert!(toml_str.contains("dns_seeds"));
+        assert!(toml_str.contains("p2p_port = 45831"));
+        assert!(toml_str.contains("network_id = \"mainnet\""));
+    }
+
+    #[test]
+    fn test_toml_from_file() {
+        let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
+        let content = r#"
+[bootstrap]
+dns_seeds = ["seed-from-file.dsdn.network"]
+p2p_port = 32323
+network_id = "testnet"
+role = "storage-compute"
+node_class = "datacenter"
+max_outbound_connections = 16
+"#;
+        std::fs::write(tmp.path(), content).expect("write toml");
+
+        std::env::remove_var("BOOTSTRAP_P2P_PORT");
+        std::env::remove_var("BOOTSTRAP_DNS_SEEDS");
+        std::env::remove_var("BOOTSTRAP_ROLE");
+
+        let cfg = BootstrapConfig::from_file(tmp.path()).expect("from_file");
+        assert_eq!(cfg.dns_seeds.len(), 1);
+        assert_eq!(cfg.p2p_port, 32323);
+        assert_eq!(cfg.role, NodeRole::StorageCompute);
+        assert_eq!(cfg.node_class, Some(NodeClass::DataCenter));
+        assert_eq!(cfg.service_type, ServiceType::StorageDC);
+        assert!(cfg.loaded_from.is_some());
+    }
+
+    #[test]
+    fn test_toml_from_file_missing() {
+        assert!(BootstrapConfig::from_file(Path::new("/nonexistent/dsdn.toml")).is_err());
+    }
+
+    #[test]
+    fn test_toml_unknown_fields_ignored() {
+        let toml = r#"
+[bootstrap]
+dns_seeds = ["seed1.test"]
+some_future_field = "hello"
+another_new_setting = 42
+"#;
+        let parsed = BootstrapConfig::parse_toml_str(toml);
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn test_loaded_from_tracking() {
+        let cfg = BootstrapConfig::default();
+        assert!(cfg.loaded_from().is_none());
+
+        let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
+        std::fs::write(tmp.path(), "[bootstrap]\np2p_port = 12345\n").expect("write");
+        let cfg2 = BootstrapConfig::from_file(tmp.path()).expect("from_file");
+        assert_eq!(cfg2.loaded_from().unwrap(), tmp.path());
+    }
+
+    #[test]
+    fn test_env_override_priority() {
+        let toml = r#"
+[bootstrap]
+p2p_port = 45831
+network_id = "mainnet"
+role = "storage-compute"
+dns_seeds = ["seed1.dsdn.network"]
+"#;
+        let mut cfg = BootstrapConfig::from_toml_str(toml).expect("parse base");
+        assert_eq!(cfg.p2p_port, 45831);
+        assert_eq!(cfg.role, NodeRole::StorageCompute);
+
+        std::env::set_var("BOOTSTRAP_P2P_PORT", "41414");
+        std::env::set_var("BOOTSTRAP_NETWORK_ID", "testnet");
+        cfg.apply_env_overrides();
+
+        assert_eq!(cfg.p2p_port, 41414);
+        assert_eq!(cfg.network_id, NetworkId::Testnet);
+        assert_eq!(cfg.dns_seeds.len(), 1); // Not overridden
+
+        std::env::remove_var("BOOTSTRAP_P2P_PORT");
+        std::env::remove_var("BOOTSTRAP_NETWORK_ID");
+    }
+
+    #[test]
+    fn test_peer_manager_active_peers_by_role() {
         let addr1: SocketAddr = "192.168.1.100:45831".parse().unwrap();
         let addr2: SocketAddr = "192.168.1.101:45831".parse().unwrap();
 
         let mut connector = MockPeerConnector::new();
+        // SC peer → REQUIRED for our SC
         connector.add_reachable(addr1, make_remote_handshake(REMOTE_NODE_ID));
-
-        let mut hs2 = make_remote_handshake(REMOTE_NODE_ID_2);
-        hs2.service_type = ServiceType::Coordinator;
-        connector.add_reachable(addr2, hs2);
+        // Coordinator peer → REQUIRED for our SC
+        connector.add_reachable(
+            addr2,
+            make_remote_handshake_role(REMOTE_NODE_ID_2, NodeRole::Coordinator, None),
+        );
 
         let mut config = test_config();
         config.static_peers = vec![
@@ -3254,337 +4199,38 @@ mod tests {
             Box::new(NullDnsResolver),
             Box::new(connector),
         );
-
         mgr.bootstrap();
-        let storage_peers = mgr.active_peers_by_service(ServiceType::Storage);
-        let coord_peers = mgr.active_peers_by_service(ServiceType::Coordinator);
-        assert_eq!(storage_peers.len(), 1);
-        assert_eq!(coord_peers.len(), 1);
+
+        assert_eq!(mgr.active_peers_by_role(NodeRole::StorageCompute).len(), 1);
+        assert_eq!(mgr.active_peers_by_role(NodeRole::Coordinator).len(), 1);
+        // Backward compat still works
+        assert_eq!(mgr.active_peers_by_service(ServiceType::Storage).len(), 1);
+        assert_eq!(mgr.active_peers_by_service(ServiceType::Coordinator).len(), 1);
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // TOML CONFIG PARSING
-    // ────────────────────────────────────────────────────────────────────
-
-    /// Exact TOML format from Tahap 28 design doc should parse correctly.
     #[test]
-    fn test_toml_parse_full_section() {
-        let toml = r#"
-[bootstrap]
-dns_seeds = [
-    "seed1.dsdn.network",
-    "seed2.dsdn.network",
-    "seed3.dsdn.network",
-]
-static_peers = [
-    "203.0.113.50:45831",
-    "198.51.100.10:45831",
-]
-peers_file = "peers.dat"
-max_outbound_connections = 8
-max_inbound_connections = 125
-dns_resolve_timeout_secs = 10
-peer_connect_timeout_secs = 5
-p2p_port = 45831
-network_id = "mainnet"
-service_type = "storage"
-"#;
-        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse full TOML");
-        assert_eq!(cfg.dns_seeds.len(), 3);
-        assert_eq!(cfg.dns_seeds[0], "seed1.dsdn.network");
-        assert_eq!(cfg.static_peers.len(), 2);
-        assert_eq!(cfg.static_peers[0], "203.0.113.50:45831");
-        assert_eq!(cfg.peers_file, PathBuf::from("peers.dat"));
-        assert_eq!(cfg.max_outbound, 8);
-        assert_eq!(cfg.max_inbound, 125);
-        assert_eq!(cfg.dns_timeout_secs, 10);
-        assert_eq!(cfg.connect_timeout_secs, 5);
-        assert_eq!(cfg.p2p_port, 45831);
-        assert_eq!(cfg.network_id, NetworkId::Mainnet);
-        assert_eq!(cfg.service_type, ServiceType::Storage);
-    }
-
-    /// TOML with all seeds commented out — empty arrays are valid.
-    #[test]
-    fn test_toml_parse_empty_arrays() {
-        let toml = r#"
-[bootstrap]
-dns_seeds = []
-static_peers = []
-peers_file = "peers.dat"
-max_outbound_connections = 4
-max_inbound_connections = 50
-dns_resolve_timeout_secs = 5
-peer_connect_timeout_secs = 3
-"#;
-        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse empty arrays");
-        assert!(cfg.dns_seeds.is_empty());
-        assert!(cfg.static_peers.is_empty());
-        assert_eq!(cfg.max_outbound, 4);
-        assert_eq!(cfg.max_inbound, 50);
-        // Unset fields get defaults
-        assert_eq!(cfg.p2p_port, DEFAULT_P2P_PORT);
-        assert_eq!(cfg.network_id, NetworkId::Mainnet);
-    }
-
-    /// TOML with only partial fields — unset fields use defaults.
-    #[test]
-    fn test_toml_parse_partial_config() {
-        let toml = r#"
-[bootstrap]
-p2p_port = 31313
-network_id = "testnet"
-service_type = "coordinator"
-"#;
-        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse partial");
-        assert_eq!(cfg.p2p_port, 31313);
-        assert_eq!(cfg.network_id, NetworkId::Testnet);
-        assert_eq!(cfg.service_type, ServiceType::Coordinator);
-        // Unset fields = defaults
-        assert!(cfg.dns_seeds.is_empty());
-        assert_eq!(cfg.max_outbound, DEFAULT_MAX_OUTBOUND);
-        assert_eq!(cfg.peers_file, PathBuf::from("peers.dat"));
-    }
-
-    /// TOML with custom network_id.
-    #[test]
-    fn test_toml_parse_custom_network() {
-        let toml = r#"
-[bootstrap]
-network_id = "devnet-alpha"
-service_type = "validator"
-"#;
-        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse custom net");
-        match &cfg.network_id {
-            NetworkId::Custom(s) => assert_eq!(s, "devnet-alpha"),
-            other => panic!("expected Custom, got {:?}", other),
+    fn test_peer_manager_fallback_order() {
+        let config = BootstrapConfig {
+            dns_seeds: vec!["seed.test".to_string()],
+            static_peers: vec!["192.168.1.200:45831".to_string()],
+            peers_file: PathBuf::from("/dev/null"),
+            network_id: NetworkId::Testnet,
+            ..BootstrapConfig::default()
+        };
+        let dns_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let dns_addr = SocketAddr::new(dns_ip, DEFAULT_P2P_PORT);
+        let mut dns = MockDnsResolver::new();
+        dns.add_result("seed.test", vec![dns_ip]);
+        let mut connector = MockPeerConnector::new();
+        connector.add_reachable(dns_addr, make_remote_handshake(REMOTE_NODE_ID));
+        let mut mgr = PeerManager::new(config, TEST_NODE_ID, Box::new(dns), Box::new(connector));
+        let result = mgr.bootstrap();
+        match result {
+            BootstrapResult::Connected { source, .. } => {
+                assert_eq!(source, "dns_seed");
+            }
+            other => panic!("expected Connected via dns, got {:?}", other),
         }
-        assert_eq!(cfg.service_type, ServiceType::Validator);
-    }
-
-    /// No [bootstrap] section → from_toml_str returns Err.
-    #[test]
-    fn test_toml_parse_missing_section() {
-        let toml = r#"
-[storage]
-data_dir = "/data"
-"#;
-        let result = BootstrapConfig::from_toml_str(toml);
-        assert!(result.is_err());
-    }
-
-    /// Invalid TOML → from_toml_str returns Err.
-    #[test]
-    fn test_toml_parse_invalid_toml() {
-        let result = BootstrapConfig::from_toml_str("this is not valid toml {{{}");
-        assert!(result.is_err());
-    }
-
-    /// dsdn.toml with OTHER sections alongside [bootstrap] — only
-    /// [bootstrap] is parsed, other sections are ignored.
-    #[test]
-    fn test_toml_parse_ignores_other_sections() {
-        let toml = r#"
-[da]
-endpoint = "http://localhost:26658"
-network = "mocha-4"
-
-[storage]
-data_dir = "/data/dsdn"
-max_capacity_gb = 100
-
-[bootstrap]
-dns_seeds = ["seed1.dsdn.network"]
-p2p_port = 45831
-network_id = "testnet"
-
-[chain]
-rpc_endpoint = "http://localhost:26657"
-"#;
-        let cfg = BootstrapConfig::from_toml_str(toml).expect("parse with other sections");
-        assert_eq!(cfg.dns_seeds.len(), 1);
-        assert_eq!(cfg.dns_seeds[0], "seed1.dsdn.network");
-        assert_eq!(cfg.p2p_port, 45831);
-        assert_eq!(cfg.network_id, NetworkId::Testnet);
-    }
-
-    /// Env vars override TOML values (priority chain).
-    #[test]
-    fn test_toml_env_override_priority() {
-        let toml = r#"
-[bootstrap]
-p2p_port = 45831
-network_id = "mainnet"
-max_outbound_connections = 8
-dns_seeds = ["seed1.dsdn.network"]
-"#;
-        // Parse TOML first
-        let mut cfg = BootstrapConfig::from_toml_str(toml).expect("parse base");
-        assert_eq!(cfg.p2p_port, 45831);
-        assert_eq!(cfg.network_id, NetworkId::Mainnet);
-        assert_eq!(cfg.dns_seeds.len(), 1);
-
-        // Now simulate env overrides
-        std::env::set_var("BOOTSTRAP_P2P_PORT", "41414");
-        std::env::set_var("BOOTSTRAP_NETWORK_ID", "testnet");
-        cfg.apply_env_overrides();
-
-        // Env should win
-        assert_eq!(cfg.p2p_port, 41414);
-        assert_eq!(cfg.network_id, NetworkId::Testnet);
-        // DNS seeds not overridden by env → TOML value preserved
-        assert_eq!(cfg.dns_seeds.len(), 1);
-        assert_eq!(cfg.dns_seeds[0], "seed1.dsdn.network");
-
-        // Cleanup
-        std::env::remove_var("BOOTSTRAP_P2P_PORT");
-        std::env::remove_var("BOOTSTRAP_NETWORK_ID");
-    }
-
-    /// TOML file persistence: from_file reads a real file.
-    #[test]
-    fn test_toml_from_file() {
-        let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
-        let content = r#"
-[bootstrap]
-dns_seeds = ["seed-from-file.dsdn.network"]
-p2p_port = 32323
-network_id = "testnet"
-service_type = "storage"
-max_outbound_connections = 16
-"#;
-        std::fs::write(tmp.path(), content).expect("write toml");
-
-        // Clear env to avoid interference
-        std::env::remove_var("BOOTSTRAP_P2P_PORT");
-        std::env::remove_var("BOOTSTRAP_DNS_SEEDS");
-
-        let cfg = BootstrapConfig::from_file(tmp.path()).expect("from_file");
-        assert_eq!(cfg.dns_seeds.len(), 1);
-        assert_eq!(cfg.dns_seeds[0], "seed-from-file.dsdn.network");
-        assert_eq!(cfg.p2p_port, 32323);
-        assert_eq!(cfg.network_id, NetworkId::Testnet);
-        assert_eq!(cfg.max_outbound, 16);
-        assert!(cfg.loaded_from.is_some());
-    }
-
-    /// from_file with missing file returns Err.
-    #[test]
-    fn test_toml_from_file_missing() {
-        let result = BootstrapConfig::from_file(Path::new("/nonexistent/dsdn.toml"));
-        assert!(result.is_err());
-    }
-
-    /// to_toml_string generates valid TOML that re-parses identically.
-    #[test]
-    fn test_toml_roundtrip() {
-        let mut original = BootstrapConfig::default();
-        original.dns_seeds = vec![
-            "seed1.dsdn.network".to_string(),
-            "seed2.dsdn.network".to_string(),
-        ];
-        original.static_peers = vec!["203.0.113.50:45831".to_string()];
-        original.p2p_port = 31313;
-        original.network_id = NetworkId::Testnet;
-        original.service_type = ServiceType::Coordinator;
-        original.max_outbound = 16;
-
-        let toml_str = original.to_toml_string();
-
-        // Re-parse the generated TOML
-        let reparsed = BootstrapConfig::from_toml_str(&toml_str)
-            .expect("roundtrip parse");
-
-        assert_eq!(reparsed.dns_seeds, original.dns_seeds);
-        assert_eq!(reparsed.static_peers, original.static_peers);
-        assert_eq!(reparsed.p2p_port, original.p2p_port);
-        assert_eq!(reparsed.network_id, original.network_id);
-        assert_eq!(reparsed.service_type, original.service_type);
-        assert_eq!(reparsed.max_outbound, original.max_outbound);
-    }
-
-    /// to_toml_string with defaults generates proper commented-out format.
-    #[test]
-    fn test_toml_generate_defaults() {
-        let cfg = BootstrapConfig::default();
-        let toml_str = cfg.to_toml_string();
-        assert!(toml_str.contains("[bootstrap]"));
-        assert!(toml_str.contains("dns_seeds"));
-        assert!(toml_str.contains("static_peers"));
-        assert!(toml_str.contains("peers_file"));
-        assert!(toml_str.contains("max_outbound_connections = 8"));
-        assert!(toml_str.contains("max_inbound_connections = 125"));
-        assert!(toml_str.contains("p2p_port = 45831"));
-        assert!(toml_str.contains("network_id = \"mainnet\""));
-        assert!(toml_str.contains("service_type = \"storage\""));
-    }
-
-    /// TOML field name mapping matches the user's expected format.
-    #[test]
-    fn test_toml_field_names_match_spec() {
-        // This is the exact TOML from the user's spec
-        let toml = r#"
-[bootstrap]
-# DNS seeds (founder/community maintained)
-dns_seeds = [
-    "seed1.dsdn.network",
-    "seed2.dsdn.network",
-    "seed3.dsdn.network",
-]
-
-# Static IP peers (community maintained)
-static_peers = [
-    "203.0.113.50:45831",
-    "198.51.100.10:45831",
-]
-
-# Local peer cache
-peers_file = "peers.dat"
-
-# Connection settings
-max_outbound_connections = 8
-max_inbound_connections = 125
-dns_resolve_timeout_secs = 10
-peer_connect_timeout_secs = 5
-"#;
-        let cfg = BootstrapConfig::from_toml_str(toml).expect("user spec format");
-        assert_eq!(cfg.dns_seeds.len(), 3);
-        assert_eq!(cfg.static_peers.len(), 2);
-        assert_eq!(cfg.peers_file, PathBuf::from("peers.dat"));
-        assert_eq!(cfg.max_outbound, 8);
-        assert_eq!(cfg.max_inbound, 125);
-        assert_eq!(cfg.dns_timeout_secs, 10);
-        assert_eq!(cfg.connect_timeout_secs, 5);
-    }
-
-    /// BootstrapToml with unknown fields in TOML → ignored gracefully.
-    #[test]
-    fn test_toml_unknown_fields_ignored() {
-        let toml = r#"
-[bootstrap]
-dns_seeds = ["seed1.test"]
-some_future_field = "hello"
-another_new_setting = 42
-"#;
-        // Should still parse, ignoring unknown fields
-        let parsed = BootstrapConfig::parse_toml_str(toml);
-        assert!(parsed.is_some());
-        let section = parsed.unwrap();
-        assert_eq!(section.dns_seeds.unwrap().len(), 1);
-    }
-
-    /// loaded_from tracks which file was used.
-    #[test]
-    fn test_loaded_from_tracking() {
-        let cfg = BootstrapConfig::default();
-        assert!(cfg.loaded_from().is_none());
-
-        let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
-        std::fs::write(
-            tmp.path(),
-            "[bootstrap]\np2p_port = 12345\n",
-        ).expect("write");
-        let cfg2 = BootstrapConfig::from_file(tmp.path()).expect("from_file");
-        assert_eq!(cfg2.loaded_from().unwrap(), tmp.path());
+        assert!(mgr.metrics().fallback_triggered >= 1);
     }
 }

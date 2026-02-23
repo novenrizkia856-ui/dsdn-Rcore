@@ -810,14 +810,31 @@ pub use status_tracker::NodeStatusTracker;
 pub use status_notification::{StatusNotificationHandler, StatusNotification};
 pub use tls_manager::{TLSCertManager, TLSError};
 
-// Bootstrap Network System (Pre-21.1 Foundation)
+// Bootstrap Network System (Tahap 21 Aligned)
 pub use bootstrap::{
+    // Core config & types
     BootstrapConfig, BootstrapMetrics, BootstrapResult, BootstrapSummary,
-    ServiceType, NetworkId, PeerSource,
+    NetworkId, PeerSource,
+
+    // Tahap 21: Role + Class system (preferred)
+    NodeRole, NodeClass,
+    RoleDependencyMatrix, RoleDependency,
+    PostHandshakeAction, DisconnectReason,
+
+    // Backward compat (deprecated — use NodeRole + NodeClass instead)
+    ServiceType,
+
+    // Peer management
     PeerInfo, PeerStore, PeerStoreStats, PeerStoreError,
     PeerManager,
+
+    // Handshake protocol (Tahap 21: role+class exchange)
     HandshakeMessage, HandshakeError,
+
+    // PEX (Tahap 21: role+class aware)
     PexRequest, PexResponse, PexPeerEntry,
+
+    // I/O traits
     DnsResolver, MockDnsResolver, NullDnsResolver,
     PeerConnector, MockPeerConnector,
 };
