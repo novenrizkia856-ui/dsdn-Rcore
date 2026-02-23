@@ -2537,6 +2537,66 @@ impl Chain {
             .collect()
     }
 
+    // ── P2P ROLE-AWARE QUERIES (Tahap 21 v2) ────────────────────
+
+    /// Get our P2P role (from dsdn.toml config).
+    pub fn p2p_our_role(&self) -> p2p::NodeRole {
+        self.peer_manager.read().our_role
+    }
+
+    /// Get our P2P node class (Some for StorageCompute, None for others).
+    pub fn p2p_our_class(&self) -> Option<p2p::NodeClass> {
+        self.peer_manager.read().our_node_class
+    }
+
+    /// Get connected peers by specific role.
+    pub fn p2p_connected_by_role(&self, role: p2p::NodeRole) -> Vec<p2p::PeerEntry> {
+        self.peer_manager.read()
+            .get_connected_by_role(role)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Get count of connected peers by role.
+    pub fn p2p_connected_count_by_role(&self, role: p2p::NodeRole) -> usize {
+        self.peer_manager.read().connected_count_by_role(role)
+    }
+
+    /// Check whether all REQUIRED roles have at least one connected peer.
+    pub fn p2p_all_required_roles_met(&self) -> bool {
+        self.peer_manager.read().all_required_roles_met()
+    }
+
+    /// Get list of REQUIRED roles yang belum ada connected peer-nya.
+    pub fn p2p_missing_required_roles(&self) -> Vec<p2p::NodeRole> {
+        self.peer_manager.read().missing_required_roles()
+    }
+
+    /// Get role health summary: (role, dependency_level, connected_count).
+    pub fn p2p_role_health(&self) -> Vec<(p2p::NodeRole, p2p::RoleDependency, usize)> {
+        self.peer_manager.read().role_health()
+    }
+
+    /// Decide what to do after handshake based on RoleDependencyMatrix.
+    pub fn p2p_decide_post_handshake(
+        &self,
+        peer_role: p2p::NodeRole,
+        peer_class: Option<p2p::NodeClass>,
+    ) -> p2p::manager::PostHandshakeAction {
+        self.peer_manager.read().decide_post_handshake(peer_role, peer_class)
+    }
+
+    /// Build PEX request targeted at missing REQUIRED roles.
+    pub fn p2p_build_pex_for_missing(&self) -> p2p::PexRequest {
+        self.peer_manager.read().build_pex_request_for_missing_roles()
+    }
+
+    /// Get P2P peer store stats (role+class breakdown).
+    pub fn p2p_store_stats(&self) -> p2p::store::PeerStoreStats {
+        self.peer_manager.read().store.stats()
+    }
+
     /// Get P2P status summary string (untuk monitoring/debugging).
     pub fn p2p_status(&self) -> String {
         self.peer_manager.read().status_summary()

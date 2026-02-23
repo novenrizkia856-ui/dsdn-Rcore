@@ -400,6 +400,17 @@ pub enum Commands {
     },
 
     // ═══════════════════════════════════════════════════════════
+    // P2P NETWORK (Tahap 21 v2)
+    // ═══════════════════════════════════════════════════════════
+
+    /// P2P network management commands
+    /// Status, peer management, role health, bootstrap
+    P2p {
+        #[command(subcommand)]
+        command: P2pCommand,
+    },
+
+    // ═══════════════════════════════════════════════════════════
     // FULL INTEGRATION TESTING (13.19)
     // ═══════════════════════════════════════════════════════════
 
@@ -421,6 +432,47 @@ pub enum TestCommand {
     /// Executes all 9 integration tests sequentially
     /// Reports: SYSTEM OK / SYSTEM DEGRADED / SYSTEM INVALID
     Full,
+}
+
+/// P2P network commands (Tahap 21 v2)
+///
+/// Manage P2P peer lifecycle, role-based connectivity, and network health.
+/// All roles use single port 45831 with role+class identification via handshake.
+///
+/// ## Subcommands
+///
+/// - `status`: Show P2P network status, role, connected peers, health
+/// - `peers`: List all connected peers with role+class
+/// - `add-peer`: Add peer manually
+/// - `role-health`: Show RoleDependencyMatrix health per role
+/// - `bootstrap`: Trigger bootstrap process
+/// - `stats`: Show peer store statistics
+#[derive(Subcommand)]
+pub enum P2pCommand {
+    /// Show P2P network status overview
+    /// Displays role, connection counts, bootstrap state, and role health
+    Status,
+
+    /// List all connected peers with role and class info
+    Peers,
+
+    /// Add peer manually by IP:Port
+    /// Example: dsdn p2p add-peer --addr 203.0.113.50:45831
+    AddPeer {
+        #[arg(long)]
+        addr: String,
+    },
+
+    /// Show role dependency health matrix
+    /// Displays REQUIRED/OPTIONAL status and connected count per role
+    RoleHealth,
+
+    /// Trigger bootstrap — discover and connect to peers
+    /// Follows fallback chain: peers.dat → static IPs → DNS seeds
+    Bootstrap,
+
+    /// Show peer store statistics (role/class/source breakdown)
+    Stats,
 }
 
 /// Service node gating commands (14B.19)
@@ -3404,6 +3456,216 @@ println!("   Bootstrap Mode: {}", if config.bootstrap_mode { "YES ⚠️" } else
                             println!("   ❌ Snapshot not found at height {}: {}", height, e);
                         }
                     }
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // P2P NETWORK COMMANDS (Tahap 21 v2)
+        // ═══════════════════════════════════════════════════════════
+        Commands::P2p { command } => {
+            match command {
+                P2pCommand::Status => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("🌐 P2P NETWORK STATUS");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let our_role = chain.p2p_our_role();
+                    let our_class = chain.p2p_our_class();
+                    let class_str = our_class
+                        .map(|c| format!(" ({})", c))
+                        .unwrap_or_default();
+
+                    println!("   Role:       {}{}", our_role, class_str);
+                    println!("   Connected:  {} peers", chain.p2p_peer_count());
+                    println!("   Known:      {} peers", chain.p2p_known_count());
+
+                    let missing = chain.p2p_missing_required_roles();
+                    if missing.is_empty() {
+                        println!("   Health:     ✅ All REQUIRED roles connected");
+                    } else {
+                        let names: Vec<String> = missing.iter()
+                            .map(|r| r.to_string())
+                            .collect();
+                        println!("   Health:     ⚠️  Missing REQUIRED: {}", names.join(", "));
+                    }
+
+                    println!();
+                    println!("   Role breakdown:");
+                    for (role, dep, count) in chain.p2p_role_health() {
+                        let dep_str = match dep {
+                            crate::p2p::RoleDependency::Required => "REQUIRED",
+                            crate::p2p::RoleDependency::Optional => "OPTIONAL",
+                            crate::p2p::RoleDependency::Skip => "SKIP",
+                        };
+                        let icon = if count > 0 { "✅" } else {
+                            match dep {
+                                crate::p2p::RoleDependency::Required => "❌",
+                                _ => "—",
+                            }
+                        };
+                        println!("     {} {:20} {:>8}   {} connected",
+                            icon, role.to_string(), dep_str, count);
+                    }
+
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
+                P2pCommand::Peers => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("🌐 CONNECTED P2P PEERS");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let mgr = chain.peer_manager.read();
+                    let peers = mgr.get_connected_peers();
+
+                    if peers.is_empty() {
+                        println!("   No connected peers");
+                    } else {
+                        println!("   {:>4} | {:>22} | {:>16} | {:>10} | {:>8} | {:>5}",
+                            "#", "Address", "Role", "Class", "Score", "Succ");
+                        println!("   {}", "-".repeat(78));
+                        for (i, p) in peers.iter().enumerate() {
+                            let class_str = p.node_class
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "-".to_string());
+                            println!("   {:>4} | {:>22} | {:>16} | {:>10} | {:>8} | {:>5}",
+                                i + 1,
+                                p.addr.to_string(),
+                                p.role.to_string(),
+                                class_str,
+                                p.score,
+                                p.success_count,
+                            );
+                        }
+                    }
+                    println!("   Total: {} connected, {} known",
+                        mgr.connected_count(), mgr.known_count());
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
+                P2pCommand::AddPeer { addr } => {
+                    match chain.add_peer_p2p(addr) {
+                        Ok(_) => {
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("✅ PEER ADDED");
+                            println!("   Address: {}", addr);
+                            println!("   Note: Role will be known after handshake");
+                            println!("═══════════════════════════════════════════════════════════");
+                        }
+                        Err(e) => {
+                            println!("═══════════════════════════════════════════════════════════");
+                            println!("❌ FAILED TO ADD PEER");
+                            println!("   Address: {}", addr);
+                            println!("   Error: {}", e);
+                            println!("═══════════════════════════════════════════════════════════");
+                        }
+                    }
+                }
+
+                P2pCommand::RoleHealth => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("🏥 P2P ROLE DEPENDENCY HEALTH");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let our_role = chain.p2p_our_role();
+                    let our_class = chain.p2p_our_class();
+                    println!("   Our role: {}{}", our_role,
+                        our_class.map(|c| format!(" ({})", c)).unwrap_or_default());
+                    println!();
+
+                    println!("   {:>20} | {:>10} | {:>10} | {:>6}",
+                        "Peer Role", "Dependency", "Connected", "Status");
+                    println!("   {}", "-".repeat(56));
+
+                    for (role, dep, count) in chain.p2p_role_health() {
+                        let dep_str = match dep {
+                            crate::p2p::RoleDependency::Required => "REQUIRED",
+                            crate::p2p::RoleDependency::Optional => "OPTIONAL",
+                            crate::p2p::RoleDependency::Skip => "SKIP",
+                        };
+                        let status = match dep {
+                            crate::p2p::RoleDependency::Required => {
+                                if count > 0 { "✅ OK" } else { "❌ MISS" }
+                            }
+                            crate::p2p::RoleDependency::Optional => {
+                                if count > 0 { "✅ OK" } else { "— NONE" }
+                            }
+                            crate::p2p::RoleDependency::Skip => "— SKIP",
+                        };
+                        println!("   {:>20} | {:>10} | {:>10} | {:>6}",
+                            role.to_string(), dep_str, count, status);
+                    }
+
+                    println!();
+                    if chain.p2p_all_required_roles_met() {
+                        println!("   ✅ All REQUIRED roles satisfied");
+                    } else {
+                        let missing = chain.p2p_missing_required_roles();
+                        let names: Vec<String> = missing.iter()
+                            .map(|r| r.to_string())
+                            .collect();
+                        println!("   ⚠️  Missing REQUIRED roles: {}", names.join(", "));
+                        println!("   Tip: Run 'dsdn p2p bootstrap' or add peers manually");
+                    }
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
+                P2pCommand::Bootstrap => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("🚀 P2P BOOTSTRAP");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let candidates = chain.bootstrap_peers();
+
+                    if candidates.is_empty() {
+                        println!("   ❌ No bootstrap candidates found");
+                        println!("   Tip: Add static_peers or dns_seeds to dsdn.toml");
+                    } else {
+                        println!("   Found {} candidates:", candidates.len());
+                        for (i, p) in candidates.iter().take(10).enumerate() {
+                            println!("     {}. {} (source={:?}, score={})",
+                                i + 1, p.addr, p.source, p.score);
+                        }
+                        if candidates.len() > 10 {
+                            println!("     ... and {} more", candidates.len() - 10);
+                        }
+                        println!();
+                        println!("   Note: Actual TCP/QUIC connections handled at Tahap 28");
+                    }
+                    println!("═══════════════════════════════════════════════════════════");
+                }
+
+                P2pCommand::Stats => {
+                    println!("═══════════════════════════════════════════════════════════");
+                    println!("📊 P2P PEER STORE STATISTICS");
+                    println!("═══════════════════════════════════════════════════════════");
+
+                    let stats = chain.p2p_store_stats();
+                    println!("   Total peers:    {}", stats.total);
+                    println!();
+                    println!("   By status:");
+                    println!("     Connected:    {}", stats.connected);
+                    println!("     Disconnected: {}", stats.disconnected);
+                    println!("     Discovered:   {}", stats.discovered);
+                    println!("     Connecting:   {}", stats.connecting);
+                    println!("     Banned:       {}", stats.banned);
+                    println!();
+                    println!("   By role:");
+                    println!("     StorageCompute:  {} (reguler={}, datacenter={})",
+                        stats.role_storage_compute, stats.class_reguler, stats.class_datacenter);
+                    println!("     Validator:       {}", stats.role_validator);
+                    println!("     Coordinator:     {}", stats.role_coordinator);
+                    println!("     Bootstrap:       {}", stats.role_bootstrap);
+                    println!();
+                    println!("   By source:");
+                    println!("     DNS seed:     {}", stats.from_dns);
+                    println!("     Static:       {}", stats.from_static);
+                    println!("     PEX:          {}", stats.from_pex);
+                    println!("     Inbound:      {}", stats.from_inbound);
+                    println!("     Manual:       {}", stats.from_manual);
+                    println!("     Cache:        {}", stats.from_cache);
                     println!("═══════════════════════════════════════════════════════════");
                 }
             }

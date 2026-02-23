@@ -859,6 +859,80 @@ pub struct BanStatusRes {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// P2P NETWORK RPC RESPONSE TYPES (Tahap 21 v2)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// P2P network status overview.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P2pStatusRes {
+    /// Role operasional node ini (storage-compute, validator, coordinator)
+    pub role: String,
+    /// Kelas node (reguler, datacenter) — hanya untuk storage-compute
+    pub node_class: Option<String>,
+    /// Jumlah peer yang sedang terkoneksi
+    pub connected_count: usize,
+    /// Jumlah peer yang diketahui (termasuk cached)
+    pub known_count: usize,
+    /// Apakah semua REQUIRED roles sudah terpenuhi
+    pub all_required_met: bool,
+    /// Daftar REQUIRED roles yang belum ada connected peer-nya
+    pub missing_required: Vec<String>,
+    /// Bootstrap state (e.g. "Completed", "Failed", "NotStarted")
+    pub bootstrap_state: String,
+}
+
+/// Info tentang satu connected peer.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P2pPeerRes {
+    pub address: String,
+    pub node_id: String,
+    pub role: String,
+    pub node_class: Option<String>,
+    pub score: i64,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub source: String,
+}
+
+/// Role dependency health entry.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P2pRoleHealthEntry {
+    pub role: String,
+    pub dependency: String,
+    pub connected_count: usize,
+    pub status: String,
+}
+
+/// Response for p2p_role_health RPC.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P2pRoleHealthRes {
+    pub our_role: String,
+    pub our_class: Option<String>,
+    pub all_required_met: bool,
+    pub roles: Vec<P2pRoleHealthEntry>,
+}
+
+/// P2P store statistics (role/class/source breakdown).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct P2pStoreStatsRes {
+    pub total: usize,
+    pub connected: usize,
+    pub disconnected: usize,
+    pub banned: usize,
+    pub role_storage_compute: usize,
+    pub class_reguler: usize,
+    pub class_datacenter: usize,
+    pub role_validator: usize,
+    pub role_coordinator: usize,
+    pub from_dns: usize,
+    pub from_static: usize,
+    pub from_pex: usize,
+    pub from_inbound: usize,
+    pub from_manual: usize,
+    pub from_cache: usize,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // SERVICE NODE REGISTRATION RPC REQUEST TYPE (14B.54)
 // ════════════════════════════════════════════════════════════════════════════
 // Request struct for service node on-chain registration.
@@ -4009,6 +4083,122 @@ SyncRequest::GetChainTip => {
                     message: e.to_string(),
                 })
             }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // P2P NETWORK RPC ENDPOINTS (Tahap 21 v2)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Get P2P network status overview.
+    ///
+    /// Returns role, connection counts, health status, and bootstrap state.
+    pub fn p2p_status(&self) -> P2pStatusRes {
+        let mgr = self.chain.peer_manager.read();
+        let missing = mgr.missing_required_roles();
+        P2pStatusRes {
+            role: mgr.our_role.to_string(),
+            node_class: mgr.our_node_class.map(|c| c.to_string()),
+            connected_count: mgr.connected_count(),
+            known_count: mgr.store.count(),
+            all_required_met: missing.is_empty(),
+            missing_required: missing.iter().map(|r| r.to_string()).collect(),
+            bootstrap_state: format!("{:?}", mgr.bootstrap_state),
+        }
+    }
+
+    /// Get list of connected P2P peers with role and class info.
+    pub fn p2p_peers(&self) -> Vec<P2pPeerRes> {
+        let mgr = self.chain.peer_manager.read();
+        mgr.get_connected_peers()
+            .iter()
+            .map(|p| P2pPeerRes {
+                address: p.addr.to_string(),
+                node_id: p.node_id.to_string(),
+                role: p.role.to_string(),
+                node_class: p.node_class.map(|c| c.to_string()),
+                score: p.score,
+                success_count: p.success_count,
+                failure_count: p.failure_count,
+                source: format!("{:?}", p.source),
+            })
+            .collect()
+    }
+
+    /// Add a peer manually via RPC.
+    ///
+    /// * `addr` — Socket address string "IP:PORT" (e.g. "203.0.113.50:45831")
+    pub fn p2p_add_peer(&self, addr: String) -> Result<(), RpcError> {
+        self.chain.add_peer_p2p(&addr)
+            .map_err(|e| RpcError {
+                code: -32000,
+                message: format!("Failed to add peer: {}", e),
+            })
+    }
+
+    /// Get role dependency health matrix.
+    ///
+    /// Shows which roles are REQUIRED/OPTIONAL/SKIP for this node,
+    /// how many connected peers exist per role, and overall health.
+    pub fn p2p_role_health(&self) -> P2pRoleHealthRes {
+        let mgr = self.chain.peer_manager.read();
+        let missing = mgr.missing_required_roles();
+
+        use crate::p2p::RoleDependency;
+
+        let roles: Vec<P2pRoleHealthEntry> = mgr.role_health()
+            .into_iter()
+            .map(|(role, dep, count)| {
+                let dep_str = match dep {
+                    RoleDependency::Required => "REQUIRED",
+                    RoleDependency::Optional => "OPTIONAL",
+                    RoleDependency::Skip => "SKIP",
+                };
+                let status = match dep {
+                    RoleDependency::Required => {
+                        if count > 0 { "OK" } else { "MISSING" }
+                    }
+                    RoleDependency::Optional => {
+                        if count > 0 { "OK" } else { "NONE" }
+                    }
+                    RoleDependency::Skip => "SKIP",
+                };
+                P2pRoleHealthEntry {
+                    role: role.to_string(),
+                    dependency: dep_str.to_string(),
+                    connected_count: count,
+                    status: status.to_string(),
+                }
+            })
+            .collect();
+
+        P2pRoleHealthRes {
+            our_role: mgr.our_role.to_string(),
+            our_class: mgr.our_node_class.map(|c| c.to_string()),
+            all_required_met: missing.is_empty(),
+            roles,
+        }
+    }
+
+    /// Get peer store statistics (role/class/source breakdown).
+    pub fn p2p_store_stats(&self) -> P2pStoreStatsRes {
+        let stats = self.chain.p2p_store_stats();
+        P2pStoreStatsRes {
+            total: stats.total,
+            connected: stats.connected,
+            disconnected: stats.disconnected,
+            banned: stats.banned,
+            role_storage_compute: stats.role_storage_compute,
+            class_reguler: stats.class_reguler,
+            class_datacenter: stats.class_datacenter,
+            role_validator: stats.role_validator,
+            role_coordinator: stats.role_coordinator,
+            from_dns: stats.from_dns,
+            from_static: stats.from_static,
+            from_pex: stats.from_pex,
+            from_inbound: stats.from_inbound,
+            from_manual: stats.from_manual,
+            from_cache: stats.from_cache,
         }
     }
 }
