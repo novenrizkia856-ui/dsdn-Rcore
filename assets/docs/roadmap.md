@@ -2478,73 +2478,116 @@ Validator hanya boleh: baca metadata, memblokir endpoint/pointer. Validator tida
 
 ## Tahap 21 --- Bootstrap Network System (DNS Seed + Peer Discovery)
 
-**Tujuan:** Mengimplementasikan sistem bootstrap jaringan DSDN berbasis DNS seed dan IP publik, mirip Bitcoin, agar seluruh komponen sistem (chain, node, coordinator, validator, ingress) dapat saling menemukan dan terhubung secara peer-to-peer tanpa hardcoded address. Tahap ini adalah **critical gate** sebelum mainnet launch --- gagal di bootstrap berarti gagal mainnet.
+**Tujuan:** Mengimplementasikan sistem bootstrap jaringan DSDN berbasis DNS seed dan IP publik, menggunakan **single port untuk semua role**. Setiap node listen di port `45831` apapun role-nya. Setelah handshake, node saling tahu role masing-masing dan memfilter peer sesuai kebutuhan. Sistem ini mengikuti model Bitcoin: DNS seed → peer exchange → local cache → self-sustaining network.
 
-**Prinsip Penting:**
+**Prinsip Arsitektur Single-Port:**
 
-- Bootstrap hanya pintu masuk awal. Setelah node terhubung dan mendapat peer list, node mandiri.
-- Tidak ada single point of failure. Seed DNS dan IP publik bersifat redundant dan fallback-chain.
-- Founder, komunitas, dan operator bisa menambah seed kapan saja.
-- File `peers.dat` menjadi persistent local cache agar node tidak selalu bergantung pada seed.
-- Sistem harus toleran terhadap seed yang mati, expired, invalid, atau unreachable.
-- Desain mengikuti model Bitcoin: DNS seed → peer exchange → local cache → self-sustaining network.
+- **Satu port untuk semua**: Port `45831` adalah satu-satunya port jaringan DSDN. Semua role (Chain, Validator, Coordinator, StorageCompute) listen di port yang sama.
+- **Role diketahui setelah handshake**: DNS seed dan static IP hanya memberikan `IP:45831`. Node baru connect dulu, lalu handshake mengungkapkan role dari peer tersebut.
+- **Filter setelah handshake**: Jika node Chain butuh peer Chain lain, ia connect ke semua IP dari DNS → handshake → cek role → jika role bukan Chain, politely disconnect dan simpan info role-nya untuk referensi node lain yang butuh.
+- **Semua peer di-cache**: Walaupun role tidak match kebutuhan langsung, peer tetap disimpan di `peers.dat` dengan role-nya. Node lain bisa ambil info ini via PEX.
+
+**Roles:**
+
+| Role | Fungsi |
+|------|--------|
+| `Chain` | Block production, state management, block sync |
+| `Validator` | Consensus & validation, block verification |
+| `Coordinator` | Workload coordination, TSS/FROST committee |
+| `StorageCompute` | Data storage & compute execution |
 
 **Depends on:** Tahap 20.A (Mainnet Preparation selesai, semua komponen infrastruktur sudah ready).
 
-**Catatan Pre-Mainnet Wajib:** Founder harus membeli minimal 1 domain untuk DNS seed sebelum mainnet launch (contoh: `seed1.dsdn.network`). Domain tambahan sangat disarankan untuk redundansi. Pembelian domain dicatat sebagai checklist item di Tahap 20.A (Mainnet Preparation).
+**Catatan Pre-Mainnet Wajib:** Founder harus membeli minimal 1 domain untuk DNS seed sebelum mainnet launch (contoh: `seed1.dsdn.network`). Domain tambahan sangat disarankan untuk redundansi.
 
 ---
 
 ## 21.1.A --- Bootstrap Config & Seed Registry Foundation
 
-**Tujuan:** Membuat file `bootstrap_system.rs` di crate `common` yang berisi konfigurasi seed DNS, daftar IP publik statis, dan logic registry seed. File ini menjadi sumber kebenaran bootstrap untuk seluruh komponen DSDN.
+**Tujuan:** Membuat file `bootstrap_system.rs` di crate `common` yang berisi konfigurasi seed DNS, daftar IP publik statis, role definitions, dan logic registry seed. File ini menjadi sumber kebenaran bootstrap untuk seluruh komponen DSDN.
 
 ### Kenapa di crate `common`?
 
-Karena semua komponen DSDN (chain, node, coordinator, validator, ingress) membutuhkan bootstrap. Menaruh di `common` menghindari duplikasi dan menjamin konsistensi konfigurasi di seluruh sistem.
+Karena semua komponen DSDN (chain, validator, coordinator, storage-compute) membutuhkan bootstrap. Menaruh di `common` menghindari duplikasi dan menjamin konsistensi konfigurasi di seluruh sistem.
 
 ### File Baru: `crates/common/src/bootstrap_system.rs`
 
 Isi modul ini mencakup:
 
-#### 1. Seed DNS Config
+#### 1. Single-Port Architecture & Role Definition
 
-Struct konfigurasi yang menyimpan daftar DNS seed. Saat ini dikosongkan karena domain belum dibeli, tetapi struct dan logic harus sudah lengkap.
+Seluruh jaringan DSDN menggunakan **satu port**: `45831`. Tidak ada port berbeda per role. Role didefinisikan sebagai enum:
+
+```rust
+pub const DSDN_DEFAULT_PORT: u16 = 45831;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum NodeRole {
+    Chain,
+    Validator,
+    Coordinator,
+    StorageCompute,
+}
+```
+
+Setiap node mendeklarasikan role-nya saat startup dan mengumumkannya saat handshake. Satu node fisik bisa menjalankan **satu role** per instance. Jika operator ingin menjalankan multiple role, jalankan multiple instance di port yang sama dengan binding berbeda, atau gunakan satu instance dengan multi-role flag (implementasi di tahap lanjut).
+
+#### 2. Seed DNS Config
+
+Struct konfigurasi yang menyimpan daftar DNS seed. DNS seed tidak mengetahui role — ia hanya return IP address. Role baru diketahui setelah handshake.
 
 Contoh format seed DNS yang akan diisi menjelang mainnet:
 ```
-seed1.dsdn.network
-seed2.dsdn.network
-seed3.dsdn.network
+seed1.dsdn.network  →  resolve ke [IP_A, IP_B, IP_C, ...]
+seed2.dsdn.network  →  resolve ke [IP_D, IP_E, ...]
+```
+
+Alur dari DNS ke role filtering:
+```
+1. Node Chain baru start
+2. Resolve seed1.dsdn.network → dapat [IP_A, IP_B, IP_C]
+3. Connect ke IP_A:45831 → handshake → role = Validator → bukan Chain → simpan di peers.dat, disconnect
+4. Connect ke IP_B:45831 → handshake → role = Chain → match! → keep connection, simpan di peers.dat
+5. Connect ke IP_C:45831 → handshake → role = StorageCompute → bukan Chain → simpan di peers.dat, disconnect
 ```
 
 Aturan seed DNS:
 - Setiap seed DNS adalah domain yang di-resolve ke satu atau lebih IP address (A record / AAAA record).
-- Satu seed bisa return banyak IP (round-robin DNS).
+- Satu seed bisa return banyak IP (round-robin DNS). IP bisa milik node dengan role apapun.
 - Seed list bisa ditambah oleh founder, komunitas, atau operator melalui config file.
 - Minimal 1 seed wajib ada untuk mainnet, direkomendasikan 3+.
+- DNS seed TIDAK role-aware — semua role tercampur di satu DNS record.
 
-#### 2. Static IP Registry
+#### 3. Static IP Registry
 
-Daftar IP publik statis sebagai alternatif DNS seed. IP ini bisa dari:
-- Node komunitas yang bersedia menjadi bootstrap node.
-- Founder-operated seed node.
-- Operator data center yang menyediakan entry point.
+Daftar IP publik statis sebagai alternatif DNS seed. Semua IP menggunakan port `45831`. Role-nya baru diketahui setelah handshake.
 
-Format: `IP:Port` (`203.0.113.50:45831`).
+Format: `IP:45831` (port selalu 45831, bisa di-omit dan default ke 45831).
+
+```
+203.0.113.50:45831   → bisa Chain, bisa Validator, bisa apa saja — baru tahu setelah handshake
+198.51.100.10:45831  → idem
+```
 
 Aturan IP statis:
 - Bisa ditambah siapa saja melalui config file atau CLI.
 - Bisa 0 (kosong) jika hanya mengandalkan DNS seed.
-- Tidak ada batas jumlah (1, 2, 3, ... 50, bahkan lebih).
+- Tidak ada batas jumlah.
 - IP yang invalid atau unreachable akan di-skip otomatis.
+- Port default `45831` jika tidak disertakan.
 
-#### 3. Bootstrap Config File (`root_dsdn/dsdn.toml`)
+#### 4. Bootstrap Config File (`root_dsdn/dsdn.toml`)
 
-Format konfigurasi yang bisa diedit user:
 ```toml
 [bootstrap]
+# Node role for this instance
+role = "chain"  # chain | validator | coordinator | storage-compute
+
+# Network port (single port for all roles)
+port = 45831
+
 # DNS seeds (founder/community maintained)
+# Seeds return mixed-role peers — filtering happens after handshake
 dns_seeds = [
     # "seed1.dsdn.network",
     # "seed2.dsdn.network",
@@ -2552,6 +2595,7 @@ dns_seeds = [
 ]
 
 # Static IP peers (community maintained)
+# All use port 45831 — role unknown until handshake
 static_peers = [
     # "203.0.113.50:45831",
     # "198.51.100.10:45831",
@@ -2565,42 +2609,93 @@ max_outbound_connections = 8
 max_inbound_connections = 125
 dns_resolve_timeout_secs = 10
 peer_connect_timeout_secs = 5
+
+# Role-specific connection targets
+# Node akan prioritaskan connect ke role yang dibutuhkan
+# Chain butuh: Chain peers (block sync) + Validator (consensus)
+# Validator butuh: Chain peers (state) + Validator (consensus) + Coordinator (coordination)
+# Coordinator butuh: Chain (stake verify) + StorageCompute (task dispatch) + Coordinator (committee)
+# StorageCompute butuh: Coordinator (task receive) + StorageCompute (replication)
 ```
 
-#### 4. Seed Priority & Fallback Order
+#### 5. Role Dependency Matrix
 
-Implementasi urutan fallback yang jelas:
+Setiap role memiliki kebutuhan koneksi yang berbeda. Ini menentukan peer mana yang di-keep vs di-disconnect setelah handshake:
+
+```
+Chain Node membutuhkan:
+  - Chain (REQUIRED)        → block sync, state propagation
+  - Validator (REQUIRED)    → consensus messages
+  - Coordinator (OPTIONAL)  → status queries
+  - StorageCompute (SKIP)   → tidak dibutuhkan langsung
+
+Validator membutuhkan:
+  - Chain (REQUIRED)        → state verification, block data
+  - Validator (REQUIRED)    → consensus protocol
+  - Coordinator (REQUIRED)  → coordination
+  - StorageCompute (SKIP)   → tidak dibutuhkan langsung
+
+Coordinator membutuhkan:
+  - Chain (REQUIRED)        → stake verification
+  - Validator (OPTIONAL)    → consensus status
+  - Coordinator (REQUIRED)  → committee communication (TSS/FROST)
+  - StorageCompute (REQUIRED) → task dispatch, node management
+
+StorageCompute membutuhkan:
+  - Chain (OPTIONAL)        → on-chain verification
+  - Validator (SKIP)        → tidak dibutuhkan langsung
+  - Coordinator (REQUIRED)  → receive tasks, register
+  - StorageCompute (REQUIRED) → data replication
+```
+
+Aturan koneksi:
+- `REQUIRED`: Node HARUS punya minimal 1 peer dengan role ini. Jika belum ada, terus cari.
+- `OPTIONAL`: Bagus jika ada, tapi tidak blocking.
+- `SKIP`: Disconnect setelah handshake, tapi tetap simpan di `peers.dat` agar bisa di-share via PEX ke node lain yang butuh.
+
+#### 6. Seed Priority & Fallback Order
+
+Implementasi urutan fallback (sama untuk semua role):
+
 ```
 1. Coba peers dari peers.dat (local cache, paling cepat)
-   -> Jika ada peer valid dan reachable -> gunakan
-   -> Jika semua gagal atau peers.dat kosong -> lanjut ke 2
+   -> Filter by role yang dibutuhkan (lihat Role Dependency Matrix)
+   -> Jika ada peer valid dan reachable dengan role yang cocok → gunakan
+   -> Jika tidak ada yang cocok → juga coba peer dengan role apapun (mungkin role-nya berubah)
+   -> Jika semua gagal atau peers.dat kosong → lanjut ke 2
 
 2. Coba static IP peers dari config
-   -> Iterasi satu per satu
-   -> Jika IP valid dan reachable -> gunakan, simpan ke peers.dat
-   -> Jika IP tidak valid/unreachable -> skip, coba IP berikutnya
-   -> Jika semua IP gagal -> lanjut ke 3
+   -> Connect ke IP:45831 → handshake → cek role
+   -> Jika role cocok → keep connection, simpan ke peers.dat
+   -> Jika role tidak cocok → simpan ke peers.dat (dengan role-nya), disconnect
+   -> Jika IP unreachable → skip, coba IP berikutnya
+   -> Jika semua IP gagal atau tidak ada role yang cocok → lanjut ke 3
 
 3. Coba DNS seeds dari config
-   -> Resolve seed1 -> dapat IP list -> coba connect
-   -> Jika seed1 gagal (DNS error, timeout, no A record) -> coba seed2
-   -> Jika seed2 gagal -> coba seed3
-   -> Dan seterusnya sampai seed terakhir
-   -> Jika semua DNS seed gagal -> lanjut ke 4
+   -> Resolve seed1 → dapat IP list → connect satu per satu ke port 45831
+   -> Handshake → cek role → keep jika cocok, simpan semua ke peers.dat
+   -> Jika seed1 gagal → coba seed2 → dan seterusnya
+   -> Jika semua DNS seed gagal → lanjut ke 4
 
 4. Fallback: Kombinasi retry
-   -> Retry semua sumber di atas dengan backoff
+   -> Retry semua sumber di atas dengan exponential backoff
    -> Log warning bahwa tidak ada peer yang bisa dihubungi
    -> Node tetap hidup dan retry periodik (setiap 30 detik)
 ```
 
+**Catatan penting fallback**: Karena DNS seed dan static IP berisi mixed-role peers, mungkin saja node sudah berhasil connect tapi belum ketemu role yang dibutuhkan. Dalam kasus ini, node tetap minta PEX dari peer yang sudah terkoneksi (walaupun beda role) untuk menemukan peer dengan role yang tepat.
+
 ### Deliverables 21.1.A
 
-1. File `crates/common/src/bootstrap_system.rs` dengan struct `BootstrapConfig`, `DnsSeed`, `StaticPeer`, `SeedRegistry`.
-2. Parser untuk bootstrap config (dari `bootstrap.toml` atau section di `dsdn.toml`).
+1. File `crates/common/src/bootstrap_system.rs` dengan:
+   - `NodeRole` enum (Chain, Validator, Coordinator, StorageCompute)
+   - `BootstrapConfig` struct (termasuk role, single port)
+   - `DnsSeed`, `StaticPeer`, `SeedRegistry` structs
+   - `RoleDependencyMatrix` — logic siapa butuh siapa
+2. Parser untuk bootstrap config (dari section `[bootstrap]` di `dsdn.toml`).
 3. DNS resolver wrapper yang async, timeout-aware, dan error-tolerant.
-4. Fallback chain logic (peers.dat → static IP → DNS seed → retry).
-5. Unit test: config parsing, DNS resolve mock, fallback ordering, invalid seed handling.
+4. Fallback chain logic (peers.dat → static IP → DNS seed → retry) dengan role-aware filtering.
+5. Unit test: config parsing, role dependency, DNS resolve mock, fallback ordering, invalid seed handling.
 
 ### Crates Terlibat
 
@@ -2608,83 +2703,170 @@ Implementasi urutan fallback yang jelas:
 
 ### Kriteria Selesai
 
-- `BootstrapConfig` bisa di-load dari file config.
+- `BootstrapConfig` bisa di-load dari file config termasuk `role` field.
+- `NodeRole` enum terdefinisi dengan 4 role.
+- `RoleDependencyMatrix` bisa menentukan role mana yang REQUIRED/OPTIONAL/SKIP untuk setiap role.
 - DNS seed list bisa kosong (valid untuk development, invalid untuk mainnet).
 - Static IP list bisa kosong.
-- Fallback chain logic ter-test dengan semua kombinasi: semua sumber gagal, hanya DNS works, hanya IP works, hanya peers.dat works, semua works.
+- Semua IP menggunakan port 45831 secara default.
+- Fallback chain logic ter-test dengan semua kombinasi: semua sumber gagal, hanya DNS works, hanya IP works, hanya peers.dat works, semua works, role match/mismatch scenarios.
 
 ---
 
-## 21.1.B --- Peer Discovery, Exchange & Local Cache (peers.dat)
+## 21.1.B --- Peer Discovery, Handshake with Role Exchange & Local Cache (peers.dat)
 
-**Tujuan:** Mengimplementasikan peer discovery melalui DNS resolve dan IP connect, peer exchange protocol antar node, dan persistent local cache `peers.dat` agar node bisa bootstrap tanpa DNS setelah pernah terhubung.
+**Tujuan:** Mengimplementasikan peer discovery melalui DNS resolve dan IP connect, **handshake yang menyertakan role information**, peer exchange protocol antar node, dan persistent local cache `peers.dat` dengan role metadata.
 
-**Depends on:** 21.1.A (BootstrapConfig dan SeedRegistry ready)
+**Depends on:** 21.1.A (BootstrapConfig, SeedRegistry, NodeRole ready)
 
-### 1. DNS Seed Resolution
+### 1. DNS Seed Resolution (Role-Agnostic)
 
-Proses resolve DNS seed menjadi IP address:
+DNS seed resolution tidak berubah — DNS tidak tahu role. Yang berubah adalah post-resolution flow:
 
 ```
 dns_seed "seed1.dsdn.network"
 -> DNS A record query
 -> returns: [203.0.113.50, 203.0.113.51, 198.51.100.10]
 -> shuffle (randomize order untuk load distribution)
--> coba connect satu per satu
--> yang berhasil connect -> masuk ke active peers
+-> semua IP menggunakan port 45831
+-> coba connect satu per satu ke IP:45831
+-> handshake → baru tahu role masing-masing
+-> filter berdasarkan kebutuhan (keep/disconnect)
 ```
 
 Aturan resolve:
 - Timeout per DNS query: configurable (default 10 detik).
-- Jika DNS return 0 IP -> seed dianggap gagal, lanjut ke seed berikutnya.
-- Jika DNS return IP tapi semua unreachable -> seed dianggap partially failed, log warning.
+- Jika DNS return 0 IP → seed dianggap gagal, lanjut ke seed berikutnya.
+- Jika DNS return IP tapi semua unreachable → seed dianggap partially failed, log warning.
 - Support IPv4 (A record) dan IPv6 (AAAA record).
 - Randomize hasil resolve agar tidak semua node connect ke IP yang sama.
+- **Semua IP yang di-resolve di-connect ke port 45831 — tidak ada port lain.**
 
-### 2. Peer Connection & Handshake
+### 2. Peer Connection & Handshake with Role Exchange
 
-Setelah mendapat IP dari DNS/static/peers.dat, node melakukan:
-
-```
-1. TCP connect ke IP:Port
-2. Handshake:
-   - Kirim: protocol_version, network_id (mainnet/testnet), node_id, listen_port
-   - Terima: protocol_version, network_id, node_id, listen_port
-   - Validasi: network_id harus sama, protocol_version compatible
-3. Jika handshake sukses -> peer dianggap valid
-4. Jika handshake gagal -> disconnect, coba peer berikutnya
-```
-
-Network ID penting untuk isolasi:
-- `mainnet` → hanya connect ke mainnet peer.
-- `testnet` → hanya connect ke testnet peer.
-- Mismatch → reject handshake.
-
-### 3. Peer Exchange Protocol (PEX)
-
-Setelah terhubung ke minimal 1 peer, node bisa minta peer list dari peer yang sudah terkoneksi:
+Ini adalah perubahan utama dari versi sebelumnya. Handshake sekarang menyertakan **role** dari masing-masing node:
 
 ```
-Node A -> Node B: "GetPeers" request
-Node B -> Node A: response berisi list peer yang Node B ketahui (max 1000 entries)
-Node A: filter, validate, coba connect ke peer baru
+1. TCP connect ke IP:45831
+
+2. Handshake (role-aware):
+   Kirim:
+     - protocol_version: u32
+     - network_id: String (mainnet/testnet)
+     - node_id: Ed25519PublicKey
+     - role: NodeRole (Chain/Validator/Coordinator/StorageCompute)
+     - listen_port: u16 (selalu 45831)
+     - capabilities: Vec<String> (optional, untuk future extension)
+
+   Terima:
+     - protocol_version: u32
+     - network_id: String
+     - node_id: Ed25519PublicKey
+     - role: NodeRole
+     - listen_port: u16
+     - capabilities: Vec<String>
+
+3. Validasi:
+   - network_id HARUS sama (mainnet↔mainnet, testnet↔testnet)
+   - protocol_version HARUS compatible
+   - node_id HARUS valid Ed25519 public key
+
+4. Role filtering (post-handshake):
+   - Cek RoleDependencyMatrix: apakah role peer ini REQUIRED/OPTIONAL/SKIP?
+   - REQUIRED → keep connection aktif
+   - OPTIONAL → keep connection jika belum cukup peer, atau disconnect jika sudah cukup
+   - SKIP → simpan peer info (IP, role, node_id) ke peers.dat, lalu disconnect
+
+5. Simpan ke peers.dat:
+   - Semua peer yang berhasil handshake disimpan, terlepas dari apakah koneksi di-keep atau tidak
+   - Ini penting agar PEX bisa share info tentang peer role lain
 ```
+
+**Contoh skenario handshake:**
+
+```
+Node A (Chain) connect ke Node B (StorageCompute):
+  → A kirim: {role: Chain, network_id: mainnet, ...}
+  → B kirim: {role: StorageCompute, network_id: mainnet, ...}
+  → A cek: Chain butuh StorageCompute? → SKIP
+  → A simpan B ke peers.dat: {ip: B_IP, port: 45831, role: StorageCompute, node_id: B_ID}
+  → A disconnect dari B (politely, dengan disconnect reason: "role_not_needed")
+  → B juga simpan A ke peers.dat-nya
+
+Node A (Chain) connect ke Node C (Chain):
+  → A kirim: {role: Chain, ...}
+  → C kirim: {role: Chain, ...}
+  → A cek: Chain butuh Chain? → REQUIRED
+  → A keep connection → mulai block sync
+```
+
+**Disconnect reason codes:**
+
+```rust
+pub enum DisconnectReason {
+    RoleNotNeeded,        // Role tidak match kebutuhan
+    TooManyPeers,         // Sudah cukup peer
+    NetworkIdMismatch,    // Network berbeda
+    ProtocolIncompatible, // Versi tidak kompatibel
+    Timeout,              // Handshake timeout
+    BadHandshake,         // Invalid handshake data
+    Banned,               // Peer di-ban
+    Shutdown,             // Node shutting down
+}
+```
+
+### 3. Peer Exchange Protocol (PEX) — Role-Aware
+
+PEX sekarang menyertakan role information untuk setiap peer yang di-share:
+
+```
+Node A (Chain) → Node B (Validator): "GetPeers" request
+  → Optional filter: { roles: [Chain, Validator] }  (A hanya minta role yang dibutuhkan)
+
+Node B → Node A: response berisi peer list:
+  [
+    { ip: "1.2.3.4", port: 45831, role: Chain, node_id: "...", last_seen: "..." },
+    { ip: "5.6.7.8", port: 45831, role: Validator, node_id: "...", last_seen: "..." },
+    { ip: "9.10.11.12", port: 45831, role: Coordinator, node_id: "...", last_seen: "..." },
+  ]
+
+Node A: filter response berdasarkan kebutuhan, coba connect ke peer Chain dan Validator
+```
+
+**PEX Cross-Role:**
+
+Ini adalah kekuatan dari single-port + role system. Walaupun Node A (Chain) temporary connect ke Node X (StorageCompute) dan kemudian disconnect, Node A tetap bisa minta PEX dari Node X sebelum disconnect:
+
+```
+Node A (Chain) connect ke Node X (StorageCompute):
+  → Handshake → role = StorageCompute → SKIP untuk A
+  → TAPI sebelum disconnect, A bisa kirim GetPeers { roles: [Chain] }
+  → X response: "Saya kenal Node Y (Chain) di IP 1.2.3.4:45831"
+  → A disconnect dari X
+  → A connect ke Node Y (Chain) → handshake → role match → keep!
+```
+
+Ini efisien karena setiap handshake + PEX, walaupun ke node dengan role berbeda, bisa memberi tahu lokasi node yang dibutuhkan.
 
 Aturan PEX:
-- Peer hanya share peer yang pernah berhasil di-connect dalam 24 jam terakhir (bukan dead peer).
-- Response di-limit (max 1000 peer per response) untuk anti-spam.
+- Peer hanya share peer yang pernah berhasil di-connect dalam 24 jam terakhir.
+- Response di-limit (max 1000 peer per response).
 - Node tidak boleh share peer yang sudah di-ban.
 - PEX request di-rate-limit (max 1 request per peer per 15 menit).
+- **PEX response HARUS menyertakan role per peer.**
+- Optional role filter di request: node bisa minta "berikan saya hanya peer Chain dan Validator".
+- Jika tidak ada filter, return semua role.
 
-### 4. peers.dat --- Persistent Peer Cache
+### 4. peers.dat --- Persistent Peer Cache (Role-Enriched)
 
-File `peers.dat` menyimpan peer yang pernah berhasil di-contact, agar node bisa bootstrap cepat tanpa DNS resolve.
+File `peers.dat` sekarang menyimpan role per entry:
 
-Isi peers.dat per entry:
 ```
+Per entry:
 - IP address (IPv4 atau IPv6)
-- Port
+- Port (selalu 45831, tapi tetap disimpan untuk forward compatibility)
 - Node ID (Ed25519 public key)
+- Role (Chain / Validator / Coordinator / StorageCompute)
 - Last seen timestamp
 - Last successful connect timestamp
 - Connection success count
@@ -2694,16 +2876,31 @@ Isi peers.dat per entry:
 ```
 
 Aturan peers.dat:
-- Disimpan sebagai binary file (compact, cepat baca/tulis) atau JSON (debug-friendly). Pilih satu, konsisten.
-- Max entries: 10.000 (cukup untuk jaringan besar, tidak terlalu berat di disk).
-- Entries yang tidak pernah berhasil connect dalam 30 hari -> otomatis dihapus (garbage collection).
-- Entries yang gagal connect 10x berturut-turut -> ditandai sebagai "suspicious", prioritas rendah.
-- peers.dat di-write secara atomik (write ke temp file, lalu rename) untuk mencegah corruption.
-- Saat startup, peers.dat di-load dan peer diurutkan berdasarkan: last successful connect (terbaru duluan).
+- Disimpan sebagai binary file (compact, cepat baca/tulis). JSON mode untuk debug bisa di-enable via flag.
+- Max entries: 10.000.
+- Entries yang tidak pernah berhasil connect dalam 30 hari → otomatis dihapus (garbage collection).
+- Entries yang gagal connect 10x berturut-turut → ditandai "suspicious", prioritas rendah.
+- peers.dat di-write secara atomik (write ke temp file, lalu rename).
+- Saat startup, peers.dat di-load dan peer diurutkan berdasarkan:
+  1. **Role match** (peer dengan role yang REQUIRED didahulukan)
+  2. **Last successful connect** (terbaru duluan)
+  3. **Score** (lihat scoring di bawah)
 
-### 5. Peer Scoring & Selection
+**Role-based startup optimization:**
 
-Tidak semua peer sama baiknya. Sistem scoring sederhana:
+Saat node Chain start:
+```
+1. Load peers.dat
+2. Filter: ambil semua peer dengan role Chain dan Validator (REQUIRED)
+3. Sort by last_successful_connect desc
+4. Connect ke top-N peer → harusnya langsung dapat peer yang dibutuhkan
+5. Jika tidak cukup → juga coba peer Coordinator (OPTIONAL)
+6. Jika masih kurang → fallback ke static IP dan DNS seed
+```
+
+### 5. Peer Scoring & Selection (Role-Weighted)
+
+Scoring sekarang memperhitungkan role relevance:
 
 ```
 score = base_score
@@ -2711,239 +2908,351 @@ score = base_score
       - (failure_count * 3)
       + recency_bonus (peer terakhir connect < 1 jam: +10, < 24 jam: +5)
       - staleness_penalty (peer terakhir connect > 7 hari: -5, > 30 hari: -10)
+      + role_bonus (REQUIRED role: +20, OPTIONAL: +5, SKIP: +0)
 ```
 
-Node prioritaskan connect ke peer dengan score tertinggi.
+Node prioritaskan connect ke peer dengan score tertinggi, yang secara natural mengutamakan peer dengan role yang dibutuhkan.
 
 ### 6. Peer Rotation & Refresh
 
 Node yang sudah berjalan lama harus tetap menemukan peer baru:
-- Setiap 30 menit: lakukan 1 DNS seed resolve random untuk menemukan peer baru.
-- Setiap 15 menit: lakukan PEX request ke 1 random connected peer.
-- Setiap 1 jam: coba connect ke 2 peer random dari peers.dat yang belum terkoneksi.
+- Setiap 30 menit: lakukan 1 DNS seed resolve random → connect → handshake → filter by role.
+- Setiap 15 menit: lakukan PEX request ke 1 random connected peer (bisa request specific roles).
+- Setiap 1 jam: coba connect ke 2 peer random dari peers.dat yang belum terkoneksi (prioritaskan REQUIRED roles yang kurang).
 - Ini mencegah network fragmentation dan menjaga connectivity.
 
 ### Deliverables 21.1.B
 
-1. DNS seed resolver (async, timeout, multi-seed fallback, IPv4+IPv6).
-2. Peer handshake protocol (version check, network ID validation).
-3. Peer Exchange Protocol (PEX) — request/response, rate limiting, filtering.
-4. `peers.dat` read/write/garbage-collection logic.
-5. Peer scoring dan selection algorithm.
-6. Peer rotation dan periodic refresh background task.
-7. Unit test: DNS resolve mock, handshake success/failure, PEX filtering, peers.dat read/write/GC, scoring logic.
-8. Integration test: 3 node bootstrap dari 1 DNS seed, lalu PEX sampai semua saling kenal.
+1. DNS seed resolver (async, timeout, multi-seed fallback, IPv4+IPv6) — semua resolve ke port 45831.
+2. **Handshake protocol dengan role exchange** (role field, version check, network ID validation, disconnect reason).
+3. **Role filtering logic post-handshake** (keep/disconnect berdasarkan RoleDependencyMatrix).
+4. **PEX dengan role metadata** — request optional role filter, response include role per peer.
+5. **peers.dat dengan role field** — read/write/garbage-collection/role-based sorting.
+6. Peer scoring dengan role weighting.
+7. Peer rotation dan periodic refresh background task.
+8. Unit test: DNS resolve mock, handshake with role exchange, role filtering, PEX with role filter, peers.dat role-based read/write/GC, scoring logic.
+9. Integration test: 3 node dengan role berbeda bootstrap dari 1 DNS seed, handshake, role filter, PEX sampai semua menemukan peer yang dibutuhkan.
 
 ### Crates Terlibat
 
-`common`, `node`, `proto` (untuk handshake dan PEX message definitions)
+`common`, `node`, `proto` (untuk handshake message dengan role field dan PEX message definitions)
 
 ### Kriteria Selesai
 
-- Node bisa bootstrap dari DNS seed, mendapat peer, dan menyimpan ke peers.dat.
-- Node restart → langsung connect dari peers.dat tanpa DNS resolve.
-- PEX bekerja: node A kenal node B, node B kenal node C, setelah PEX node A kenal node C.
-- peers.dat garbage collection bekerja (dead peer dihapus setelah 30 hari).
-- Fallback chain fully functional: peers.dat → static IP → DNS seed.
-- Peer scoring mengutamakan peer yang reliable.
+- Semua koneksi menggunakan single port 45831.
+- Handshake menyertakan `role` field — kedua node saling tahu role.
+- Node bisa filter peer berdasarkan role setelah handshake (keep REQUIRED, disconnect SKIP).
+- PEX menyertakan role per peer dan support optional role filter.
+- peers.dat menyimpan role dan bisa difilter saat startup.
+- Node Chain restart → langsung connect ke peer Chain dan Validator dari peers.dat tanpa DNS resolve.
+- Cross-role PEX bekerja: node connect ke peer beda role → minta PEX → dapat info peer dengan role yang dibutuhkan.
+- Fallback chain fully functional: peers.dat (role-filtered) → static IP → DNS seed.
+- Peer scoring mengutamakan peer dengan role yang dibutuhkan dan reliable.
 
 ---
 
-## 21.1.C --- Full System P2P Integration & Network Resilience
+## 21.1.C --- Full System Integration & Network Resilience
 
-**Tujuan:** Mengintegrasikan bootstrap system ke seluruh komponen DSDN (chain, node, coordinator, validator, ingress) sehingga semua bisa saling menemukan melalui P2P, dan memastikan jaringan resilient terhadap berbagai failure scenario.
+**Tujuan:** Mengintegrasikan bootstrap system ke seluruh komponen DSDN sehingga semua role bisa saling menemukan melalui single-port P2P + role handshake, dan memastikan jaringan resilient terhadap berbagai failure scenario.
 
-**Depends on:** 21.1.A (config), 21.1.B (discovery & peers.dat)
+**Depends on:** 21.1.A (config, role definitions), 21.1.B (discovery, handshake, peers.dat)
 
-### 1. Integrasi ke Setiap Komponen DSDN
+### 1. Integrasi ke Setiap Role
 
-Setiap komponen yang butuh jaringan harus menggunakan bootstrap system:
+Setiap role menggunakan bootstrap system yang sama, hanya berbeda di role dependency:
 
-#### Chain Node
-- Saat startup, chain node menggunakan `BootstrapConfig` untuk menemukan peer chain lainnya.
-- Setelah terhubung, chain node melakukan block sync dan state sync dari peer.
-- Chain node mengiklankan dirinya ke peer lain agar bisa ditemukan.
-- Chain node menyimpan peer ke peers.dat.
-
-#### Storage Node
-- Storage node bootstrap untuk menemukan coordinator dan chain node.
-- Setelah terhubung ke coordinator (via peer discovery, bukan hardcoded address), node register diri.
-- Storage node juga menyimpan peer storage node lain untuk data replication.
-
-#### Coordinator
-- Coordinator bootstrap untuk menemukan chain node (untuk stake verification) dan storage node.
-- Coordinator committee members menemukan satu sama lain via bootstrap (critical untuk TSS/FROST).
-- Coordinator mengiklankan dirinya sebagai discoverable service type.
-
-#### Validator
-- Validator bootstrap untuk menemukan chain node dan coordinator.
-- Validator harus bisa menemukan semua validator lain untuk consensus.
-
-#### Ingress
-- Ingress bootstrap untuk menemukan coordinator dan storage node terdekat.
-- Ingress node mengiklankan dirinya untuk load balancing.
-
-### 2. Service Discovery via Peer Advertisement
-
-Setiap node mengiklankan "service type" saat handshake:
-
+#### Chain Node (`role = "chain"`)
 ```
-ServiceType:
-  - Chain         (block production, state)
-  - Storage       (data storage node - reguler)
-  - StorageDC     (data storage node - data center)
-  - Coordinator   (workload coordination)
-  - Validator     (consensus & validation)
-  - Ingress       (HTTP gateway)
-  - Bootstrap     (dedicated bootstrap node, no other function)
+Startup:
+1. Load BootstrapConfig dengan role = Chain
+2. Bootstrap → connect ke IP:45831 → handshake → filter:
+   - Peer Chain → KEEP → mulai block sync
+   - Peer Validator → KEEP → consensus channel
+   - Peer Coordinator → KEEP jika butuh → status queries
+   - Peer StorageCompute → simpan di peers.dat → disconnect
+3. Setelah punya cukup peer Chain + Validator → operational
 ```
 
-Saat node melakukan PEX, peer juga menyertakan service type. Ini memungkinkan node untuk menemukan komponen spesifik yang dibutuhkan. Misal: validator hanya perlu menemukan chain node dan coordinator, tidak perlu connect ke semua storage node.
+#### Validator (`role = "validator"`)
+```
+Startup:
+1. Load BootstrapConfig dengan role = Validator
+2. Bootstrap → connect → handshake → filter:
+   - Peer Chain → KEEP → state verification
+   - Peer Validator → KEEP → consensus protocol
+   - Peer Coordinator → KEEP → coordination
+   - Peer StorageCompute → simpan → disconnect
+3. Setelah punya Chain + Validator + Coordinator → operational
+```
 
-### 3. Bootstrap Node (Dedicated)
+#### Coordinator (`role = "coordinator"`)
+```
+Startup:
+1. Load BootstrapConfig dengan role = Coordinator
+2. Bootstrap → connect → handshake → filter:
+   - Peer Chain → KEEP → stake verification
+   - Peer Validator → KEEP jika butuh → status
+   - Peer Coordinator → KEEP → committee (TSS/FROST, critical!)
+   - Peer StorageCompute → KEEP → task dispatch
+3. Setelah punya Chain + Coordinator + StorageCompute → operational
+```
 
-Founder dan komunitas bisa menjalankan dedicated bootstrap node yang hanya melayani peer discovery:
+#### StorageCompute (`role = "storage-compute"`)
+```
+Startup:
+1. Load BootstrapConfig dengan role = StorageCompute
+2. Bootstrap → connect → handshake → filter:
+   - Peer Chain → KEEP jika butuh → on-chain verification
+   - Peer Validator → simpan → disconnect
+   - Peer Coordinator → KEEP → register, receive tasks
+   - Peer StorageCompute → KEEP → data replication
+3. Setelah punya Coordinator + StorageCompute → operational
+```
 
-- Tidak menyimpan data.
-- Tidak ikut consensus.
-- Hanya melayani handshake, PEX, dan menjadi entry point jaringan.
-- Resource requirement sangat rendah (bisa berjalan di VPS kecil).
-- DNS seed biasanya mengarah ke bootstrap node ini.
+### 2. Bootstrap Node (Dedicated)
 
-Cara menjalankan:
+Founder dan komunitas bisa menjalankan dedicated bootstrap node. Bootstrap node adalah node khusus yang **tidak memiliki role operasional** — ia hanya melayani handshake, PEX, dan menjadi entry point jaringan.
+
 ```bash
 dsdn-node --mode bootstrap --listen 0.0.0.0:45831 --network mainnet
 ```
 
-### 4. Network Partition Recovery
+Bootstrap node behavior:
+- Listen di port 45831 (sama seperti node lain).
+- Handshake-nya mengirim role khusus: `Bootstrap` (bukan salah satu dari 4 role operasional).
+- Semua node yang connect ke bootstrap node langsung tahu ini bukan peer operasional.
+- Node minta PEX dari bootstrap node → dapat list peer dari semua role.
+- Bootstrap node mengumpulkan peer info dari semua node yang connect kepadanya.
+- Resource requirement sangat rendah (bisa VPS kecil).
+- DNS seed biasanya mengarah ke bootstrap node ini.
 
-Jika jaringan mengalami partisi (sebagian node terisolasi):
+```
+Alur via bootstrap node:
+1. Node Chain baru → resolve seed1.dsdn.network → dapat IP bootstrap node
+2. Connect ke bootstrap_IP:45831 → handshake → role = Bootstrap
+3. Node tahu ini bootstrap node → minta PEX { roles: [Chain, Validator] }
+4. Bootstrap node response: "Saya kenal Chain di IP_X, Validator di IP_Y"
+5. Node disconnect dari bootstrap → connect ke IP_X dan IP_Y
+6. Handshake dengan IP_X → role = Chain → keep!
+```
+
+Untuk handshake, role `Bootstrap` ditambah sebagai variant khusus tapi BUKAN role operasional:
+
+```rust
+pub enum NodeRole {
+    // Operational roles
+    Chain,
+    Validator,
+    Coordinator,
+    StorageCompute,
+    // Special roles
+    Bootstrap,  // Dedicated bootstrap node, no operational function
+}
+```
+
+### 3. Network Partition Recovery
+
+Jika jaringan mengalami partisi:
 
 ```
 Deteksi:
-- Node mendeteksi jumlah connected peer turun drastis (di bawah min_peers threshold).
+- Node mendeteksi jumlah connected peer turun di bawah min_peers threshold.
 - Node mendeteksi tidak menerima block/event baru dalam waktu lama.
+- Khusus: jumlah peer dengan REQUIRED role turun ke 0.
 
 Recovery:
-1. Aggressive DNS seed resolve (semua seed, bukan hanya 1).
-2. Retry semua peer di peers.dat.
+1. Aggressive DNS seed resolve (semua seed, bukan hanya 1) → connect semua IP:45831 → handshake → filter role.
+2. Retry semua peer di peers.dat (terutama yang REQUIRED role).
 3. Retry semua static IP.
 4. Jika masih gagal: log critical alert, terus retry dengan exponential backoff.
 ```
 
-### 5. Seed Infrastructure Checklist (Pre-Mainnet)
+### 4. Seed Infrastructure Checklist (Pre-Mainnet)
 
-Sebelum mainnet launch, founder WAJIB menyelesaikan (checklist ini juga ada di Tahap 20.A):
+Sebelum mainnet launch, founder WAJIB menyelesaikan:
 
 ```
 [ ] Beli minimal 1 domain untuk DNS seed (contoh: seed1.dsdn.network)
-[ ] Setup DNS A record mengarah ke bootstrap node IP
+[ ] Setup DNS A record mengarah ke bootstrap node IP (port 45831)
 [ ] Bootstrap node running 24/7 di VPS/server dedicated
 [ ] Test DNS resolve dari berbagai lokasi geografis
+[ ] Test handshake: connect ke bootstrap node → dapat role = Bootstrap → PEX → dapat role lain
 [ ] (Disarankan) Beli 2 domain tambahan untuk redundansi
 [ ] (Disarankan) Setup bootstrap node di 2-3 lokasi berbeda (geo-distributed)
-[ ] (Disarankan) Minta 2-3 komunitas/operator menjalankan bootstrap node tambahan
+[ ] (Disarankan) Minta komunitas/operator menjalankan bootstrap node tambahan
 [ ] (Disarankan) Tambahkan 3-5 static IP dari operator terpercaya ke default config
-[ ] Test full bootstrap: fresh node → DNS resolve → connect → PEX → fully synced
-[ ] Test fallback: matikan seed1 → pastikan failover ke seed2 bekerja
-[ ] Test peers.dat: restart node → pastikan connect tanpa DNS
+[ ] Test full bootstrap per role:
+    [ ] Fresh Chain node → DNS → handshake → filter → PEX → find Chain+Validator → sync
+    [ ] Fresh Validator → DNS → find Chain+Validator+Coordinator → consensus
+    [ ] Fresh Coordinator → DNS → find Chain+Coordinator+StorageCompute → operational
+    [ ] Fresh StorageCompute → DNS → find Coordinator+StorageCompute → register
+[ ] Test fallback: matikan seed1 → pastikan failover ke seed2
+[ ] Test peers.dat: restart node → connect tanpa DNS menggunakan cached role info
 [ ] Document seed maintenance procedure (domain renewal, IP update, etc.)
 ```
 
-### 6. Anti-Abuse & Security
+### 5. Anti-Abuse & Security
 
-Bootstrap system bisa menjadi target attack. Proteksi:
+Proteksi untuk single-port architecture:
 
-- **DNS Poisoning:** Node harus verify peer setelah connect (handshake dengan network_id check, node_id verification). DNS hanya memberikan IP, bukan trust.
-- **Eclipse Attack:** Node harus connect ke peer dari BERBAGAI sumber (DNS seed, static IP, PEX). Jangan bergantung pada satu sumber saja. Enforce: minimal N% peer harus dari sumber berbeda.
-- **Sybil via PEX:** Rate limit PEX, jangan langsung trust semua peer dari PEX. Score peer berdasarkan behavior, bukan hanya availability.
+- **DNS Poisoning:** DNS hanya memberikan IP. Trust datang dari handshake (network_id check, node_id verification, role declaration). Role bisa di-fake — node harus verify role claim melalui behavior (node yang claim Chain tapi tidak bisa sync block → suspicious).
+- **Role Spoofing:** Node bisa claim role palsu saat handshake. Mitigasi:
+  - Setelah handshake, node verify behavior. Node Chain yang tidak bisa memberikan block header → disconnect + ban.
+  - Validator yang tidak participate di consensus → disconnect.
+  - Role verification adalah secondary check, bukan hanya handshake claim.
+- **Eclipse Attack:** Node harus connect ke peer dari BERBAGAI sumber (DNS seed, static IP, PEX). Enforce: minimal N% peer harus dari sumber berbeda.
+- **Sybil via PEX:** Rate limit PEX. Score peer berdasarkan behavior, bukan hanya handshake claim.
 - **Spam Connection:** Rate limit inbound connection per IP. Max N connection attempt per IP per menit.
-- **peers.dat Poisoning:** Jika node terkoneksi ke banyak malicious peer yang memberikan fake peer list, peers.dat bisa tercemar. Mitigasi: scoring yang mengutamakan peer dengan successful block/data exchange, bukan hanya successful handshake.
+- **peers.dat Poisoning:** Scoring yang mengutamakan peer dengan successful block/data exchange, bukan hanya successful handshake + role claim.
 
-### 7. Agent CLI Support
-
-Agent mendapat command baru untuk manajemen bootstrap:
+### 6. Agent CLI Support
 
 ```bash
-# Lihat status peer
+# Lihat semua connected peers (dengan role)
 dsdn-agent peers list
+# Output:
+# IP              PORT   ROLE           NODE_ID      CONNECTED  SCORE
+# 203.0.113.50    45831  Chain          abc123...    yes        85
+# 198.51.100.10   45831  Validator      def456...    yes        72
+# 192.0.2.100     45831  StorageCompute ghi789...    no (cached) 45
 
-# Tambah static peer manual
+# Filter by role
+dsdn-agent peers list --role chain
+dsdn-agent peers list --role validator
+dsdn-agent peers list --role coordinator
+dsdn-agent peers list --role storage-compute
+
+# Tambah static peer manual (port default 45831)
+dsdn-agent peers add 203.0.113.50
 dsdn-agent peers add 203.0.113.50:45831
 
 # Tambah DNS seed manual
 dsdn-agent peers add-seed seed4.dsdn.network
 
-# Lihat peers.dat stats
+# Lihat peers.dat stats (breakdown by role)
 dsdn-agent peers stats
+# Output:
+# Total peers in cache: 847
+# By role: Chain=203, Validator=189, Coordinator=45, StorageCompute=398, Bootstrap=12
+# Connected: 15 (Chain=4, Validator=6, Coordinator=2, StorageCompute=3)
+# Last DNS resolve: 12 min ago
+# Last PEX: 8 min ago
 
-# Force re-bootstrap (clear peers.dat, mulai dari DNS seed)
+# Force re-bootstrap
 dsdn-agent peers reset
 
-# Lihat peer berdasarkan service type
-dsdn-agent peers list --type coordinator
-dsdn-agent peers list --type chain
+# Lihat role dependency matrix untuk node ini
+dsdn-agent peers roles
+# Output (jika node ini Chain):
+# My role: Chain
+# Required peers: Chain, Validator
+# Optional peers: Coordinator
+# Skip peers: StorageCompute
 ```
 
-### 8. Monitoring & Observability
+### 7. Monitoring & Observability
 
 Metrics yang harus di-expose:
 
-- `bootstrap_dns_resolve_total` — jumlah DNS resolve attempts.
-- `bootstrap_dns_resolve_success` — jumlah DNS resolve sukses.
-- `bootstrap_dns_resolve_latency_ms` — latency DNS resolve.
-- `bootstrap_peer_connect_total` — jumlah connection attempts.
-- `bootstrap_peer_connect_success` — jumlah connection sukses.
-- `bootstrap_peer_handshake_failure` — jumlah handshake gagal (breakdown by reason).
-- `bootstrap_peers_dat_size` — jumlah entry di peers.dat.
-- `bootstrap_active_peers` — jumlah peer yang saat ini terkoneksi.
-- `bootstrap_active_peers_by_type` — breakdown per service type.
-- `bootstrap_pex_requests_total` — jumlah PEX request sent/received.
-- `bootstrap_fallback_triggered` — jumlah kali fallback dari satu sumber ke sumber lain.
+```
+# DNS & Connection
+bootstrap_dns_resolve_total              — jumlah DNS resolve attempts
+bootstrap_dns_resolve_success            — jumlah DNS resolve sukses
+bootstrap_dns_resolve_latency_ms         — latency DNS resolve
+bootstrap_peer_connect_total             — jumlah connection attempts (semua ke port 45831)
+bootstrap_peer_connect_success           — jumlah connection sukses
+
+# Handshake & Role
+bootstrap_handshake_total                — jumlah handshake attempts
+bootstrap_handshake_success              — jumlah handshake sukses
+bootstrap_handshake_failure{reason="..."}— breakdown by failure reason
+bootstrap_handshake_role_discovered{role="chain|validator|coordinator|storage_compute|bootstrap"}
+                                         — jumlah peer per role yang ditemukan via handshake
+bootstrap_peer_disconnect{reason="role_not_needed|too_many_peers|..."}
+                                         — breakdown disconnect reasons
+
+# Peer State
+bootstrap_peers_dat_size                 — jumlah entry di peers.dat
+bootstrap_peers_dat_by_role{role="..."}  — breakdown peers.dat per role
+bootstrap_active_peers                   — jumlah peer yang saat ini terkoneksi
+bootstrap_active_peers_by_role{role="..."}— breakdown active peers per role
+
+# PEX
+bootstrap_pex_requests_total             — jumlah PEX request sent/received
+bootstrap_pex_role_filter_used           — jumlah PEX request yang pakai role filter
+
+# Fallback
+bootstrap_fallback_triggered{from="peers_dat|static_ip|dns_seed"}
+                                         — jumlah kali fallback terjadi
+
+# Role Health
+bootstrap_required_role_missing{role="..."}
+                                         — alert: role REQUIRED tapi 0 connected peer
+bootstrap_time_to_first_required_peer_ms — waktu dari startup sampai punya semua REQUIRED role peers
+```
 
 ### Integration Test Scenarios
 
-1. **Fresh node, DNS only:** Node baru start dengan peers.dat kosong, hanya punya DNS seed → berhasil bootstrap, connect ke jaringan, sync state.
-2. **Fresh node, static IP only:** DNS seed dikosongkan, hanya static IP → berhasil bootstrap.
-3. **Warm restart:** Node punya peers.dat dari sesi sebelumnya → langsung connect tanpa DNS resolve.
-4. **DNS seed down:** Seed 1 dan 2 mati → fallback ke seed 3 → berhasil bootstrap.
-5. **Semua DNS seed down:** Semua DNS gagal → fallback ke static IP → berhasil bootstrap.
-6. **Semua sumber down:** DNS, static IP, peers.dat semua gagal → node retry dengan backoff, log critical → saat satu sumber kembali hidup, node berhasil connect.
-7. **Network partition recovery:** 2 group node terisolasi → satu node dari masing-masing group resolve DNS seed yang sama → kedua group reconnect.
-8. **PEX propagation:** 10 node, hanya node 1 yang kenal DNS seed. Setelah PEX rounds, semua 10 node saling kenal.
-9. **Service type discovery:** Validator berhasil menemukan coordinator dan chain node melalui PEX service type filter.
-10. **Eclipse attack resistance:** Node yang menerima peer hanya dari 1 sumber → system warning. Node dipaksa diversify sumber.
-11. **Multi-component bootstrap:** Chain node, storage node, coordinator, validator, ingress — semua start simultaneously dari bootstrap → semua saling menemukan dan beroperasi normal.
-12. **peers.dat corruption:** File peers.dat corrupt/deleted → node fallback ke DNS seed dan static IP, rebuild peers.dat dari awal.
+1. **Fresh Chain node, DNS only:** Node Chain start dengan peers.dat kosong → DNS resolve → connect ke port 45831 → handshake → beberapa peer bukan Chain → PEX → temukan Chain + Validator → operational.
+2. **Fresh Validator, static IP only:** DNS dikosongkan → static IP → handshake → filter → temukan Chain + Validator + Coordinator → operational.
+3. **Warm restart (role-cached):** Node punya peers.dat dengan role info → langsung connect ke peer dengan role yang cocok → operational dalam < 5 detik.
+4. **All DNS seeds down:** Fallback ke static IP → handshake → role filter → berhasil.
+5. **Semua sumber down:** DNS, static IP, peers.dat semua gagal → node retry dengan backoff → saat sumber kembali → berhasil connect.
+6. **Cross-role PEX discovery:** Chain node connect ke StorageCompute → PEX → dapat info Chain peer → connect → operational.
+7. **Bootstrap node as hub:** 4 node (1 per role) + 1 bootstrap node → semua bootstrap via bootstrap node → PEX → semua menemukan peer yang dibutuhkan.
+8. **Network partition recovery:** 2 group terisolasi → resolve DNS seed yang sama → reconnect.
+9. **PEX propagation:** 10 node mixed roles → hanya node 1 kenal DNS seed → setelah PEX rounds → semua menemukan peers yang dibutuhkan.
+10. **Role spoofing detection:** Node claim role Chain tapi tidak bisa serve blocks → detected → disconnected → banned.
+11. **Multi-role startup simultaneously:** Chain, Validator, Coordinator, StorageCompute start bersamaan → semua bootstrap dari DNS → handshake → role filter → semua saling menemukan → operational.
+12. **peers.dat corruption:** File corrupt/deleted → fallback ke DNS seed → rebuild peers.dat dengan role info dari scratch.
+13. **Single port verification:** Verify bahwa semua koneksi (inbound dan outbound, semua role) hanya menggunakan port 45831.
+14. **Role dependency completeness:** Chain node tanpa Validator peer → keep searching → PEX → eventually find Validator → baru fully operational.
 
 ### Deliverables 21.1.C
 
-1. Integrasi `BootstrapConfig` ke semua komponen: chain, node, coordinator, validator, ingress.
-2. Service type advertisement dalam handshake dan PEX.
-3. Dedicated bootstrap node mode (`--mode bootstrap`).
-4. Network partition detection dan recovery logic.
-5. Anti-abuse: rate limiting, eclipse attack mitigation, peers.dat poisoning protection.
-6. Agent CLI commands untuk manajemen peer dan seed.
-7. Monitoring metrics untuk observability.
+1. Integrasi `BootstrapConfig` ke semua role: chain, validator, coordinator, storage-compute.
+2. Per-role startup flow dengan role-based peer filtering.
+3. Dedicated bootstrap node mode (`--mode bootstrap`) dengan special `Bootstrap` role.
+4. Network partition detection dan recovery logic (role-aware).
+5. Anti-abuse: rate limiting, eclipse attack mitigation, role spoofing detection, peers.dat poisoning protection.
+6. Agent CLI commands dengan role filtering support.
+7. Monitoring metrics dengan role breakdown.
 8. Seed infrastructure checklist document.
-9. Full integration test suite (12 scenarios di atas).
-10. End-to-end test: seluruh komponen DSDN bootstrap dari nol, saling menemukan, dan beroperasi normal.
+9. Full integration test suite (14 scenarios).
+10. End-to-end test: semua role bootstrap dari nol via single port, saling menemukan via handshake + role exchange + PEX, dan beroperasi normal.
 
 ### Crates Terlibat
 
-`common`, `chain`, `node`, `coordinator`, `validator`, `ingress`, `agent`, `proto`
+`common`, `chain`, `node`, `coordinator`, `validator`, `storage-compute`, `agent`, `proto`
 
 ### Kriteria Selesai
 
-- Semua komponen DSDN bisa bootstrap dan saling menemukan tanpa hardcoded address.
-- Fallback chain bekerja di semua failure combination.
-- peers.dat terbukti mempercepat restart (connect < 5 detik dari cache).
-- PEX menyebarkan peer knowledge ke seluruh jaringan dalam < 10 menit.
-- Service type discovery memungkinkan komponen menemukan komponen lain yang dibutuhkan.
-- Anti-abuse protection active dan tested.
-- Semua 12 integration test pass.
-- Monitoring metrics visible di dashboard.
-- Seed infrastructure checklist siap untuk mainnet.
+- **Single port confirmed**: Semua komponen DSDN hanya menggunakan port 45831. Tidak ada port lain.
+- **Role discovery works**: Setiap node tahu role peer setelah handshake. Filtering bekerja sesuai RoleDependencyMatrix.
+- **Cross-role PEX**: Node bisa menemukan peer dengan role berbeda melalui PEX, bahkan dari peer yang di-skip.
+- **Fallback chain bekerja** di semua failure combination.
+- **peers.dat role-aware**: Restart node langsung connect ke peer dengan role yang tepat (connect < 5 detik dari cache).
+- **PEX menyebarkan role knowledge** ke seluruh jaringan dalam < 10 menit.
+- **Anti-abuse protection active** dan tested (termasuk role spoofing detection).
+- **Semua 14 integration test pass.**
+- **Monitoring metrics visible** di dashboard, termasuk role breakdown.
+- **Seed infrastructure checklist** siap untuk mainnet.
+
+---
+
+## Ringkasan Perubahan dari Versi Sebelumnya
+
+| Aspek | Sebelumnya | Sekarang |
+|-------|-----------|----------|
+| Port | Bisa berbeda per komponen | **Single port 45831 untuk semua** |
+| Role | ServiceType di-advertise saat PEX | **Role di-exchange saat handshake** |
+| DNS Seed | Return IP per komponen | **Return mixed-role IP, filter setelah handshake** |
+| Peer Filtering | Setelah PEX | **Setelah handshake (immediate)** |
+| peers.dat | Tanpa role info | **Setiap entry punya role** |
+| Roles | Chain, Storage, StorageDC, Coordinator, Validator, Ingress, Bootstrap | **Chain, Validator, Coordinator, StorageCompute, Bootstrap** |
+| Scoring | Tanpa role weight | **Role relevance masuk scoring** |
+| Connection | Connect ke semua, filter belakangan | **Handshake → role check → keep/disconnect immediate** |
+| PEX | Return semua peer | **Support optional role filter di request** |
 
 ---
 
