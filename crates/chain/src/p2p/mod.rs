@@ -25,13 +25,13 @@
 //! | Module | Fungsi |
 //! |--------|--------|
 //! | `identity` | Network ID, Node ID, Protocol Version |
-//! | `types` | PeerEntry, ServiceType, PeerSource |
-//! | `config` | BootstrapConfig, DnsSeed, StaticPeer |
-//! | `scoring` | Peer scoring & selection algorithm |
-//! | `store` | Persistent peer cache (peers.dat) |
-//! | `handshake` | Peer handshake protocol messages |
-//! | `pex` | Peer Exchange (PEX) protocol |
-//! | `manager` | PeerManager orchestrator |
+//! | `types` | NodeRole, NodeClass, PeerEntry, RoleDependencyMatrix |
+//! | `config` | BootstrapConfig (role+class), DnsSeed, StaticPeer |
+//! | `scoring` | Peer scoring (role_bonus, class_bonus, source_bonus) |
+//! | `store` | Persistent peer cache (peers.dat, role-aware) |
+//! | `handshake` | Peer handshake (role+class exchange & validation) |
+//! | `pex` | Peer Exchange (role+class aware filtering) |
+//! | `manager` | PeerManager orchestrator (RoleDependencyMatrix) |
 //!
 //! ## Desain Prinsip
 //!
@@ -60,7 +60,12 @@ pub mod manager;
 // ════════════════════════════════════════════════════════════════════════════
 
 pub use identity::{NetworkId, NodeId, ProtocolVersion, CURRENT_PROTOCOL_VERSION};
-pub use types::{PeerEntry, PeerStatus, ServiceType, PeerSource};
+pub use types::{
+    NodeRole, NodeClass, RoleDependency,
+    PeerEntry, PeerStatus, PeerSource,
+    DisconnectReason,
+    role_dependency, required_roles, optional_roles,
+};
 pub use config::{BootstrapConfig, DnsSeed, StaticPeer, ConnectionLimits};
 pub use scoring::{PeerScorer, PeerScore};
 pub use store::PeerStore;

@@ -6,10 +6,15 @@
 //! ## Flow
 //!
 //! ```text
-//! Node A ────── GetPeers ──────> Node B
-//! Node A <───── Peers(list) ──── Node B
+//! Node A ────── GetPeers { roles: [Coordinator, StorageCompute] } ──────> Node B
+//! Node A <───── Peers(list with role+class) ──── Node B
 //! Node A: filter → validate → connect ke peer baru
 //! ```
+//!
+//! ## Role+Class Aware
+//!
+//! PEX response menyertakan role DAN class per peer, sehingga node
+//! bisa memfilter dan memprioritaskan peer yang dibutuhkan.
 //!
 //! ## Rate Limiting
 //!
@@ -22,7 +27,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use super::identity::{NetworkId, NodeId};
-use super::types::{ServiceType, current_unix_time};
+use super::types::{NodeRole, NodeClass, current_unix_time};
 
 // ════════════════════════════════════════════════════════════════════════════
 // PEX CONFIG
@@ -56,12 +61,14 @@ impl Default for PexConfig {
 /// PEX request dari node ke peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PexRequest {
-    /// Request daftar peer yang diketahui
+    /// Request daftar peer yang diketahui.
     GetPeers {
         /// Network ID — hanya return peer dari network yang sama
         network_id: NetworkId,
-        /// Optional: filter by service type
-        service_type_filter: Option<ServiceType>,
+        /// Optional: filter by roles yang dibutuhkan.
+        /// Jika None → return semua role.
+        /// Jika Some([Coordinator, StorageCompute]) → hanya return peer dengan role itu.
+        role_filter: Option<Vec<NodeRole>>,
         /// Max entries yang diminta
         max_count: usize,
     },
@@ -69,14 +76,17 @@ pub enum PexRequest {
 
 /// Entry peer di PEX response.
 /// Ini BUKAN full PeerEntry — hanya info yang aman untuk di-share.
+/// Menyertakan role DAN class per peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PexPeerInfo {
-    /// Socket address (IP:Port)
+    /// Socket address (IP:Port, selalu port 45831)
     pub addr: SocketAddr,
     /// Node ID (Ed25519 pubkey)
     pub node_id: NodeId,
-    /// Service type
-    pub service_type: ServiceType,
+    /// Role operasional peer
+    pub role: NodeRole,
+    /// Kelas node — Some untuk StorageCompute, None untuk lainnya
+    pub node_class: Option<NodeClass>,
     /// Terakhir kali peer ini berhasil di-contact oleh sender
     pub last_success: u64,
 }
@@ -84,7 +94,7 @@ pub struct PexPeerInfo {
 /// PEX response dari peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PexResponse {
-    /// Daftar peer yang diketahui
+    /// Daftar peer yang diketahui (dengan role+class)
     Peers {
         /// List peer info
         peers: Vec<PexPeerInfo>,
@@ -170,7 +180,7 @@ impl PexRateLimiter {
 /// 2. Hanya peer yang last_success < max_age (tidak share dead peer)
 /// 3. Tidak share banned peers
 /// 4. Tidak share peer yang request (no echo)
-/// 5. Optional: filter by service_type
+/// 5. Optional: filter by roles
 /// 6. Limit max_count
 pub fn build_pex_response(
     peers: &[super::types::PeerEntry],
@@ -178,12 +188,12 @@ pub fn build_pex_response(
     requester_addr: &str,
     config: &PexConfig,
 ) -> PexResponse {
-    let PexRequest::GetPeers { network_id, service_type_filter, max_count } = request;
+    let PexRequest::GetPeers { network_id, role_filter, max_count } = request;
 
     let now = current_unix_time();
     let max_age = config.max_last_success_age_secs;
 
-    let mut result: Vec<PexPeerInfo> = peers.iter()
+    let result: Vec<PexPeerInfo> = peers.iter()
         .filter(|p| {
             // Filter: same network
             p.network_id == *network_id
@@ -198,9 +208,9 @@ pub fn build_pex_response(
             && !p.node_id.is_zero()
         })
         .filter(|p| {
-            // Optional service type filter
-            match service_type_filter {
-                Some(st) => p.service_type == *st,
+            // Optional role filter
+            match role_filter {
+                Some(roles) => roles.contains(&p.role),
                 None => true,
             }
         })
@@ -208,7 +218,8 @@ pub fn build_pex_response(
         .map(|p| PexPeerInfo {
             addr: p.addr,
             node_id: p.node_id.clone(),
-            service_type: p.service_type,
+            role: p.role,
+            node_class: p.node_class,
             last_success: p.last_success,
         })
         .collect();
@@ -231,11 +242,12 @@ mod tests {
     use super::super::types::*;
     use std::str::FromStr;
 
-    fn make_peer(ip: &str, success: bool) -> PeerEntry {
+    fn make_peer(ip: &str, role: NodeRole, node_class: Option<NodeClass>, success: bool) -> PeerEntry {
         let addr = SocketAddr::from_str(ip).unwrap();
         let mut p = PeerEntry::new(addr, NetworkId::Devnet, PeerSource::Manual);
         p.node_id = NodeId::from_bytes([ip.as_bytes()[0]; 32]);
-        p.service_type = ServiceType::Chain;
+        p.role = role;
+        p.node_class = node_class;
         if success {
             p.record_success();
         }
@@ -253,14 +265,14 @@ mod tests {
 
     #[test]
     fn test_pex_response_filters_banned() {
-        let mut banned = make_peer("10.0.0.1:45831", true);
+        let mut banned = make_peer("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler), true);
         banned.ban(3600);
-        let good = make_peer("10.0.0.2:45831", true);
+        let good = make_peer("10.0.0.2:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler), true);
 
         let peers = vec![banned, good];
         let request = PexRequest::GetPeers {
             network_id: NetworkId::Devnet,
-            service_type_filter: None,
+            role_filter: None,
             max_count: 100,
         };
 
@@ -275,54 +287,83 @@ mod tests {
 
     #[test]
     fn test_pex_response_filters_requester() {
-        let me = make_peer("10.0.0.1:45831", true);
-        let other = make_peer("10.0.0.2:45831", true);
+        let me = make_peer("10.0.0.1:45831", NodeRole::Validator, None, true);
+        let other = make_peer("10.0.0.2:45831", NodeRole::Coordinator, None, true);
 
         let peers = vec![me, other];
         let request = PexRequest::GetPeers {
             network_id: NetworkId::Devnet,
-            service_type_filter: None,
+            role_filter: None,
             max_count: 100,
         };
 
         let response = build_pex_response(&peers, &request, "10.0.0.1:45831", &PexConfig::default());
         if let PexResponse::Peers { peers: result, .. } = response {
-            // Should not include the requester
             assert!(result.iter().all(|p| p.addr.to_string() != "10.0.0.1:45831"));
         }
     }
 
     #[test]
-    fn test_pex_service_type_filter() {
-        let mut chain = make_peer("10.0.0.1:45831", true);
-        chain.service_type = ServiceType::Chain;
+    fn test_pex_role_filter() {
+        let storage = make_peer("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler), true);
+        let validator = make_peer("10.0.0.2:45831", NodeRole::Validator, None, true);
+        let coordinator = make_peer("10.0.0.3:45831", NodeRole::Coordinator, None, true);
 
-        let mut storage = make_peer("10.0.0.2:45831", true);
-        storage.service_type = ServiceType::Storage;
-
-        let peers = vec![chain, storage];
+        let peers = vec![storage, validator, coordinator];
         let request = PexRequest::GetPeers {
             network_id: NetworkId::Devnet,
-            service_type_filter: Some(ServiceType::Chain),
+            role_filter: Some(vec![NodeRole::StorageCompute, NodeRole::Coordinator]),
             max_count: 100,
         };
 
-        let response = build_pex_response(&peers, &request, "10.0.0.3:45831", &PexConfig::default());
+        let response = build_pex_response(&peers, &request, "10.0.0.99:45831", &PexConfig::default());
         if let PexResponse::Peers { peers: result, .. } = response {
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0].service_type, ServiceType::Chain);
+            assert_eq!(result.len(), 2);
+            assert!(result.iter().all(|p| p.role != NodeRole::Validator));
+        }
+    }
+
+    #[test]
+    fn test_pex_includes_role_and_class() {
+        let dc = make_peer("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::DataCenter), true);
+        let reg = make_peer("10.0.0.2:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler), true);
+        let val = make_peer("10.0.0.3:45831", NodeRole::Validator, None, true);
+
+        let peers = vec![dc, reg, val];
+        let request = PexRequest::GetPeers {
+            network_id: NetworkId::Devnet,
+            role_filter: None,
+            max_count: 100,
+        };
+
+        let response = build_pex_response(&peers, &request, "10.0.0.99:45831", &PexConfig::default());
+        if let PexResponse::Peers { peers: result, .. } = response {
+            assert_eq!(result.len(), 3);
+            // Check DataCenter peer has class info
+            let dc_peer = result.iter().find(|p| p.addr.to_string() == "10.0.0.1:45831").unwrap();
+            assert_eq!(dc_peer.role, NodeRole::StorageCompute);
+            assert_eq!(dc_peer.node_class, Some(NodeClass::DataCenter));
+            // Check Validator has no class
+            let val_peer = result.iter().find(|p| p.addr.to_string() == "10.0.0.3:45831").unwrap();
+            assert_eq!(val_peer.role, NodeRole::Validator);
+            assert_eq!(val_peer.node_class, None);
         }
     }
 
     #[test]
     fn test_pex_response_respects_max_count() {
         let peers: Vec<PeerEntry> = (1..=50)
-            .map(|i| make_peer(&format!("10.0.0.{}:45831", i), true))
+            .map(|i| make_peer(
+                &format!("10.0.0.{}:45831", i),
+                NodeRole::StorageCompute,
+                Some(NodeClass::Reguler),
+                true,
+            ))
             .collect();
 
         let request = PexRequest::GetPeers {
             network_id: NetworkId::Devnet,
-            service_type_filter: None,
+            role_filter: None,
             max_count: 5,
         };
 

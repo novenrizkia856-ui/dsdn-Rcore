@@ -2,6 +2,15 @@
 //!
 //! Tipe data inti untuk peer management. PeerEntry adalah representasi
 //! lengkap sebuah peer termasuk metadata scoring, source, dan status.
+//!
+//! ## Roles (sesuai Whitepaper DSDN)
+//!
+//! - **StorageCompute**: Full node (storage + compute), ada 2 kelas: Reguler & DataCenter
+//! - **Validator**: Governance, compliance, PoS consensus blockchain Nusantara
+//! - **Coordinator**: Metadata, scheduling, job queue, Celestia blob replay
+//! - **Bootstrap**: Dedicated peer discovery node (non-operational)
+//!
+//! Blockchain Nusantara berjalan embedded di semua node — bukan role terpisah.
 
 use serde::{Serialize, Deserialize};
 use std::fmt;
@@ -10,90 +19,274 @@ use super::identity::NodeId;
 use super::identity::NetworkId;
 
 // ════════════════════════════════════════════════════════════════════════════
-// SERVICE TYPE
+// NODE ROLE
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Tipe layanan yang disediakan oleh node.
+/// Role operasional node di jaringan DSDN.
 ///
-/// Saat handshake dan PEX, node mengiklankan service type-nya.
+/// Sesuai whitepaper: blockchain Nusantara embedded di semua node.
+/// Validator menjalankan PoS consensus, node lain sync block sebagai client.
+/// Tidak ada role "Chain" terpisah.
+///
+/// Saat handshake dan PEX, node mengiklankan role-nya.
 /// Ini memungkinkan node menemukan komponen spesifik yang dibutuhkan.
-/// Misal: validator hanya perlu chain node dan coordinator, bukan storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ServiceType {
-    /// Chain node (block production, state management)
-    Chain,
-    /// Storage node (data storage — reguler)
-    Storage,
-    /// Storage node (data center class)
-    StorageDC,
-    /// Coordinator (workload coordination, TSS/FROST)
-    Coordinator,
-    /// Validator (consensus & validation)
+pub enum NodeRole {
+    /// Full node: storage + compute.
+    /// Kelas (Reguler/DataCenter) menentukan kapasitas dan stake requirement.
+    /// Reguler: stake 500 $NUSA, DataCenter: stake 5,000 $NUSA.
+    StorageCompute,
+
+    /// Validator: governance, compliance, PoS consensus blockchain Nusantara.
+    /// Memproduksi block, memfinalisasi transaksi, governance voting.
+    /// Stake: 50,000 $NUSA.
     Validator,
-    /// Ingress (HTTP gateway)
-    Ingress,
-    /// Dedicated bootstrap node (peer discovery only)
+
+    /// Coordinator: metadata global, scheduling, job queue, Celestia blob replay.
+    /// Stateless scheduler — semua keputusan bisa direkonstruksi dari DA log.
+    Coordinator,
+
+    /// Dedicated bootstrap node (peer discovery only, non-operational).
+    /// Hanya melayani handshake dan PEX, tidak ikut storage/compute/consensus.
     Bootstrap,
-    /// Unknown / belum teridentifikasi
-    Unknown,
 }
 
-impl ServiceType {
+impl NodeRole {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ServiceType::Chain => "chain",
-            ServiceType::Storage => "storage",
-            ServiceType::StorageDC => "storage_dc",
-            ServiceType::Coordinator => "coordinator",
-            ServiceType::Validator => "validator",
-            ServiceType::Ingress => "ingress",
-            ServiceType::Bootstrap => "bootstrap",
-            ServiceType::Unknown => "unknown",
+            NodeRole::StorageCompute => "storage-compute",
+            NodeRole::Validator => "validator",
+            NodeRole::Coordinator => "coordinator",
+            NodeRole::Bootstrap => "bootstrap",
         }
     }
 
-    pub fn from_str_type(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "chain" => ServiceType::Chain,
-            "storage" => ServiceType::Storage,
-            "storage_dc" | "storagedc" => ServiceType::StorageDC,
-            "coordinator" => ServiceType::Coordinator,
-            "validator" => ServiceType::Validator,
-            "ingress" => ServiceType::Ingress,
-            "bootstrap" => ServiceType::Bootstrap,
-            _ => ServiceType::Unknown,
+    pub fn from_str_role(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "storage-compute" | "storagecompute" | "storage" | "compute" => Some(NodeRole::StorageCompute),
+            "validator" => Some(NodeRole::Validator),
+            "coordinator" => Some(NodeRole::Coordinator),
+            "bootstrap" => Some(NodeRole::Bootstrap),
+            _ => None,
         }
     }
 
     /// Bitmask representation untuk compact encoding di wire protocol.
     pub fn to_bitmask(&self) -> u8 {
         match self {
-            ServiceType::Chain => 0x01,
-            ServiceType::Storage => 0x02,
-            ServiceType::StorageDC => 0x04,
-            ServiceType::Coordinator => 0x08,
-            ServiceType::Validator => 0x10,
-            ServiceType::Ingress => 0x20,
-            ServiceType::Bootstrap => 0x40,
-            ServiceType::Unknown => 0x00,
+            NodeRole::StorageCompute => 0x01,
+            NodeRole::Validator => 0x02,
+            NodeRole::Coordinator => 0x04,
+            NodeRole::Bootstrap => 0x08,
         }
     }
 
-    pub fn from_bitmask(b: u8) -> Self {
+    pub fn from_bitmask(b: u8) -> Option<Self> {
         match b {
-            0x01 => ServiceType::Chain,
-            0x02 => ServiceType::Storage,
-            0x04 => ServiceType::StorageDC,
-            0x08 => ServiceType::Coordinator,
-            0x10 => ServiceType::Validator,
-            0x20 => ServiceType::Ingress,
-            0x40 => ServiceType::Bootstrap,
-            _ => ServiceType::Unknown,
+            0x01 => Some(NodeRole::StorageCompute),
+            0x02 => Some(NodeRole::Validator),
+            0x04 => Some(NodeRole::Coordinator),
+            0x08 => Some(NodeRole::Bootstrap),
+            _ => None,
+        }
+    }
+
+    /// Apakah role ini operational (bukan bootstrap)?
+    pub fn is_operational(&self) -> bool {
+        !matches!(self, NodeRole::Bootstrap)
+    }
+
+    /// Apakah role ini punya node_class?
+    /// Hanya StorageCompute yang punya class (Reguler/DataCenter).
+    pub fn has_node_class(&self) -> bool {
+        matches!(self, NodeRole::StorageCompute)
+    }
+}
+
+impl fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NODE CLASS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Kelas node, khusus untuk role StorageCompute.
+///
+/// Sesuai whitepaper DSDN:
+/// - Reguler: partisipasi publik, kapasitas terbatas (stake 500 $NUSA)
+/// - DataCenter: kapasitas besar, GPU, SLA tinggi (stake 5,000 $NUSA)
+///
+/// Validator dan Coordinator TIDAK punya kelas — node_class harus None.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeClass {
+    /// Full Node Reguler: CPU 4-8 vCPU, RAM 8-32 GiB, Storage 512GB-2TB.
+    /// Stake: 500 $NUSA.
+    Reguler,
+
+    /// Full Node Data Center: CPU 32-64 vCPU, RAM 128-256 GiB, Storage 4-16TB, GPU.
+    /// Stake: 5,000 $NUSA.
+    DataCenter,
+}
+
+impl NodeClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeClass::Reguler => "reguler",
+            NodeClass::DataCenter => "datacenter",
+        }
+    }
+
+    pub fn from_str_class(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('_', "").replace('-', "").as_str() {
+            "reguler" | "regular" => Some(NodeClass::Reguler),
+            "datacenter" | "dc" => Some(NodeClass::DataCenter),
+            _ => None,
+        }
+    }
+
+    pub fn to_bitmask(&self) -> u8 {
+        match self {
+            NodeClass::Reguler => 0x01,
+            NodeClass::DataCenter => 0x02,
+        }
+    }
+
+    pub fn from_bitmask(b: u8) -> Option<Self> {
+        match b {
+            0x01 => Some(NodeClass::Reguler),
+            0x02 => Some(NodeClass::DataCenter),
+            _ => None,
         }
     }
 }
 
-impl fmt::Display for ServiceType {
+impl fmt::Display for NodeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ROLE DEPENDENCY
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Tingkat kebutuhan koneksi terhadap role tertentu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleDependency {
+    /// HARUS punya minimal 1 peer dengan role ini.
+    Required,
+    /// Bagus jika ada, tapi tidak blocking.
+    Optional,
+    /// Tidak dibutuhkan — disconnect setelah handshake, tapi cache di peers.dat.
+    Skip,
+}
+
+/// Role Dependency Matrix — menentukan siapa butuh siapa.
+///
+/// Sesuai Tahap 21 v2:
+/// ```text
+/// StorageCompute butuh:
+///   StorageCompute → REQUIRED (data replication)
+///   Coordinator    → REQUIRED (register, terima task)
+///   Validator      → OPTIONAL (governance reads via blockchain)
+///
+/// Validator butuh:
+///   Validator      → REQUIRED (PoS consensus, block production)
+///   Coordinator    → REQUIRED (koordinasi, status)
+///   StorageCompute → OPTIONAL (monitoring, compliance)
+///
+/// Coordinator butuh:
+///   Coordinator    → REQUIRED (multi-coordinator sync, TSS/FROST)
+///   StorageCompute → REQUIRED (task dispatch, node management)
+///   Validator      → REQUIRED (stake verification, governance)
+/// ```
+pub fn role_dependency(our_role: NodeRole, peer_role: NodeRole) -> RoleDependency {
+    match (our_role, peer_role) {
+        // ── StorageCompute dependencies ──
+        (NodeRole::StorageCompute, NodeRole::StorageCompute) => RoleDependency::Required,
+        (NodeRole::StorageCompute, NodeRole::Coordinator)    => RoleDependency::Required,
+        (NodeRole::StorageCompute, NodeRole::Validator)      => RoleDependency::Optional,
+
+        // ── Validator dependencies ──
+        (NodeRole::Validator, NodeRole::Validator)      => RoleDependency::Required,
+        (NodeRole::Validator, NodeRole::Coordinator)    => RoleDependency::Required,
+        (NodeRole::Validator, NodeRole::StorageCompute) => RoleDependency::Optional,
+
+        // ── Coordinator dependencies ──
+        (NodeRole::Coordinator, NodeRole::Coordinator)    => RoleDependency::Required,
+        (NodeRole::Coordinator, NodeRole::StorageCompute) => RoleDependency::Required,
+        (NodeRole::Coordinator, NodeRole::Validator)      => RoleDependency::Required,
+
+        // ── Bootstrap: semua role Skip karena bootstrap bukan operational ──
+        (NodeRole::Bootstrap, _) => RoleDependency::Skip,
+
+        // ── Semua role terhadap Bootstrap: Skip (tapi PEX dulu sebelum disconnect) ──
+        (_, NodeRole::Bootstrap) => RoleDependency::Skip,
+    }
+}
+
+/// Get daftar role yang REQUIRED untuk role tertentu.
+pub fn required_roles(our_role: NodeRole) -> Vec<NodeRole> {
+    let all_roles = [NodeRole::StorageCompute, NodeRole::Validator, NodeRole::Coordinator];
+    all_roles.iter()
+        .filter(|&&r| role_dependency(our_role, r) == RoleDependency::Required)
+        .cloned()
+        .collect()
+}
+
+/// Get daftar role yang OPTIONAL untuk role tertentu.
+pub fn optional_roles(our_role: NodeRole) -> Vec<NodeRole> {
+    let all_roles = [NodeRole::StorageCompute, NodeRole::Validator, NodeRole::Coordinator];
+    all_roles.iter()
+        .filter(|&&r| role_dependency(our_role, r) == RoleDependency::Optional)
+        .cloned()
+        .collect()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DISCONNECT REASON
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Alasan disconnect dari peer setelah handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DisconnectReason {
+    /// Role tidak dibutuhkan oleh node ini (SKIP di RoleDependencyMatrix)
+    RoleNotNeeded,
+    /// Sudah cukup peer — max connections reached
+    TooManyPeers,
+    /// Network ID berbeda (mainnet vs testnet)
+    NetworkIdMismatch,
+    /// Protocol version tidak kompatibel
+    ProtocolIncompatible,
+    /// Handshake data invalid (misal: Validator kirim node_class = DataCenter)
+    InvalidHandshake,
+    /// Handshake timeout
+    Timeout,
+    /// Peer di-ban
+    Banned,
+    /// Node sedang shutdown
+    Shutdown,
+}
+
+impl DisconnectReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DisconnectReason::RoleNotNeeded => "role_not_needed",
+            DisconnectReason::TooManyPeers => "too_many_peers",
+            DisconnectReason::NetworkIdMismatch => "network_id_mismatch",
+            DisconnectReason::ProtocolIncompatible => "protocol_incompatible",
+            DisconnectReason::InvalidHandshake => "invalid_handshake",
+            DisconnectReason::Timeout => "timeout",
+            DisconnectReason::Banned => "banned",
+            DisconnectReason::Shutdown => "shutdown",
+        }
+    }
+}
+
+impl fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -176,23 +369,29 @@ pub enum PeerStatus {
 /// ## Field Groups
 ///
 /// - **Identity**: addr, node_id, network_id
-/// - **Metadata**: service_type, source, status
+/// - **Role**: role, node_class
+/// - **Metadata**: source, status
 /// - **Timestamps**: first_seen, last_seen, last_success, last_failure
 /// - **Counters**: success_count, failure_count, consecutive_failures
 /// - **Scoring**: score (computed by PeerScorer)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
     // ── Identity ──────────────────────────────────────────
-    /// Socket address (IP:Port)
+    /// Socket address (IP:Port, selalu port 45831)
     pub addr: SocketAddr,
     /// Node ID (Ed25519 pubkey) — bisa unknown sebelum handshake
     pub node_id: NodeId,
     /// Network yang dilaporkan peer (verified saat handshake)
     pub network_id: NetworkId,
 
+    // ── Role & Class (diketahui setelah handshake) ───────
+    /// Role operasional peer
+    pub role: NodeRole,
+    /// Kelas node — hanya relevan jika role == StorageCompute.
+    /// None untuk Validator, Coordinator, dan Bootstrap.
+    pub node_class: Option<NodeClass>,
+
     // ── Metadata ──────────────────────────────────────────
-    /// Tipe layanan yang disediakan peer
-    pub service_type: ServiceType,
     /// Dari mana peer ini ditemukan
     pub source: PeerSource,
     /// Status koneksi saat ini
@@ -223,13 +422,15 @@ pub struct PeerEntry {
 
 impl PeerEntry {
     /// Buat PeerEntry baru dengan defaults yang wajar.
+    /// Role = StorageCompute (default, akan di-update setelah handshake).
     pub fn new(addr: SocketAddr, network_id: NetworkId, source: PeerSource) -> Self {
         let now = current_unix_time();
         Self {
             addr,
             node_id: NodeId::zero(),
             network_id,
-            service_type: ServiceType::Unknown,
+            role: NodeRole::StorageCompute, // default, updated after handshake
+            node_class: None,               // unknown until handshake
             source,
             status: PeerStatus::Discovered,
             first_seen: now,
@@ -284,7 +485,6 @@ impl PeerEntry {
     }
 
     /// Check apakah peer "suspicious" (gagal 10x berturut-turut).
-    /// Suspicious peer mendapat prioritas rendah tapi belum di-ban.
     pub fn is_suspicious(&self) -> bool {
         self.consecutive_failures >= 10
     }
@@ -299,16 +499,42 @@ impl PeerEntry {
     pub fn store_key(&self) -> String {
         self.addr.to_string()
     }
+
+    /// Update role dan class setelah handshake.
+    pub fn update_role(&mut self, role: NodeRole, node_class: Option<NodeClass>) {
+        self.role = role;
+        self.node_class = node_class;
+    }
+
+    /// Validasi konsistensi role + class.
+    /// - StorageCompute HARUS punya node_class.
+    /// - Validator/Coordinator/Bootstrap HARUS node_class = None.
+    pub fn is_role_class_valid(&self) -> bool {
+        match self.role {
+            NodeRole::StorageCompute => self.node_class.is_some(),
+            NodeRole::Validator | NodeRole::Coordinator | NodeRole::Bootstrap => {
+                self.node_class.is_none()
+            }
+        }
+    }
+
+    /// Human-readable role + class string (e.g. "storage-compute:datacenter").
+    pub fn role_display(&self) -> String {
+        match self.node_class {
+            Some(class) => format!("{}:{}", self.role, class),
+            None => self.role.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for PeerEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Peer({} node={} type={} src={} score={} ok/fail={}/{})",
+            "Peer({} node={} role={} src={} score={} ok/fail={}/{})",
             self.addr,
             self.node_id,
-            self.service_type,
+            self.role_display(),
             self.source,
             self.score,
             self.success_count,
@@ -351,7 +577,8 @@ mod tests {
         assert_eq!(peer.success_count, 0);
         assert_eq!(peer.failure_count, 0);
         assert!(peer.node_id.is_zero());
-        assert_eq!(peer.service_type, ServiceType::Unknown);
+        assert_eq!(peer.role, NodeRole::StorageCompute);
+        assert_eq!(peer.node_class, None);
     }
 
     #[test]
@@ -382,10 +609,9 @@ mod tests {
     #[test]
     fn test_peer_ban_and_expiry() {
         let mut peer = make_peer();
-        peer.ban(3600); // ban 1 hour
+        peer.ban(3600);
         assert!(peer.is_banned());
 
-        // Simulate expired ban
         if let PeerStatus::Banned { ref mut until } = peer.status {
             *until = 0; // expired
         }
@@ -393,20 +619,105 @@ mod tests {
     }
 
     #[test]
-    fn test_service_type_bitmask_roundtrip() {
-        let types = [
-            ServiceType::Chain,
-            ServiceType::Storage,
-            ServiceType::StorageDC,
-            ServiceType::Coordinator,
-            ServiceType::Validator,
-            ServiceType::Ingress,
-            ServiceType::Bootstrap,
+    fn test_node_role_bitmask_roundtrip() {
+        let roles = [
+            NodeRole::StorageCompute,
+            NodeRole::Validator,
+            NodeRole::Coordinator,
+            NodeRole::Bootstrap,
         ];
-        for st in types {
-            let mask = st.to_bitmask();
-            let restored = ServiceType::from_bitmask(mask);
-            assert_eq!(st, restored);
+        for role in roles {
+            let mask = role.to_bitmask();
+            let restored = NodeRole::from_bitmask(mask).unwrap();
+            assert_eq!(role, restored);
         }
+    }
+
+    #[test]
+    fn test_node_class_bitmask_roundtrip() {
+        let classes = [NodeClass::Reguler, NodeClass::DataCenter];
+        for class in classes {
+            let mask = class.to_bitmask();
+            let restored = NodeClass::from_bitmask(mask).unwrap();
+            assert_eq!(class, restored);
+        }
+    }
+
+    #[test]
+    fn test_role_class_validation() {
+        let mut peer = make_peer();
+
+        // StorageCompute tanpa class → invalid
+        peer.role = NodeRole::StorageCompute;
+        peer.node_class = None;
+        assert!(!peer.is_role_class_valid());
+
+        // StorageCompute dengan class → valid
+        peer.node_class = Some(NodeClass::Reguler);
+        assert!(peer.is_role_class_valid());
+
+        // Validator dengan class → invalid
+        peer.role = NodeRole::Validator;
+        peer.node_class = Some(NodeClass::DataCenter);
+        assert!(!peer.is_role_class_valid());
+
+        // Validator tanpa class → valid
+        peer.node_class = None;
+        assert!(peer.is_role_class_valid());
+
+        // Coordinator tanpa class → valid
+        peer.role = NodeRole::Coordinator;
+        assert!(peer.is_role_class_valid());
+    }
+
+    #[test]
+    fn test_role_dependency_matrix() {
+        // StorageCompute dependencies
+        assert_eq!(role_dependency(NodeRole::StorageCompute, NodeRole::StorageCompute), RoleDependency::Required);
+        assert_eq!(role_dependency(NodeRole::StorageCompute, NodeRole::Coordinator), RoleDependency::Required);
+        assert_eq!(role_dependency(NodeRole::StorageCompute, NodeRole::Validator), RoleDependency::Optional);
+
+        // Validator dependencies
+        assert_eq!(role_dependency(NodeRole::Validator, NodeRole::Validator), RoleDependency::Required);
+        assert_eq!(role_dependency(NodeRole::Validator, NodeRole::Coordinator), RoleDependency::Required);
+        assert_eq!(role_dependency(NodeRole::Validator, NodeRole::StorageCompute), RoleDependency::Optional);
+
+        // Coordinator dependencies
+        assert_eq!(role_dependency(NodeRole::Coordinator, NodeRole::Coordinator), RoleDependency::Required);
+        assert_eq!(role_dependency(NodeRole::Coordinator, NodeRole::StorageCompute), RoleDependency::Required);
+        assert_eq!(role_dependency(NodeRole::Coordinator, NodeRole::Validator), RoleDependency::Required);
+
+        // Bootstrap: semua skip
+        assert_eq!(role_dependency(NodeRole::Bootstrap, NodeRole::Validator), RoleDependency::Skip);
+        assert_eq!(role_dependency(NodeRole::StorageCompute, NodeRole::Bootstrap), RoleDependency::Skip);
+    }
+
+    #[test]
+    fn test_required_roles() {
+        let sc_required = required_roles(NodeRole::StorageCompute);
+        assert!(sc_required.contains(&NodeRole::StorageCompute));
+        assert!(sc_required.contains(&NodeRole::Coordinator));
+        assert!(!sc_required.contains(&NodeRole::Validator));
+
+        let coord_required = required_roles(NodeRole::Coordinator);
+        assert_eq!(coord_required.len(), 3); // semua required
+    }
+
+    #[test]
+    fn test_role_display() {
+        let mut peer = make_peer();
+        peer.role = NodeRole::StorageCompute;
+        peer.node_class = Some(NodeClass::DataCenter);
+        assert_eq!(peer.role_display(), "storage-compute:datacenter");
+
+        peer.role = NodeRole::Validator;
+        peer.node_class = None;
+        assert_eq!(peer.role_display(), "validator");
+    }
+
+    #[test]
+    fn test_disconnect_reason_display() {
+        assert_eq!(DisconnectReason::RoleNotNeeded.as_str(), "role_not_needed");
+        assert_eq!(DisconnectReason::InvalidHandshake.as_str(), "invalid_handshake");
     }
 }

@@ -1,33 +1,37 @@
 //! # Handshake Protocol
 //!
 //! Protocol handshake saat dua node pertama kali connect.
+//! Setelah handshake, kedua node saling tahu role dan class masing-masing.
 //!
 //! ## Flow
 //!
 //! ```text
 //! Node A ──────────────────────── Node B
 //!   │                                │
-//!   │── HandshakeMessage::Hello ────>│
-//!   │                                │── validate
-//!   │<── HandshakeMessage::Hello ────│
+//!   │── HandshakeMessage::Hello ────>│  (kirim role + class)
+//!   │                                │── validate (role, class, network, version)
+//!   │<── HandshakeMessage::Hello ────│  (kirim role + class)
 //!   │── validate                     │
 //!   │                                │
-//!   │ (jika valid: Connected)        │
-//!   │ (jika invalid: Disconnect)     │
+//!   │ (role check via RoleDependencyMatrix)
+//!   │ (REQUIRED → keep, SKIP → PEX lalu disconnect)
 //! ```
 //!
-//! ## Validation Rules (Consensus-Critical)
+//! ## Validation Rules
 //!
 //! 1. protocol_version.major HARUS sama
 //! 2. network_id HARUS sama (mainnet ≠ testnet)
 //! 3. node_id HARUS valid (non-zero, bukan self)
 //! 4. listen_port HARUS > 0
+//! 5. role + node_class HARUS konsisten:
+//!    - StorageCompute → node_class HARUS Some(Reguler|DataCenter)
+//!    - Validator/Coordinator/Bootstrap → node_class HARUS None
 
 use serde::{Serialize, Deserialize};
 use std::fmt;
 
 use super::identity::{NetworkId, NodeId, ProtocolVersion, CURRENT_PROTOCOL_VERSION};
-use super::types::ServiceType;
+use super::types::{NodeRole, NodeClass, DisconnectReason};
 
 // ════════════════════════════════════════════════════════════════════════════
 // HANDSHAKE MESSAGE
@@ -36,18 +40,22 @@ use super::types::ServiceType;
 /// Message yang dikirim saat handshake antar node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HandshakeMessage {
-    /// Hello — pesan pertama dari kedua pihak
+    /// Hello — pesan pertama dari kedua pihak.
+    /// Menyertakan role dan class untuk role-based peer filtering.
     Hello {
         /// Versi protocol P2P
         protocol_version: ProtocolVersion,
-        /// Network yang digunakan
+        /// Network yang digunakan (mainnet/testnet/devnet)
         network_id: NetworkId,
         /// Identitas node (Ed25519 pubkey)
         node_id: NodeId,
-        /// Port yang di-listen untuk inbound connections
+        /// Port yang di-listen untuk inbound connections (selalu 45831)
         listen_port: u16,
-        /// Service type yang disediakan node
-        service_type: ServiceType,
+        /// Role operasional node
+        role: NodeRole,
+        /// Kelas node — hanya untuk StorageCompute (Reguler/DataCenter).
+        /// None untuk Validator, Coordinator, Bootstrap.
+        node_class: Option<NodeClass>,
         /// Chain tip height (agar peer tahu seberapa synced kita)
         chain_height: u64,
         /// User agent string (opsional, untuk observability)
@@ -78,8 +86,10 @@ pub enum HandshakeRejectReason {
     Banned,
     /// Too many connections
     TooManyConnections,
-    /// Invalid node ID
+    /// Invalid node ID (zero)
     InvalidNodeId,
+    /// Role + Class tidak konsisten (misal: Validator kirim class=DataCenter)
+    InvalidRoleClass,
 }
 
 impl fmt::Display for HandshakeRejectReason {
@@ -92,6 +102,7 @@ impl fmt::Display for HandshakeRejectReason {
             Self::Banned => write!(f, "banned"),
             Self::TooManyConnections => write!(f, "too_many_connections"),
             Self::InvalidNodeId => write!(f, "invalid_node_id"),
+            Self::InvalidRoleClass => write!(f, "invalid_role_class"),
         }
     }
 }
@@ -103,12 +114,14 @@ impl fmt::Display for HandshakeRejectReason {
 /// Hasil validasi handshake.
 #[derive(Debug, Clone)]
 pub enum HandshakeResult {
-    /// Handshake berhasil
+    /// Handshake berhasil — role dan class terverifikasi
     Accepted {
         /// Node ID peer yang terverifikasi
         node_id: NodeId,
-        /// Service type peer
-        service_type: ServiceType,
+        /// Role peer
+        role: NodeRole,
+        /// Class peer (Some untuk StorageCompute, None untuk lainnya)
+        node_class: Option<NodeClass>,
         /// Chain height peer
         chain_height: u64,
         /// Protocol version peer
@@ -158,6 +171,22 @@ impl fmt::Display for HandshakeError {
 impl std::error::Error for HandshakeError {}
 
 // ════════════════════════════════════════════════════════════════════════════
+// ROLE + CLASS VALIDATION
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Validasi konsistensi role + node_class.
+///
+/// Rules:
+/// - StorageCompute HARUS punya node_class (Reguler atau DataCenter)
+/// - Validator, Coordinator, Bootstrap HARUS node_class = None
+fn validate_role_class(role: &NodeRole, node_class: &Option<NodeClass>) -> bool {
+    match role {
+        NodeRole::StorageCompute => node_class.is_some(),
+        NodeRole::Validator | NodeRole::Coordinator | NodeRole::Bootstrap => node_class.is_none(),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // HANDSHAKE VALIDATOR
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -187,7 +216,8 @@ pub fn validate_hello(
             network_id,
             node_id,
             listen_port: _,
-            service_type,
+            role,
+            node_class,
             chain_height,
             user_agent: _,
         } => {
@@ -251,10 +281,22 @@ pub fn validate_hello(
                 };
             }
 
+            // Rule 7: Role + Class consistency
+            if !validate_role_class(role, node_class) {
+                return HandshakeResult::Rejected {
+                    reason: HandshakeRejectReason::InvalidRoleClass,
+                    message: format!(
+                        "invalid role+class: role={} class={:?}",
+                        role, node_class,
+                    ),
+                };
+            }
+
             // All checks passed
             HandshakeResult::Accepted {
                 node_id: node_id.clone(),
-                service_type: *service_type,
+                role: *role,
+                node_class: *node_class,
                 chain_height: *chain_height,
                 protocol_version: *protocol_version,
             }
@@ -274,7 +316,8 @@ pub fn build_hello(
     network_id: NetworkId,
     node_id: NodeId,
     listen_port: u16,
-    service_type: ServiceType,
+    role: NodeRole,
+    node_class: Option<NodeClass>,
     chain_height: u64,
 ) -> HandshakeMessage {
     HandshakeMessage::Hello {
@@ -282,9 +325,10 @@ pub fn build_hello(
         network_id,
         node_id,
         listen_port,
-        service_type,
+        role,
+        node_class,
         chain_height,
-        user_agent: format!("dsdn-chain/{}", CURRENT_PROTOCOL_VERSION),
+        user_agent: format!("dsdn-node/{}", CURRENT_PROTOCOL_VERSION),
     }
 }
 
@@ -300,30 +344,59 @@ mod tests {
     fn our_id() -> NodeId { NodeId::from_bytes([0xAAu8; 32]) }
     fn peer_id() -> NodeId { NodeId::from_bytes([0xBBu8; 32]) }
 
-    fn make_valid_hello() -> HandshakeMessage {
+    fn make_valid_hello_storage() -> HandshakeMessage {
         build_hello(
             NetworkId::Devnet,
             peer_id(),
-            30305,
-            ServiceType::Chain,
+            45831,
+            NodeRole::StorageCompute,
+            Some(NodeClass::Reguler),
+            100,
+        )
+    }
+
+    fn make_valid_hello_validator() -> HandshakeMessage {
+        build_hello(
+            NetworkId::Devnet,
+            peer_id(),
+            45831,
+            NodeRole::Validator,
+            None,
             100,
         )
     }
 
     #[test]
-    fn test_valid_hello_accepted() {
-        let hello = make_valid_hello();
+    fn test_valid_hello_storage_accepted() {
+        let hello = make_valid_hello_storage();
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
         );
         assert!(result.is_accepted());
+        if let HandshakeResult::Accepted { role, node_class, .. } = result {
+            assert_eq!(role, NodeRole::StorageCompute);
+            assert_eq!(node_class, Some(NodeClass::Reguler));
+        }
+    }
+
+    #[test]
+    fn test_valid_hello_validator_accepted() {
+        let hello = make_valid_hello_validator();
+        let result = validate_hello(
+            &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
+        );
+        assert!(result.is_accepted());
+        if let HandshakeResult::Accepted { role, node_class, .. } = result {
+            assert_eq!(role, NodeRole::Validator);
+            assert_eq!(node_class, None);
+        }
     }
 
     #[test]
     fn test_wrong_network_rejected() {
         let hello = build_hello(
-            NetworkId::Mainnet, // different!
-            peer_id(), 45831, ServiceType::Chain, 100,
+            NetworkId::Mainnet,
+            peer_id(), 45831, NodeRole::Validator, None, 100,
         );
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
@@ -340,8 +413,9 @@ mod tests {
             protocol_version: ProtocolVersion::new(99, 0, 0),
             network_id: NetworkId::Devnet,
             node_id: peer_id(),
-            listen_port: 30305,
-            service_type: ServiceType::Chain,
+            listen_port: 45831,
+            role: NodeRole::Validator,
+            node_class: None,
             chain_height: 100,
             user_agent: "test".to_string(),
         };
@@ -355,8 +429,8 @@ mod tests {
     fn test_self_connection_rejected() {
         let hello = build_hello(
             NetworkId::Devnet,
-            our_id(), // same as ours!
-            30305, ServiceType::Chain, 100,
+            our_id(),
+            45831, NodeRole::Validator, None, 100,
         );
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
@@ -373,7 +447,7 @@ mod tests {
         let mut connected = HashSet::new();
         connected.insert(peer_id());
 
-        let hello = make_valid_hello();
+        let hello = make_valid_hello_validator();
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &connected, 0, 125,
         );
@@ -386,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_connection_limit_rejected() {
-        let hello = make_valid_hello();
+        let hello = make_valid_hello_validator();
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 125, 125,
         );
@@ -402,7 +476,7 @@ mod tests {
         let hello = build_hello(
             NetworkId::Devnet,
             NodeId::zero(),
-            30305, ServiceType::Chain, 100,
+            45831, NodeRole::Validator, None, 100,
         );
         let result = validate_hello(
             &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
@@ -412,5 +486,105 @@ mod tests {
         } else {
             panic!("expected rejection");
         }
+    }
+
+    // ── NEW: Role + Class validation tests ──
+
+    #[test]
+    fn test_validator_with_class_rejected() {
+        // Validator TIDAK boleh punya node_class
+        let hello = build_hello(
+            NetworkId::Devnet,
+            peer_id(),
+            45831,
+            NodeRole::Validator,
+            Some(NodeClass::DataCenter), // INVALID!
+            100,
+        );
+        let result = validate_hello(
+            &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
+        );
+        if let HandshakeResult::Rejected { reason, .. } = result {
+            assert_eq!(reason, HandshakeRejectReason::InvalidRoleClass);
+        } else {
+            panic!("expected rejection for Validator with class");
+        }
+    }
+
+    #[test]
+    fn test_coordinator_with_class_rejected() {
+        let hello = build_hello(
+            NetworkId::Devnet,
+            peer_id(),
+            45831,
+            NodeRole::Coordinator,
+            Some(NodeClass::Reguler), // INVALID!
+            100,
+        );
+        let result = validate_hello(
+            &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
+        );
+        if let HandshakeResult::Rejected { reason, .. } = result {
+            assert_eq!(reason, HandshakeRejectReason::InvalidRoleClass);
+        } else {
+            panic!("expected rejection for Coordinator with class");
+        }
+    }
+
+    #[test]
+    fn test_storage_without_class_rejected() {
+        // StorageCompute HARUS punya node_class
+        let hello = build_hello(
+            NetworkId::Devnet,
+            peer_id(),
+            45831,
+            NodeRole::StorageCompute,
+            None, // INVALID! StorageCompute needs class
+            100,
+        );
+        let result = validate_hello(
+            &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
+        );
+        if let HandshakeResult::Rejected { reason, .. } = result {
+            assert_eq!(reason, HandshakeRejectReason::InvalidRoleClass);
+        } else {
+            panic!("expected rejection for StorageCompute without class");
+        }
+    }
+
+    #[test]
+    fn test_storage_datacenter_accepted() {
+        let hello = build_hello(
+            NetworkId::Devnet,
+            peer_id(),
+            45831,
+            NodeRole::StorageCompute,
+            Some(NodeClass::DataCenter),
+            100,
+        );
+        let result = validate_hello(
+            &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
+        );
+        assert!(result.is_accepted());
+        if let HandshakeResult::Accepted { role, node_class, .. } = result {
+            assert_eq!(role, NodeRole::StorageCompute);
+            assert_eq!(node_class, Some(NodeClass::DataCenter));
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_role_accepted() {
+        let hello = build_hello(
+            NetworkId::Devnet,
+            peer_id(),
+            45831,
+            NodeRole::Bootstrap,
+            None,
+            0,
+        );
+        let result = validate_hello(
+            &hello, NetworkId::Devnet, &our_id(), &HashSet::new(), 0, 125,
+        );
+        assert!(result.is_accepted());
     }
 }

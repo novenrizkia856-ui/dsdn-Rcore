@@ -926,7 +926,9 @@ pub use economic::{
 // ════════════════════════════════════════════════════════════════════════════
 pub use p2p::{
      NetworkId, NodeId, ProtocolVersion, CURRENT_PROTOCOL_VERSION,
-     PeerEntry, PeerStatus, ServiceType, PeerSource,
+     NodeRole, NodeClass, RoleDependency,
+     PeerEntry, PeerStatus, PeerSource,
+     DisconnectReason,
      BootstrapConfig, PeerManager,
      HandshakeMessage, HandshakeResult,
      PexRequest, PexResponse,
@@ -1168,7 +1170,6 @@ impl Chain {
             network_id,
             node_id,
             p2p_config,
-            p2p::ServiceType::Chain,
         );
         peer_mgr.initialize()?;
         let peer_manager = Arc::new(RwLock::new(peer_mgr));
@@ -2474,12 +2475,13 @@ impl Chain {
         &self,
         addr: std::net::SocketAddr,
         node_id: p2p::NodeId,
-        service_type: p2p::ServiceType,
+        role: p2p::NodeRole,
+        node_class: Option<p2p::NodeClass>,
         chain_height: u64,
     ) {
         // Update PeerManager
         self.peer_manager.write().on_handshake_success(
-            addr, node_id, service_type, chain_height,
+            addr, node_id, role, node_class, chain_height,
         );
 
         // Bridge ke BroadcastManager
@@ -2487,7 +2489,7 @@ impl Chain {
         let peer_info = crate::rpc::PeerInfo {
             id: addr.to_string(),
             address: format!("http://{}:{}", addr.ip(), rpc_port),
-            is_validator: matches!(service_type, p2p::ServiceType::Validator),
+            is_validator: matches!(role, p2p::NodeRole::Validator),
         };
         self.broadcast_manager.add_peer(peer_info);
     }
@@ -2506,8 +2508,9 @@ impl Chain {
     }
 
     /// Build PEX request untuk kirim ke connected peer.
-    pub fn build_pex_request(&self, service_filter: Option<p2p::ServiceType>) -> p2p::PexRequest {
-        self.peer_manager.read().build_pex_request(service_filter)
+    /// Optional: filter by specific roles yang dibutuhkan.
+    pub fn build_pex_request(&self, role_filter: Option<Vec<p2p::NodeRole>>) -> p2p::PexRequest {
+        self.peer_manager.read().build_pex_request(role_filter)
     }
 
     /// Handle incoming PEX request dari peer.

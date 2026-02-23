@@ -3,6 +3,11 @@
 //! Persistent peer cache agar node bisa bootstrap cepat tanpa DNS resolve.
 //! Format: JSON (debug-friendly, bisa diedit manual saat troubleshoot).
 //!
+//! ## Role+Class Aware
+//!
+//! Setiap entry menyimpan role dan class peer. Saat startup,
+//! peers.dat di-load dan difilter berdasarkan role yang dibutuhkan.
+//!
 //! ## Atomic Write
 //!
 //! Write selalu ke temp file dulu, lalu rename. Ini mencegah corruption
@@ -18,7 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
 
-use super::types::{PeerEntry, PeerStatus, PeerSource, current_unix_time};
+use super::types::{PeerEntry, PeerStatus, PeerSource, NodeRole, NodeClass, current_unix_time};
 use super::identity::NetworkId;
 use super::scoring::PeerScorer;
 use super::config::ConnectionLimits;
@@ -38,6 +43,8 @@ pub struct PeerStore {
     file_path: PathBuf,
     /// Network ID untuk filtering
     network_id: NetworkId,
+    /// Role node kita — untuk scoring (role_bonus)
+    our_role: NodeRole,
     /// Limits
     limits: ConnectionLimits,
     /// Dirty flag — true jika ada perubahan sejak last save
@@ -48,11 +55,17 @@ impl PeerStore {
     /// Buat PeerStore baru.
     ///
     /// Tidak otomatis load dari disk — panggil `load()` setelah construct.
-    pub fn new(file_path: &str, network_id: NetworkId, limits: ConnectionLimits) -> Self {
+    pub fn new(
+        file_path: &str,
+        network_id: NetworkId,
+        our_role: NodeRole,
+        limits: ConnectionLimits,
+    ) -> Self {
         Self {
             peers: HashMap::new(),
             file_path: PathBuf::from(file_path),
             network_id,
+            our_role,
             limits,
             dirty: false,
         }
@@ -98,10 +111,6 @@ impl PeerStore {
     }
 
     /// Save peers ke disk (atomic write).
-    ///
-    /// 1. Write ke temp file (peers.dat.tmp)
-    /// 2. Rename temp → peers.dat
-    /// 3. Ini atomic di sebagian besar OS/filesystem
     pub fn save(&mut self) -> Result<(), anyhow::Error> {
         if !self.dirty {
             return Ok(());
@@ -111,11 +120,7 @@ impl PeerStore {
         let json = serde_json::to_string_pretty(&entries)?;
 
         let tmp_path = self.file_path.with_extension("dat.tmp");
-
-        // Write ke temp
         std::fs::write(&tmp_path, &json)?;
-
-        // Atomic rename
         std::fs::rename(&tmp_path, &self.file_path)?;
 
         self.dirty = false;
@@ -123,15 +128,10 @@ impl PeerStore {
     }
 
     /// Insert atau update peer.
-    ///
-    /// Jika peer sudah ada, update metadata yang berubah.
-    /// Jika peer baru, insert dan enforce max entries.
     pub fn upsert(&mut self, mut entry: PeerEntry) {
         let key = entry.store_key();
 
-        // Jika sudah ada, merge metadata
         if let Some(existing) = self.peers.get(&key) {
-            // Preserve historical counters
             entry.first_seen = existing.first_seen;
             if existing.success_count > entry.success_count {
                 entry.success_count = existing.success_count;
@@ -141,13 +141,12 @@ impl PeerStore {
             }
         }
 
-        // Recompute score
-        PeerScorer::update_score(&mut entry);
+        // Recompute score with role awareness
+        PeerScorer::update_score(&mut entry, self.our_role);
 
         self.peers.insert(key, entry);
         self.dirty = true;
 
-        // Enforce max entries
         self.enforce_max_entries();
     }
 
@@ -185,6 +184,18 @@ impl PeerStore {
         entries
     }
 
+    /// Get connectable peers filtered by role.
+    /// Useful saat bootstrap: hanya cari peer dengan role yang dibutuhkan.
+    pub fn get_connectable_by_role(&self, role: NodeRole) -> Vec<&PeerEntry> {
+        let mut entries: Vec<&PeerEntry> = self.peers.values()
+            .filter(|p| !p.is_banned())
+            .filter(|p| !matches!(p.status, PeerStatus::Connected))
+            .filter(|p| p.role == role)
+            .collect();
+        entries.sort_by(|a, b| b.score.cmp(&a.score));
+        entries
+    }
+
     /// Get connected peers.
     pub fn get_connected(&self) -> Vec<&PeerEntry> {
         self.peers.values()
@@ -192,10 +203,25 @@ impl PeerStore {
             .collect()
     }
 
-    /// Get peers by service type.
-    pub fn get_by_service_type(&self, service_type: super::types::ServiceType) -> Vec<&PeerEntry> {
+    /// Get peers by role.
+    pub fn get_by_role(&self, role: NodeRole) -> Vec<&PeerEntry> {
         self.peers.values()
-            .filter(|p| p.service_type == service_type)
+            .filter(|p| p.role == role)
+            .collect()
+    }
+
+    /// Get peers by role AND class.
+    pub fn get_by_role_class(&self, role: NodeRole, class: NodeClass) -> Vec<&PeerEntry> {
+        self.peers.values()
+            .filter(|p| p.role == role && p.node_class == Some(class))
+            .collect()
+    }
+
+    /// Get connected peers by role.
+    pub fn get_connected_by_role(&self, role: NodeRole) -> Vec<&PeerEntry> {
+        self.peers.values()
+            .filter(|p| matches!(p.status, PeerStatus::Connected))
+            .filter(|p| p.role == role)
             .collect()
     }
 
@@ -211,6 +237,13 @@ impl PeerStore {
             .count()
     }
 
+    /// Count connected peers by role.
+    pub fn count_connected_by_role(&self, role: NodeRole) -> usize {
+        self.peers.values()
+            .filter(|p| matches!(p.status, PeerStatus::Connected) && p.role == role)
+            .count()
+    }
+
     /// Check if address exists in store.
     pub fn contains(&self, addr_key: &str) -> bool {
         self.peers.contains_key(addr_key)
@@ -221,13 +254,6 @@ impl PeerStore {
     // ════════════════════════════════════════════════════════════════════════
 
     /// Run garbage collection.
-    ///
-    /// Hapus:
-    /// 1. Peer yang expired ban (unban)
-    /// 2. Peer yang tidak terlihat > max_age
-    /// 3. Enforce max entries (hapus yang score terendah)
-    ///
-    /// Returns jumlah entries yang dihapus.
     pub fn garbage_collect(&mut self) -> usize {
         let now = current_unix_time();
         let max_age = self.limits.peer_max_age_secs;
@@ -273,17 +299,14 @@ impl PeerStore {
             return 0;
         }
 
-        // Sort by score ascending (worst first)
         let mut scored: Vec<(String, i64)> = self.peers.iter()
             .map(|(k, p)| (k.clone(), p.score))
             .collect();
         scored.sort_by(|a, b| a.1.cmp(&b.1));
 
-        // Remove worst until within limit
         let to_remove = self.peers.len() - max;
         let mut removed = 0;
         for (key, _) in scored.into_iter().take(to_remove) {
-            // Never remove connected peers
             if let Some(peer) = self.peers.get(&key) {
                 if matches!(peer.status, PeerStatus::Connected) {
                     continue;
@@ -296,20 +319,22 @@ impl PeerStore {
         removed
     }
 
-    /// Recompute scores for all peers.
+    /// Recompute scores for all peers (role-aware).
     pub fn recompute_all_scores(&mut self) {
+        let our_role = self.our_role;
         for peer in self.peers.values_mut() {
-            PeerScorer::update_score(peer);
+            PeerScorer::update_score(peer, our_role);
         }
         self.dirty = true;
     }
 
-    /// Get store stats for observability.
+    /// Get store stats for observability (with role+class breakdown).
     pub fn stats(&self) -> PeerStoreStats {
         let mut stats = PeerStoreStats::default();
         stats.total = self.peers.len();
 
         for peer in self.peers.values() {
+            // Status breakdown
             match peer.status {
                 PeerStatus::Connected => stats.connected += 1,
                 PeerStatus::Disconnected => stats.disconnected += 1,
@@ -318,6 +343,7 @@ impl PeerStore {
                 PeerStatus::Banned { .. } => stats.banned += 1,
             }
 
+            // Source breakdown
             match peer.source {
                 PeerSource::DnsSeed => stats.from_dns += 1,
                 PeerSource::StaticConfig => stats.from_static += 1,
@@ -325,6 +351,21 @@ impl PeerStore {
                 PeerSource::Inbound => stats.from_inbound += 1,
                 PeerSource::Manual => stats.from_manual += 1,
                 PeerSource::PeerCache => stats.from_cache += 1,
+            }
+
+            // Role breakdown (NEW)
+            match peer.role {
+                NodeRole::StorageCompute => {
+                    stats.role_storage_compute += 1;
+                    match peer.node_class {
+                        Some(NodeClass::Reguler) => stats.class_reguler += 1,
+                        Some(NodeClass::DataCenter) => stats.class_datacenter += 1,
+                        None => {} // shouldn't happen for StorageCompute
+                    }
+                }
+                NodeRole::Validator => stats.role_validator += 1,
+                NodeRole::Coordinator => stats.role_coordinator += 1,
+                NodeRole::Bootstrap => stats.role_bootstrap += 1,
             }
         }
 
@@ -336,17 +377,27 @@ impl PeerStore {
 #[derive(Debug, Clone, Default)]
 pub struct PeerStoreStats {
     pub total: usize,
+    // Status
     pub connected: usize,
     pub disconnected: usize,
     pub discovered: usize,
     pub connecting: usize,
     pub banned: usize,
+    // Source
     pub from_dns: usize,
     pub from_static: usize,
     pub from_pex: usize,
     pub from_inbound: usize,
     pub from_manual: usize,
     pub from_cache: usize,
+    // Role (NEW)
+    pub role_storage_compute: usize,
+    pub role_validator: usize,
+    pub role_coordinator: usize,
+    pub role_bootstrap: usize,
+    // Class (NEW — breakdown StorageCompute)
+    pub class_reguler: usize,
+    pub class_datacenter: usize,
 }
 
 impl std::fmt::Display for PeerStoreStats {
@@ -354,8 +405,11 @@ impl std::fmt::Display for PeerStoreStats {
         write!(
             f,
             "Peers: {} total ({} connected, {} disconnected, {} banned) | \
+             Roles: sc={} (reg={}, dc={}) val={} coord={} boot={} | \
              Sources: dns={} static={} pex={} inbound={} manual={} cache={}",
             self.total, self.connected, self.disconnected, self.banned,
+            self.role_storage_compute, self.class_reguler, self.class_datacenter,
+            self.role_validator, self.role_coordinator, self.role_bootstrap,
             self.from_dns, self.from_static, self.from_pex,
             self.from_inbound, self.from_manual, self.from_cache,
         )
@@ -376,6 +430,7 @@ mod tests {
         PeerStore::new(
             tmp.to_str().unwrap(),
             NetworkId::Devnet,
+            NodeRole::StorageCompute,
             ConnectionLimits::default(),
         )
     }
@@ -383,6 +438,14 @@ mod tests {
     fn make_entry(ip: &str) -> PeerEntry {
         let addr = SocketAddr::from_str(ip).unwrap();
         PeerEntry::new(addr, NetworkId::Devnet, PeerSource::Manual)
+    }
+
+    fn make_entry_with_role(ip: &str, role: NodeRole, class: Option<NodeClass>) -> PeerEntry {
+        let addr = SocketAddr::from_str(ip).unwrap();
+        let mut e = PeerEntry::new(addr, NetworkId::Devnet, PeerSource::Manual);
+        e.role = role;
+        e.node_class = class;
+        e
     }
 
     #[test]
@@ -405,10 +468,9 @@ mod tests {
         store.upsert(entry1);
 
         let mut entry2 = make_entry("10.0.0.1:45831");
-        entry2.success_count = 5; // lower
+        entry2.success_count = 5;
         store.upsert(entry2);
 
-        // Should preserve higher count
         let peer = store.get("10.0.0.1:45831").unwrap();
         assert_eq!(peer.success_count, 10);
     }
@@ -441,6 +503,52 @@ mod tests {
     }
 
     #[test]
+    fn test_store_get_by_role() {
+        let mut store = make_store();
+        store.upsert(make_entry_with_role("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler)));
+        store.upsert(make_entry_with_role("10.0.0.2:45831", NodeRole::Validator, None));
+        store.upsert(make_entry_with_role("10.0.0.3:45831", NodeRole::Coordinator, None));
+        store.upsert(make_entry_with_role("10.0.0.4:45831", NodeRole::StorageCompute, Some(NodeClass::DataCenter)));
+
+        let sc_peers = store.get_by_role(NodeRole::StorageCompute);
+        assert_eq!(sc_peers.len(), 2);
+
+        let val_peers = store.get_by_role(NodeRole::Validator);
+        assert_eq!(val_peers.len(), 1);
+    }
+
+    #[test]
+    fn test_store_get_by_role_class() {
+        let mut store = make_store();
+        store.upsert(make_entry_with_role("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler)));
+        store.upsert(make_entry_with_role("10.0.0.2:45831", NodeRole::StorageCompute, Some(NodeClass::DataCenter)));
+        store.upsert(make_entry_with_role("10.0.0.3:45831", NodeRole::StorageCompute, Some(NodeClass::DataCenter)));
+
+        let dc_peers = store.get_by_role_class(NodeRole::StorageCompute, NodeClass::DataCenter);
+        assert_eq!(dc_peers.len(), 2);
+
+        let reg_peers = store.get_by_role_class(NodeRole::StorageCompute, NodeClass::Reguler);
+        assert_eq!(reg_peers.len(), 1);
+    }
+
+    #[test]
+    fn test_store_get_connectable_by_role() {
+        let mut store = make_store();
+
+        let mut sc = make_entry_with_role("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler));
+        sc.status = PeerStatus::Disconnected;
+        store.upsert(sc);
+
+        let mut val = make_entry_with_role("10.0.0.2:45831", NodeRole::Validator, None);
+        val.status = PeerStatus::Disconnected;
+        store.upsert(val);
+
+        let sc_connectable = store.get_connectable_by_role(NodeRole::StorageCompute);
+        assert_eq!(sc_connectable.len(), 1);
+        assert_eq!(sc_connectable[0].role, NodeRole::StorageCompute);
+    }
+
+    #[test]
     fn test_store_enforce_max_entries() {
         let limits = ConnectionLimits {
             max_peer_store_entries: 3,
@@ -448,26 +556,25 @@ mod tests {
         };
         let mut store = PeerStore::new(
             std::env::temp_dir().join("dsdn_test_max.dat").to_str().unwrap(),
-            NetworkId::Devnet, limits,
+            NetworkId::Devnet, NodeRole::StorageCompute, limits,
         );
 
         for i in 1..=5 {
             store.upsert(make_entry(&format!("10.0.0.{}:45831", i)));
         }
 
-        // Should be capped at 3
         assert!(store.count() <= 3);
     }
 
     #[test]
     fn test_store_gc_removes_stale() {
         let limits = ConnectionLimits {
-            peer_max_age_secs: 1, // 1 second for testing
+            peer_max_age_secs: 1,
             ..Default::default()
         };
         let mut store = PeerStore::new(
             std::env::temp_dir().join("dsdn_test_gc.dat").to_str().unwrap(),
-            NetworkId::Devnet, limits,
+            NetworkId::Devnet, NodeRole::StorageCompute, limits,
         );
 
         let mut entry = make_entry("10.0.0.1:45831");
@@ -482,40 +589,51 @@ mod tests {
     #[test]
     fn test_store_save_load_roundtrip() {
         let tmp = std::env::temp_dir().join("dsdn_test_peers_roundtrip.dat");
-        // Cleanup
         let _ = std::fs::remove_file(&tmp);
 
         let tmp_str = tmp.to_str().unwrap();
-        let mut store1 = PeerStore::new(tmp_str, NetworkId::Devnet, ConnectionLimits::default());
-        store1.upsert(make_entry("10.0.0.1:45831"));
-        store1.upsert(make_entry("10.0.0.2:45831"));
+        let mut store1 = PeerStore::new(tmp_str, NetworkId::Devnet, NodeRole::StorageCompute, ConnectionLimits::default());
+        store1.upsert(make_entry_with_role("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler)));
+        store1.upsert(make_entry_with_role("10.0.0.2:45831", NodeRole::Validator, None));
         store1.save().unwrap();
 
-        let mut store2 = PeerStore::new(tmp_str, NetworkId::Devnet, ConnectionLimits::default());
+        let mut store2 = PeerStore::new(tmp_str, NetworkId::Devnet, NodeRole::StorageCompute, ConnectionLimits::default());
         let loaded = store2.load().unwrap();
         assert_eq!(loaded, 2);
         assert!(store2.contains("10.0.0.1:45831"));
 
-        // Cleanup
+        // Verify role is preserved
+        let p = store2.get("10.0.0.2:45831").unwrap();
+        assert_eq!(p.role, NodeRole::Validator);
+
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
-    fn test_store_stats() {
+    fn test_store_stats_with_role_breakdown() {
         let mut store = make_store();
 
-        let mut p1 = make_entry("10.0.0.1:45831");
+        let mut p1 = make_entry_with_role("10.0.0.1:45831", NodeRole::StorageCompute, Some(NodeClass::Reguler));
         p1.status = PeerStatus::Connected;
         p1.source = PeerSource::DnsSeed;
         store.upsert(p1);
 
-        let mut p2 = make_entry("10.0.0.2:45831");
+        let mut p2 = make_entry_with_role("10.0.0.2:45831", NodeRole::StorageCompute, Some(NodeClass::DataCenter));
         p2.source = PeerSource::PeerExchange;
         store.upsert(p2);
 
+        let mut p3 = make_entry_with_role("10.0.0.3:45831", NodeRole::Validator, None);
+        p3.source = PeerSource::Manual;
+        store.upsert(p3);
+
         let stats = store.stats();
-        assert_eq!(stats.total, 2);
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.role_storage_compute, 2);
+        assert_eq!(stats.class_reguler, 1);
+        assert_eq!(stats.class_datacenter, 1);
+        assert_eq!(stats.role_validator, 1);
         assert_eq!(stats.from_dns, 1);
         assert_eq!(stats.from_pex, 1);
+        assert_eq!(stats.from_manual, 1);
     }
 }
