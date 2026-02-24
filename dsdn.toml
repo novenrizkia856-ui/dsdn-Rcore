@@ -1,5 +1,19 @@
 [bootstrap]
+# Node role for this instance
+role = "storage-compute"  # storage-compute | validator | coordinator | bootstrap
+
+# Node class (hanya relevan untuk storage-compute)
+# Diabaikan jika role bukan storage-compute
+node_class = "reguler"  # reguler | datacenter
+
+# Network port (single port for all roles)
+port = 45831
+
+# Network identity
+network_id = "mainnet"  # mainnet | testnet
+
 # DNS seeds (founder/community maintained)
+# Seeds return mixed-role peers — filtering happens after handshake
 dns_seeds = [
     # "seed1.dsdn.network",
     # "seed2.dsdn.network",
@@ -7,6 +21,7 @@ dns_seeds = [
 ]
 
 # Static IP peers (community maintained)
+# All use port 45831 — role unknown until handshake
 static_peers = [
     # "203.0.113.50:45831",
     # "198.51.100.10:45831",

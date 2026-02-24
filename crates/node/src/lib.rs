@@ -218,7 +218,6 @@
 //! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
 //! | `rejoin_manager`    | Re-join eligibility, request building, and coordinator response handling (14B.46) |
 //! | `status_notification`| Status notification processing, DA gating event handling, and lifecycle transitions (14B.49) |
-//! | `bootstrap`          | P2P bootstrap: config, peer store, scoring, handshake, PEX, role-aware discovery (Tahap 21) |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -713,43 +712,6 @@
 //! - On error, no state is changed (atomic: success or no-op).
 //! - Quarantine metadata is cleared on transition away from Quarantined.
 //!
-//! ## Bootstrap Network System (Tahap 21 Aligned)
-//!
-//! The `bootstrap` module provides the complete P2P discovery
-//! foundation with role-aware peer management.
-//! All network I/O is trait-abstracted (`DnsResolver`,
-//! `PeerConnector`) with production implementations in `transport.rs`
-//! (`StdDnsResolver`, `TcpPeerConnector`).
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                    PeerManager                           │
-//! │  BootstrapConfig ── PeerStore ── BootstrapMetrics       │
-//! │                                                         │
-//! │  Roles: StorageCompute | Validator | Coordinator        │
-//! │  Class: Reguler | DataCenter (StorageCompute only)      │
-//! │  RoleDependencyMatrix → post-handshake filtering        │
-//! │                                                         │
-//! │  Fallback: peers.dat → static IP → DNS seed → retry    │
-//! │                                                         │
-//! │  dyn DnsResolver ────── dyn PeerConnector               │
-//! │  (StdDnsResolver)      (TcpPeerConnector)               │
-//! └─────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ### Role-Aware Peer Discovery
-//!
-//! Every node advertises its `NodeRole` and `NodeClass` during handshake.
-//! After handshake, the `RoleDependencyMatrix` determines whether the
-//! peer is REQUIRED, OPTIONAL, or SKIP for this node's role.
-//! SKIP peers are disconnected but saved to peers.dat for PEX.
-//!
-//! ### Peer Scoring (Tahap 21)
-//!
-//! Peers are ranked by a deterministic scoring formula:
-//! `score = base + success×2 − failure×3 + recency − staleness + role_bonus + class_bonus`.
-//! REQUIRED role peers (+20) are tried first during bootstrap.
-//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -781,8 +743,6 @@ pub mod state_sync;
 pub mod status_notification;
 pub mod status_tracker;
 pub mod tls_manager;
-pub mod bootstrap;
-pub mod transport;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -814,35 +774,3 @@ pub use rejoin_manager::RejoinManager;
 pub use status_tracker::NodeStatusTracker;
 pub use status_notification::{StatusNotificationHandler, StatusNotification};
 pub use tls_manager::{TLSCertManager, TLSError};
-
-// Bootstrap Network System (Tahap 21: Role+Class Aware)
-pub use bootstrap::{
-    // Core config & types
-    BootstrapConfig, BootstrapMetrics, BootstrapResult, BootstrapSummary,
-    NetworkId, PeerSource,
-
-    // Tahap 21: Role + Class system (preferred)
-    NodeRole, NodeClass,
-    RoleDependencyMatrix, RoleDependency,
-    PostHandshakeAction, DisconnectReason,
-
-    // Backward compat (deprecated)
-    ServiceType,
-
-    // Peer management
-    PeerInfo as BootstrapPeerInfo, PeerStore, PeerStoreStats, PeerStoreError,
-    PeerManager,
-
-    // Handshake protocol (Tahap 21: role+class exchange)
-    HandshakeMessage, HandshakeError,
-
-    // PEX (Tahap 21: role+class aware)
-    PexRequest, PexResponse, PexPeerEntry,
-
-    // I/O traits
-    DnsResolver, MockDnsResolver, NullDnsResolver,
-    PeerConnector, MockPeerConnector,
-};
-
-// Real transport implementations (production)
-pub use transport::{StdDnsResolver, TcpPeerConnector};

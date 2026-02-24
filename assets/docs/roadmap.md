@@ -2607,7 +2607,19 @@ Validator hanya boleh: baca metadata, memblokir endpoint/pointer. Validator tida
 
 ## Tahap 21 --- Bootstrap Network System (DNS Seed + Peer Discovery)
 
-**Tujuan:** Mengimplementasikan sistem bootstrap jaringan DSDN berbasis DNS seed dan IP publik, menggunakan **single port untuk semua role**. Setiap node listen di port `45831` apapun role-nya. Setelah handshake, node saling tahu role dan kelas masing-masing, lalu memfilter peer sesuai kebutuhan. Sistem ini mengikuti model Bitcoin: DNS seed → peer exchange → local cache → self-sustaining network.
+**Tujuan:**  Membangun sistem bootstrap jaringan DSDN berbasis DNS seed dan IP publik, menggunakan single port untuk semua role. Setiap node listen di port 45831 apapun role-nya. Setelah handshake, node saling tahu role dan kelas masing-masing, lalu memfilter peer sesuai kebutuhan. Sistem ini mengikuti model Bitcoin: DNS seed → peer exchange → local cache → self-sustaining network.
+
+**Scope Tahap Ini:**
+
+Tahap 21 adalah **parent phase** yang mendefinisikan arsitektur, prinsip desain, dan role system untuk bootstrap network. Tahap ini sendiri tidak menghasilkan kode — seluruh implementasi ada di sub-tahap:
+
+- **21.1.A** — Config, enum, seed registry, role resolution → `common`
+- **21.1.B** — Handshake, PEX, peer discovery, peers.dat → `common`, `node`, `proto`
+- **21.1.C** — Integrasi ke semua role, resilience, monitoring → `common`, `chain`, `node`, `coordinator`, `validator`, `agent`, `proto`
+
+**Crates total yang terlibat:** `common`, `chain`, `node`, `coordinator`, `validator`, `agent`, `proto`.
+
+Crates total yang terlibat: common, chain, node, coordinator, validator, ingress, agent, proto.
 
 **(FIX #1) Depends on:** Tahap 20.A-Core (genesis config, TSS ceremony, fraud proof params ready). **Tidak bergantung pada** 20.A-Bootstrap — justru 20.A-Bootstrap bergantung pada tahap ini.
 
@@ -2657,74 +2669,45 @@ Isi modul ini mencakup:
 
 Seluruh jaringan DSDN menggunakan **satu port**: `45831`. Role dan kelas didefinisikan sebagai enum:
 
-**(FIX #2)** `Bootstrap` variant sudah didefinisikan di sini (bukan ditambahkan belakangan di 21.1.C) agar handshake dan PEX di 21.1.B sudah compatible sejak awal.
+- `NodeRole` — 4 variant: `StorageCompute`, `Validator`, `Coordinator`, `Bootstrap`.
+- `NodeClass` — re-export dari `crates/common/src/node_class.rs` (Tahap 16): `Reguler`, `DataCenter`. Hanya relevan untuk `StorageCompute`.
+- `NodeIdentity` — struct gabungan role + class + node_id + network_id + protocol_version + listen_port + capabilities. Digunakan saat handshake.
 
-**(FIX #9)** `NodeRole` dan `NodeClass` di sini meng-extend definisi `NodeClass` yang sudah ada dari Tahap 16 (`crates/common/src/node_class.rs`). `NodeClass` enum tetap satu definisi — tidak duplikasi.
+Blockchain Nusantara berjalan embedded di semua role — bukan role terpisah.
 
-```rust
-pub const DSDN_DEFAULT_PORT: u16 = 45831;
+**Mapping role-class-stake:**
 
-/// Role operasional node di jaringan DSDN.
-/// Blockchain Nusantara berjalan embedded di semua role — bukan role terpisah.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum NodeRole {
-    /// Full node: storage + compute.
-    /// Kelas (Reguler/DataCenter) menentukan kapasitas dan stake requirement.
-    StorageCompute,
+| Kombinasi | Fungsi | Stake |
+|-----------|--------|-------|
+| StorageCompute + Reguler | Full Node Reguler — storage + light compute | 500 $NUSA |
+| StorageCompute + DataCenter | Full Node Data Center — storage + heavy compute + GPU | 5,000 $NUSA |
+| Validator + None | Governance, compliance, PoS consensus | 50,000 $NUSA |
+| Coordinator + None | Stateless scheduler, metadata, Celestia blob replay | 0 |
+| Bootstrap + None | Peer discovery only, non-operational | 0 |
 
-    /// Validator: governance, compliance, PoS consensus blockchain Nusantara.
-    /// Memproduksi block, memfinalisasi transaksi, menjalankan voting.
-    Validator,
+**Validasi:**
+- `StorageCompute` WAJIB punya `node_class` (Reguler atau DataCenter).
+- `Validator`, `Coordinator`, `Bootstrap` TIDAK BOLEH punya `node_class` (harus None).
 
-    /// Coordinator: metadata, scheduling, job queue, Celestia blob replay.
-    /// Stateless scheduler — semua keputusan bisa direkonstruksi dari DA log.
-    Coordinator,
+#### 2. Role & Class: Via CLI / Environment Variable, BUKAN di dsdn.toml
 
-    /// Bootstrap: dedicated peer discovery node (non-operational).
-    /// Tidak menjalankan storage, compute, consensus, atau scheduling.
-    /// Hanya melayani handshake dan PEX — "yellow pages" jaringan.
-    /// Tidak memerlukan stake.
-    /// (FIX #2: Didefinisikan di 21.1.A agar 21.1.B handshake & PEX sudah compatible)
-    Bootstrap,
-}
+`role` dan `node_class` bersifat **per-instance** — setiap node punya role berbeda. `dsdn.toml` ada di repo DSDN dan dipakai oleh semua role. Maka `role` dan `node_class` di-supply melalui:
 
-// NodeClass sudah didefinisikan di crates/common/src/node_class.rs sejak Tahap 16.
-// Re-export di sini untuk convenience:
-pub use crate::node_class::NodeClass;
-// NodeClass::Reguler dan NodeClass::DataCenter
+**Prioritas:** CLI argument → environment variable → error (tidak ada default).
 
-/// Informasi lengkap identitas node saat handshake.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeIdentity {
-    pub role: NodeRole,
-    /// Hanya relevan jika role == StorageCompute.
-    /// Validator, Coordinator, dan Bootstrap tidak punya kelas — field ini None.
-    pub node_class: Option<NodeClass>,
-    pub node_id: Ed25519PublicKey,
-    pub network_id: String,        // "mainnet" | "testnet"
-    pub protocol_version: u32,
-    pub listen_port: u16,          // selalu 45831
-    pub capabilities: Vec<String>, // future extension
-}
-```
+CLI flags:
+- `--role <storage-compute|validator|coordinator|bootstrap>` (WAJIB)
+- `--node-class <reguler|datacenter>` (WAJIB jika role = storage-compute, diabaikan jika bukan)
 
-**Kenapa role dan kelas dipisah?**
+Environment variables:
+- `DSDN_ROLE` (WAJIB)
+- `DSDN_NODE_CLASS` (WAJIB jika role = storage-compute)
 
-Karena whitepaper DSDN mendefinisikan Full Node Reguler dan Full Node Data Center sebagai **dua kelas dari role yang sama** (storage & compute), bukan dua role berbeda. Validator dan Coordinator tidak punya kelas — mereka berdiri sendiri. Pemisahan ini menjaga konsistensi dengan whitepaper:
+Tidak ada default value. Node yang start tanpa set role → **error, tidak jalan**. Ini mencegah salah identifikasi.
 
-- `StorageCompute` + `Reguler` = Full Node Reguler (500 $NUSA)
-- `StorageCompute` + `DataCenter` = Full Node Data Center (5,000 $NUSA)
-- `Validator` + `None` = Validator (50,000 $NUSA)
-- `Coordinator` + `None` = Coordinator
-- `Bootstrap` + `None` = Bootstrap node (no stake)
+Struct `NodeRoleConfig` meng-handle resolve dari CLI + env + validasi role-class compatibility.
 
-**Handshake validation rules untuk `Bootstrap` (FIX #2):**
-- `Bootstrap` role: `node_class` HARUS `None`.
-- `Bootstrap` node tidak memerlukan stake verification.
-- `Bootstrap` node tidak di-dispatch workload.
-- Semua role treat `Bootstrap` peer sebagai PEX-only (connect → PEX → disconnect).
-
-#### 2. Seed DNS Config
+#### 3. Seed DNS Config
 
 Struct konfigurasi yang menyimpan daftar DNS seed. DNS seed tidak mengetahui role — ia hanya return IP address. Role baru diketahui setelah handshake.
 
@@ -2753,7 +2736,7 @@ Aturan seed DNS:
 - Minimal 1 seed wajib ada untuk mainnet, direkomendasikan 3+.
 - DNS seed TIDAK role-aware — semua role tercampur di satu DNS record.
 
-#### 3. Static IP Registry
+#### 4. Static IP Registry
 
 Daftar IP publik statis sebagai alternatif DNS seed. Semua IP menggunakan port `45831`. Role-nya baru diketahui setelah handshake.
 
@@ -2766,17 +2749,12 @@ Aturan IP statis:
 - IP yang invalid atau unreachable akan di-skip otomatis.
 - Port default `45831` jika tidak disertakan.
 
-#### 4. Bootstrap Config File (`root_dsdn/dsdn.toml`)
+#### 5. Bootstrap Config File (`root_dsdn/dsdn.toml`)
+
+File ini berisi **hanya konfigurasi jaringan** yang sama untuk semua role. Tidak ada `role` atau `node_class` di sini.
 
 ```toml
 [bootstrap]
-# Node role for this instance
-role = "storage-compute"  # storage-compute | validator | coordinator | bootstrap
-
-# Node class (hanya relevan untuk storage-compute)
-# Diabaikan jika role bukan storage-compute
-node_class = "reguler"  # reguler | datacenter
-
 # Network port (single port for all roles)
 port = 45831
 
@@ -2808,11 +2786,9 @@ dns_resolve_timeout_secs = 10
 peer_connect_timeout_secs = 5
 ```
 
-#### 5. Role Dependency Matrix
+#### 6. Role Dependency Matrix
 
 Setiap role memiliki kebutuhan koneksi yang berbeda. Ini menentukan peer mana yang di-keep vs di-disconnect setelah handshake:
-
-**(FIX #2)** Matrix sudah menyertakan `Bootstrap` role sebagai peer type:
 
 ```
 StorageCompute (Reguler maupun DataCenter) membutuhkan:
@@ -2857,7 +2833,7 @@ Hubungan blockchain sync dan bootstrap:
 - Semua node sync blockchain state dari Validator (block propagation) setelah bootstrap selesai.
 ```
 
-#### 6. Seed Priority & Fallback Order
+#### 7. Seed Priority & Fallback Order
 
 Implementasi urutan fallback (sama untuk semua role):
 
@@ -2892,16 +2868,19 @@ Implementasi urutan fallback (sama untuk semua role):
 ### Deliverables 21.1.A
 
 1. File `crates/common/src/bootstrap_system.rs` dengan:
-   - `NodeRole` enum (StorageCompute, Validator, Coordinator, **Bootstrap** — FIX #2)
-   - Re-export `NodeClass` enum dari `crates/common/src/node_class.rs` (Reguler, DataCenter — FIX #9)
+   - `NodeRole` enum (StorageCompute, Validator, Coordinator, Bootstrap)
+   - Re-export `NodeClass` enum dari `crates/common/src/node_class.rs` (Reguler, DataCenter)
    - `NodeIdentity` struct (role + class + node_id + network_id + ...)
-   - `BootstrapConfig` struct (termasuk role, class, single port)
+   - `NodeRoleConfig` struct — resolve role + class dari CLI args / env var, validasi compatibility
+   - `BootstrapConfig` struct (network-only: port, network_id, seeds, peers, limits — tanpa role/class)
    - `DnsSeed`, `StaticPeer`, `SeedRegistry` structs
-   - `RoleDependencyMatrix` — logic siapa butuh siapa (**termasuk Bootstrap role** — FIX #2)
-2. Parser untuk bootstrap config (dari section `[bootstrap]` di `dsdn.toml`).
-3. DNS resolver wrapper yang async, timeout-aware, dan error-tolerant.
-4. Fallback chain logic (peers.dat → static IP → DNS seed → retry) dengan role-aware filtering.
-5. Unit test: config parsing, role/class validation, role dependency, DNS resolve mock, fallback ordering, invalid seed handling, **Bootstrap role handshake validation** (FIX #2).
+   - `RoleDependencyMatrix` — logic siapa butuh siapa (termasuk Bootstrap role)
+2. Parser untuk bootstrap config (dari section `[bootstrap]` di `dsdn.toml`) — parse hanya field jaringan, bukan role/class.
+3. `NodeRoleConfig::resolve()` — resolve role + class dari CLI + env, validasi, error jika tidak di-set.
+4. DNS resolver wrapper yang async, timeout-aware, dan error-tolerant.
+5. Fallback chain logic (peers.dat → static IP → DNS seed → retry) dengan role-aware filtering.
+6. Update `dsdn.toml` di repo — hapus field `role` dan `node_class`.
+7. Unit test: config parsing, role/class validation (CLI + env), role dependency, DNS resolve mock, fallback ordering, invalid seed handling, Bootstrap role handshake validation.
 
 ### Crates Terlibat
 
@@ -2909,17 +2888,19 @@ Implementasi urutan fallback (sama untuk semua role):
 
 ### Kriteria Selesai
 
-- `BootstrapConfig` bisa di-load dari file config termasuk `role` dan `node_class` field.
-- `NodeRole` enum terdefinisi dengan **4 variant** (StorageCompute, Validator, Coordinator, **Bootstrap** — FIX #2).
+- `BootstrapConfig` bisa di-load dari `dsdn.toml` — hanya berisi konfigurasi jaringan (port, network_id, seeds, peers, limits).
+- `dsdn.toml` TIDAK mengandung `role` atau `node_class`.
+- `NodeRoleConfig::resolve()` berhasil resolve role + class dari CLI args atau env var.
+- Node yang start tanpa `--role` atau `DSDN_ROLE` → error, tidak jalan.
+- `StorageCompute` tanpa `--node-class` atau `DSDN_NODE_CLASS` → error, tidak jalan.
+- `Validator` dengan `--node-class datacenter` → warning, class diabaikan.
+- `Bootstrap` dengan `--node-class reguler` → warning, class diabaikan.
+- `NodeRole` enum terdefinisi dengan 4 variant (StorageCompute, Validator, Coordinator, Bootstrap).
 - `NodeClass` enum terdefinisi dengan 2 kelas (Reguler, DataCenter), hanya valid untuk StorageCompute.
-- **`Bootstrap` role: `node_class` harus `None`, tidak memerlukan stake (FIX #2).**
-- `RoleDependencyMatrix` bisa menentukan role mana yang REQUIRED/OPTIONAL/PEX_ONLY/SKIP untuk setiap role **termasuk Bootstrap** (FIX #2).
-- Config dengan `role = "validator"` dan `node_class = "datacenter"` → error (validator tidak punya kelas).
-- **Config dengan `role = "bootstrap"` dan `node_class = "reguler"` → error (bootstrap tidak punya kelas) (FIX #2).**
+- `RoleDependencyMatrix` bisa menentukan role mana yang REQUIRED/OPTIONAL/PEX_ONLY/SKIP untuk setiap role termasuk Bootstrap.
 - DNS seed list dan static IP list bisa kosong.
 - Semua IP menggunakan port 45831 secara default.
 - Fallback chain logic ter-test dengan semua kombinasi termasuk role match/mismatch dan class scenarios.
-
 ---
 
 ## 21.1.B --- Peer Discovery, Handshake with Role+Class Exchange & Local Cache (peers.dat)
@@ -3499,7 +3480,7 @@ bootstrap_blockchain_peer_count              — jumlah peer yang provide block 
 
 ### Crates Terlibat
 
-`common`, `node`, `coordinator`, `validator`, `agent`, `proto`
+`common`, `node`, `coordinator`, `validator`, `agent`, `proto`, `chain`
 
 ### Kriteria Selesai
 
