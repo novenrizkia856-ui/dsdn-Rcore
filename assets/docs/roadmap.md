@@ -1659,6 +1659,8 @@ dan runtime (WASM + VM) memproduksi output yang bisa di-commit.
 - Storage workload vs compute workload dibedakan
   (storage = immediate, compute = challenge period).
 
+> **Catatan Penting (FIX #4):** Challenge period pada tahap ini bersifat **timer-only**. Receipt compute akan auto-finalize setelah challenge window habis tanpa kemungkinan challenge apapun. Actual fraud proof submission dan verification diimplementasi di Tahap 18.8. Node dan chain cukup mengimplementasi timer countdown — bukan fraud proof verification logic.
+
 ---
 
 ## Tahap 14C.C — TSS Integration, Validator Reward & System Wiring
@@ -1682,7 +1684,9 @@ agent/ingress routing, dan DA log sinkronisasi.
    - Distribusi ke validator set proporsional (atau equal split — tentukan di sini).
    - Validator bisa query pending rewards dan claimed rewards.
    - Pastikan validator reward hanya dari receipt yang sudah finalized
-     (compute: setelah challenge period lewat tanpa fraud proof).
+     (compute: setelah challenge period lewat).
+
+> **Catatan Penting (FIX #4):** Pada tahap ini, "finalized" untuk compute receipt berarti challenge timer habis (auto-finalize). Belum ada mekanisme fraud proof yang bisa membatalkan receipt. Fraud proof integration ke reward finalization diimplementasi di Tahap 18.8.
 
 3. **`agent`** — Orchestrasi flow ekonomi end-to-end:
    - Agent mengelola lifecycle: workload dispatch → execution → receipt → claim.
@@ -1693,8 +1697,49 @@ agent/ingress routing, dan DA log sinkronisasi.
 4. **`ingress`** — Routing dan endpoint untuk economic transactions:
    - Expose RPC/API endpoint untuk `ClaimReward` submission.
    - Expose endpoint untuk query receipt status dan reward balance.
-   - Expose endpoint untuk fraud proof submission (placeholder — accept tapi belum process).
+   - Expose endpoint untuk fraud proof submission (placeholder — accept dan log, tapi belum process/verify).
    - Rate limiting dan basic validation sebelum forward ke chain.
+
+> **Catatan Penting (FIX #4):** Fraud proof endpoint di ingress pada tahap ini adalah **placeholder only**. Endpoint menerima submission dan menyimpan ke log, tapi tidak memicu arbitration atau slashing. Full fraud proof processing diaktifkan di Tahap 18.8.
+
+### Coordinator Committee Formation (FIX #7)
+
+Karena TSS/FROST membutuhkan committee, tahap ini juga mendefinisikan:
+
+**Committee Formation Protocol:**
+
+- Committee terdiri dari `n` coordinator nodes yang menjalankan TSS key shares.
+- **Minimum quorum:** `t` dari `n` (threshold), dimana `t = ceil(2n/3) + 1`. Untuk bootstrap, `n=3, t=2` sudah cukup.
+- **Formation:** Pada genesis/bootstrap, committee members di-hardcode di genesis config. Pada tahap selanjutnya (post-mainnet), committee membership bisa di-rotate via governance.
+- **Rotation:** Belum aktif pada tahap ini. Rotation events di-log (Tahap 15) tapi actual rotation mechanism diimplementasi setelah governance matang (post Tahap 20).
+- **Failure handling:**
+  - Jika committee member offline saat signing round → timeout → retry tanpa member tersebut.
+  - Jika jumlah online members < threshold `t` → signing gagal → receipt pending → retry saat quorum terpenuhi.
+  - Persistent failure (member offline > 1 epoch) → log alert, tapi belum auto-rotate pada tahap ini.
+
+**Committee struct:**
+
+```rust
+struct CoordinatorCommittee {
+    members: Vec<CommitteeMember>,
+    threshold: u32,          // minimum signatures needed
+    epoch: u64,
+    formation_method: FormationMethod, // Genesis | GovernanceVote (future)
+}
+
+struct CommitteeMember {
+    coordinator_id: PublicKey,
+    tss_key_share_index: u32,
+    status: MemberStatus, // Active | Offline | Rotating
+}
+
+enum FormationMethod {
+    Genesis,          // hardcoded at launch
+    GovernanceVote,   // future: elected by validators
+}
+```
+
+**Crates tambahan terlibat:** `coordinator`, `proto`
 
 ### Kriteria Selesai 14C.C
 
@@ -1703,11 +1748,14 @@ agent/ingress routing, dan DA log sinkronisasi.
 - Validator menerima 20% share dari finalized receipt.
 - Agent bisa orchestrate full flow tanpa manual intervention.
 - Ingress endpoints bisa menerima ClaimReward dan return status.
+- Ingress fraud proof endpoint menerima submission dan log (placeholder).
+- **Coordinator committee terbentuk dari genesis config dengan minimum 2-of-3 threshold (FIX #7).**
+- **Committee failure handling tested: member offline → signing tetap sukses jika quorum terpenuhi (FIX #7).**
 - Full integration test: node execute → commitment → coordinator TSS sign
   → submit via ingress → chain validate → reward distribute
   (70% node, 20% validator, 10% treasury).
 - DA log mencatat semua receipt events.
-- Anti-self-dealing, duplicate rejection, dan challenge period
+- Anti-self-dealing, duplicate rejection, dan challenge period (timer-only)
   berfungsi di full integrated flow.
 
 ---
@@ -1718,7 +1766,7 @@ agent/ingress routing, dan DA log sinkronisasi.
   ↓
 14C.B (node, runtime_wasm, runtime_vm)
   ↓
-14C.C (tss, validator, agent, ingress)
+14C.C (tss, validator, agent, ingress, + coordinator committee formation)
 ```
 
 - **14C.A** harus selesai duluan: tanpa proto types dan chain validation,
@@ -1743,11 +1791,18 @@ agent/ingress routing, dan DA log sinkronisasi.
 - User-controlled delete.
 - DA-sync sequence number.
 - Governance proposal + delay window.
-- Coordinator committee rotation events (baru).
-- DA fallback activation/deactivation events (baru).
-- Compute challenge events.
+- Coordinator committee rotation events. *(FIX #5: Producer aktif setelah committee rotation diimplementasi post-Tahap 20. Pada tahap ini, definisikan log schema dan hook. Hook akan dipanggil saat rotation mechanism aktif.)*
+- DA fallback activation/deactivation events. *(FIX #5: Producer aktif setelah DA fallback diimplementasi di Tahap 15.1. Pada tahap ini, definisikan log schema dan hook.)*
+- Compute challenge events. *(FIX #5: Producer aktif setelah fraud proof system diimplementasi di Tahap 18.8. Pada tahap ini, definisikan log schema dan hook. Hook menerima event tapi hanya log — belum trigger action.)*
 
-**Selesai jika:** Log--DA sync mirror 100% match.
+> **Catatan Implementasi (FIX #5):** Untuk setiap log type yang producer-nya belum exist, implementasi pada tahap ini meliputi:
+> 1. Definisikan `LogEventType` enum variant dan schema struct.
+> 2. Implementasi log writer yang bisa menerima event dan persist ke WORM + DA.
+> 3. Buat trait/interface hook yang bisa dipanggil oleh producer di tahap mendatang.
+> 4. Tandai dengan `// Producer: Tahap X` di code.
+> 5. Unit test: pastikan hook callable dan log writer berfungsi (dengan synthetic/mock events).
+
+**Selesai jika:** Log--DA sync mirror 100% match. Semua log schema terdefinisi. Hook untuk future producers terimplementasi dan tested dengan mock events.
 
 **Crates yang harus diubah / dilibatkan:** `coordinator`, `storage`, `proto`, `chain`, `node`, `validator`, `agent`, `ingress`, `common`.
 
@@ -1759,17 +1814,45 @@ agent/ingress routing, dan DA log sinkronisasi.
 
 **Yang baru:**
 
-Coordinator harus menolak node yang: TLS sertifikat invalid, stake kurang (500 / 5000), identitas operator tidak cocok, pernah kena slashing cooldown.
+Coordinator harus menolak node yang: TLS sertifikat invalid, stake kurang dari minimum sesuai role, identitas operator tidak cocok, pernah kena slashing cooldown.
+
+**(FIX #3) Stake requirement per role:**
+
+| Role | Class | Minimum Stake |
+|------|-------|---------------|
+| StorageCompute | Reguler | 500 $NUSA |
+| StorageCompute | DataCenter | 5,000 $NUSA |
+| Validator | — | 50,000 $NUSA |
+| Coordinator | — | — (no stake requirement) |
 
 Chain Nusantara harus expose API:
 
 ```
-get_stake(address)
-get_node_class(address)
-check_slashing_status(address)
+get_stake(address) -> Amount
+get_node_role(address) -> NodeRole
+get_node_class(address) -> Option<NodeClass>  // None jika bukan StorageCompute
+check_slashing_status(address) -> SlashingStatus
 ```
 
+**(FIX #3)** Coordinator melakukan validasi gabungan: `get_stake(address)` harus ≥ minimum stake untuk `get_node_role(address)` + `get_node_class(address)`. Contoh:
+- Node claim StorageCompute Reguler tapi stake 300 → reject.
+- Node claim StorageCompute DataCenter tapi stake 4,000 → reject.
+- Node claim Validator tapi stake 10,000 → reject.
+
 Coordinator baru boleh menerima node setelah semua cek lulus.
+
+**(FIX #9) Forward Definition — NodeClass:**
+
+> `NodeClass` enum (`Reguler`, `DataCenter`) harus sudah didefinisikan di crate `common` pada tahap ini untuk digunakan oleh stake verification dan scheduling (Tahap 17). Definisi formal lengkap dengan `NodeIdentity` struct akan di-expand di Tahap 21.1.A, tapi enum dasar harus ada sekarang agar Tahap 16-17 compatible.
+
+```rust
+// crates/common/src/node_class.rs — didefinisikan di Tahap 16
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum NodeClass {
+    Reguler,
+    DataCenter,
+}
+```
 
 **Crates yang harus diubah / dilibatkan:** `coordinator`, `node`, `validator`, `chain`, `agent`, `common`.
 
@@ -1786,10 +1869,10 @@ S = w1*CPU + w2*RAM + w3*GPU + w4*(1/latency)
   - w5*IO_pressure + w6*class_weight + w7*stake_weight
 ```
 
-**Stake Weight:**
+**Stake Weight (menggunakan `NodeClass` dari Tahap 16):**
 
-- Node reguler: `log2(stake / 500)`
-- Node DC: `log2(stake / 5000)`
+- Node reguler (`NodeClass::Reguler`): `log2(stake / 500)`
+- Node DC (`NodeClass::DataCenter`): `log2(stake / 5000)`
 
 **Bootstrap system di masa mendatang**
 - Node identity (`node_id`, Ed25519 public key) yang sudah diimplementasi di tahap ini juga digunakan sebagai peer ID dalam bootstrap system (Tahap 21). Pastikan `node_id` format compatible dengan peer identification di bootstrap handshake.
@@ -2015,6 +2098,12 @@ UI memilih level.
 - Fraud proof harus murah untuk verify, mahal untuk fake.
 - Node yang terbukti curang di-slash.
 
+> **Catatan Integrasi (FIX #4):** Tahap ini mengubah behavior challenge period yang sebelumnya timer-only (sejak 14C.B) menjadi **active fraud proof system**. Setelah tahap ini selesai:
+> - Ingress fraud proof endpoint (dari 14C.C) diaktifkan untuk processing — bukan hanya logging.
+> - Chain validation ditambah: fraud proof verification sebelum reward finalization.
+> - Validator reward finalization untuk compute receipt sekarang bergantung pada "no successful challenge" — bukan hanya timer habis.
+> - Tahap 15 log hooks untuk "compute challenge events" sekarang terhubung ke actual producer.
+
 ### Arsitektur Fraud Proof
 
 ```
@@ -2203,6 +2292,14 @@ Untuk workload critical, user bisa request redundant execution:
 - Slashing works correctly.
 - Challenge bond prevents spam.
 
+### Post-Implementation Integration Checklist
+
+> **(FIX #4)** Setelah tahap ini selesai, lakukan integrasi balik ke komponen yang sebelumnya timer-only:
+> - [ ] Ingress: fraud proof endpoint → aktifkan processing (bukan hanya log).
+> - [ ] Chain: reward finalization → cek fraud proof status sebelum distribute.
+> - [ ] Validator: reward claim → pastikan "no successful challenge" sebelum finalize.
+> - [ ] Tahap 15 hooks: connect compute challenge event producer ke log system.
+
 ### Kriteria Selesai
 
 - `ExecutionTrace` generation functional.
@@ -2211,8 +2308,10 @@ Untuk workload critical, user bisa request redundant execution:
 - Interactive game implementation.
 - Slashing integration.
 - Redundant execution mode (optional).
+- **Ingress fraud proof endpoint activated (bukan placeholder lagi).**
+- **Tahap 15 compute challenge log hooks connected.**
 
-**Crates terlibat:** `runtime_wasm`, `runtime_vm`, `chain`, `coordinator`, `node`, `validator`, `proto`, `common`.
+**Crates terlibat:** `runtime_wasm`, `runtime_vm`, `chain`, `coordinator`, `node`, `validator`, `proto`, `common`, `ingress`.
 
 **Crate baru:** `crates/fraud_proof/` --- Fraud proof logic and verification.
 
@@ -2240,12 +2339,16 @@ Untuk workload critical, user bisa request redundant execution:
 
 #### 1. DSDN SDK (Multi-language)
 
+**(FIX #8)** Semua SDK berada di directory `sdks/` untuk konsistensi. Rust SDK adalah wrapper/re-export dari internal crates.
+
 ```
-crates/sdk_rust/     -- Native Rust SDK
+sdks/sdk_rust/       -- Rust SDK (public API, wraps internal crates)
 sdks/sdk_python/     -- Python SDK
 sdks/sdk_js/         -- JavaScript/TypeScript SDK
 sdks/sdk_go/         -- Go SDK
 ```
+
+> **Catatan (FIX #8):** `sdks/sdk_rust/` bukan crate internal — ia adalah public-facing SDK yang re-exports dan simplifies API dari internal crates. Internal crates (`crates/*`) tetap digunakan dalam DSDN codebase sendiri. SDK Rust ini ditujukan untuk developer eksternal yang membangun di atas DSDN.
 
 #### 2. SDK Core Features
 
@@ -2365,7 +2468,7 @@ Compute Receipt (Standard):
   -> ExecutionCommitment verified
   -> Challenge period (1-4 hours)
   -> If no challenge -> reward distributed
-  -> If challenge -> arbitration
+  -> If challenge -> arbitration (via fraud proof system, Tahap 18.8)
 
 Compute Receipt (Redundant):
   -> Multi-node execution
@@ -2440,6 +2543,12 @@ Quadratic Voting komunitas: opsional, tidak mengikat.
 
 ## Tahap 20.A --- Mainnet Preparation (With Identity Verification)
 
+**(FIX #1) PENTING: Tahap ini dipecah menjadi dua bagian untuk menghilangkan circular dependency dengan Tahap 21.**
+
+### 20.A-Core — Genesis & Infrastructure Preparation
+
+**Tidak bergantung pada bootstrap system. Bisa dikerjakan sebelum Tahap 21.**
+
 **Tambahan:**
 
 - Node reguler tidak wajib KYC.
@@ -2452,11 +2561,31 @@ Pada genesis: stake requirement embed, multisig validator embed, slashing rules 
 - Coordinator committee initial members.
 - TSS key ceremony results.
 - Fraud proof parameters.
+
+**Kriteria Selesai 20.A-Core:**
+
+- Genesis config lengkap dengan semua parameter di atas.
+- TSS key ceremony berhasil dan keys terdistribusi ke committee members.
+- Semua parameter embed di genesis block.
+- Identity verification flow tested.
+
+### 20.A-Bootstrap — Bootstrap Infrastructure Readiness
+
+**Depends on: Tahap 21.1.C (bootstrap system fully implemented). Dikerjakan SETELAH Tahap 21.**
+
+Checklist bootstrap infrastructure:
+
 - DNS seed domain(s) telah dibeli dan DNS A record aktif.
 - Minimal 1 dedicated bootstrap node running 24/7.
 - Bootstrap config default sudah terisi dengan DNS seed production.
 - `peers.dat` path sudah di-set di production config.
-- Full bootstrap test dari fresh node berhasil.
+- Full bootstrap test dari fresh node berhasil (semua role: StorageCompute Reguler, StorageCompute DataCenter, Validator, Coordinator).
+
+**Kriteria Selesai 20.A-Bootstrap:**
+
+- DNS seed resolvable dari berbagai lokasi.
+- Bootstrap node operational 24/7.
+- Fresh node bisa bootstrap dan menjadi operational dalam < 60 detik.
 
 **Crates yang harus diubah / dilibatkan:** `chain`, `validator`, `coordinator`, `node`, `ingress`, `agent`.
 
@@ -2479,6 +2608,8 @@ Validator hanya boleh: baca metadata, memblokir endpoint/pointer. Validator tida
 ## Tahap 21 --- Bootstrap Network System (DNS Seed + Peer Discovery)
 
 **Tujuan:** Mengimplementasikan sistem bootstrap jaringan DSDN berbasis DNS seed dan IP publik, menggunakan **single port untuk semua role**. Setiap node listen di port `45831` apapun role-nya. Setelah handshake, node saling tahu role dan kelas masing-masing, lalu memfilter peer sesuai kebutuhan. Sistem ini mengikuti model Bitcoin: DNS seed → peer exchange → local cache → self-sustaining network.
+
+**(FIX #1) Depends on:** Tahap 20.A-Core (genesis config, TSS ceremony, fraud proof params ready). **Tidak bergantung pada** 20.A-Bootstrap — justru 20.A-Bootstrap bergantung pada tahap ini.
 
 **Prinsip Arsitektur Single-Port:**
 
@@ -2506,9 +2637,7 @@ Karena blockchain embedded, **tidak ada role "Chain" yang terpisah**. Konsensus 
 | `Validator` | — | Governance, compliance, PoS consensus blockchain Nusantara | 50,000 $NUSA |
 | `Coordinator` | — | Metadata global, scheduling, job queue, replay Celestia blob | — |
 
-**Depends on:** Tahap 20.A (Mainnet Preparation selesai, semua komponen infrastruktur sudah ready).
-
-**Catatan Pre-Mainnet Wajib:** Founder harus membeli minimal 1 domain untuk DNS seed sebelum mainnet launch (contoh: `seed1.dsdn.network`). Domain tambahan sangat disarankan untuk redundansi.
+**Catatan Pre-Mainnet Wajib:** Founder harus membeli minimal 1 domain untuk DNS seed sebelum mainnet launch (contoh: `seed1.dsdn.network`). Domain tambahan sangat disarankan untuk redundansi. *(Checklist detail ada di 20.A-Bootstrap)*
 
 ---
 
@@ -2528,6 +2657,10 @@ Isi modul ini mencakup:
 
 Seluruh jaringan DSDN menggunakan **satu port**: `45831`. Role dan kelas didefinisikan sebagai enum:
 
+**(FIX #2)** `Bootstrap` variant sudah didefinisikan di sini (bukan ditambahkan belakangan di 21.1.C) agar handshake dan PEX di 21.1.B sudah compatible sejak awal.
+
+**(FIX #9)** `NodeRole` dan `NodeClass` di sini meng-extend definisi `NodeClass` yang sudah ada dari Tahap 16 (`crates/common/src/node_class.rs`). `NodeClass` enum tetap satu definisi — tidak duplikasi.
+
 ```rust
 pub const DSDN_DEFAULT_PORT: u16 = 45831;
 
@@ -2546,27 +2679,26 @@ pub enum NodeRole {
     /// Coordinator: metadata, scheduling, job queue, Celestia blob replay.
     /// Stateless scheduler — semua keputusan bisa direkonstruksi dari DA log.
     Coordinator,
+
+    /// Bootstrap: dedicated peer discovery node (non-operational).
+    /// Tidak menjalankan storage, compute, consensus, atau scheduling.
+    /// Hanya melayani handshake dan PEX — "yellow pages" jaringan.
+    /// Tidak memerlukan stake.
+    /// (FIX #2: Didefinisikan di 21.1.A agar 21.1.B handshake & PEX sudah compatible)
+    Bootstrap,
 }
 
-/// Kelas node, khusus untuk role StorageCompute.
-/// Menentukan kapasitas, stake requirement, dan prioritas scheduler.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum NodeClass {
-    /// Node reguler: partisipasi publik, kapasitas terbatas.
-    /// Stake: 500 $NUSA. CPU 4-8 vCPU, RAM 8-32 GiB, Storage 512GB-2TB.
-    Reguler,
-
-    /// Node data center: kapasitas besar, GPU, SLA tinggi.
-    /// Stake: 5,000 $NUSA. CPU 32-64 vCPU, RAM 128-256 GiB, Storage 4-16TB.
-    DataCenter,
-}
+// NodeClass sudah didefinisikan di crates/common/src/node_class.rs sejak Tahap 16.
+// Re-export di sini untuk convenience:
+pub use crate::node_class::NodeClass;
+// NodeClass::Reguler dan NodeClass::DataCenter
 
 /// Informasi lengkap identitas node saat handshake.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub role: NodeRole,
     /// Hanya relevan jika role == StorageCompute.
-    /// Validator dan Coordinator tidak punya kelas — field ini None.
+    /// Validator, Coordinator, dan Bootstrap tidak punya kelas — field ini None.
     pub node_class: Option<NodeClass>,
     pub node_id: Ed25519PublicKey,
     pub network_id: String,        // "mainnet" | "testnet"
@@ -2584,6 +2716,13 @@ Karena whitepaper DSDN mendefinisikan Full Node Reguler dan Full Node Data Cente
 - `StorageCompute` + `DataCenter` = Full Node Data Center (5,000 $NUSA)
 - `Validator` + `None` = Validator (50,000 $NUSA)
 - `Coordinator` + `None` = Coordinator
+- `Bootstrap` + `None` = Bootstrap node (no stake)
+
+**Handshake validation rules untuk `Bootstrap` (FIX #2):**
+- `Bootstrap` role: `node_class` HARUS `None`.
+- `Bootstrap` node tidak memerlukan stake verification.
+- `Bootstrap` node tidak di-dispatch workload.
+- Semua role treat `Bootstrap` peer sebagai PEX-only (connect → PEX → disconnect).
 
 #### 2. Seed DNS Config
 
@@ -2632,7 +2771,7 @@ Aturan IP statis:
 ```toml
 [bootstrap]
 # Node role for this instance
-role = "storage-compute"  # storage-compute | validator | coordinator
+role = "storage-compute"  # storage-compute | validator | coordinator | bootstrap
 
 # Node class (hanya relevan untuk storage-compute)
 # Diabaikan jika role bukan storage-compute
@@ -2673,28 +2812,37 @@ peer_connect_timeout_secs = 5
 
 Setiap role memiliki kebutuhan koneksi yang berbeda. Ini menentukan peer mana yang di-keep vs di-disconnect setelah handshake:
 
+**(FIX #2)** Matrix sudah menyertakan `Bootstrap` role sebagai peer type:
+
 ```
 StorageCompute (Reguler maupun DataCenter) membutuhkan:
   - StorageCompute (REQUIRED)  → data replication antar node, chunk transfer
   - Coordinator (REQUIRED)     → register diri, terima task, report status
   - Validator (OPTIONAL)       → baca keputusan governance jika perlu
                                   (biasanya cukup via blockchain state)
+  - Bootstrap (PEX_ONLY)       → PEX lalu disconnect
 
 Validator membutuhkan:
   - Validator (REQUIRED)       → PoS consensus, block production, governance voting
   - Coordinator (REQUIRED)     → koordinasi, status jaringan
   - StorageCompute (OPTIONAL)  → monitoring node health, verifikasi compliance
                                   (bisa juga via on-chain data)
+  - Bootstrap (PEX_ONLY)       → PEX lalu disconnect
 
 Coordinator membutuhkan:
   - Coordinator (REQUIRED)     → multi-coordinator sync, committee (TSS/FROST)
   - StorageCompute (REQUIRED)  → task dispatch, node management, health check
   - Validator (REQUIRED)       → stake verification, governance decision reads
+  - Bootstrap (PEX_ONLY)       → PEX lalu disconnect
+
+Bootstrap membutuhkan:
+  - ALL ROLES (ACCEPT)         → accept semua koneksi, serve PEX, no keep
 ```
 
 Aturan koneksi:
 - `REQUIRED`: Node HARUS punya minimal 1 peer dengan role ini. Jika belum ada, terus cari.
 - `OPTIONAL`: Bagus jika ada, tapi tidak blocking. Informasi biasanya bisa didapat via blockchain state.
+- `PEX_ONLY`: Connect → request PEX → disconnect. Simpan di peers.dat.
 - `SKIP`: Disconnect setelah handshake, tapi tetap simpan di `peers.dat` agar bisa di-share via PEX.
 
 **Catatan tentang blockchain sync:**
@@ -2744,16 +2892,16 @@ Implementasi urutan fallback (sama untuk semua role):
 ### Deliverables 21.1.A
 
 1. File `crates/common/src/bootstrap_system.rs` dengan:
-   - `NodeRole` enum (StorageCompute, Validator, Coordinator)
-   - `NodeClass` enum (Reguler, DataCenter)
+   - `NodeRole` enum (StorageCompute, Validator, Coordinator, **Bootstrap** — FIX #2)
+   - Re-export `NodeClass` enum dari `crates/common/src/node_class.rs` (Reguler, DataCenter — FIX #9)
    - `NodeIdentity` struct (role + class + node_id + network_id + ...)
    - `BootstrapConfig` struct (termasuk role, class, single port)
    - `DnsSeed`, `StaticPeer`, `SeedRegistry` structs
-   - `RoleDependencyMatrix` — logic siapa butuh siapa
+   - `RoleDependencyMatrix` — logic siapa butuh siapa (**termasuk Bootstrap role** — FIX #2)
 2. Parser untuk bootstrap config (dari section `[bootstrap]` di `dsdn.toml`).
 3. DNS resolver wrapper yang async, timeout-aware, dan error-tolerant.
 4. Fallback chain logic (peers.dat → static IP → DNS seed → retry) dengan role-aware filtering.
-5. Unit test: config parsing, role/class validation, role dependency, DNS resolve mock, fallback ordering, invalid seed handling.
+5. Unit test: config parsing, role/class validation, role dependency, DNS resolve mock, fallback ordering, invalid seed handling, **Bootstrap role handshake validation** (FIX #2).
 
 ### Crates Terlibat
 
@@ -2762,10 +2910,12 @@ Implementasi urutan fallback (sama untuk semua role):
 ### Kriteria Selesai
 
 - `BootstrapConfig` bisa di-load dari file config termasuk `role` dan `node_class` field.
-- `NodeRole` enum terdefinisi dengan 3 role (StorageCompute, Validator, Coordinator).
+- `NodeRole` enum terdefinisi dengan **4 variant** (StorageCompute, Validator, Coordinator, **Bootstrap** — FIX #2).
 - `NodeClass` enum terdefinisi dengan 2 kelas (Reguler, DataCenter), hanya valid untuk StorageCompute.
-- `RoleDependencyMatrix` bisa menentukan role mana yang REQUIRED/OPTIONAL/SKIP untuk setiap role.
+- **`Bootstrap` role: `node_class` harus `None`, tidak memerlukan stake (FIX #2).**
+- `RoleDependencyMatrix` bisa menentukan role mana yang REQUIRED/OPTIONAL/PEX_ONLY/SKIP untuk setiap role **termasuk Bootstrap** (FIX #2).
 - Config dengan `role = "validator"` dan `node_class = "datacenter"` → error (validator tidak punya kelas).
+- **Config dengan `role = "bootstrap"` dan `node_class = "reguler"` → error (bootstrap tidak punya kelas) (FIX #2).**
 - DNS seed list dan static IP list bisa kosong.
 - Semua IP menggunakan port 45831 secara default.
 - Fallback chain logic ter-test dengan semua kombinasi termasuk role match/mismatch dan class scenarios.
@@ -2776,7 +2926,7 @@ Implementasi urutan fallback (sama untuk semua role):
 
 **Tujuan:** Mengimplementasikan peer discovery melalui DNS resolve dan IP connect, **handshake yang menyertakan role dan kelas node**, peer exchange protocol, dan persistent local cache `peers.dat` dengan role+class metadata.
 
-**Depends on:** 21.1.A (BootstrapConfig, SeedRegistry, NodeRole, NodeClass ready)
+**Depends on:** 21.1.A (BootstrapConfig, SeedRegistry, NodeRole **including Bootstrap variant**, NodeClass ready)
 
 ### 1. DNS Seed Resolution (Role-Agnostic)
 
@@ -2812,7 +2962,7 @@ Handshake menyertakan **role dan kelas** dari masing-masing node:
      - protocol_version: u32
      - network_id: String ("mainnet" / "testnet")
      - node_id: Ed25519PublicKey
-     - role: NodeRole (StorageCompute / Validator / Coordinator)
+     - role: NodeRole (StorageCompute / Validator / Coordinator / Bootstrap)
      - node_class: Option<NodeClass> (Some(Reguler) / Some(DataCenter) / None)
      - listen_port: u16 (selalu 45831)
      - capabilities: Vec<String>
@@ -2824,12 +2974,13 @@ Handshake menyertakan **role dan kelas** dari masing-masing node:
    - protocol_version HARUS compatible
    - node_id HARUS valid Ed25519 public key
    - Jika role == StorageCompute, node_class HARUS Some(_)
-   - Jika role == Validator atau Coordinator, node_class HARUS None
+   - Jika role == Validator, Coordinator, atau Bootstrap → node_class HARUS None
 
 4. Role filtering (post-handshake):
-   - Cek RoleDependencyMatrix: apakah role peer ini REQUIRED/OPTIONAL/SKIP?
+   - Cek RoleDependencyMatrix: apakah role peer ini REQUIRED/OPTIONAL/PEX_ONLY/SKIP?
    - REQUIRED → keep connection aktif
    - OPTIONAL → keep jika belum cukup peer, disconnect jika sudah cukup
+   - PEX_ONLY → request PEX → simpan results → disconnect
    - SKIP → simpan peer info ke peers.dat, lalu disconnect
 
 5. Simpan ke peers.dat:
@@ -2854,6 +3005,9 @@ Coordinator connect ke berbagai node:
 
 → Peer D: {role: Coordinator}
   Coordinator butuh Coordinator? → REQUIRED → keep → multi-coordinator sync
+
+→ Peer E: {role: Bootstrap}
+  Coordinator butuh Bootstrap? → PEX_ONLY → request PEX → disconnect
 ```
 
 ```
@@ -2868,6 +3022,9 @@ StorageCompute (Reguler) connect ke berbagai node:
 → Peer Z: {role: Validator}
   StorageCompute butuh Validator? → OPTIONAL → keep jika belum ada, atau disconnect
   Catatan: biasanya cukup baca governance via blockchain state
+
+→ Peer W: {role: Bootstrap}
+  StorageCompute butuh Bootstrap? → PEX_ONLY → PEX → disconnect
 ```
 
 **Disconnect reason codes:**
@@ -2875,6 +3032,7 @@ StorageCompute (Reguler) connect ke berbagai node:
 ```rust
 pub enum DisconnectReason {
     RoleNotNeeded,
+    PexCompleted,     // (FIX #2: untuk Bootstrap peer setelah PEX selesai)
     TooManyPeers,
     NetworkIdMismatch,
     ProtocolIncompatible,
@@ -2913,6 +3071,17 @@ StorageCompute baru connect ke Validator (OPTIONAL → SKIP jika sudah cukup):
   → Connect ke IP_X (Coordinator) → handshake → REQUIRED → keep!
 ```
 
+**PEX via Bootstrap node (FIX #2 — primary use case):**
+
+```
+StorageCompute baru → resolve DNS → IP = bootstrap node:
+  → Handshake → role = Bootstrap
+  → Kirim GetPeers { roles: [Coordinator, StorageCompute] }
+  → Bootstrap response: semua known peers dengan role tersebut
+  → Disconnect dari Bootstrap (PEX_ONLY)
+  → Connect ke peer yang dikembalikan → handshake → keep jika REQUIRED
+```
+
 **Kegunaan class info di PEX:**
 
 Coordinator bisa menggunakan class info dari PEX untuk scheduling:
@@ -2937,7 +3106,7 @@ Per entry:
 - IP address (IPv4 atau IPv6)
 - Port (selalu 45831)
 - Node ID (Ed25519 public key)
-- Role (StorageCompute / Validator / Coordinator)
+- Role (StorageCompute / Validator / Coordinator / Bootstrap)
 - Class (Reguler / DataCenter / null)   ← null jika bukan StorageCompute
 - Last seen timestamp
 - Last successful connect timestamp
@@ -2987,7 +3156,7 @@ score = base_score
       - (failure_count * 3)
       + recency_bonus (< 1 jam: +10, < 24 jam: +5)
       - staleness_penalty (> 7 hari: -5, > 30 hari: -10)
-      + role_bonus (REQUIRED: +20, OPTIONAL: +5, SKIP: +0)
+      + role_bonus (REQUIRED: +20, OPTIONAL: +5, PEX_ONLY: +2, SKIP: +0)
       + class_bonus (DataCenter peer jika butuh kapasitas besar: +5)
 ```
 
@@ -3000,14 +3169,14 @@ score = base_score
 ### Deliverables 21.1.B
 
 1. DNS seed resolver (async, timeout, multi-seed fallback, IPv4+IPv6) — semua ke port 45831.
-2. **Handshake protocol dengan role+class exchange** (NodeIdentity, validation rules, disconnect reason).
-3. **Role+class filtering logic post-handshake** (keep/disconnect per RoleDependencyMatrix).
-4. **PEX dengan role+class metadata** — optional role filter, response termasuk class.
-5. **peers.dat dengan role+class fields** — read/write/GC/role-class-based sorting.
+2. **Handshake protocol dengan role+class exchange** (NodeIdentity, validation rules, disconnect reason **termasuk PexCompleted**).
+3. **Role+class filtering logic post-handshake** (keep/disconnect per RoleDependencyMatrix **termasuk PEX_ONLY untuk Bootstrap**).
+4. **PEX dengan role+class metadata** — optional role filter, response termasuk class. **PEX via Bootstrap node tested** (FIX #2).
+5. **peers.dat dengan role+class fields** — read/write/GC/role-class-based sorting. **Bootstrap entries stored** (FIX #2).
 6. Peer scoring dengan role+class weighting.
 7. Peer rotation background task.
-8. Unit test: handshake validation (termasuk invalid class untuk Validator), role filtering, PEX, peers.dat, scoring.
-9. Integration test: node StorageCompute + Coordinator + Validator bootstrap dari 1 DNS seed, handshake, role+class filter, PEX.
+8. Unit test: handshake validation (termasuk invalid class untuk Validator **dan Bootstrap**), role filtering, PEX, peers.dat, scoring.
+9. Integration test: node StorageCompute + Coordinator + Validator **+ Bootstrap** bootstrap dari 1 DNS seed, handshake, role+class filter, PEX.
 
 ### Crates Terlibat
 
@@ -3018,7 +3187,9 @@ score = base_score
 - Semua koneksi menggunakan single port 45831.
 - Handshake menyertakan `role` dan `node_class` — kedua node saling tahu.
 - Validator yang kirim `node_class = Some(DataCenter)` → handshake ditolak (invalid).
+- **Bootstrap yang kirim `node_class = Some(Reguler)` → handshake ditolak (invalid) (FIX #2).**
 - Node bisa filter peer berdasarkan role+class setelah handshake.
+- **Node yang connect ke Bootstrap → PEX → disconnect (PEX_ONLY flow) (FIX #2).**
 - PEX menyertakan role+class per peer.
 - peers.dat menyimpan role+class dan bisa difilter saat startup.
 - Cross-role PEX bekerja: connect ke peer beda role → PEX → dapat info peer yang dibutuhkan.
@@ -3030,7 +3201,7 @@ score = base_score
 
 **Tujuan:** Mengintegrasikan bootstrap system ke seluruh komponen DSDN sehingga semua role bisa saling menemukan melalui single-port P2P + role+class handshake, dan memastikan jaringan resilient terhadap berbagai failure scenario.
 
-**Depends on:** 21.1.A (config, role+class definitions), 21.1.B (discovery, handshake, peers.dat)
+**Depends on:** 21.1.A (config, role+class definitions **including Bootstrap**), 21.1.B (discovery, handshake, peers.dat)
 
 ### 1. Integrasi ke Setiap Role
 
@@ -3042,6 +3213,7 @@ Startup:
    - Peer Coordinator → KEEP → register diri, terima task
    - Peer StorageCompute (Reguler/DataCenter) → KEEP → chunk replication
    - Peer Validator → OPTIONAL → keep jika belum ada, simpan jika skip
+   - Peer Bootstrap → PEX_ONLY → PEX → disconnect
 3. Setelah punya Coordinator + StorageCompute peer → operational
 4. Blockchain sync: connect ke Validator untuk block propagation (via internal blockchain protocol)
 ```
@@ -3062,6 +3234,7 @@ Startup:
    - Peer Validator → KEEP → PoS consensus, block production, governance voting
    - Peer Coordinator → KEEP → koordinasi, status jaringan
    - Peer StorageCompute → OPTIONAL → monitoring, compliance check
+   - Peer Bootstrap → PEX_ONLY → PEX → disconnect
 3. Setelah punya Validator peer(s) + Coordinator → operational
 4. Mulai participate di PoS consensus → memproduksi/memfinalisasi block
 5. Block di-propagate ke semua node (StorageCompute, Coordinator) via blockchain protocol
@@ -3076,6 +3249,7 @@ Startup:
    - Peer StorageCompute → KEEP → task dispatch, manage nodes
      → Bisa bedakan Reguler vs DataCenter dari handshake class info
    - Peer Validator → KEEP → stake verification, governance reads
+   - Peer Bootstrap → PEX_ONLY → PEX → disconnect
 3. Setelah punya Coordinator + StorageCompute + Validator → operational
 4. Mulai consume Celestia blob → build local state → scheduling
 ```
@@ -3090,7 +3264,7 @@ dsdn-node --mode bootstrap --listen 0.0.0.0:45831 --network mainnet
 
 Bootstrap node behavior:
 - Listen di port 45831.
-- Handshake mengirim role khusus: `Bootstrap`.
+- Handshake mengirim role: `Bootstrap` **(sudah ada di NodeRole enum sejak 21.1.A — FIX #2)**.
 - Tidak menjalankan storage, compute, consensus, atau scheduling.
 - Hanya melayani handshake dan PEX — menjadi "yellow pages" jaringan.
 - Mengumpulkan peer info (role+class) dari semua node yang connect.
@@ -3107,18 +3281,7 @@ Alur via bootstrap node:
 6. Handshake masing-masing → role match → keep!
 ```
 
-Role `Bootstrap` sebagai variant khusus (BUKAN role operasional):
-
-```rust
-pub enum NodeRole {
-    // Operational roles (sesuai whitepaper)
-    StorageCompute,
-    Validator,
-    Coordinator,
-    // Special role (non-operational)
-    Bootstrap,
-}
-```
+> **Catatan (FIX #2):** Tidak perlu menambahkan `Bootstrap` ke `NodeRole` enum di tahap ini — sudah ada sejak 21.1.A. Tahap ini hanya mengimplementasi bootstrap node runtime behavior dan CLI.
 
 ### 3. Blockchain Sync Integration
 
@@ -3160,6 +3323,8 @@ Recovery:
 ```
 
 ### 5. Seed Infrastructure Checklist (Pre-Mainnet)
+
+> **(FIX #1)** Checklist ini adalah deliverable dari **Tahap 20.A-Bootstrap** (bukan 21.1.C), tapi dicantumkan di sini sebagai referensi karena 20.A-Bootstrap bergantung pada 21.1.C.
 
 ```
 [ ] Beli minimal 1 domain untuk DNS seed (contoh: seed1.dsdn.network)
@@ -3211,6 +3376,7 @@ dsdn-agent peers list
 dsdn-agent peers list --role storage-compute
 dsdn-agent peers list --role validator
 dsdn-agent peers list --role coordinator
+dsdn-agent peers list --role bootstrap
 
 # Filter by role + class
 dsdn-agent peers list --role storage-compute --class datacenter
@@ -3250,6 +3416,7 @@ dsdn-agent peers roles
 # My role: StorageCompute (Reguler)
 # Required peers: StorageCompute, Coordinator
 # Optional peers: Validator
+# PEX-only peers: Bootstrap
 ```
 
 ### 8. Monitoring & Observability
@@ -3268,7 +3435,7 @@ bootstrap_handshake_success
 bootstrap_handshake_failure{reason="..."}
 bootstrap_handshake_role_discovered{role="storage_compute|validator|coordinator|bootstrap"}
 bootstrap_handshake_class_discovered{class="reguler|datacenter|none"}
-bootstrap_peer_disconnect{reason="role_not_needed|too_many_peers|invalid_handshake|..."}
+bootstrap_peer_disconnect{reason="role_not_needed|pex_completed|too_many_peers|invalid_handshake|..."}
 
 # Peer State
 bootstrap_peers_dat_size
@@ -3281,6 +3448,7 @@ bootstrap_active_peers_by_class{class="..."}
 # PEX
 bootstrap_pex_requests_total
 bootstrap_pex_role_filter_used
+bootstrap_pex_via_bootstrap_node           — PEX specifically through Bootstrap role peers
 
 # Fallback
 bootstrap_fallback_triggered{from="peers_dat|static_ip|dns_seed"}
@@ -3325,7 +3493,7 @@ bootstrap_blockchain_peer_count              — jumlah peer yang provide block 
 6. Anti-abuse: rate limiting, eclipse attack mitigation, role+class spoofing detection, stake-based verification.
 7. Agent CLI dengan role+class filtering.
 8. Monitoring metrics dengan role+class breakdown.
-9. Seed infrastructure checklist.
+9. Seed infrastructure checklist *(ownership: 20.A-Bootstrap, referenced here)*.
 10. Full integration test suite (18 scenarios).
 11. End-to-end test: semua role+class bootstrap dari nol via single port, saling menemukan, blockchain sync, operational.
 
@@ -3339,6 +3507,7 @@ bootstrap_blockchain_peer_count              — jumlah peer yang provide block 
 - **Role+class discovery works**: Handshake menyertakan role DAN class. Filtering sesuai RoleDependencyMatrix.
 - **Tidak ada role "Chain" terpisah**: Blockchain Nusantara berjalan embedded di semua node. Validator menjalankan PoS consensus, node lain sync block.
 - **StorageCompute class distinction**: Reguler dan DataCenter di-advertise saat handshake dan di-cache di peers.dat. Coordinator bisa bedakan untuk scheduling.
+- **Bootstrap role functional (FIX #2)**: Bootstrap node bisa serve PEX, semua role bisa discover peer via Bootstrap node.
 - **Cross-role PEX**: Berfungsi termasuk class info.
 - **Fallback chain bekerja** di semua kombinasi.
 - **peers.dat role+class aware**: Restart langsung connect ke peer tepat (< 5 detik).
@@ -3355,7 +3524,7 @@ bootstrap_blockchain_peer_count              — jumlah peer yang provide block 
 
 | Aspek | Revisi v1 (salah) | Revisi v2 (sesuai whitepaper) |
 |-------|-------------------|-------------------------------|
-| Roles | Chain, Validator, Coordinator, StorageCompute | **StorageCompute, Validator, Coordinator** (3 role, bukan 4) |
+| Roles | Chain, Validator, Coordinator, StorageCompute | **StorageCompute, Validator, Coordinator** (3 role operasional + Bootstrap khusus) |
 | "Chain" role | Ada sebagai role terpisah | **Dihapus** — blockchain embedded di semua node |
 | Blockchain | Dijalankan oleh "Chain node" | **Validator jalankan PoS consensus, node lain sync** |
 | Node class | Tidak ada | **Reguler vs DataCenter** (sub-class StorageCompute) |
@@ -3376,23 +3545,33 @@ bootstrap_blockchain_peer_count              — jumlah peer yang provide block 
 
 ---
 
-## Ringkasan Dependency (Tahap 21)
+## Ringkasan Dependency (Tahap 21 — FIXED)
+
+**(FIX #1)** Dependency chain yang benar, tanpa circular reference:
 
 ```
-21.1.A (Config & Seed Registry)
+20.A-Core (Genesis config, TSS ceremony, fraud proof params)
   ↓
-21.1.B (Discovery, PEX, peers.dat)
+21.1.A (Config & Seed Registry — includes Bootstrap role)
+  ↓
+21.1.B (Discovery, PEX, peers.dat — handles Bootstrap peers)
   ↓
 21.1.C (Full System Integration & Resilience)
+  ↓
+20.A-Bootstrap (DNS seed purchase, bootstrap node deployment, full bootstrap test)
   ↓
 Tahap 22 (Mainnet Launch) — semua komponen DSDN fully P2P
 ```
 
-**21.1.A** → Data layer. Config, struct, DNS resolver, fallback logic. Bisa dikerjakan independen.
+**20.A-Core** → Genesis preparation. Tidak butuh bootstrap. Bisa paralel dengan development lain.
+
+**21.1.A** → Data layer. Config, struct, DNS resolver, fallback logic. Depends on 20.A-Core untuk genesis params.
 
 **21.1.B** → Network layer. Discovery, handshake, PEX, peers.dat. Depends on 21.1.A.
 
 **21.1.C** → Integration layer. Menyambungkan ke seluruh komponen DSDN + security + monitoring. Depends on 21.1.A + 21.1.B. Tahap paling berat dan paling critical karena melibatkan seluruh crates.
+
+**20.A-Bootstrap** → Infrastructure deployment. Beli domain, deploy bootstrap nodes, test. Depends on 21.1.C.
 
 **Estimasi effort:** 21.1.A (20%), 21.1.B (35%), 21.1.C (45%).
 
@@ -3402,10 +3581,12 @@ Tahap 22 (Mainnet Launch) — semua komponen DSDN fully P2P
 
 ## Tahap 22 --- Mainnet Launch (Limited / Pilot Mainnet)
 
+**Depends on:** 20.A-Bootstrap (bootstrap infrastructure verified and operational).
+
 **Launch Dashboard untuk:**
 
 - Node stake status.
-- DA sync status (Celestia + fallback).
+- DA sync status (Celestia + fallback — Tahap 15.1).
 - Coordinator committee status.
 - Reward distribution.
 - Fraud proof challenges active.
@@ -3422,6 +3603,23 @@ Tahap 22 (Mainnet Launch) — semua komponen DSDN fully P2P
 **Crates yang harus diubah / dilibatkan:** `chain`, `coordinator`, `node`, `validator`, `ingress`, `agent`.
 
 > Tidak diperbolehkan klaim "desentralisasi penuh", "trustless", atau "production-ready" dalam komunikasi eksternal.
+
+---
+
+## Appendix: Changelog Fixes Applied
+
+| Fix # | Severity | Issue | Resolution |
+|-------|----------|-------|------------|
+| 1 | CRITICAL | Circular dependency 20.A ↔ 21 | Split 20.A into 20.A-Core (before 21) and 20.A-Bootstrap (after 21.1.C). Updated dependency chain. |
+| 2 | HIGH | Bootstrap variant missing in 21.1.A NodeRole enum | Added `Bootstrap` to NodeRole enum in 21.1.A. Updated RoleDependencyMatrix with PEX_ONLY. Updated handshake validation, PEX, peers.dat throughout 21.1.A/B/C. |
+| 3 | HIGH | Tahap 16 stake check missing Validator 50,000 | Added complete stake table (500/5000/50000) and combined role+stake validation to Tahap 16. |
+| 4 | MEDIUM | Challenge period ambiguous before fraud proof exists | Added explicit notes in 14C.B, 14C.C that challenge period is timer-only. Added integration checklist in 18.8 for activating real fraud proof. |
+| 5 | MEDIUM | Tahap 15 references events from future stages | Added per-log-type annotations marking which producer is from which tahap. Defined hook-based approach with mock event testing. |
+| 6 | MEDIUM | DA fallback has no dedicated implementation stage | Created new Tahap 15.1 with DA health monitor, fallback buffer, reconciliation, and activation events. |
+| 7 | MEDIUM | Coordinator committee formation undefined | Added committee formation section to 14C.C with protocol, quorum, failure handling, and structs. |
+| 8 | LOW | SDK directory structure inconsistent | Moved Rust SDK to `sdks/sdk_rust/` with note that it's a public wrapper over internal crates. |
+| 9 | LOW | NodeClass used in Tahap 16-17 before formal definition in 21 | Added forward definition of NodeClass enum in Tahap 16 (`common/src/node_class.rs`). 21.1.A re-exports from this. |
+
 ---
 
 ## Tahap 23 --- Two-Class Config with Stake Validation
