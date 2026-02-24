@@ -10,6 +10,7 @@
 //! - Status observability  
 //! - Metrics export (Prometheus)
 //! - State inspection (debugging)
+//! - P2P / Bootstrap status (Tahap 21)
 //!
 //! NO POST/PUT/DELETE endpoints for operations.
 
@@ -23,11 +24,12 @@ use serde::Serialize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
     NodeDerivedState, NodeHealth, HealthStorage, DAInfo,
     FALLBACK_DEGRADATION_THRESHOLD_MS,
+    PeerManager, BootstrapSummary, NodeRole,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -52,6 +54,9 @@ pub struct NodeAppState<S: HealthStorage + Send + Sync + 'static> {
     pub da_network: String,
     /// DA endpoint URL.
     pub da_endpoint: String,
+    /// P2P bootstrap peer manager (Tahap 21).
+    /// `None` only if P2P is explicitly disabled.
+    pub peer_manager: Option<Arc<Mutex<PeerManager>>>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -92,6 +97,15 @@ pub struct StatusResp {
     pub storage_used_bytes: u64,
     pub storage_capacity_bytes: u64,
     pub uptime_secs: u64,
+    // ── P2P (Tahap 21) ──────────────────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2p_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2p_node_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2p_active_peers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2p_known_peers: Option<usize>,
 }
 
 /// GET /state response
@@ -251,7 +265,22 @@ pub async fn status_handler<S: HealthStorage + Send + Sync + 'static>(
     State(app): State<Arc<NodeAppState<S>>>,
 ) -> Json<StatusResp> {
     let state = app.state.read();
-    
+
+    // P2P info (if available)
+    let (p2p_role, p2p_node_class, p2p_active_peers, p2p_known_peers) =
+        if let Some(ref pm) = app.peer_manager {
+            let mgr = pm.lock();
+            let summary = mgr.summary();
+            (
+                Some(summary.role),
+                summary.node_class,
+                Some(summary.active_peers),
+                Some(summary.known_peers),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
     Json(StatusResp {
         node_id: app.node_id.clone(),
         healthy: app.da_info.is_connected() && !state.fallback_active,
@@ -263,6 +292,10 @@ pub async fn status_handler<S: HealthStorage + Send + Sync + 'static>(
         storage_used_bytes: app.storage.storage_used_bytes(),
         storage_capacity_bytes: app.storage.storage_capacity_bytes(),
         uptime_secs: now_secs().saturating_sub(app.start_time),
+        p2p_role,
+        p2p_node_class,
+        p2p_active_peers,
+        p2p_known_peers,
     })
 }
 
@@ -384,8 +417,8 @@ pub async fn prometheus_handler<S: HealthStorage + Send + Sync + 'static>(
     let uptime = now_secs().saturating_sub(app.start_time);
     let da_connected: u8 = if app.da_info.is_connected() { 1 } else { 0 };
     let fallback_active: u8 = if state.fallback_active { 1 } else { 0 };
-    
-    format!(
+
+    let mut out = format!(
 r#"# HELP dsdn_node_uptime_seconds Node uptime in seconds
 # TYPE dsdn_node_uptime_seconds gauge
 dsdn_node_uptime_seconds{{node_id="{node_id}"}} {uptime}
@@ -427,7 +460,185 @@ dsdn_node_assignments_count{{node_id="{node_id}"}} {assignments}
         storage_used = app.storage.storage_used_bytes(),
         storage_capacity = app.storage.storage_capacity_bytes(),
         assignments = state.my_chunks.len(),
-    )
+    );
+
+    // Append P2P / bootstrap metrics if PeerManager is active
+    if let Some(ref pm) = app.peer_manager {
+        let mgr = pm.lock();
+        out.push_str(&mgr.metrics().to_prometheus(&app.node_id));
+    }
+
+    out
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// P2P RESPONSE TYPES (Tahap 21)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// GET /p2p/status response — high-level bootstrap subsystem summary.
+#[derive(Debug, Serialize)]
+pub struct P2PStatusResp {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<BootstrapSummary>,
+}
+
+/// Single active peer entry for /p2p/peers.
+#[derive(Debug, Serialize)]
+pub struct P2PPeerEntry {
+    pub address: String,
+    pub role: Option<String>,
+    pub node_class: Option<String>,
+    pub score: i64,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub last_connected: u64,
+}
+
+/// GET /p2p/peers response.
+#[derive(Debug, Serialize)]
+pub struct P2PPeersResp {
+    pub active_count: usize,
+    pub known_count: usize,
+    pub peers: Vec<P2PPeerEntry>,
+}
+
+/// GET /p2p/store/stats response.
+#[derive(Debug, Serialize)]
+pub struct P2PStoreStatsResp {
+    pub total: usize,
+    pub suspicious: usize,
+    pub expired: usize,
+    pub connected_24h: usize,
+    pub by_role: std::collections::HashMap<String, usize>,
+    pub by_class: std::collections::HashMap<String, usize>,
+    pub by_source: std::collections::HashMap<String, usize>,
+}
+
+/// GET /p2p/role response — what this node needs.
+#[derive(Debug, Serialize)]
+pub struct P2PRoleInfoResp {
+    pub our_role: String,
+    pub our_class: Option<String>,
+    pub required_roles: Vec<String>,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// P2P HANDLERS (ALL READ-ONLY)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// GET /p2p/status
+///
+/// Bootstrap subsystem summary: role, class, active peers, metrics.
+pub async fn p2p_status_handler<S: HealthStorage + Send + Sync + 'static>(
+    State(app): State<Arc<NodeAppState<S>>>,
+) -> Json<P2PStatusResp> {
+    let summary = app.peer_manager.as_ref().map(|pm| {
+        let mgr = pm.lock();
+        mgr.summary()
+    });
+
+    Json(P2PStatusResp {
+        enabled: app.peer_manager.is_some(),
+        summary,
+    })
+}
+
+/// GET /p2p/peers
+///
+/// List all active peers with scoring info.
+pub async fn p2p_peers_handler<S: HealthStorage + Send + Sync + 'static>(
+    State(app): State<Arc<NodeAppState<S>>>,
+) -> Json<P2PPeersResp> {
+    let (active_count, known_count, peers) = if let Some(ref pm) = app.peer_manager {
+        let mgr = pm.lock();
+        let now = now_secs();
+        let our_role = mgr.config().role;
+        let active: Vec<P2PPeerEntry> = mgr
+            .active_peers()
+            .map(|p| P2PPeerEntry {
+                address: p.socket_addr().to_string(),
+                role: p.role.map(|r| r.to_string()),
+                node_class: p.node_class.map(|c| c.to_string()),
+                score: p.score_with_role(now, Some(our_role)),
+                success_count: p.success_count,
+                failure_count: p.failure_count,
+                last_connected: p.last_connected,
+            })
+            .collect();
+        let active_count = active.len();
+        let known_count = mgr.store().len();
+        (active_count, known_count, active)
+    } else {
+        (0, 0, Vec::new())
+    };
+
+    Json(P2PPeersResp {
+        active_count,
+        known_count,
+        peers,
+    })
+}
+
+/// GET /p2p/store/stats
+///
+/// Peer store statistics breakdown by role, class, source.
+pub async fn p2p_store_stats_handler<S: HealthStorage + Send + Sync + 'static>(
+    State(app): State<Arc<NodeAppState<S>>>,
+) -> Json<P2PStoreStatsResp> {
+    let resp = if let Some(ref pm) = app.peer_manager {
+        let mgr = pm.lock();
+        let stats = mgr.store().stats();
+        P2PStoreStatsResp {
+            total: stats.total,
+            suspicious: stats.suspicious,
+            expired: stats.expired,
+            connected_24h: stats.connected_24h,
+            by_role: stats.by_role,
+            by_class: stats.by_class,
+            by_source: stats.by_source,
+        }
+    } else {
+        P2PStoreStatsResp {
+            total: 0,
+            suspicious: 0,
+            expired: 0,
+            connected_24h: 0,
+            by_role: Default::default(),
+            by_class: Default::default(),
+            by_source: Default::default(),
+        }
+    };
+
+    Json(resp)
+}
+
+/// GET /p2p/role
+///
+/// This node's role, class, and which roles it needs from peers.
+pub async fn p2p_role_handler<S: HealthStorage + Send + Sync + 'static>(
+    State(app): State<Arc<NodeAppState<S>>>,
+) -> Json<P2PRoleInfoResp> {
+    use crate::RoleDependencyMatrix;
+
+    let (our_role, our_class) = if let Some(ref pm) = app.peer_manager {
+        let mgr = pm.lock();
+        let cfg = mgr.config();
+        (cfg.role, cfg.node_class)
+    } else {
+        (NodeRole::StorageCompute, None)
+    };
+
+    let required_roles: Vec<String> = RoleDependencyMatrix::required_roles(our_role)
+        .into_iter()
+        .map(|r| r.to_string())
+        .collect();
+
+    Json(P2PRoleInfoResp {
+        our_role: our_role.to_string(),
+        our_class: our_class.map(|c| c.to_string()),
+        required_roles,
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -457,6 +668,11 @@ pub fn build_router<S: HealthStorage + Send + Sync + 'static>(
         // Metrics
         .route("/metrics", get(metrics_handler::<S>))
         .route("/metrics/prometheus", get(prometheus_handler::<S>))
+        // P2P / Bootstrap (Tahap 21)
+        .route("/p2p/status", get(p2p_status_handler::<S>))
+        .route("/p2p/peers", get(p2p_peers_handler::<S>))
+        .route("/p2p/store/stats", get(p2p_store_stats_handler::<S>))
+        .route("/p2p/role", get(p2p_role_handler::<S>))
         .with_state(app_state)
 }
 

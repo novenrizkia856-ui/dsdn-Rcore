@@ -55,6 +55,18 @@
 //! ### `dsdn-node store stats`
 //! Show local storage statistics.
 //!
+//! ### `dsdn-node p2p status [--port PORT]`
+//! Query P2P bootstrap subsystem status (role, peers, metrics).
+//!
+//! ### `dsdn-node p2p peers [--port PORT]`
+//! List active P2P peers with scoring info.
+//!
+//! ### `dsdn-node p2p role [--port PORT]`
+//! Show this node's role and peer dependency requirements.
+//!
+//! ### `dsdn-node p2p store-stats [--port PORT]`
+//! Show peer store statistics breakdown.
+//!
 //! ## Initialization Flow (run)
 //! 1. Load .env.mainnet (or custom env file)
 //! 2. Parse configuration (CLI or env)
@@ -62,9 +74,10 @@
 //! 4. Initialize DA layer with startup health check
 //! 5. Initialize storage (LocalFsStorage)
 //! 6. Initialize DA follower
-//! 7. Start gRPC storage server
-//! 8. Start HTTP server (Axum - observability + storage endpoints)
-//! 9. Start follower
+//! 7. Start P2P bootstrap system (Tahap 21)
+//! 8. Start gRPC storage server
+//! 9. Start HTTP server (Axum - observability + storage + P2P endpoints)
+//! 10. Start follower + P2P maintenance task
 
 use std::env;
 
@@ -154,6 +167,34 @@ async fn main() {
                     eprintln!("  stats                               Show storage statistics");
                     eprintln!("  send <grpc-addr> <file>             Send file chunks via gRPC");
                     eprintln!("  fetch <grpc-addr> <hash> [output]   Fetch chunk from remote");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        // ── p2p (Tahap 21) ──────────────────────────────────────────────
+        Some("p2p") => {
+            let p2p_sub = args.get(2).map(|s| s.as_str());
+            let p2p_args: Vec<String> = if args.len() > 3 {
+                args[3..].to_vec()
+            } else {
+                vec![]
+            };
+            let port = cli::parse_port_flag(&p2p_args);
+
+            match p2p_sub {
+                Some("status") => cli::cmd_p2p_status(port).await,
+                Some("peers") => cli::cmd_p2p_peers(port).await,
+                Some("role") => cli::cmd_p2p_role(port).await,
+                Some("store-stats") => cli::cmd_p2p_store_stats(port).await,
+                _ => {
+                    eprintln!("Usage: dsdn-node p2p <status|peers|role|store-stats> [--port PORT]");
+                    eprintln!();
+                    eprintln!("Subcommands:");
+                    eprintln!("  status       Bootstrap subsystem status (role, peers, metrics)");
+                    eprintln!("  peers        List active P2P peers with scores");
+                    eprintln!("  role         Show role dependency info (required/optional peers)");
+                    eprintln!("  store-stats  Peer store statistics breakdown");
                     std::process::exit(2);
                 }
             }

@@ -14,17 +14,22 @@ use axum::extract::{Path as AxumPath, State as AxumState};
 use axum::http::StatusCode;
 use axum::routing::{get, put as axum_put};
 use axum::{Json, Router};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use sha2::{Sha256, Digest};
 
 use dsdn_common::cid::sha256_hex;
 use dsdn_common::{CelestiaDA, DAConfig, DAError, DAHealthStatus, DALayer, MockDA};
 use dsdn_node::{
     DAInfo, HealthResponse, HealthStorage, NodeDerivedState, NodeHealth,
     NodeAppState, build_router,
+    // Tahap 21: Bootstrap / P2P integration
+    BootstrapConfig, BootstrapResult, PeerManager,
+    StdDnsResolver, TcpPeerConnector,
+    NodeRole, NodeClass,
 };
 use dsdn_storage::chunker;
 use dsdn_storage::localfs::LocalFsStorage;
@@ -54,6 +59,13 @@ pub(crate) struct NodeConfig {
     pub use_mock_da: bool,
     /// Configuration source (cli or env).
     pub config_source: String,
+    // ── P2P / Bootstrap (Tahap 21) ────────────────────────
+    /// Node operational role for P2P peer discovery.
+    pub role: NodeRole,
+    /// Node class (only for StorageCompute; None for Validator/Coordinator).
+    pub node_class: Option<NodeClass>,
+    /// Whether P2P bootstrap subsystem is enabled.
+    pub p2p_enabled: bool,
 }
 
 impl NodeConfig {
@@ -160,6 +172,10 @@ impl NodeConfig {
         // gRPC port: from env or http_port + offset
         let grpc_port = Self::resolve_grpc_port(http_port);
 
+        // P2P role/class from env (always — CLI mode shares env for P2P config)
+        let (role, node_class) = Self::resolve_role_class();
+        let p2p_enabled = Self::resolve_p2p_enabled();
+
         Ok(Self {
             node_id,
             da_config,
@@ -168,6 +184,9 @@ impl NodeConfig {
             grpc_port,
             use_mock_da,
             config_source: "cli".to_string(),
+            role,
+            node_class,
+            p2p_enabled,
         })
     }
 
@@ -213,6 +232,10 @@ impl NodeConfig {
         // gRPC port: from env or http_port + offset
         let grpc_port = Self::resolve_grpc_port(http_port);
 
+        // P2P role/class from env
+        let (role, node_class) = Self::resolve_role_class();
+        let p2p_enabled = Self::resolve_p2p_enabled();
+
         Ok(Self {
             node_id,
             da_config,
@@ -221,6 +244,9 @@ impl NodeConfig {
             grpc_port,
             use_mock_da,
             config_source: "env".to_string(),
+            role,
+            node_class,
+            p2p_enabled,
         })
     }
 
@@ -230,6 +256,46 @@ impl NodeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| http_port.saturating_add(DEFAULT_GRPC_PORT_OFFSET))
+    }
+
+    /// Resolve NodeRole + NodeClass from environment variables.
+    ///
+    /// Priority: `BOOTSTRAP_ROLE` / `BOOTSTRAP_NODE_CLASS` env vars.
+    /// Default: StorageCompute + Reguler.
+    ///
+    /// Auto-enforcement:
+    /// - Validator/Coordinator → node_class forced to None.
+    /// - StorageCompute without class → defaults to Reguler.
+    fn resolve_role_class() -> (NodeRole, Option<NodeClass>) {
+        let role = env::var("BOOTSTRAP_ROLE")
+            .ok()
+            .and_then(|s| NodeRole::from_str_tag(&s))
+            .unwrap_or(NodeRole::StorageCompute);
+
+        let node_class = if role.has_class() {
+            // StorageCompute: try to parse class, default to Reguler
+            Some(
+                env::var("BOOTSTRAP_NODE_CLASS")
+                    .ok()
+                    .and_then(|s| NodeClass::from_str_tag(&s))
+                    .unwrap_or(NodeClass::Reguler),
+            )
+        } else {
+            // Validator, Coordinator, Bootstrap → always None
+            None
+        };
+
+        (role, node_class)
+    }
+
+    /// Resolve whether P2P is enabled from env.
+    ///
+    /// Default: true (P2P is on by default).
+    /// Set `BOOTSTRAP_ENABLED=false` to disable.
+    fn resolve_p2p_enabled() -> bool {
+        env::var("BOOTSTRAP_ENABLED")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true)
     }
 
     /// Validate configuration.
@@ -257,6 +323,20 @@ impl NodeConfig {
             return Err(format!(
                 "HTTP port ({}) and gRPC port ({}) cannot be the same",
                 self.http_port, self.grpc_port
+            ));
+        }
+
+        // Validate role+class consistency (Tahap 21)
+        if self.role.has_class() && self.node_class.is_none() {
+            return Err(format!(
+                "Role {:?} requires a node_class (Reguler or DataCenter)",
+                self.role
+            ));
+        }
+        if !self.role.has_class() && self.node_class.is_some() {
+            return Err(format!(
+                "Role {:?} must not have a node_class (got {:?})",
+                self.role, self.node_class
             ));
         }
 
@@ -306,6 +386,28 @@ pub fn load_env_file() {
         }
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// P2P HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Convert a human-readable node_id string into a 32-byte identifier
+/// suitable for PeerManager. Uses SHA-256 hash.
+fn node_id_to_bytes(node_id: &str) -> [u8; 32] {
+    let hash = Sha256::digest(node_id.as_bytes());
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hash);
+    bytes
+}
+
+/// Interval between P2P maintenance cycles (peer GC + persist).
+const P2P_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+
+/// Interval between re-bootstrap attempts when peer count is low.
+const P2P_REBOOTSTRAP_INTERVAL_SECS: u64 = 300;
+
+/// Minimum active peers before triggering re-bootstrap.
+const P2P_MIN_ACTIVE_PEERS: usize = 1;
 
 // ════════════════════════════════════════════════════════════════════════════
 // NODE STORAGE BACKEND (wraps LocalFsStorage)
@@ -757,6 +859,12 @@ pub fn print_usage(prog: &str) {
     eprintln!("  {} store send <grpc-addr> <file>                      Send file chunks via gRPC", prog);
     eprintln!("  {} store fetch <grpc-addr> <hash> [output]            Fetch chunk from remote via gRPC", prog);
     eprintln!();
+    eprintln!("P2P commands (Tahap 21):");
+    eprintln!("  {} p2p status [--port PORT]                           P2P bootstrap status", prog);
+    eprintln!("  {} p2p peers  [--port PORT]                           List active P2P peers", prog);
+    eprintln!("  {} p2p role   [--port PORT]                           Show role dependency info", prog);
+    eprintln!("  {} p2p store-stats [--port PORT]                      Peer store statistics", prog);
+    eprintln!();
     eprintln!("Environment variables (env mode):");
     eprintln!("  NODE_ID             Unique node identifier (or 'auto')");
     eprintln!("  NODE_STORAGE_PATH   Storage directory path");
@@ -765,6 +873,12 @@ pub fn print_usage(prog: &str) {
     eprintln!("  DA_RPC_URL          Celestia light node RPC endpoint");
     eprintln!("  DA_NAMESPACE        58-character hex namespace");
     eprintln!("  DA_AUTH_TOKEN       Authentication token (required for mainnet)");
+    eprintln!();
+    eprintln!("P2P / Bootstrap (Tahap 21):");
+    eprintln!("  BOOTSTRAP_ROLE          Node role: storage-compute|validator|coordinator (default: storage-compute)");
+    eprintln!("  BOOTSTRAP_NODE_CLASS    Node class: reguler|datacenter (default: reguler, StorageCompute only)");
+    eprintln!("  BOOTSTRAP_ENABLED       Enable P2P (default: true, set 'false' to disable)");
+    eprintln!("  DSDN_CONFIG_FILE        Path to dsdn.toml for [bootstrap] config");
     eprintln!();
     eprintln!("Optional:");
     eprintln!("  DA_NETWORK              Network identifier (default: mainnet)");
@@ -809,6 +923,12 @@ pub fn cmd_info() {
     println!("DA_NETWORK:         {}", env::var("DA_NETWORK").unwrap_or_else(|_| "mainnet (default)".into()));
     println!("DA_AUTH_TOKEN:      {}", if env::var("DA_AUTH_TOKEN").is_ok() { "(set)" } else { "(not set)" });
     println!("USE_MOCK_DA:        {}", env::var("USE_MOCK_DA").unwrap_or_else(|_| "false".into()));
+    println!();
+    println!("── P2P / Bootstrap (Tahap 21) ──");
+    println!("BOOTSTRAP_ROLE:     {}", env::var("BOOTSTRAP_ROLE").unwrap_or_else(|_| "storage-compute (default)".into()));
+    println!("BOOTSTRAP_NODE_CLASS: {}", env::var("BOOTSTRAP_NODE_CLASS").unwrap_or_else(|_| "reguler (default)".into()));
+    println!("BOOTSTRAP_ENABLED:  {}", env::var("BOOTSTRAP_ENABLED").unwrap_or_else(|_| "true (default)".into()));
+    println!("DSDN_CONFIG_FILE:   {}", env::var("DSDN_CONFIG_FILE").unwrap_or_else(|_| "(auto-detect dsdn.toml)".into()));
     println!("═══════════════════════════════════════════════════════════════");
 }
 
@@ -1191,6 +1311,11 @@ pub async fn cmd_run(run_args: &[String]) {
             error!("  DSDN_ENV_FILE           - Custom env file path (default: .env.mainnet)");
             error!("  NODE_GRPC_PORT          - gRPC storage port (default: HTTP_PORT + 1000)");
             error!("  NODE_STORAGE_CAPACITY_GB - Storage capacity in GB (default: 100)");
+            error!("");
+            error!("P2P / Bootstrap (Tahap 21):");
+            error!("  BOOTSTRAP_ROLE          - storage-compute|validator|coordinator (default: storage-compute)");
+            error!("  BOOTSTRAP_NODE_CLASS    - reguler|datacenter (default: reguler)");
+            error!("  BOOTSTRAP_ENABLED       - true|false (default: true)");
             std::process::exit(1);
         }
     };
@@ -1218,6 +1343,9 @@ pub async fn cmd_run(run_args: &[String]) {
     info!("Storage Path: {}", config.storage_path);
     info!("HTTP Port:    {}", config.http_port);
     info!("gRPC Port:    {}", config.grpc_port);
+    info!("P2P Role:     {:?}", config.role);
+    info!("P2P Class:    {:?}", config.node_class);
+    info!("P2P Enabled:  {}", if config.p2p_enabled { "YES" } else { "NO" });
     info!("═══════════════════════════════════════════════════════════════");
 
     // Step 1: Initialize DA layer
@@ -1288,6 +1416,75 @@ pub async fn cmd_run(run_args: &[String]) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // ── Step 7.5: P2P Bootstrap System Init (Tahap 21) ─────────────────
+    let peer_manager: Option<Arc<Mutex<PeerManager>>> = if config.p2p_enabled {
+        info!("🔗 Initializing P2P bootstrap subsystem...");
+
+        // 7.5a: Load bootstrap config (dsdn.toml + env overrides)
+        let mut bootstrap_config = BootstrapConfig::load();
+
+        // 7.5b: Override role/class from NodeConfig (NodeConfig is authoritative)
+        bootstrap_config.role = config.role;
+        bootstrap_config.node_class = config.node_class;
+
+        // 7.5c: Place peers.dat alongside node storage
+        bootstrap_config.peers_file =
+            PathBuf::from(&config.storage_path).join("peers.dat");
+
+        // 7.5d: Validate role+class
+        if let Err(e) = bootstrap_config.validate_role_class() {
+            error!("❌ Bootstrap config invalid: {}", e);
+            std::process::exit(1);
+        }
+
+        if let Some(path) = bootstrap_config.loaded_from() {
+            info!("   Config:     {} (+ env overrides)", path.display());
+        } else {
+            info!("   Config:     defaults + env overrides");
+        }
+        info!("   Role:       {:?}", bootstrap_config.role);
+        info!("   Class:      {:?}", bootstrap_config.node_class);
+        info!("   Network:    {}", bootstrap_config.network_id);
+        info!("   P2P Port:   {}", bootstrap_config.p2p_port);
+        info!("   Peers file: {}", bootstrap_config.peers_file.display());
+        info!("   DNS seeds:  {}", bootstrap_config.dns_seeds.len());
+        info!("   Static:     {}", bootstrap_config.static_peers.len());
+
+        // 7.5e: Create PeerManager with real transport
+        let node_id_bytes = node_id_to_bytes(&config.node_id);
+        let dns_resolver = StdDnsResolver::new(bootstrap_config.dns_timeout_secs);
+        let tcp_connector = TcpPeerConnector::new(
+            bootstrap_config.connect_timeout_secs,
+            bootstrap_config.connect_timeout_secs * 2, // handshake timeout = 2× connect
+        );
+        let mut mgr = PeerManager::new(
+            bootstrap_config,
+            node_id_bytes,
+            Box::new(dns_resolver),
+            Box::new(tcp_connector),
+        );
+
+        // 7.5f: Run initial bootstrap attempt
+        let result = mgr.bootstrap();
+        match &result {
+            BootstrapResult::Connected { peer_count, source } => {
+                info!("   ✅ Bootstrap: {} peers from {}", peer_count, source);
+            }
+            BootstrapResult::NoPeersAvailable { summary } => {
+                warn!("   ⚠️ Bootstrap: no peers — {}", summary);
+                warn!("      Configure DNS seeds or static peers in dsdn.toml or env");
+            }
+            BootstrapResult::Skipped { reason } => {
+                info!("   ℹ️ Bootstrap skipped: {}", reason);
+            }
+        }
+
+        Some(Arc::new(Mutex::new(mgr)))
+    } else {
+        info!("🔗 P2P bootstrap: DISABLED (BOOTSTRAP_ENABLED=false)");
+        None
+    };
+
     // Step 8: Build NodeAppState for Axum handlers
     let app_state = Arc::new(NodeAppState {
         node_id: config.node_id.clone(),
@@ -1297,9 +1494,10 @@ pub async fn cmd_run(run_args: &[String]) {
         start_time,
         da_network: config.da_config.network.clone(),
         da_endpoint: config.da_config.rpc_url.clone(),
+        peer_manager: peer_manager.clone(),
     });
 
-    // Step 9: Build combined router (observability + storage data plane)
+    // Step 9: Build combined router (observability + storage + P2P data plane)
     let observability_router = build_router(app_state);
 
     let storage_http_state = Arc::new(StorageHttpState {
@@ -1359,6 +1557,14 @@ pub async fn cmd_run(run_args: &[String]) {
     info!("╠═══════════════════════════════════════════════════════════════╣");
     info!("║  Storage:  gRPC  → 0.0.0.0:{}                            ║", config.grpc_port);
     info!("║            HTTP  → 0.0.0.0:{}/storage/*                  ║", config.http_port);
+    info!("║  P2P:      {:?} {:?}{}║",
+        config.role,
+        config.node_class,
+        " ".repeat(37usize.saturating_sub(
+            format!("{:?} {:?}", config.role, config.node_class).len()
+        )),
+    );
+    info!("║  Observe:  /p2p/status  /p2p/peers  /p2p/role             ║");
     info!("╚═══════════════════════════════════════════════════════════════╝");
     info!("");
 
@@ -1427,6 +1633,65 @@ pub async fn cmd_run(run_args: &[String]) {
         })
     };
 
+    // ── Step 13: P2P Maintenance Background Task (Tahap 21) ──────────
+    let p2p_handle = if let Some(ref pm) = peer_manager {
+        let pm = pm.clone();
+        let shutdown = shutdown.clone();
+
+        Some(tokio::spawn(async move {
+            info!("🔗 P2P maintenance task started");
+            let mut last_gc = Instant::now();
+            let mut last_rebootstrap = Instant::now();
+
+            loop {
+                tokio::select! {
+                    _ = shutdown.notified() => {
+                        // Persist peer store on shutdown
+                        let mut mgr = pm.lock();
+                        mgr.persist_store();
+                        info!("P2P maintenance shutting down (peers persisted)");
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        // ── Periodic GC (every P2P_MAINTENANCE_INTERVAL_SECS) ──
+                        if last_gc.elapsed().as_secs() >= P2P_MAINTENANCE_INTERVAL_SECS {
+                            last_gc = Instant::now();
+                            let mut mgr = pm.lock();
+                            let removed = mgr.gc();
+                            if removed > 0 {
+                                info!("P2P GC: removed {} expired/suspicious peers", removed);
+                            }
+                            mgr.persist_store();
+                        }
+
+                        // ── Re-bootstrap if too few peers ──
+                        if last_rebootstrap.elapsed().as_secs() >= P2P_REBOOTSTRAP_INTERVAL_SECS {
+                            last_rebootstrap = Instant::now();
+                            let mut mgr = pm.lock();
+                            if mgr.active_peer_count() < P2P_MIN_ACTIVE_PEERS {
+                                info!("P2P: active peers below minimum, re-bootstrapping...");
+                                let result = mgr.bootstrap();
+                                match &result {
+                                    BootstrapResult::Connected { peer_count, source } => {
+                                        info!("P2P re-bootstrap: {} peers from {}", peer_count, source);
+                                    }
+                                    BootstrapResult::NoPeersAvailable { .. } => {
+                                        warn!("P2P re-bootstrap: still no peers");
+                                    }
+                                    BootstrapResult::Skipped { reason } => {
+                                        info!("P2P re-bootstrap skipped: {}", reason);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Wait for shutdown signal (Ctrl+C)
     info!("Node running. Press Ctrl+C to shutdown.");
     match tokio::signal::ctrl_c().await {
@@ -1445,10 +1710,102 @@ pub async fn cmd_run(run_args: &[String]) {
     let _ = http_handle.await;
     let _ = grpc_handle.await;
     let _ = follower_handle.await;
+    if let Some(handle) = p2p_handle {
+        let _ = handle.await;
+    }
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("                    Node stopped cleanly                       ");
     info!("═══════════════════════════════════════════════════════════════");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// P2P CLI SUBCOMMANDS (Tahap 21)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Execute `p2p status` subcommand — query running node's P2P status via HTTP.
+pub async fn cmd_p2p_status(port: u16) {
+    let url = format!("http://127.0.0.1:{}/p2p/status", port);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.text().await {
+                Ok(body) => {
+                    // Pretty-print JSON
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or(body));
+                    } else {
+                        println!("{}", body);
+                    }
+                }
+                Err(e) => eprintln!("Failed to read response: {}", e),
+            }
+        }
+        Ok(resp) => eprintln!("P2P status request failed: HTTP {}", resp.status()),
+        Err(e) => eprintln!("Cannot connect to node at {}: {}", url, e),
+    }
+}
+
+/// Execute `p2p peers` subcommand — list active peers.
+pub async fn cmd_p2p_peers(port: u16) {
+    let url = format!("http://127.0.0.1:{}/p2p/peers", port);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.text().await {
+                Ok(body) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or(body));
+                    } else {
+                        println!("{}", body);
+                    }
+                }
+                Err(e) => eprintln!("Failed to read response: {}", e),
+            }
+        }
+        Ok(resp) => eprintln!("P2P peers request failed: HTTP {}", resp.status()),
+        Err(e) => eprintln!("Cannot connect to node at {}: {}", url, e),
+    }
+}
+
+/// Execute `p2p role` subcommand — show this node's role dependency info.
+pub async fn cmd_p2p_role(port: u16) {
+    let url = format!("http://127.0.0.1:{}/p2p/role", port);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.text().await {
+                Ok(body) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or(body));
+                    } else {
+                        println!("{}", body);
+                    }
+                }
+                Err(e) => eprintln!("Failed to read response: {}", e),
+            }
+        }
+        Ok(resp) => eprintln!("P2P role request failed: HTTP {}", resp.status()),
+        Err(e) => eprintln!("Cannot connect to node at {}: {}", url, e),
+    }
+}
+
+/// Execute `p2p store-stats` subcommand — show peer store statistics.
+pub async fn cmd_p2p_store_stats(port: u16) {
+    let url = format!("http://127.0.0.1:{}/p2p/store/stats", port);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.text().await {
+                Ok(body) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or(body));
+                    } else {
+                        println!("{}", body);
+                    }
+                }
+                Err(e) => eprintln!("Failed to read response: {}", e),
+            }
+        }
+        Ok(resp) => eprintln!("P2P store stats request failed: HTTP {}", resp.status()),
+        Err(e) => eprintln!("Cannot connect to node at {}: {}", url, e),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1470,6 +1827,9 @@ mod tests {
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
+            p2p_enabled: true,
         };
         assert!(config.validate().is_err());
     }
@@ -1484,6 +1844,9 @@ mod tests {
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
+            p2p_enabled: true,
         };
         assert!(config.validate().is_err());
     }
@@ -1498,6 +1861,9 @@ mod tests {
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
+            p2p_enabled: true,
         };
         assert!(config.validate().is_err());
     }
@@ -1512,6 +1878,9 @@ mod tests {
             grpc_port: 45831,
             use_mock_da: true,
             config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
+            p2p_enabled: true,
         };
         assert!(config.validate().is_err());
     }
@@ -1526,6 +1895,9 @@ mod tests {
             grpc_port: 9080,
             use_mock_da: true,
             config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
+            p2p_enabled: true,
         };
         assert!(config.validate().is_ok());
     }
@@ -1736,5 +2108,117 @@ mod tests {
     fn test_hex_preview() {
         assert_eq!(hex_preview(&[0xab, 0xcd, 0xef], 10), "abcdef");
         assert_eq!(hex_preview(&[0xab, 0xcd, 0xef], 2), "abcd...");
+    }
+
+    // ── P2P / Bootstrap Tests (Tahap 21) ─────────────────────────────
+
+    #[test]
+    fn test_node_id_to_bytes() {
+        let bytes = node_id_to_bytes("test-node-1");
+        assert_eq!(bytes.len(), 32);
+        // Deterministic: same input → same output
+        assert_eq!(bytes, node_id_to_bytes("test-node-1"));
+        // Different input → different output
+        assert_ne!(bytes, node_id_to_bytes("test-node-2"));
+    }
+
+    #[test]
+    fn test_resolve_role_class_defaults() {
+        // Ensure env is clean
+        env::remove_var("BOOTSTRAP_ROLE");
+        env::remove_var("BOOTSTRAP_NODE_CLASS");
+
+        let (role, class) = NodeConfig::resolve_role_class();
+        assert_eq!(role, NodeRole::StorageCompute);
+        assert_eq!(class, Some(NodeClass::Reguler));
+    }
+
+    #[test]
+    fn test_resolve_role_class_validator() {
+        env::set_var("BOOTSTRAP_ROLE", "validator");
+        env::remove_var("BOOTSTRAP_NODE_CLASS");
+
+        let (role, class) = NodeConfig::resolve_role_class();
+        assert_eq!(role, NodeRole::Validator);
+        assert_eq!(class, None); // Validator has no class
+
+        env::remove_var("BOOTSTRAP_ROLE");
+    }
+
+    #[test]
+    fn test_resolve_role_class_datacenter() {
+        env::set_var("BOOTSTRAP_ROLE", "storage-compute");
+        env::set_var("BOOTSTRAP_NODE_CLASS", "datacenter");
+
+        let (role, class) = NodeConfig::resolve_role_class();
+        assert_eq!(role, NodeRole::StorageCompute);
+        assert_eq!(class, Some(NodeClass::DataCenter));
+
+        env::remove_var("BOOTSTRAP_ROLE");
+        env::remove_var("BOOTSTRAP_NODE_CLASS");
+    }
+
+    #[test]
+    fn test_resolve_p2p_enabled_default() {
+        env::remove_var("BOOTSTRAP_ENABLED");
+        assert!(NodeConfig::resolve_p2p_enabled());
+    }
+
+    #[test]
+    fn test_resolve_p2p_enabled_false() {
+        env::set_var("BOOTSTRAP_ENABLED", "false");
+        assert!(!NodeConfig::resolve_p2p_enabled());
+        env::remove_var("BOOTSTRAP_ENABLED");
+    }
+
+    #[test]
+    fn test_validate_role_class_ok() {
+        let config = NodeConfig {
+            node_id: "test".to_string(),
+            da_config: DAConfig::default(),
+            storage_path: "./data".to_string(),
+            http_port: 45831,
+            grpc_port: 9080,
+            use_mock_da: true,
+            config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: Some(NodeClass::Reguler),
+            p2p_enabled: true,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_class_validator_with_class_rejected() {
+        let config = NodeConfig {
+            node_id: "test".to_string(),
+            da_config: DAConfig::default(),
+            storage_path: "./data".to_string(),
+            http_port: 45831,
+            grpc_port: 9080,
+            use_mock_da: true,
+            config_source: "test".to_string(),
+            role: NodeRole::Validator,
+            node_class: Some(NodeClass::Reguler), // Invalid!
+            p2p_enabled: true,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_role_class_storage_without_class_rejected() {
+        let config = NodeConfig {
+            node_id: "test".to_string(),
+            da_config: DAConfig::default(),
+            storage_path: "./data".to_string(),
+            http_port: 45831,
+            grpc_port: 9080,
+            use_mock_da: true,
+            config_source: "test".to_string(),
+            role: NodeRole::StorageCompute,
+            node_class: None, // Invalid for StorageCompute!
+            p2p_enabled: true,
+        };
+        assert!(config.validate().is_err());
     }
 }
