@@ -63,6 +63,45 @@
 //! | [`committed_execution`] | `exec_committed` — async wrapper producing [`VmExecutionResult`] (14C.B.9) |
 //! | [`firecracker_vm`] | Firecracker microVM backend (skeleton + committed execution placeholder, 14C.B.10) |
 //! | [`mock_vm`] | Process-based mock VM for testing |
+//!
+//! ## Determinism Verification (14C.B.11)
+//!
+//! The critical fraud-proof invariant is verified by integration tests
+//! in `tests/commitment_tests.rs`:
+//!
+//! **Commitment-critical fields are fully deterministic:**
+//! - `input_hash` — `hash_input` (SHA3-256, `DSDN:wasm_input:v1:`)
+//! - `output_hash` — `hash_output` (SHA3-256, `DSDN:wasm_output:v1:`)
+//! - `state_root_before` — `SHA3-256(DSDN:vm_state:v1:before: || input)`
+//! - `state_root_after` — `SHA3-256(DSDN:vm_state:v1:after: || stdout)`
+//! - `execution_trace_merkle_root` — `compute_trace_merkle_root` (binary SHA3-256)
+//! - `commitment_hash()` — `ExecutionCommitment::compute_hash`
+//!
+//! **Operational fields are NOT commitment-critical:**
+//! - `execution_time_ms` — wall-clock, varies between runs
+//! - `cpu_cycles_estimate` — derived from wall-clock
+//! - `stderr` — VM process error output
+//! - `exit_code` — VM process exit status
+//!
+//! **Error path guarantee:** If `exec()` fails, no partial
+//! `VmExecutionResult` is ever constructed.
+//!
+//! **Cross-runtime guarantee:** `hash_input` and `hash_output` produce
+//! byte-identical hashes to `runtime_wasm::state_capture` for the same
+//! data. `compute_trace_merkle_root` is byte-identical to both
+//! `runtime_wasm::merkle` and the coordinator.
+//!
+//! ## Test Coverage
+//!
+//! | Location | Tests | Scope |
+//! |----------|-------|-------|
+//! | `execution_result.rs` (unit) | 10 | Struct, clone, Send/Sync, commitment bridge |
+//! | `merkle.rs` (unit) | 6 | Empty, single, even, odd, determinism 100x, order |
+//! | `state_capture.rs` (unit) | 6 | Domain separation, determinism 100x, prefix bytes |
+//! | `committed_execution.rs` (unit) | 10 | Full pipeline, hash consistency, error propagation |
+//! | `tests/commitment_tests.rs` (integration) | 12 | Determinism 10x, cross-runtime, Firecracker placeholder |
+//!
+//! Total: 44 tests.
 
 /// Firecracker microVM backend (skeleton).
 ///
