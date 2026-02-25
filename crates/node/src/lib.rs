@@ -846,6 +846,20 @@
 //! propagated directly. [`MockChainTransport`] enables deterministic
 //! testing without chain access.
 //!
+//! ## RewardOrchestrator — Full Pipeline (14C.B.18)
+//!
+//! [`RewardOrchestrator`] is the glue layer that integrates all subsystems
+//! into a single sequential pipeline:
+//!
+//! ```text
+//! execute → proof → coordinator → receipt → chain → status update
+//! ```
+//!
+//! Each component remains modular and independently testable. The
+//! orchestrator does NOT perform cryptography, retry, or network I/O —
+//! it delegates to trait-abstracted subsystems. State consistency is
+//! maintained: receipt status is only updated after chain response.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -882,6 +896,7 @@ pub mod usage_proof_builder;
 pub mod coordinator_client;
 pub mod receipt_handler;
 pub mod chain_submitter;
+pub mod reward_orchestrator;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -929,3 +944,4 @@ pub use chain_submitter::{
     ChainSubmitter, ChainTransport, MockChainTransport,
     ClaimRewardRequest, ClaimRewardResponse, ChainSubmitError,
 };
+pub use reward_orchestrator::{RewardOrchestrator, OrchestratorError};
