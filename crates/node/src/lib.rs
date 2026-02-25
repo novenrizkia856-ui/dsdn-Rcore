@@ -824,6 +824,28 @@
 //! by `CoordinatorSubmitter`. `pending_submission()` returns validated
 //! receipts sorted by `received_at` ascending (deterministic).
 //!
+//! ## ChainSubmitter — On-Chain Reward Claim (14C.B.17)
+//!
+//! [`ChainSubmitter`] submits [`ClaimRewardRequest`] to the blockchain
+//! for reward settlement via a trait-abstracted [`ChainTransport`]:
+//!
+//! ```text
+//! ReceiptV1Proto + submitter_address
+//!      │
+//!      ▼
+//! ChainSubmitter::submit_claim()
+//!      │
+//!      ▼
+//! dyn ChainTransport (trait object)
+//!      │
+//!      ▼
+//! ClaimRewardResponse { Success | Rejected | ChallengePeriod }
+//! ```
+//!
+//! No implicit retry. No response transformation. Transport errors
+//! propagated directly. [`MockChainTransport`] enables deterministic
+//! testing without chain access.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -859,6 +881,7 @@ pub mod workload_executor;
 pub mod usage_proof_builder;
 pub mod coordinator_client;
 pub mod receipt_handler;
+pub mod chain_submitter;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -901,4 +924,8 @@ pub use coordinator_client::{
 };
 pub use receipt_handler::{
     ReceiptHandler, ReceiptStatus, StoredReceipt, ReceiptHandlerError,
+};
+pub use chain_submitter::{
+    ChainSubmitter, ChainTransport, MockChainTransport,
+    ClaimRewardRequest, ClaimRewardResponse, ChainSubmitError,
 };
