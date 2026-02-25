@@ -860,6 +860,43 @@
 //! it delegates to trait-abstracted subsystems. State consistency is
 //! maintained: receipt status is only updated after chain response.
 //!
+//! ## Separation of Concerns
+//!
+//! Each pipeline stage is handled by an independent, testable module:
+//!
+//! | Stage | Module | Responsibility |
+//! |-------|--------|----------------|
+//! | Execute | `workload_executor` | Dispatch to WASM/VM runtime |
+//! | Proof | `usage_proof_builder` | Ed25519-signed resource attestation |
+//! | Coordinator | `coordinator_client` | Receipt request via trait transport |
+//! | Receipt | `receipt_handler` | Storage, validation, lifecycle |
+//! | Chain | `chain_submitter` | Reward claim via trait transport |
+//! | Orchestrate | `reward_orchestrator` | Pipeline glue only |
+//!
+//! **Determinism**: Given identical inputs and mock transports, the pipeline
+//! produces identical outputs. No system clock, no randomness, no implicit retry.
+//!
+//! ## Integration Test Coverage (14C.B.19)
+//!
+//! `tests/reward_pipeline_tests.rs` provides 20 end-to-end tests covering:
+//!
+//! - Full pipeline success (storage via both `process_workload` and
+//!   `process_storage_workload`)
+//! - Compute runtime errors (WASM empty module, VM not available)
+//! - Coordinator response handling (Signed, Rejected, Pending)
+//! - Chain response handling (Success, Rejected, ChallengePeriod)
+//! - Atomicity: chain failure leaves receipt in `Validated` status
+//! - Usage proof Ed25519 signature verification
+//! - Receipt duplicate rejection and lifecycle transitions
+//! - Timeout propagation via custom transport
+//! - Storage vs compute metric differentiation
+//! - Determinism: 10x identical inputs → identical signatures
+//! - Sequential multi-workload processing
+//! - Error display for all `OrchestratorError` variants
+//!
+//! All tests use `MockCoordinatorTransport` and `MockChainTransport`.
+//! Zero network, zero sleep, zero randomness.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator

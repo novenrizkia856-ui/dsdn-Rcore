@@ -301,6 +301,16 @@ impl RewardOrchestrator {
         self.handle_coordinator_response(coordinator_response, timestamp).await
     }
 
+    /// Returns a reference to the internal [`ReceiptHandler`] for status
+    /// inspection.
+    ///
+    /// Primarily used in integration tests to verify receipt lifecycle
+    /// transitions after pipeline execution.
+    #[must_use]
+    pub fn receipt_handler(&self) -> &ReceiptHandler {
+        &self.receipt_handler
+    }
+
     /// Common handler for coordinator response: store receipt, submit to
     /// chain, update status.
     ///
