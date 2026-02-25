@@ -200,24 +200,31 @@
 //!
 //! # Modules
 //!
-//! | Module              | Description                                          |
-//! |---------------------|------------------------------------------------------|
-//! | `da_follower`       | DA subscription, event processing, source transitions|
-//! | `event_processor`   | Event handling logic with fallback detection         |
-//! | `placement_verifier`| Placement verification                               |
-//! | `delete_handler`    | Delete request handling                              |
-//! | `state_sync`        | State synchronization                                |
-//! | `health`            | Health reporting with fallback awareness and identity extension (14B.48) |
-//! | `multi_da_source`   | Multi-DA source abstraction (Primary/Secondary/Emergency) |
-//! | `metrics`           | Node fallback metrics for Prometheus export          |
-//! | `identity_manager`  | Ed25519 keypair management and identity proof construction (14B.41) |
-//! | `identity_persistence`| Secure disk persistence for Ed25519 keys and operator addresses (14B.47) |
-//! | `tls_manager`       | TLS certificate loading, generation, and fingerprint computation (14B.42) |
-//! | `join_request`      | Join request builder with validation and deterministic proof construction (14B.43) |
-//! | `status_tracker`    | Node-side lifecycle state machine with transition validation and audit history (14B.44) |
-//! | `quarantine_handler`| Quarantine notification processing, duration tracking, and recovery eligibility (14B.45) |
-//! | `rejoin_manager`    | Re-join eligibility, request building, and coordinator response handling (14B.46) |
-//! | `status_notification`| Status notification processing, DA gating event handling, and lifecycle transitions (14B.49) |
+//! | Module                | Responsibility                                         | Key Dependencies         |
+//! |-----------------------|--------------------------------------------------------|--------------------------|
+//! | `da_follower`         | DA subscription, event processing, source transitions  | `multi_da_source`        |
+//! | `delete_handler`      | Delete request handling with quarantine awareness       | —                        |
+//! | `event_processor`     | Event handling logic with fallback detection            | `da_follower`            |
+//! | `handlers`            | HTTP API routes and application state                  | `health`, `metrics`      |
+//! | `health`              | Health reporting with fallback awareness & identity     | `identity_manager`       |
+//! | `identity_manager`    | Ed25519 keypair management and identity proofs (14B.41) | `ed25519-dalek`         |
+//! | `identity_persistence`| Secure disk persistence for Ed25519 keys (14B.47)      | `identity_manager`       |
+//! | `join_request`        | Join request builder with validation (14B.43)          | `identity_manager`, `tls_manager` |
+//! | `metrics`             | Node fallback metrics for Prometheus export             | —                        |
+//! | `multi_da_source`     | Multi-DA source abstraction (Primary/Secondary/Emergency) | —                     |
+//! | `placement_verifier`  | Placement verification against coordinator instructions | —                        |
+//! | `quarantine_handler`  | Quarantine processing and recovery eligibility (14B.45) | `status_tracker`         |
+//! | `rejoin_manager`      | Re-join eligibility and request building (14B.46)       | `identity_manager`, `tls_manager` |
+//! | `state_sync`          | State synchronization across DA sources                 | —                        |
+//! | `status_notification` | Status notification processing and lifecycle events (14B.49) | `status_tracker`    |
+//! | `status_tracker`      | Node lifecycle state machine with audit history (14B.44) | —                       |
+//! | `tls_manager`         | TLS certificate loading, generation, fingerprints (14B.42) | `rcgen`, `x509-parser` |
+//! | `workload_executor`   | Stateless runtime dispatch to WASM/VM (14C.B.13)       | `dsdn_runtime_wasm`      |
+//! | `usage_proof_builder` | Ed25519-signed resource usage proofs (14C.B.14)         | `identity_manager`, `sha3` |
+//! | `coordinator_client`  | Receipt submission via trait transport (14C.B.15)       | `async-trait`            |
+//! | `receipt_handler`     | Receipt storage, validation, lifecycle (14C.B.16)       | `dsdn_common`            |
+//! | `chain_submitter`     | On-chain reward claim via trait transport (14C.B.17)    | `async-trait`            |
+//! | `reward_orchestrator` | Full pipeline glue: execute→proof→coord→receipt→chain (14C.B.18) | all above        |
 //!
 //! # Node Identity & Gating (14B)
 //!
@@ -712,7 +719,202 @@
 //! - On error, no state is changed (atomic: success or no-op).
 //! - Quarantine metadata is cleared on transition away from Quarantined.
 //!
-//! ## WorkloadExecutor — Runtime Dispatch (14C.B.13)
+//! # Reward Pipeline (14C.B.13–14C.B.19)
+//!
+//! The node implements a complete reward pipeline from workload execution
+//! through on-chain reward claiming. The pipeline is composed of six
+//! independent modules coordinated by [`RewardOrchestrator`].
+//!
+//! ## Pipeline ASCII Diagram
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                    REWARD PIPELINE                       │
+//! │                                                          │
+//! │  WorkloadAssignment                                      │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  WorkloadExecutor ── runtime_wasm / runtime_vm           │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  ExecutionCommitment (compute only)                      │
+//! │  UnifiedResourceUsage                                    │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  UsageProofBuilder ── Ed25519 sign                       │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  CoordinatorSubmitter ── ReceiptRequest                  │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  ReceiptHandler ── validate + store                      │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  ChainSubmitter ── ClaimReward tx                        │
+//! │       │                                                  │
+//! │       ▼                                                  │
+//! │  RewardOrchestrator ── full pipeline glue                │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Cross-Crate Dependency Diagram
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────┐
+//! │                    node crate                               │
+//! │                                                             │
+//! │  WorkloadExecutor ──┬── dsdn_runtime_wasm (internal crate) │
+//! │                     └── dsdn_runtime_vm  (internal crate)  │
+//! │                                                             │
+//! │  UsageProofBuilder ──── dsdn_common::coordinator::WorkloadId│
+//! │                         ed25519-dalek, sha3                 │
+//! │                                                             │
+//! │  CoordinatorSubmitter ── async-trait                        │
+//! │       │                  dsdn_common::receipt_v1_convert    │
+//! │       │                                                     │
+//! │  ReceiptHandler ──────── dsdn_common::receipt_v1_convert   │
+//! │                          dsdn_common::ExecutionCommitment  │
+//! │                                                             │
+//! │  ChainSubmitter ───────── async-trait                       │
+//! │                           dsdn_common::receipt_v1_convert  │
+//! │                                                             │
+//! │  RewardOrchestrator ──── (all above, no external deps)     │
+//! └────────────────────────────────────────────────────────────┘
+//!          │                              │
+//!          ▼                              ▼
+//!  ┌──────────────────┐    ┌────────────────────────┐
+//!  │ Coordinator       │    │ Chain                   │
+//!  │ (external system) │    │ (external system)       │
+//!  │                   │    │                          │
+//!  │ Receives:         │    │ Receives:                │
+//!  │  ReceiptRequest   │    │  ClaimRewardRequest      │
+//!  │                   │    │                          │
+//!  │ Returns:          │    │ Returns:                 │
+//!  │  ReceiptResponse  │    │  ClaimRewardResponse     │
+//!  │  {Signed|Rejected │    │  {Success|Rejected       │
+//!  │   |Pending}       │    │   |ChallengePeriod}     │
+//!  └──────────────────┘    └────────────────────────┘
+//! ```
+//!
+//! **Internal crates**: `dsdn_runtime_wasm`, `dsdn_runtime_vm`, `dsdn_common`
+//! are compiled as Cargo workspace members. **External systems**: Coordinator
+//! and Chain are accessed only via trait-abstracted transports
+//! ([`CoordinatorTransport`], [`ChainTransport`]). The node never makes
+//! direct network calls — all I/O is behind trait objects.
+//!
+//! ## Storage vs Compute Flow Comparison
+//!
+//! ```text
+//! COMPUTE (WASM/VM)                     STORAGE
+//! ─────────────────                     ───────
+//! WorkloadAssignment                    WorkloadAssignment
+//!      │                                     │
+//!      ▼                                     ▼
+//! WorkloadExecutor                      WorkloadExecutor
+//!   ├─ WASM: run_wasm_committed()         └─ No runtime call
+//!   └─ VM: RuntimeNotAvailable (V1)         commitment = None
+//!      │                                     resource_usage = zeros
+//!      ▼                                     │
+//! ExecutionCommitment (Some)                 ▼
+//! UnifiedResourceUsage (nonzero)        UsageProofBuilder
+//!      │                                  (cpu_cycles=0, ram_bytes=0,
+//!      ▼                                   chunk_count, bandwidth_bytes
+//! UsageProofBuilder                        from parameters)
+//!      │                                     │
+//!      ▼                                     ▼
+//! ReceiptRequest                        ReceiptRequest
+//!   execution_commitment: Some(...)       execution_commitment: None
+//!   workload_type: ComputeWasm/Vm         workload_type: Storage
+//!      │                                     │
+//!      └─────────────┬───────────────────────┘
+//!                     ▼
+//!              (same pipeline)
+//!         Coordinator → Receipt → Chain
+//! ```
+//!
+//! Key differences:
+//!
+//! - **Compute**: Produces `ExecutionCommitment` with state/input/output
+//!   hashes for fraud-proof verification. Resource metrics reflect actual
+//!   CPU/memory consumption.
+//! - **Storage**: No runtime execution. `ExecutionCommitment` is `None`.
+//!   Resource metrics are zero except `chunk_count` and `bandwidth_bytes`
+//!   which are provided by the caller.
+//! - **`process_storage_workload()`**: Dedicated method on
+//!   [`RewardOrchestrator`] that skips `WorkloadExecutor` entirely and
+//!   constructs `UnifiedResourceUsage` directly from parameters.
+//!
+//! ## Relationship to Coordinator Pipeline (CO.1–CO.9)
+//!
+//! The node and coordinator have complementary but separate roles:
+//!
+//! ```text
+//! NODE (this crate)              COORDINATOR (coordinator crate)
+//! ─────────────────              ────────────────────────────────
+//! Builds UsageProof        ───►  verify_usage_proof()
+//!   (Ed25519 sign)                 (Ed25519 verify)
+//!                                  (signing message byte-identical)
+//!
+//! Sends ReceiptRequest     ───►  Validates proof + commitment
+//!   (proof + commitment)           Signs ReceiptV1Proto
+//!                                  Returns Signed/Rejected/Pending
+//!
+//! Receives ReceiptV1Proto  ◄───  Coordinator-signed receipt
+//!   Stores in ReceiptHandler       (threshold signature)
+//!
+//! Submits to Chain         ───►  Chain verifies receipt
+//!   (ClaimRewardRequest)           Distributes reward
+//! ```
+//!
+//! **Node does NOT**:
+//!
+//! - Verify its own usage proofs (the coordinator does this).
+//! - Validate the coordinator's threshold signature (the chain does this).
+//! - Determine reward amounts (the chain calculates from `reward_base`).
+//! - Retry failed submissions (the orchestration caller decides).
+//!
+//! **Signing message byte-identity**: The 148-byte signing message built by
+//! `UsageProofBuilder::build_usage_proof()` MUST be byte-identical to
+//! `build_signing_message()` in `coordinator/execution/usage_verifier.rs`.
+//! Domain: `b"DSDN:usage_proof:v1:"` (20 bytes), followed by workload_id (32),
+//! node_id (32), cpu_cycles LE (8), ram_bytes LE (8), chunk_count LE (8),
+//! bandwidth_bytes LE (8), SHA3-256(proof_data) (32). Total: 148 bytes.
+//!
+//! ## Determinism Guarantees
+//!
+//! The reward pipeline is designed to be fully deterministic:
+//!
+//! 1. **ExecutionCommitment**: For WASM workloads, `run_wasm_committed()`
+//!    produces deterministic state/input/output hashes. Same module + same
+//!    input = same commitment. VM committed execution is V2.
+//!
+//! 2. **UsageProof signing**: Ed25519 signatures are deterministic (RFC 8032).
+//!    Same keypair + same 148-byte message = same 64-byte signature.
+//!    Verified by integration test `determinism_same_input_same_proof_10x`.
+//!
+//! 3. **No implicit retry**: Every pipeline method performs exactly one
+//!    attempt. `RewardOrchestrator` delegates errors immediately.
+//!    Retry policy belongs to the caller.
+//!
+//! 4. **No randomness**: No random number generation anywhere in the
+//!    pipeline. Mock transports return responses in FIFO order.
+//!
+//! 5. **No timestamp injection**: All timestamps are caller-provided
+//!    parameters (`timestamp: u64`). The pipeline never calls
+//!    `SystemTime::now()` or any clock source.
+//!
+//! 6. **Explicit state transitions**: Receipt status changes only via
+//!    `ReceiptHandler::update_status()` with a caller-specified new status.
+//!    Status is only updated AFTER successful chain response — if chain
+//!    submission fails, the receipt remains in `Validated` status.
+//!
+//! 7. **Deterministic ordering**: `ReceiptHandler::pending_submission()`
+//!    sorts results by `received_at` ascending, regardless of HashMap
+//!    iteration order.
+//!
+//! ## Pipeline Module Details
+//!
+//! ### WorkloadExecutor — Runtime Dispatch (14C.B.13)
 //!
 //! [`WorkloadExecutor`] is a stateless dispatcher that routes
 //! [`WorkloadAssignment`] to the appropriate runtime backend:
@@ -728,28 +930,14 @@
 //! ExecutionOutput { commitment, resource_usage, stdout }
 //! ```
 //!
-//! ### Stateless Design
-//!
 //! `WorkloadExecutor` holds no state. All inputs come from `WorkloadAssignment`.
-//! The executor maps runtime-specific results to a unified `ExecutionOutput`
-//! with `UnifiedResourceUsage` and optional `ExecutionCommitment`.
-//!
-//! ### Error Mapping
-//!
 //! Runtime errors are mapped to `ExecutionError` variants (`WasmError`,
-//! `VmError`) with the original error message preserved. No errors are
-//! swallowed. `InvalidWorkloadType` is returned for compute workloads
-//! with empty module bytes.
+//! `VmError`, `RuntimeNotAvailable`, `InvalidWorkloadType`).
 //!
-//! ## UsageProofBuilder — Self-Reported Resource Usage Proof (14C.B.14)
+//! ### UsageProofBuilder — Signed Resource Attestation (14C.B.14)
 //!
 //! [`UsageProofBuilder`] constructs signed [`UsageProof`] instances that
-//! the coordinator's `verify_usage_proof` can verify. The builder:
-//!
-//! 1. Maps [`UnifiedResourceUsage`] fields to proof fields.
-//! 2. Builds a 148-byte signing message byte-identical to the coordinator's
-//!    `build_signing_message()` in `execution/usage_verifier.rs`.
-//! 3. Signs with Ed25519 via [`NodeIdentityManager::sign_message`].
+//! the coordinator's `verify_usage_proof` can verify:
 //!
 //! ```text
 //! UnifiedResourceUsage + WorkloadId + proof_data
@@ -765,44 +953,27 @@
 //! UsageProof { ..., node_signature: [u8; 64] }
 //! ```
 //!
-//! ### Signing Message Format
+//! ### CoordinatorSubmitter — Receipt Submission Client (14C.B.15)
 //!
-//! Domain separator `b"DSDN:usage_proof:v1:"` + workload_id (32) +
-//! node_id (32) + cpu_cycles (u64 LE) + ram_bytes (u64 LE) +
-//! chunk_count (u64 LE) + bandwidth_bytes (u64 LE) + SHA3-256(proof_data) (32).
-//! Total: 148 bytes. Any divergence breaks consensus.
-//!
-//! ## CoordinatorSubmitter — Receipt Submission Client (14C.B.15)
-//!
-//! [`CoordinatorSubmitter`] sends a [`ReceiptRequest`] (containing
-//! [`UsageProof`] + optional [`ExecutionCommitment`] + [`WorkloadType`])
-//! to the coordinator and receives a [`ReceiptResponse`]:
+//! [`CoordinatorSubmitter`] sends a [`ReceiptRequest`] to the coordinator
+//! via a [`CoordinatorTransport`] trait object:
 //!
 //! ```text
-//! UsageProof + ExecutionCommitment + WorkloadType
+//! ReceiptRequest { usage_proof, execution_commitment, workload_type }
 //!      │
 //!      ▼
-//! CoordinatorSubmitter::submit(&ReceiptRequest)
-//!      │
-//!      ▼
-//! dyn CoordinatorTransport (trait object)
+//! dyn CoordinatorTransport
 //!      │
 //!      ▼
 //! ReceiptResponse { Signed(ReceiptV1Proto) | Rejected | Pending }
 //! ```
 //!
-//! ### Transport Abstraction
+//! [`MockCoordinatorTransport`] provides FIFO response queue for testing.
 //!
-//! The [`CoordinatorTransport`] async trait decouples submission logic
-//! from network implementation. [`MockCoordinatorTransport`] enables
-//! deterministic testing without network access. Production transports
-//! (HTTP, gRPC) implement the same trait.
-//!
-//! ## ReceiptHandler — Receipt Storage & Lifecycle (14C.B.16)
+//! ### ReceiptHandler — Receipt Storage & Lifecycle (14C.B.16)
 //!
 //! [`ReceiptHandler`] receives coordinator-signed [`ReceiptV1Proto`],
-//! performs structural validation, and stores receipts in memory with
-//! lifecycle status management:
+//! performs structural validation, and manages lifecycle:
 //!
 //! ```text
 //! ReceiptV1Proto → handle_receipt() → StoredReceipt { Validated }
@@ -811,88 +982,55 @@
 //!                          │
 //!      ┌───────────────────┼───────────────────┐
 //!      ▼                   ▼                   ▼
-//! SubmittedToChain  InChallengePeriod  Rejected
+//! SubmittedToChain  InChallengePeriod    Rejected
 //!      │                   │
 //!      ▼                   ▼
 //!              Confirmed { reward_amount }
 //! ```
 //!
-//! ### Separation of Concerns
-//!
-//! `ReceiptHandler` handles **storage and status** only. Cryptographic
-//! verification is chain responsibility. Chain submission is handled
-//! by `CoordinatorSubmitter`. `pending_submission()` returns validated
-//! receipts sorted by `received_at` ascending (deterministic).
-//!
-//! ## ChainSubmitter — On-Chain Reward Claim (14C.B.17)
+//! ### ChainSubmitter — On-Chain Reward Claim (14C.B.17)
 //!
 //! [`ChainSubmitter`] submits [`ClaimRewardRequest`] to the blockchain
-//! for reward settlement via a trait-abstracted [`ChainTransport`]:
+//! via a [`ChainTransport`] trait object:
 //!
 //! ```text
-//! ReceiptV1Proto + submitter_address
-//!      │
-//!      ▼
-//! ChainSubmitter::submit_claim()
-//!      │
-//!      ▼
-//! dyn ChainTransport (trait object)
+//! ReceiptV1Proto + submitter_address → ChainSubmitter::submit_claim()
 //!      │
 //!      ▼
 //! ClaimRewardResponse { Success | Rejected | ChallengePeriod }
 //! ```
 //!
-//! No implicit retry. No response transformation. Transport errors
-//! propagated directly. [`MockChainTransport`] enables deterministic
-//! testing without chain access.
+//! [`MockChainTransport`] provides FIFO response queue for testing.
 //!
-//! ## RewardOrchestrator — Full Pipeline (14C.B.18)
+//! ### RewardOrchestrator — Full Pipeline Glue (14C.B.18)
 //!
-//! [`RewardOrchestrator`] is the glue layer that integrates all subsystems
-//! into a single sequential pipeline:
+//! [`RewardOrchestrator`] integrates all subsystems into a single
+//! sequential pipeline:
 //!
 //! ```text
 //! execute → proof → coordinator → receipt → chain → status update
 //! ```
 //!
-//! Each component remains modular and independently testable. The
-//! orchestrator does NOT perform cryptography, retry, or network I/O —
-//! it delegates to trait-abstracted subsystems. State consistency is
-//! maintained: receipt status is only updated after chain response.
-//!
-//! ## Separation of Concerns
-//!
-//! Each pipeline stage is handled by an independent, testable module:
-//!
-//! | Stage | Module | Responsibility |
-//! |-------|--------|----------------|
-//! | Execute | `workload_executor` | Dispatch to WASM/VM runtime |
-//! | Proof | `usage_proof_builder` | Ed25519-signed resource attestation |
-//! | Coordinator | `coordinator_client` | Receipt request via trait transport |
-//! | Receipt | `receipt_handler` | Storage, validation, lifecycle |
-//! | Chain | `chain_submitter` | Reward claim via trait transport |
-//! | Orchestrate | `reward_orchestrator` | Pipeline glue only |
-//!
-//! **Determinism**: Given identical inputs and mock transports, the pipeline
-//! produces identical outputs. No system clock, no randomness, no implicit retry.
+//! The orchestrator does NOT perform cryptography, retry, or network I/O.
+//! State consistency: receipt status is only updated after chain response.
+//! If chain submission fails, receipt remains `Validated`.
 //!
 //! ## Integration Test Coverage (14C.B.19)
 //!
-//! `tests/reward_pipeline_tests.rs` provides 20 end-to-end tests covering:
+//! `tests/reward_pipeline_tests.rs` provides 20 end-to-end tests:
 //!
-//! - Full pipeline success (storage via both `process_workload` and
-//!   `process_storage_workload`)
-//! - Compute runtime errors (WASM empty module, VM not available)
-//! - Coordinator response handling (Signed, Rejected, Pending)
-//! - Chain response handling (Success, Rejected, ChallengePeriod)
-//! - Atomicity: chain failure leaves receipt in `Validated` status
-//! - Usage proof Ed25519 signature verification
-//! - Receipt duplicate rejection and lifecycle transitions
-//! - Timeout propagation via custom transport
-//! - Storage vs compute metric differentiation
-//! - Determinism: 10x identical inputs → identical signatures
-//! - Sequential multi-workload processing
-//! - Error display for all `OrchestratorError` variants
+//! | Category | Tests |
+//! |----------|-------|
+//! | Full pipeline success | Storage (both methods), sequential multi-workload |
+//! | Compute errors | WASM empty module, VM not available |
+//! | Coordinator handling | Signed, Rejected, Pending (skips chain) |
+//! | Chain handling | Success→Confirmed, Rejected→Rejected, ChallengePeriod |
+//! | Atomicity | Chain fail → receipt stays Validated |
+//! | Crypto verification | Ed25519 verify_strict on usage proof |
+//! | Receipt lifecycle | Duplicate rejection, status transitions |
+//! | Error propagation | Timeout, network error, all Display variants |
+//! | Determinism | 10x identical inputs → identical signatures |
+//! | Differentiation | Storage zero compute metrics vs compute |
 //!
 //! All tests use `MockCoordinatorTransport` and `MockChainTransport`.
 //! Zero network, zero sleep, zero randomness.
@@ -910,6 +1048,14 @@
 //!
 //! 4. **No Silent Failures**: All errors are explicitly handled and propagated.
 //!    No panic, unwrap, or expect in production code paths.
+//!
+//! 5. **Reward Pipeline Atomicity**: Receipt status is updated only after
+//!    successful chain response. Chain failure leaves receipt in `Validated`.
+//!    No partial updates, no double-confirm.
+//!
+//! 6. **Signing Message Byte-Identity**: The 148-byte usage proof signing
+//!    message built by the node MUST be byte-identical to the coordinator's
+//!    verification message. Any divergence breaks consensus.
 
 pub mod da_follower;
 pub mod delete_handler;
