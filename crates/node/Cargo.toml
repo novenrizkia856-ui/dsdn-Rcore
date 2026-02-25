@@ -37,6 +37,7 @@ dotenvy = "0.15"
 socket2 = "0.5"
 toml = "0.9.8"
 sha3 = "0.10.8"
+async-trait = "0.1"
 
 [dev-dependencies]
 dsdn-chain = { path = "../chain" }

@@ -772,6 +772,32 @@
 //! chunk_count (u64 LE) + bandwidth_bytes (u64 LE) + SHA3-256(proof_data) (32).
 //! Total: 148 bytes. Any divergence breaks consensus.
 //!
+//! ## CoordinatorSubmitter — Receipt Submission Client (14C.B.15)
+//!
+//! [`CoordinatorSubmitter`] sends a [`ReceiptRequest`] (containing
+//! [`UsageProof`] + optional [`ExecutionCommitment`] + [`WorkloadType`])
+//! to the coordinator and receives a [`ReceiptResponse`]:
+//!
+//! ```text
+//! UsageProof + ExecutionCommitment + WorkloadType
+//!      │
+//!      ▼
+//! CoordinatorSubmitter::submit(&ReceiptRequest)
+//!      │
+//!      ▼
+//! dyn CoordinatorTransport (trait object)
+//!      │
+//!      ▼
+//! ReceiptResponse { Signed(ReceiptV1Proto) | Rejected | Pending }
+//! ```
+//!
+//! ### Transport Abstraction
+//!
+//! The [`CoordinatorTransport`] async trait decouples submission logic
+//! from network implementation. [`MockCoordinatorTransport`] enables
+//! deterministic testing without network access. Production transports
+//! (HTTP, gRPC) implement the same trait.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -805,6 +831,7 @@ pub mod status_tracker;
 pub mod tls_manager;
 pub mod workload_executor;
 pub mod usage_proof_builder;
+pub mod coordinator_client;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -841,3 +868,7 @@ pub use workload_executor::{
     ExecutionOutput, UnifiedResourceUsage, ExecutionError,
 };
 pub use usage_proof_builder::{UsageProofBuilder, UsageProofError, UsageProof};
+pub use coordinator_client::{
+    CoordinatorSubmitter, CoordinatorTransport, MockCoordinatorTransport,
+    ReceiptRequest, ReceiptResponse, SubmitError,
+};
