@@ -798,6 +798,32 @@
 //! deterministic testing without network access. Production transports
 //! (HTTP, gRPC) implement the same trait.
 //!
+//! ## ReceiptHandler — Receipt Storage & Lifecycle (14C.B.16)
+//!
+//! [`ReceiptHandler`] receives coordinator-signed [`ReceiptV1Proto`],
+//! performs structural validation, and stores receipts in memory with
+//! lifecycle status management:
+//!
+//! ```text
+//! ReceiptV1Proto → handle_receipt() → StoredReceipt { Validated }
+//!                                          │
+//!                     update_status() ◄─────┘
+//!                          │
+//!      ┌───────────────────┼───────────────────┐
+//!      ▼                   ▼                   ▼
+//! SubmittedToChain  InChallengePeriod  Rejected
+//!      │                   │
+//!      ▼                   ▼
+//!              Confirmed { reward_amount }
+//! ```
+//!
+//! ### Separation of Concerns
+//!
+//! `ReceiptHandler` handles **storage and status** only. Cryptographic
+//! verification is chain responsibility. Chain submission is handled
+//! by `CoordinatorSubmitter`. `pending_submission()` returns validated
+//! receipts sorted by `received_at` ascending (deterministic).
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -832,6 +858,7 @@ pub mod tls_manager;
 pub mod workload_executor;
 pub mod usage_proof_builder;
 pub mod coordinator_client;
+pub mod receipt_handler;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -871,4 +898,7 @@ pub use usage_proof_builder::{UsageProofBuilder, UsageProofError, UsageProof};
 pub use coordinator_client::{
     CoordinatorSubmitter, CoordinatorTransport, MockCoordinatorTransport,
     ReceiptRequest, ReceiptResponse, SubmitError,
+};
+pub use receipt_handler::{
+    ReceiptHandler, ReceiptStatus, StoredReceipt, ReceiptHandlerError,
 };
