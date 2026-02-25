@@ -741,6 +741,37 @@
 //! swallowed. `InvalidWorkloadType` is returned for compute workloads
 //! with empty module bytes.
 //!
+//! ## UsageProofBuilder — Self-Reported Resource Usage Proof (14C.B.14)
+//!
+//! [`UsageProofBuilder`] constructs signed [`UsageProof`] instances that
+//! the coordinator's `verify_usage_proof` can verify. The builder:
+//!
+//! 1. Maps [`UnifiedResourceUsage`] fields to proof fields.
+//! 2. Builds a 148-byte signing message byte-identical to the coordinator's
+//!    `build_signing_message()` in `execution/usage_verifier.rs`.
+//! 3. Signs with Ed25519 via [`NodeIdentityManager::sign_message`].
+//!
+//! ```text
+//! UnifiedResourceUsage + WorkloadId + proof_data
+//!      │
+//!      ▼
+//! UsageProofBuilder::build_usage_proof()
+//!      │
+//!      ├─ Map fields (cpu_cycles_estimate → cpu_cycles, etc.)
+//!      ├─ Build 148-byte signing message (domain + fields + SHA3-256)
+//!      └─ Sign with Ed25519
+//!      │
+//!      ▼
+//! UsageProof { ..., node_signature: [u8; 64] }
+//! ```
+//!
+//! ### Signing Message Format
+//!
+//! Domain separator `b"DSDN:usage_proof:v1:"` + workload_id (32) +
+//! node_id (32) + cpu_cycles (u64 LE) + ram_bytes (u64 LE) +
+//! chunk_count (u64 LE) + bandwidth_bytes (u64 LE) + SHA3-256(proof_data) (32).
+//! Total: 148 bytes. Any divergence breaks consensus.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -773,6 +804,7 @@ pub mod status_notification;
 pub mod status_tracker;
 pub mod tls_manager;
 pub mod workload_executor;
+pub mod usage_proof_builder;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -808,3 +840,4 @@ pub use workload_executor::{
     WorkloadExecutor, WorkloadType, WorkloadAssignment, ResourceLimits,
     ExecutionOutput, UnifiedResourceUsage, ExecutionError,
 };
+pub use usage_proof_builder::{UsageProofBuilder, UsageProofError, UsageProof};

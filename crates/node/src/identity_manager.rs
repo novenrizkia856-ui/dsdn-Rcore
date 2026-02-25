@@ -270,6 +270,25 @@ impl NodeIdentityManager {
         signature.to_bytes()
     }
 
+    /// Signs an arbitrary-length message using the node's Ed25519 private key.
+    ///
+    /// Unlike [`sign_challenge`] which only accepts 32-byte nonces, this
+    /// method signs messages of any length. Used by `UsageProofBuilder`
+    /// to sign the 148-byte usage proof message.
+    ///
+    /// ## Parameters
+    ///
+    /// - `message`: Byte slice to sign (any length).
+    ///
+    /// ## Returns
+    ///
+    /// A 64-byte Ed25519 signature. Deterministic per RFC 8032:
+    /// same `(key, message)` always produces the same signature.
+    pub fn sign_message(&self, message: &[u8]) -> [u8; 64] {
+        let signature = self.signing_key.sign(message);
+        signature.to_bytes()
+    }
+
     /// Creates a complete [`IdentityProof`] for coordinator admission.
     ///
     /// Signs the challenge nonce and packages the signature with the
