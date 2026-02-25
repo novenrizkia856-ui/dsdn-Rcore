@@ -1458,6 +1458,12 @@ pub async fn cmd_run(run_args: &[String]) {
 mod tests {
     use super::*;
     use dsdn_common::MockDA;
+    use std::sync::Mutex;
+
+    /// Serializes all tests that touch process-global env vars.
+    /// Rust tests run in parallel by default — `env::set_var` / `env::remove_var`
+    /// mutate shared process state, causing flaky failures when tests race.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_config_validation_empty_node_id() {
@@ -1571,6 +1577,8 @@ mod tests {
 
     #[test]
     fn test_config_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
         env::set_var("USE_MOCK_DA", "true");
         env::set_var("NODE_ID", "test-node");
         env::set_var("NODE_STORAGE_PATH", "./test-data");
@@ -1594,6 +1602,8 @@ mod tests {
 
     #[test]
     fn test_config_grpc_port_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
         env::set_var("USE_MOCK_DA", "true");
         env::set_var("NODE_ID", "test-grpc");
         env::set_var("NODE_STORAGE_PATH", "./test-grpc");
@@ -1613,6 +1623,8 @@ mod tests {
 
     #[test]
     fn test_config_auto_node_id() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
         env::set_var("USE_MOCK_DA", "true");
         env::set_var("NODE_ID", "auto");
         env::set_var("NODE_STORAGE_PATH", "./test-data");
@@ -1633,6 +1645,8 @@ mod tests {
 
     #[test]
     fn test_run_args_empty_defaults_to_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
         env::set_var("USE_MOCK_DA", "true");
         env::set_var("NODE_ID", "test-run");
         env::set_var("NODE_STORAGE_PATH", "./test-run-data");
@@ -1651,6 +1665,8 @@ mod tests {
 
     #[test]
     fn test_run_args_env_keyword() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
         env::set_var("USE_MOCK_DA", "true");
         env::set_var("NODE_ID", "test-env-kw");
         env::set_var("NODE_STORAGE_PATH", "./test-env");
@@ -1686,6 +1702,8 @@ mod tests {
 
     #[test]
     fn test_parse_port_flag() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
         let args = vec!["--port".to_string(), "9999".to_string()];
         assert_eq!(parse_port_flag(&args), 9999);
 

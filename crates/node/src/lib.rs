@@ -712,6 +712,35 @@
 //! - On error, no state is changed (atomic: success or no-op).
 //! - Quarantine metadata is cleared on transition away from Quarantined.
 //!
+//! ## WorkloadExecutor — Runtime Dispatch (14C.B.13)
+//!
+//! [`WorkloadExecutor`] is a stateless dispatcher that routes
+//! [`WorkloadAssignment`] to the appropriate runtime backend:
+//!
+//! ```text
+//! WorkloadAssignment
+//!      │
+//!      ├─ Storage ────► No execution, commitment = None
+//!      ├─ ComputeWasm ► runtime_wasm::run_wasm_committed() → ExecutionCommitment
+//!      └─ ComputeVm ──► runtime_vm::exec_committed() (V2, RuntimeNotAvailable in V1)
+//!      │
+//!      ▼
+//! ExecutionOutput { commitment, resource_usage, stdout }
+//! ```
+//!
+//! ### Stateless Design
+//!
+//! `WorkloadExecutor` holds no state. All inputs come from `WorkloadAssignment`.
+//! The executor maps runtime-specific results to a unified `ExecutionOutput`
+//! with `UnifiedResourceUsage` and optional `ExecutionCommitment`.
+//!
+//! ### Error Mapping
+//!
+//! Runtime errors are mapped to `ExecutionError` variants (`WasmError`,
+//! `VmError`) with the original error message preserved. No errors are
+//! swallowed. `InvalidWorkloadType` is returned for compute workloads
+//! with empty module bytes.
+//!
 //! # Key Invariants
 //!
 //! 1. **DA-Derived State**: Node does NOT receive instructions from Coordinator
@@ -743,6 +772,7 @@ pub mod state_sync;
 pub mod status_notification;
 pub mod status_tracker;
 pub mod tls_manager;
+pub mod workload_executor;
 
 // Integration tests for Node Identity & Gating (14B.50)
 #[cfg(test)]
@@ -774,3 +804,7 @@ pub use rejoin_manager::RejoinManager;
 pub use status_tracker::NodeStatusTracker;
 pub use status_notification::{StatusNotificationHandler, StatusNotification};
 pub use tls_manager::{TLSCertManager, TLSError};
+pub use workload_executor::{
+    WorkloadExecutor, WorkloadType, WorkloadAssignment, ResourceLimits,
+    ExecutionOutput, UnifiedResourceUsage, ExecutionError,
+};
