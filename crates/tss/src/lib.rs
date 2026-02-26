@@ -91,21 +91,53 @@
 //!
 //! ### Phase 2: Threshold Signing
 //!
+//! Signing menggunakan real FROST 2-round signing protocol dari `frost-ed25519`.
+//! Setiap signing session melibatkan minimal `t` signers dari `n` total participants.
+//!
+//! **Round 1 — Commitment** (`frost::round1::commit`): Setiap signer yang berpartisipasi
+//! generate random hiding dan binding nonces via `frost::round1::commit(signing_share, rng)`.
+//! Nonces disimpan secara internal di `LocalThresholdSigner`. Commitment (nonce commitments
+//! berupa compressed Edwards Y points) di-broadcast ke coordinator.
+//! **Nonces TIDAK boleh di-reuse** — setiap signing session membutuhkan nonces baru.
+//!
+//! **Round 2 — Partial Signature** (`frost::round2::sign`): Setelah menerima semua
+//! commitments, coordinator mendistribusikan signing package (message + all commitments).
+//! Setiap signer memanggil `frost::round2::sign(signing_package, nonces, key_package)`
+//! untuk menghasilkan real FROST `SignatureShare` (partial signature). Nonces di-zeroize
+//! setelah digunakan untuk mencegah nonce reuse.
+//!
+//! **Aggregation** (`frost::aggregate`): Coordinator mengumpulkan minimal `t` partial
+//! signatures dan memanggil `frost::aggregate()` untuk menghasilkan valid Ed25519
+//! aggregate signature yang dapat diverifikasi menggunakan group public key.
+//!
+//! **Nonce Safety**: `frost::round1::SigningNonces` implements `Zeroize` — nonces
+//! secara otomatis di-clear saat di-drop. `LocalThresholdSigner` menjamin nonces
+//! hanya digunakan sekali: commitment hanya dapat di-generate jika tidak ada
+//! pending nonces, dan sign mengkonsumsi nonces (set ke None).
+//!
+//! **Kompatibilitas**: Semua partial signatures yang dihasilkan kompatibel dengan
+//! `frost-ed25519::aggregate()` dan menghasilkan standard Ed25519 signatures.
+//!
 //! ```text
 //! Signer 1                Signer 2               Coordinator
 //!      │                      │                      │
+//!      │ frost::round1::commit()                     │
 //!      │ ──── Commitment ────────────────────────────>
+//!      │                      │ frost::round1::commit()
 //!      │                      │ ──── Commitment ────>│
 //!      │                      │                      │
 //!      │ <── All Commitments ────────────────────────│
 //!      │                      │ <── All Commitments ─│
 //!      │                      │                      │
+//!      │ frost::round2::sign()                       │
 //!      │ ── Partial Signature ──────────────────────>│
+//!      │                      │ frost::round2::sign()│
 //!      │                      │ ── Partial Sig ─────>│
 //!      │                      │                      │
-//!      │                      │               aggregate()
+//!      │                      │         frost::aggregate()
 //!      │                      │                      │
-//!      │                      │              AggregateSignature
+//!      │                      │         AggregateSignature
+//!      │                      │         (valid Ed25519 sig)
 //! ```
 //!
 //! ## Modules
@@ -224,6 +256,11 @@
 //! - Domain separation untuk semua hash operations
 //! - Real FROST cryptography via `frost-ed25519` (ZCash Foundation)
 //! - DKG menggunakan real Feldman VSS (Pedersen DKG) dari `frost::keys::dkg`
+//! - Signing menggunakan real FROST 2-round protocol:
+//!   - Round 1: `frost::round1::commit()` generates real hiding + binding nonces
+//!   - Round 2: `frost::round2::sign()` computes real partial signatures
+//!   - Aggregation: `frost::aggregate()` produces standard Ed25519 signatures
+//! - Nonces di-zeroize setelah sign via `Zeroize` trait pada `frost::round1::SigningNonces`
 //! - `frost_adapter` module menyediakan konversi ke/dari real Ed25519 FROST types
 //! - DKG output (KeyShare) kompatibel dengan `frost-ed25519` threshold signing
 //!

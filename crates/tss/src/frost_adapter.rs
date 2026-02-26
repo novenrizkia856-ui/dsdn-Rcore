@@ -10,6 +10,7 @@
 //! - [`SigningCommitment`] ↔ [`frost_ed25519::round1::SigningCommitments`]
 //! - [`FrostSignatureShare`] ↔ [`frost_ed25519::round2::SignatureShare`]
 //! - [`KeyShare`] ↔ [`frost_ed25519::keys::KeyPackage`]
+//! - [`SignerId`] → [`frost_ed25519::Identifier`] (via `deserialize`, for signing rounds)
 //!
 //! Serta mapping error dari `frost_ed25519::Error` ke [`TSSError`].
 //!
@@ -52,7 +53,7 @@ use crate::primitives::{
     FrostSignature, FrostSignatureShare, GroupPublicKey, ParticipantPublicKey, SecretShare,
     SigningCommitment, PUBLIC_KEY_SIZE, SCALAR_SIZE, SIGNATURE_SIZE,
 };
-use crate::types::ParticipantId;
+use crate::types::{ParticipantId, SignerId};
 
 // Re-export frost_ed25519 crate agar consumer dapat mengakses tipe frost
 // tanpa menambahkan dependency sendiri.
@@ -548,6 +549,40 @@ pub fn participant_id_to_frost_identifier(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// 8) SignerId -> frost::Identifier (signing round conversion)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Mengkonversi [`SignerId`] ke [`frost::Identifier`] via deserialization.
+///
+/// Berbeda dari [`participant_id_to_frost_identifier`] yang menggunakan `derive()`,
+/// fungsi ini menggunakan `deserialize()` karena `SignerId` dalam signing context
+/// **sudah berisi** serialized frost Identifier bytes — bukan raw participant ID
+/// yang perlu di-hash.
+///
+/// ## Kapan Gunakan
+///
+/// Digunakan saat membangun `frost::SigningPackage` dari `(SignerId, SigningCommitment)`
+/// pairs selama threshold signing round 2.
+///
+/// ## Perbedaan dengan `participant_id_to_frost_identifier()`
+///
+/// | Function | Input | Method | Use case |
+/// |----------|-------|--------|----------|
+/// | `participant_id_to_frost_identifier` | Raw ParticipantId | `derive()` (hash-to-field) | DKG |
+/// | `signer_id_to_frost_identifier` | Serialized frost Identifier | `deserialize()` | Signing |
+///
+/// # Errors
+///
+/// Mengembalikan [`TSSError::Crypto`] jika bytes bukan valid nonzero scalar
+/// pada Ed25519 scalar field.
+pub fn signer_id_to_frost_identifier(
+    sid: &SignerId,
+) -> Result<frost::Identifier, TSSError> {
+    frost::Identifier::deserialize(sid.as_bytes())
+        .map_err(|e| crypto_err("signer_id_to_frost_identifier", &e.to_string()))
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // UNIT TESTS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -916,5 +951,64 @@ mod tests {
         let pid = ParticipantId::from_bytes([0x00; 32]);
         let result = participant_id_to_frost_identifier(&pid);
         assert!(result.is_ok(), "derive must succeed for any input");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 9: SignerId → frost Identifier roundtrip
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_signer_id_to_frost_identifier_roundtrip() {
+        // Generate a valid frost Identifier, serialize it, use as SignerId,
+        // then convert back — must be identical.
+        let (key_packages, _) = generate_test_keys();
+        let (frost_id, _) = key_packages
+            .iter()
+            .next()
+            .expect("must have at least one key package");
+
+        let id_bytes = frost_id.serialize();
+        let arr: [u8; 32] = id_bytes.as_slice().try_into().expect("32 bytes");
+        let sid = crate::types::SignerId::from_bytes(arr);
+
+        let roundtrip_id = signer_id_to_frost_identifier(&sid)
+            .expect("signer_id_to_frost_identifier must succeed for valid Identifier bytes");
+
+        assert_eq!(
+            frost_id.serialize(),
+            roundtrip_id.serialize(),
+            "SignerId roundtrip must produce identical frost Identifier"
+        );
+    }
+
+    #[test]
+    fn test_signer_id_to_frost_identifier_deterministic() {
+        let (key_packages, _) = generate_test_keys();
+        let (frost_id, _) = key_packages
+            .iter()
+            .next()
+            .expect("must have at least one key package");
+
+        let id_bytes = frost_id.serialize();
+        let arr: [u8; 32] = id_bytes.as_slice().try_into().expect("32 bytes");
+        let sid = crate::types::SignerId::from_bytes(arr);
+
+        let id1 = signer_id_to_frost_identifier(&sid).expect("ok");
+        let id2 = signer_id_to_frost_identifier(&sid).expect("ok");
+
+        assert_eq!(
+            id1.serialize(),
+            id2.serialize(),
+            "same SignerId must produce same frost Identifier"
+        );
+    }
+
+    #[test]
+    fn test_signer_id_to_frost_identifier_rejects_zero() {
+        // Zero bytes are not a valid nonzero scalar → should fail
+        let sid = crate::types::SignerId::from_bytes([0x00; 32]);
+        let result = signer_id_to_frost_identifier(&sid);
+        // frost Identifier::deserialize rejects the zero scalar
+        assert!(result.is_err(), "zero bytes must be rejected as Identifier");
     }
 }
