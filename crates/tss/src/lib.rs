@@ -56,6 +56,16 @@
 //! Setelah menerima shares, setiap participant memverifikasi terhadap VSS
 //! commitments dan menghitung final signing share + group public key.
 //!
+//! **Key Finalization** (`process_round2` → `frost::keys::dkg::part3`): Output
+//! berupa `KeyShare` yang membungkus real frost `KeyPackage` components:
+//! - `signing_share()`: Ed25519 signing scalar (32 bytes, unique per participant)
+//! - `group_public_key()`: Ed25519 verifying key (32 bytes, identical across all)
+//! - `participant_pubkey()`: Verifying share individual (32 bytes, unique)
+//!
+//! `KeyShare` dapat di-serialize via `KeyShareSerialization` trait (encrypted
+//! untuk production, plaintext untuk testing). Serialization bersifat deterministik
+//! dan aman — secret share dienkripsi dengan ChaCha20-Poly1305 style construction.
+//!
 //! Output DKG kompatibel dengan `frost-ed25519` threshold signing.
 //!
 //! ```text

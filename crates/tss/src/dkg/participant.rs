@@ -164,6 +164,24 @@ impl KeyShare {
     pub const fn total(&self) -> u8 {
         self.total
     }
+
+    /// Mengembalikan signing share sebagai 32-byte serialized scalar.
+    ///
+    /// Convenience method — equivalent to `self.secret_share().as_bytes()`.
+    ///
+    /// **WARNING**: Handle dengan hati-hati — ini adalah secret data.
+    #[must_use]
+    pub fn signing_share(&self) -> &[u8; 32] {
+        self.secret_share.as_bytes()
+    }
+
+    /// Mengembalikan group public key sebagai 32-byte compressed point.
+    ///
+    /// Convenience method — equivalent to `self.group_pubkey().as_bytes()`.
+    #[must_use]
+    pub fn group_public_key(&self) -> &[u8; 32] {
+        self.group_pubkey.as_bytes()
+    }
 }
 
 // KeyShare TIDAK implement Debug untuk keamanan
@@ -1432,5 +1450,155 @@ mod tests {
             key_shares[0].group_pubkey().as_bytes(),
             key_shares[1].group_pubkey().as_bytes()
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 7 (spec): Double finalize (process_round2) rejection
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_double_finalize_rejection() {
+        let mut rng = ChaCha20Rng::seed_from_u64(9000);
+        let session_id = SessionId::from_bytes([0xEE; 32]);
+        let pids = make_participant_ids(3);
+
+        let mut participants: Vec<LocalDKGParticipant> = pids
+            .iter()
+            .map(|pid| make_participant(session_id.clone(), pid.clone(), 2, 3))
+            .collect();
+
+        // Round 1
+        let mut round1_packages = Vec::new();
+        for p in &mut participants {
+            round1_packages.push(
+                p.generate_round1_with_rng(&mut rng)
+                    .expect("round1 must succeed"),
+            );
+        }
+
+        // Process round 1
+        let mut all_round2_packages: Vec<Vec<Round2Package>> = Vec::new();
+        for p in &mut participants {
+            all_round2_packages.push(
+                p.process_round1(&round1_packages)
+                    .expect("process_round1 must succeed"),
+            );
+        }
+
+        // Process round 2 for participant 0 (first call — success)
+        let my_packages: Vec<Round2Package> = all_round2_packages
+            .iter()
+            .flat_map(|pkgs| pkgs.iter())
+            .filter(|pkg| pkg.to_participant() == participants[0].participant_id())
+            .cloned()
+            .collect();
+
+        let _key_share = participants[0]
+            .process_round2(&my_packages)
+            .expect("first process_round2 must succeed");
+
+        // Second call to process_round2 — must be rejected (state is Completed)
+        let result = participants[0].process_round2(&my_packages);
+        assert!(
+            result.is_err(),
+            "double finalize (process_round2) must be rejected"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 8 (spec): Invalid state finalize rejection
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_invalid_state_finalize_rejection() {
+        let mut rng = ChaCha20Rng::seed_from_u64(9100);
+        let session_id = SessionId::from_bytes([0xFF; 32]);
+        let pids = make_participant_ids(3);
+
+        // Test 1: Calling process_round2 from Initialized state
+        let mut p_init = make_participant(session_id.clone(), pids[0].clone(), 2, 3);
+        let result = p_init.process_round2(&[]);
+        assert!(
+            result.is_err(),
+            "process_round2 from Initialized must fail"
+        );
+
+        // Test 2: Calling process_round2 from Round1Generated state
+        let mut p_r1 = make_participant(session_id.clone(), pids[0].clone(), 2, 3);
+        let _pkg = p_r1
+            .generate_round1_with_rng(&mut rng)
+            .expect("round1 must succeed");
+        let result = p_r1.process_round2(&[]);
+        assert!(
+            result.is_err(),
+            "process_round2 from Round1Generated must fail"
+        );
+
+        // Test 3: Calling process_round2 from Aborted state
+        let mut p_aborted = make_participant(session_id.clone(), pids[0].clone(), 2, 3);
+        p_aborted.abort();
+        let result = p_aborted.process_round2(&[]);
+        assert!(
+            result.is_err(),
+            "process_round2 from Aborted must fail"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 9: KeyShare convenience methods
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_key_share_convenience_methods() {
+        let key_shares = run_full_dkg(2, 3, 9200);
+
+        for ks in &key_shares {
+            // signing_share() must equal secret_share().as_bytes()
+            assert_eq!(
+                ks.signing_share(),
+                ks.secret_share().as_bytes(),
+                "signing_share() must match secret_share().as_bytes()"
+            );
+
+            // group_public_key() must equal group_pubkey().as_bytes()
+            assert_eq!(
+                ks.group_public_key(),
+                ks.group_pubkey().as_bytes(),
+                "group_public_key() must match group_pubkey().as_bytes()"
+            );
+
+            // signing_share must be nonzero (valid scalar)
+            assert!(
+                ks.signing_share().iter().any(|&b| b != 0),
+                "signing share must not be all zeros"
+            );
+
+            // signing_share must be 32 bytes
+            assert_eq!(ks.signing_share().len(), 32);
+
+            // group_public_key must be 32 bytes
+            assert_eq!(ks.group_public_key().len(), 32);
+        }
+
+        // All group_public_key() must be identical across participants
+        let first = key_shares[0].group_public_key();
+        for ks in &key_shares[1..] {
+            assert_eq!(
+                ks.group_public_key(),
+                first,
+                "all participants must have identical group_public_key()"
+            );
+        }
+
+        // All signing_share() must be unique across participants
+        for i in 0..key_shares.len() {
+            for j in (i + 1)..key_shares.len() {
+                assert_ne!(
+                    key_shares[i].signing_share(),
+                    key_shares[j].signing_share(),
+                    "signing shares must be unique per participant"
+                );
+            }
+        }
     }
 }

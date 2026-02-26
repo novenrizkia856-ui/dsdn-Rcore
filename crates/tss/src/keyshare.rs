@@ -688,4 +688,119 @@ mod tests {
     fn test_plaintext_size_constant() {
         assert_eq!(PLAINTEXT_SIZE, 131);
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // REAL DKG INTEGRATION TESTS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Run a minimal 2-of-3 DKG and return key shares.
+    fn run_dkg_for_serialization_test() -> Vec<KeyShare> {
+        use crate::dkg::participant::{DKGParticipant, LocalDKGParticipant};
+        use crate::dkg::packages::Round2Package;
+        use crate::types::SessionId;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(77777);
+        let session_id = SessionId::from_bytes([0xBB; 32]);
+
+        let pids: Vec<ParticipantId> = (1..=3u8)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = i;
+                ParticipantId::from_bytes(bytes)
+            })
+            .collect();
+
+        let mut participants: Vec<LocalDKGParticipant> = pids
+            .iter()
+            .map(|pid| {
+                LocalDKGParticipant::new(pid.clone(), session_id.clone(), 2, 3)
+                    .expect("valid params")
+            })
+            .collect();
+
+        // Round 1
+        let mut r1_pkgs = Vec::new();
+        for p in &mut participants {
+            r1_pkgs.push(
+                p.generate_round1_with_rng(&mut rng)
+                    .expect("round1 ok"),
+            );
+        }
+
+        // Process round 1
+        let mut all_r2: Vec<Vec<Round2Package>> = Vec::new();
+        for p in &mut participants {
+            all_r2.push(p.process_round1(&r1_pkgs).expect("process_round1 ok"));
+        }
+
+        // Process round 2
+        let mut key_shares = Vec::new();
+        for p in &mut participants {
+            let my_pkgs: Vec<Round2Package> = all_r2
+                .iter()
+                .flat_map(|pkgs| pkgs.iter())
+                .filter(|pkg| pkg.to_participant() == p.participant_id())
+                .cloned()
+                .collect();
+            key_shares.push(p.process_round2(&my_pkgs).expect("process_round2 ok"));
+        }
+
+        key_shares
+    }
+
+    #[test]
+    fn test_real_dkg_keyshare_plaintext_roundtrip() {
+        let key_shares = run_dkg_for_serialization_test();
+
+        for ks in &key_shares {
+            let bytes = ks.serialize_plaintext();
+            let recovered = KeyShare::deserialize_plaintext(&bytes)
+                .expect("plaintext deserialization must succeed");
+
+            assert_eq!(recovered.signing_share(), ks.signing_share());
+            assert_eq!(recovered.group_public_key(), ks.group_public_key());
+            assert_eq!(recovered.participant_pubkey().as_bytes(), ks.participant_pubkey().as_bytes());
+            assert_eq!(recovered.threshold(), ks.threshold());
+            assert_eq!(recovered.total(), ks.total());
+        }
+    }
+
+    #[test]
+    fn test_real_dkg_keyshare_encrypted_roundtrip() {
+        let key_shares = run_dkg_for_serialization_test();
+        let encryption_key = make_encryption_key();
+
+        for ks in &key_shares {
+            let bytes = ks
+                .serialize_encrypted(&encryption_key)
+                .expect("encryption must succeed");
+            let recovered = KeyShare::deserialize_encrypted(&bytes, &encryption_key)
+                .expect("decryption must succeed");
+
+            assert_eq!(recovered.signing_share(), ks.signing_share());
+            assert_eq!(recovered.group_public_key(), ks.group_public_key());
+            assert_eq!(recovered.participant_pubkey().as_bytes(), ks.participant_pubkey().as_bytes());
+            assert_eq!(recovered.threshold(), ks.threshold());
+            assert_eq!(recovered.total(), ks.total());
+        }
+    }
+
+    #[test]
+    fn test_real_dkg_keyshare_encrypted_wrong_key_rejected() {
+        let key_shares = run_dkg_for_serialization_test();
+        let encryption_key = make_encryption_key();
+        let wrong_key = EncryptionKey::from_bytes([0x99; 32]).expect("valid key");
+
+        let bytes = key_shares[0]
+            .serialize_encrypted(&encryption_key)
+            .expect("encryption must succeed");
+
+        let result = KeyShare::deserialize_encrypted(&bytes, &wrong_key);
+        assert!(
+            result.is_err(),
+            "decryption with wrong key must fail"
+        );
+    }
 }
