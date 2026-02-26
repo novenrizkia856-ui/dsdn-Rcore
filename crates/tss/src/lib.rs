@@ -94,6 +94,7 @@
 //! | [`signing`] | Signing protocol state machine dan aggregation |
 //! | [`verify`] | Signature verification functions |
 //! | [`keyshare`] | KeyShare serialization dan encryption |
+//! | [`frost_adapter`] | Adapter layer: internal types ↔ frost-ed25519 types |
 //!
 //! ## Contoh Penggunaan
 //!
@@ -194,9 +195,11 @@
 //!
 //! ### Cryptographic Notes
 //!
-//! - Menggunakan SHA3-256 untuk hashing
+//! - Menggunakan SHA3-256 untuk hashing internal
 //! - Domain separation untuk semua hash operations
-//! - Placeholder implementations untuk EC operations (akan diganti dengan real crypto)
+//! - Real FROST cryptography via `frost-ed25519` (ZCash Foundation) adapter
+//! - `frost_adapter` module menyediakan konversi ke/dari real Ed25519 FROST types
+//! - Placeholder implementations untuk EC operations masih ada (akan diganti incremental)
 //!
 //! ## Feature Flags
 //!
@@ -277,6 +280,24 @@ pub mod verify;
 /// - Encrypted serialization untuk production
 /// - Plaintext serialization untuk testing
 pub mod keyshare;
+
+/// FROST Crypto Adapter Module.
+///
+/// Adapter layer antara tipe internal crate ini dan library resmi
+/// `frost-ed25519` (ZCash Foundation). Menyediakan konversi dua arah
+/// untuk semua tipe kriptografis:
+///
+/// - [`GroupPublicKey`] ↔ `frost_ed25519::VerifyingKey`
+/// - [`SecretShare`] ↔ `frost_ed25519::keys::SigningShare`
+/// - [`FrostSignature`] ↔ `frost_ed25519::Signature`
+/// - [`SigningCommitment`] ↔ `frost_ed25519::round1::SigningCommitments`
+/// - [`FrostSignatureShare`] ↔ `frost_ed25519::round2::SignatureShare`
+/// - [`KeyShare`] ↔ `frost_ed25519::keys::KeyPackage`
+///
+/// Serta mapping `frost_ed25519::Error` → [`TSSError`].
+///
+/// Semua konversi deterministic, byte-identical, dan return `Result`.
+pub mod frost_adapter;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS

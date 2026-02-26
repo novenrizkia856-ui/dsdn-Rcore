@@ -13,5 +13,12 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 zeroize = { version = "1.7", features = ["derive"] }
 
+# FROST threshold signature library (ZCash Foundation)
+# frost-ed25519 menyediakan implementasi FROST(Ed25519, SHA-512)
+# frost-core menyediakan tipe dasar dan trait generik
+frost-ed25519 = { version = "2.2", default-features = true }
+frost-core = { version = "2.2", default-features = true }
+
 [dev-dependencies]
 serde_json = "1.0"
+rand_chacha = "0.3"
