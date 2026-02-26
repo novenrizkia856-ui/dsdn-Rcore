@@ -373,14 +373,15 @@ impl DKGSession {
     /// - State harus `Round1Commitment`
     /// - Participant harus terdaftar
     /// - Tidak boleh ada duplicate package dari participant yang sama
-    /// - Proof harus valid (via `verify_proof()`)
+    ///
+    /// Commitment dan proof verification dilakukan otomatis oleh frost library
+    /// saat `frost::keys::dkg::part2()` di `LocalDKGParticipant::process_round1()`.
     ///
     /// # Errors
     ///
     /// - `DKGError::InvalidState` jika state bukan `Round1Commitment`
     /// - `DKGError::InvalidRound1Package` jika participant tidak terdaftar
     /// - `DKGError::DuplicateParticipant` jika package sudah ada
-    /// - `DKGError::InvalidProof` jika proof tidak valid
     pub fn add_round1_package(&mut self, package: Round1Package) -> Result<(), DKGError> {
         // Validasi state
         if !matches!(self.state, DKGState::Round1Commitment) {
@@ -407,12 +408,9 @@ impl DKGSession {
             });
         }
 
-        // Verify proof
-        if !package.verify_proof() {
-            return Err(DKGError::InvalidProof {
-                participant: participant_id,
-            });
-        }
+        // Note: Commitment dan proof verification dilakukan oleh frost library
+        // secara otomatis saat frost::keys::dkg::part2() dipanggil.
+        // Session controller hanya collect dan route packages.
 
         // Insert package
         self.round1_packages.insert(participant_id, package);
@@ -701,6 +699,7 @@ impl DKGSession {
     }
 }
 
+
 // ════════════════════════════════════════════════════════════════════════════════
 // UNIT TESTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -708,6 +707,10 @@ impl DKGSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frost_ed25519 as frost;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+    use std::collections::BTreeMap;
 
     // ────────────────────────────────────────────────────────────────────────────
     // HELPER FUNCTIONS
@@ -722,7 +725,92 @@ mod tests {
     fn make_session(n: usize, threshold: u8) -> DKGSession {
         let session_id = SessionId::from_bytes([0xAA; 32]);
         let participants = make_participants(n);
-        DKGSession::new(session_id, participants, threshold).unwrap()
+        DKGSession::new(session_id, participants, threshold).expect("valid session params")
+    }
+
+    /// Create a deterministic frost Identifier from u16.
+    fn frost_id(n: u16) -> frost::Identifier {
+        frost::Identifier::try_from(n).expect("nonzero u16 → valid Identifier")
+    }
+
+    /// Generate real FROST round1 packages for n participants with given threshold.
+    /// Participant i gets ParticipantId::from_bytes([i as u8; 32]) and frost_id(i+1).
+    fn generate_real_round1_packages(
+        n: usize,
+        threshold: u16,
+        rng: &mut ChaCha20Rng,
+    ) -> Vec<Round1Package> {
+        let mut packages = Vec::new();
+        for i in 0..n {
+            let fid = frost_id((i + 1) as u16);
+            let (_secret, frost_pkg) =
+                frost::keys::dkg::part1(fid, n as u16, threshold, &mut *rng)
+                    .expect("part1 must succeed");
+            let pid = ParticipantId::from_bytes([i as u8; 32]);
+            packages.push(Round1Package::new(pid, frost_pkg));
+        }
+        packages
+    }
+
+    /// Generate a real FROST round2 package (from_idx → to_idx).
+    /// Uses independent part1+part2 calls (packages won't be cryptographically
+    /// linked to the session's round1, but the types are correct for routing tests).
+    fn generate_real_round2_package(
+        session_id: SessionId,
+        from_idx: u8,
+        to_idx: u8,
+        rng: &mut ChaCha20Rng,
+    ) -> Round2Package {
+        let fid_from = frost_id((from_idx + 1) as u16);
+        let fid_to = frost_id((to_idx + 1) as u16);
+
+        let (secret_from, _pkg_from) =
+            frost::keys::dkg::part1(fid_from, 2, 2, &mut *rng).expect("part1 from");
+        let (_secret_to, pkg_to) =
+            frost::keys::dkg::part1(fid_to, 2, 2, &mut *rng).expect("part1 to");
+
+        let mut r1_map = BTreeMap::new();
+        r1_map.insert(fid_to, pkg_to);
+
+        let (_r2_secret, r2_pkgs) =
+            frost::keys::dkg::part2(secret_from, &r1_map).expect("part2 must succeed");
+
+        let frost_r2 = r2_pkgs.get(&fid_to).expect("must have package").clone();
+
+        let p_from = ParticipantId::from_bytes([from_idx; 32]);
+        let p_to = ParticipantId::from_bytes([to_idx; 32]);
+        Round2Package::new(session_id, p_from, p_to, frost_r2)
+    }
+
+    /// Helper: advance session to Round2Share state with real round1 packages.
+    fn setup_round2_session() -> DKGSession {
+        let mut rng = ChaCha20Rng::seed_from_u64(999);
+        let mut session = make_session(3, 2);
+        session.start_round1().expect("start_round1");
+
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        for pkg in packages {
+            session.add_round1_package(pkg).expect("add_round1_package");
+        }
+
+        session.complete_round1().expect("complete_round1");
+        session.start_round2().expect("start_round2");
+        session
+    }
+
+    /// Helper: fill all round2 packages into a session in Round2Share state.
+    fn fill_round2_packages(session: &mut DKGSession, rng: &mut ChaCha20Rng) {
+        let session_id = session.session_id().clone();
+        for from in 0..3u8 {
+            for to in 0..3u8 {
+                if from != to {
+                    let pkg = generate_real_round2_package(
+                        session_id.clone(), from, to, rng,
+                    );
+                    session.add_round2_package(pkg).expect("add r2");
+                }
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -808,7 +896,7 @@ mod tests {
     fn test_session_id() {
         let session_id = SessionId::from_bytes([0xBB; 32]);
         let participants = make_participants(3);
-        let session = DKGSession::new(session_id.clone(), participants, 2).unwrap();
+        let session = DKGSession::new(session_id.clone(), participants, 2).expect("ok");
         assert_eq!(session.session_id(), &session_id);
     }
 
@@ -841,42 +929,44 @@ mod tests {
     #[test]
     fn test_start_round1_twice_fails() {
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("first start");
         let result = session.start_round1();
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_round1_package() {
+        let mut rng = ChaCha20Rng::seed_from_u64(100);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
 
-        let p0 = ParticipantId::from_bytes([0; 32]);
-        let package = Round1Package::new(p0.clone(), [0xAA; 32], [0xBB; 64]);
-
-        assert!(session.add_round1_package(package).is_ok());
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        assert!(session.add_round1_package(packages[0].clone()).is_ok());
         assert_eq!(session.get_round1_packages().len(), 1);
     }
 
     #[test]
     fn test_add_round1_package_wrong_state_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(101);
         let mut session = make_session(3, 2);
         // Don't start round1
 
-        let p0 = ParticipantId::from_bytes([0; 32]);
-        let package = Round1Package::new(p0, [0xAA; 32], [0xBB; 64]);
-
-        let result = session.add_round1_package(package);
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        let result = session.add_round1_package(packages[0].clone());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_add_round1_package_unregistered_participant_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(102);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
 
+        let fid = frost_id(1);
+        let (_secret, frost_pkg) =
+            frost::keys::dkg::part1(fid, 3, 2, &mut rng).expect("part1");
         let unknown = ParticipantId::from_bytes([0xFF; 32]);
-        let package = Round1Package::new(unknown, [0xAA; 32], [0xBB; 64]);
+        let package = Round1Package::new(unknown, frost_pkg);
 
         let result = session.add_round1_package(package);
         assert!(result.is_err());
@@ -884,29 +974,35 @@ mod tests {
 
     #[test]
     fn test_add_round1_package_duplicate_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(103);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
 
         let p0 = ParticipantId::from_bytes([0; 32]);
-        let package1 = Round1Package::new(p0.clone(), [0xAA; 32], [0xBB; 64]);
-        let package2 = Round1Package::new(p0, [0xCC; 32], [0xDD; 64]);
+        let fid = frost_id(1);
 
-        session.add_round1_package(package1).unwrap();
+        let (_s1, fp1) = frost::keys::dkg::part1(fid, 3, 2, &mut rng).expect("p1a");
+        let (_s2, fp2) = frost::keys::dkg::part1(fid, 3, 2, &mut rng).expect("p1b");
+
+        let package1 = Round1Package::new(p0.clone(), fp1);
+        let package2 = Round1Package::new(p0, fp2);
+
+        session.add_round1_package(package1).expect("first add");
         let result = session.add_round1_package(package2);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_has_all_round1_packages() {
+        let mut rng = ChaCha20Rng::seed_from_u64(104);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
 
         assert!(!session.has_all_round1_packages());
 
-        for i in 0..3 {
-            let p = ParticipantId::from_bytes([i as u8; 32]);
-            let package = Round1Package::new(p, [0xAA; 32], [0xBB; 64]);
-            session.add_round1_package(package).unwrap();
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        for pkg in packages {
+            session.add_round1_package(pkg).expect("add");
         }
 
         assert!(session.has_all_round1_packages());
@@ -914,14 +1010,13 @@ mod tests {
 
     #[test]
     fn test_complete_round1() {
+        let mut rng = ChaCha20Rng::seed_from_u64(105);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
 
-        // Add all packages
-        for i in 0..3 {
-            let p = ParticipantId::from_bytes([i as u8; 32]);
-            let package = Round1Package::new(p, [0xAA; 32], [0xBB; 64]);
-            session.add_round1_package(package).unwrap();
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        for pkg in packages {
+            session.add_round1_package(pkg).expect("add");
         }
 
         assert!(session.complete_round1().is_ok());
@@ -930,14 +1025,14 @@ mod tests {
 
     #[test]
     fn test_complete_round1_incomplete_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(106);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
 
         // Only add 2 of 3 packages
-        for i in 0..2 {
-            let p = ParticipantId::from_bytes([i as u8; 32]);
-            let package = Round1Package::new(p, [0xAA; 32], [0xBB; 64]);
-            session.add_round1_package(package).unwrap();
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        for pkg in packages.into_iter().take(2) {
+            session.add_round1_package(pkg).expect("add");
         }
 
         let result = session.complete_round1();
@@ -948,33 +1043,18 @@ mod tests {
     // ROUND 2 TESTS
     // ────────────────────────────────────────────────────────────────────────────
 
-    fn setup_round2_session() -> DKGSession {
-        let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
-
-        for i in 0..3 {
-            let p = ParticipantId::from_bytes([i as u8; 32]);
-            let package = Round1Package::new(p, [0xAA; 32], [0xBB; 64]);
-            session.add_round1_package(package).unwrap();
-        }
-
-        session.complete_round1().unwrap();
-        session.start_round2().unwrap();
-        session
-    }
-
     #[test]
     fn test_start_round2() {
+        let mut rng = ChaCha20Rng::seed_from_u64(200);
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start r1");
 
-        for i in 0..3 {
-            let p = ParticipantId::from_bytes([i as u8; 32]);
-            let package = Round1Package::new(p, [0xAA; 32], [0xBB; 64]);
-            session.add_round1_package(package).unwrap();
+        let packages = generate_real_round1_packages(3, 2, &mut rng);
+        for pkg in packages {
+            session.add_round1_package(pkg).expect("add r1");
         }
 
-        session.complete_round1().unwrap();
+        session.complete_round1().expect("complete r1");
         assert!(session.start_round2().is_ok());
         assert_eq!(session.state().state_name(), "Round2Share");
     }
@@ -982,12 +1062,11 @@ mod tests {
     #[test]
     fn test_add_round2_package() {
         let mut session = setup_round2_session();
-
-        let p0 = ParticipantId::from_bytes([0; 32]);
-        let p1 = ParticipantId::from_bytes([1; 32]);
+        let mut rng = ChaCha20Rng::seed_from_u64(201);
         let session_id = session.session_id().clone();
 
-        let package = Round2Package::new(session_id, p0, p1.clone(), vec![0xEE; 32]);
+        let p1 = ParticipantId::from_bytes([1; 32]);
+        let package = generate_real_round2_package(session_id, 0, 1, &mut rng);
         assert!(session.add_round2_package(package).is_ok());
 
         let packages = session.get_round2_packages_for(&p1);
@@ -997,12 +1076,22 @@ mod tests {
     #[test]
     fn test_add_round2_package_unregistered_sender_fails() {
         let mut session = setup_round2_session();
+        let mut rng = ChaCha20Rng::seed_from_u64(202);
+
+        // Generate real frost r2 package but assign to unknown sender
+        let fid1 = frost_id(1);
+        let fid2 = frost_id(2);
+        let (s1, _) = frost::keys::dkg::part1(fid1, 2, 2, &mut rng).expect("p1a");
+        let (_, p2) = frost::keys::dkg::part1(fid2, 2, 2, &mut rng).expect("p1b");
+        let mut r1_map = BTreeMap::new();
+        r1_map.insert(fid2, p2);
+        let (_, r2_pkgs) = frost::keys::dkg::part2(s1, &r1_map).expect("p2");
+        let frost_r2 = r2_pkgs.get(&fid2).expect("must have").clone();
 
         let unknown = ParticipantId::from_bytes([0xFF; 32]);
         let p1 = ParticipantId::from_bytes([1; 32]);
-        let session_id = session.session_id().clone();
+        let package = Round2Package::new(session.session_id().clone(), unknown, p1, frost_r2);
 
-        let package = Round2Package::new(session_id, unknown, p1, vec![0xEE; 32]);
         let result = session.add_round2_package(package);
         assert!(result.is_err());
     }
@@ -1010,12 +1099,21 @@ mod tests {
     #[test]
     fn test_add_round2_package_unregistered_recipient_fails() {
         let mut session = setup_round2_session();
+        let mut rng = ChaCha20Rng::seed_from_u64(203);
+
+        let fid1 = frost_id(1);
+        let fid2 = frost_id(2);
+        let (s1, _) = frost::keys::dkg::part1(fid1, 2, 2, &mut rng).expect("p1a");
+        let (_, p2) = frost::keys::dkg::part1(fid2, 2, 2, &mut rng).expect("p1b");
+        let mut r1_map = BTreeMap::new();
+        r1_map.insert(fid2, p2);
+        let (_, r2_pkgs) = frost::keys::dkg::part2(s1, &r1_map).expect("p2");
+        let frost_r2 = r2_pkgs.get(&fid2).expect("must have").clone();
 
         let p0 = ParticipantId::from_bytes([0; 32]);
         let unknown = ParticipantId::from_bytes([0xFF; 32]);
-        let session_id = session.session_id().clone();
+        let package = Round2Package::new(session.session_id().clone(), p0, unknown, frost_r2);
 
-        let package = Round2Package::new(session_id, p0, unknown, vec![0xEE; 32]);
         let result = session.add_round2_package(package);
         assert!(result.is_err());
     }
@@ -1023,70 +1121,35 @@ mod tests {
     #[test]
     fn test_add_round2_package_duplicate_fails() {
         let mut session = setup_round2_session();
-
-        let p0 = ParticipantId::from_bytes([0; 32]);
-        let p1 = ParticipantId::from_bytes([1; 32]);
+        let mut rng = ChaCha20Rng::seed_from_u64(204);
         let session_id = session.session_id().clone();
 
-        let package1 = Round2Package::new(session_id.clone(), p0.clone(), p1.clone(), vec![0xEE; 32]);
-        let package2 = Round2Package::new(session_id, p0, p1, vec![0xFF; 32]);
+        let pkg1 = generate_real_round2_package(session_id.clone(), 0, 1, &mut rng);
+        let pkg2 = generate_real_round2_package(session_id, 0, 1, &mut rng);
 
-        session.add_round2_package(package1).unwrap();
-        let result = session.add_round2_package(package2);
+        session.add_round2_package(pkg1).expect("first add");
+        let result = session.add_round2_package(pkg2);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_has_all_round2_packages() {
         let mut session = setup_round2_session();
-        let session_id = session.session_id().clone();
+        let mut rng = ChaCha20Rng::seed_from_u64(205);
 
         assert!(!session.has_all_round2_packages());
-
-        // Each participant sends to all others (total - 1 per participant)
-        // 3 participants: 0->1, 0->2, 1->0, 1->2, 2->0, 2->1
-        for from in 0..3u8 {
-            for to in 0..3u8 {
-                if from != to {
-                    let p_from = ParticipantId::from_bytes([from; 32]);
-                    let p_to = ParticipantId::from_bytes([to; 32]);
-                    let package = Round2Package::new(
-                        session_id.clone(),
-                        p_from,
-                        p_to,
-                        vec![0xEE; 32],
-                    );
-                    session.add_round2_package(package).unwrap();
-                }
-            }
-        }
-
+        fill_round2_packages(&mut session, &mut rng);
         assert!(session.has_all_round2_packages());
     }
 
     #[test]
     fn test_complete_round2() {
         let mut session = setup_round2_session();
-        let session_id = session.session_id().clone();
+        let mut rng = ChaCha20Rng::seed_from_u64(206);
 
-        // Add all round2 packages
-        for from in 0..3u8 {
-            for to in 0..3u8 {
-                if from != to {
-                    let p_from = ParticipantId::from_bytes([from; 32]);
-                    let p_to = ParticipantId::from_bytes([to; 32]);
-                    let package = Round2Package::new(
-                        session_id.clone(),
-                        p_from,
-                        p_to,
-                        vec![0xEE; 32],
-                    );
-                    session.add_round2_package(package).unwrap();
-                }
-            }
-        }
+        fill_round2_packages(&mut session, &mut rng);
 
-        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).unwrap();
+        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).expect("valid pk");
         assert!(session.complete_round2(group_pubkey).is_ok());
         assert!(session.is_complete());
         assert_eq!(session.state().state_name(), "Completed");
@@ -1096,8 +1159,7 @@ mod tests {
     fn test_complete_round2_incomplete_fails() {
         let mut session = setup_round2_session();
 
-        // Don't add all packages
-        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).unwrap();
+        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).expect("valid pk");
         let result = session.complete_round2(group_pubkey);
         assert!(result.is_err());
     }
@@ -1120,7 +1182,7 @@ mod tests {
     #[test]
     fn test_fail_from_round1() {
         let mut session = make_session(3, 2);
-        session.start_round1().unwrap();
+        session.start_round1().expect("start");
         let error = DKGError::InvalidThreshold {
             threshold: 5,
             total: 3,
@@ -1132,30 +1194,14 @@ mod tests {
     #[test]
     fn test_fail_does_not_overwrite_completed() {
         let mut session = setup_round2_session();
-        let session_id = session.session_id().clone();
+        let mut rng = ChaCha20Rng::seed_from_u64(207);
 
-        // Complete the session
-        for from in 0..3u8 {
-            for to in 0..3u8 {
-                if from != to {
-                    let p_from = ParticipantId::from_bytes([from; 32]);
-                    let p_to = ParticipantId::from_bytes([to; 32]);
-                    let package = Round2Package::new(
-                        session_id.clone(),
-                        p_from,
-                        p_to,
-                        vec![0xEE; 32],
-                    );
-                    session.add_round2_package(package).unwrap();
-                }
-            }
-        }
+        fill_round2_packages(&mut session, &mut rng);
 
-        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).unwrap();
-        session.complete_round2(group_pubkey).unwrap();
+        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).expect("valid pk");
+        session.complete_round2(group_pubkey).expect("complete");
         assert!(session.is_complete());
 
-        // Try to fail - should not change state
         let error = DKGError::InvalidThreshold {
             threshold: 5,
             total: 3,
@@ -1175,14 +1221,12 @@ mod tests {
         session.fail(error1);
         assert!(session.is_failed());
 
-        // Try to fail again - should not change
         let error2 = DKGError::InsufficientParticipants {
             expected: 10,
             got: 1,
         };
         session.fail(error2);
 
-        // State should still be Failed with original error
         match session.state() {
             DKGState::Failed { error } => match error {
                 DKGError::InvalidThreshold { threshold: 5, total: 3 } => {}
@@ -1227,52 +1271,46 @@ mod tests {
 
     #[test]
     fn test_full_dkg_lifecycle() {
-        // Create session
+        let mut rng = ChaCha20Rng::seed_from_u64(300);
         let session_id = SessionId::from_bytes([0xAA; 32]);
         let participants = make_participants(3);
-        let mut session = DKGSession::new(session_id.clone(), participants, 2).unwrap();
+        let mut session = DKGSession::new(session_id.clone(), participants, 2).expect("ok");
 
         assert_eq!(session.state().state_name(), "Initialized");
 
         // Start Round 1
-        session.start_round1().unwrap();
+        session.start_round1().expect("start r1");
         assert_eq!(session.state().state_name(), "Round1Commitment");
 
-        // Add Round 1 packages
-        for i in 0..3 {
-            let p = ParticipantId::from_bytes([i as u8; 32]);
-            let package = Round1Package::new(p, [0xAA; 32], [0xBB; 64]);
-            session.add_round1_package(package).unwrap();
+        // Add Round 1 packages (real frost)
+        let r1_packages = generate_real_round1_packages(3, 2, &mut rng);
+        for pkg in r1_packages {
+            session.add_round1_package(pkg).expect("add r1");
         }
 
         // Complete Round 1
-        session.complete_round1().unwrap();
+        session.complete_round1().expect("complete r1");
         assert_eq!(session.state().state_name(), "Round1Complete");
 
         // Start Round 2
-        session.start_round2().unwrap();
+        session.start_round2().expect("start r2");
         assert_eq!(session.state().state_name(), "Round2Share");
 
-        // Add Round 2 packages
+        // Add Round 2 packages (real frost)
         for from in 0..3u8 {
             for to in 0..3u8 {
                 if from != to {
-                    let p_from = ParticipantId::from_bytes([from; 32]);
-                    let p_to = ParticipantId::from_bytes([to; 32]);
-                    let package = Round2Package::new(
-                        session_id.clone(),
-                        p_from,
-                        p_to,
-                        vec![0xEE; 32],
+                    let pkg = generate_real_round2_package(
+                        session_id.clone(), from, to, &mut rng,
                     );
-                    session.add_round2_package(package).unwrap();
+                    session.add_round2_package(pkg).expect("add r2");
                 }
             }
         }
 
         // Complete DKG
-        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).unwrap();
-        session.complete_round2(group_pubkey).unwrap();
+        let group_pubkey = GroupPublicKey::from_bytes([0x02; 32]).expect("valid pk");
+        session.complete_round2(group_pubkey).expect("complete r2");
 
         assert!(session.is_complete());
         assert!(!session.is_failed());

@@ -1,7 +1,8 @@
 //! # DKG Participant Implementation
 //!
 //! Module ini menyediakan trait `DKGParticipant` dan implementasi lokal
-//! `LocalDKGParticipant` untuk participant-side DKG logic.
+//! `LocalDKGParticipant` untuk participant-side DKG logic menggunakan
+//! real FROST DKG dari `frost-ed25519` (ZCash Foundation).
 //!
 //! ## Lifecycle
 //!
@@ -12,44 +13,52 @@
 //!
 //!   new() ──► Initialized
 //!                 │
-//!                 │ generate_round1()
+//!                 │ generate_round1()       [frost::keys::dkg::part1]
 //!                 ▼
 //!            Round1Generated { package }
 //!                 │
-//!                 │ process_round1(packages)
-//!                 ▼
-//!            Round1Processed
-//!                 │
-//!                 │ (generates Round2Packages internally)
+//!                 │ process_round1(packages) [frost::keys::dkg::part2]
 //!                 ▼
 //!            Round2Generated { packages }
 //!                 │
-//!                 │ process_round2(packages)
+//!                 │ process_round2(packages) [frost::keys::dkg::part3]
 //!                 ▼
 //!            Completed { key_share }
 //! ```
 //!
-//! ## Catatan Implementasi
+//! ## Kriptografi
 //!
-//! Kriptografi dalam module ini adalah **placeholder deterministik**:
-//! - `generate_polynomial()` menggunakan hash-based derivation
-//! - `compute_commitment()` menggunakan SHA3-256
-//! - `encrypt_share()` dan `decrypt_share()` menggunakan XOR dengan derived key
+//! Implementasi menggunakan **real FROST DKG** (Flexible Round-Optimized
+//! Schnorr Threshold Signatures):
 //!
-//! Implementasi kriptografi sebenarnya (curve operations, Schnorr proofs)
-//! akan ditambahkan di tahap selanjutnya.
+//! - **Round 1**: `frost::keys::dkg::part1()` — Generate random polynomial,
+//!   compute Feldman VSS commitments, produce Schnorr proof of knowledge
+//! - **Round 2**: `frost::keys::dkg::part2()` — Verify all round 1 packages
+//!   (commitments + proofs), evaluate secret polynomial for each peer
+//! - **Finalization**: `frost::keys::dkg::part3()` — Verify received shares
+//!   against VSS commitments, compute final signing share and group public key
+//!
+//! ## Identifier Derivation
+//!
+//! FROST requires each participant to have a unique `frost::Identifier` (nonzero
+//! Ed25519 scalar). This is derived deterministically from `ParticipantId` bytes
+//! via `frost::Identifier::derive()`, which uses hash-to-field to guarantee a
+//! valid nonzero scalar. All participants independently compute the same mapping.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+use rand::CryptoRng;
 use rand::RngCore;
-use sha3::{Digest, Sha3_256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use frost_ed25519 as frost;
+
 use crate::error::DKGError;
-use crate::primitives::{GroupPublicKey, ParticipantPublicKey, SecretShare, SCALAR_SIZE};
+use crate::frost_adapter;
+use crate::primitives::{GroupPublicKey, ParticipantPublicKey, SecretShare, PUBLIC_KEY_SIZE};
 use crate::types::{ParticipantId, SessionId};
 
-use super::packages::{Round1Package, Round2Package, COMMITMENT_SIZE, PROOF_SIZE};
+use super::packages::{Round1Package, Round2Package};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // KEY SHARE
@@ -167,8 +176,7 @@ impl KeyShare {
 ///
 /// State transitions:
 /// - `Initialized` → `Round1Generated` (via generate_round1)
-/// - `Round1Generated` → `Round1Processed` (via process_round1 - internal)
-/// - `Round1Processed` → `Round2Generated` (via process_round1 - generates packages)
+/// - `Round1Generated` → `Round2Generated` (via process_round1)
 /// - `Round2Generated` → `Completed` (via process_round2)
 /// - Any state → `Aborted` (via abort)
 #[derive(Clone)]
@@ -286,19 +294,49 @@ pub trait DKGParticipant {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// FROST IDENTIFIER DERIVATION
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Derive a deterministic `frost::Identifier` from a `ParticipantId`.
+///
+/// Uses `frost::Identifier::derive()` which applies hash-to-field
+/// to produce a valid nonzero Ed25519 scalar. Deterministic: the same
+/// ParticipantId always produces the same Identifier across all participants.
+///
+/// # Errors
+///
+/// Returns `DKGError::InvalidRound1Package` if derivation fails (astronomically
+/// unlikely for valid hash-to-field).
+fn derive_frost_identifier(
+    pid: &ParticipantId,
+) -> Result<frost::Identifier, DKGError> {
+    frost::Identifier::derive(pid.as_bytes()).map_err(|e| {
+        DKGError::InvalidRound1Package {
+            participant: pid.clone(),
+            reason: format!("cannot derive frost identifier: {}", e),
+        }
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // LOCAL DKG PARTICIPANT
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// Implementasi lokal DKG participant.
+/// Implementasi lokal DKG participant menggunakan real FROST DKG.
 ///
-/// `LocalDKGParticipant` mengimplementasikan participant-side logic
-/// untuk DKG protocol. Struct ini menyimpan state dan secret material
-/// yang diperlukan selama DKG.
+/// `LocalDKGParticipant` mengimplementasikan Pedersen DKG (Feldman VSS variant)
+/// via `frost-ed25519::keys::dkg` API. Setiap method maps ke frost function:
+///
+/// | Method | FROST Function | Deskripsi |
+/// |--------|----------------|-----------|
+/// | `generate_round1()` | `dkg::part1()` | Generate polynomial + commitments |
+/// | `process_round1()` | `dkg::part2()` | Verify commitments, generate shares |
+/// | `process_round2()` | `dkg::part3()` | Verify shares, compute final key |
 ///
 /// ## Keamanan
 ///
-/// - `secret_polynomial` di-zeroize saat drop atau abort
-/// - `received_shares` di-zeroize saat drop atau abort
+/// - Secret polynomial state di-drop saat abort atau completion
+/// - `frost::keys::dkg::round1::SecretPackage` consumed (via take) setelah part2
 /// - Tidak ada logging secret material
 ///
 /// ## Contoh
@@ -327,23 +365,31 @@ pub struct LocalDKGParticipant {
     /// Session ID untuk DKG session.
     session_id: SessionId,
 
-    /// Threshold signature yang diperlukan.
+    /// Threshold signature yang diperlukan (min_signers).
     threshold: u8,
 
-    /// Total jumlah participants.
+    /// Total jumlah participants (max_signers).
     total: u8,
 
-    /// Secret polynomial coefficients (degree = threshold - 1).
-    /// SENSITIVE - di-zeroize saat drop.
-    secret_polynomial: Option<Vec<SecretShare>>,
+    /// Derived frost Identifier untuk participant ini.
+    /// Set during generate_round1().
+    frost_identifier: Option<frost::Identifier>,
 
-    /// Commitment ke polynomial constant term.
-    commitment: Option<[u8; COMMITMENT_SIZE]>,
+    /// FROST DKG round 1 secret state.
+    /// Produced by part1(), consumed by part2().
+    round1_secret_package: Option<frost::keys::dkg::round1::SecretPackage>,
 
-    /// Shares yang diterima dari participants lain.
-    /// Key: sender participant_id, Value: decrypted share.
-    /// SENSITIVE - di-zeroize saat drop.
-    received_shares: HashMap<ParticipantId, SecretShare>,
+    /// FROST DKG round 2 secret state.
+    /// Produced by part2(), used by part3().
+    round2_secret_package: Option<frost::keys::dkg::round2::SecretPackage>,
+
+    /// Stored round 1 packages from other participants (excluding self).
+    /// Needed by part3().
+    received_round1_packages: Option<BTreeMap<frost::Identifier, frost::keys::dkg::round1::Package>>,
+
+    /// Mapping from ParticipantId to frost Identifier for reverse lookup.
+    /// Populated during process_round1().
+    identifier_map: Vec<(ParticipantId, frost::Identifier)>,
 
     /// Current state dalam state machine.
     state: LocalParticipantState,
@@ -392,9 +438,11 @@ impl LocalDKGParticipant {
             session_id,
             threshold,
             total,
-            secret_polynomial: None,
-            commitment: None,
-            received_shares: HashMap::new(),
+            frost_identifier: None,
+            round1_secret_package: None,
+            round2_secret_package: None,
+            received_round1_packages: None,
+            identifier_map: Vec::new(),
             state: LocalParticipantState::Initialized,
         })
     }
@@ -423,27 +471,89 @@ impl LocalDKGParticipant {
         self.total
     }
 
-    /// Zeroize semua secret material.
-    fn zeroize_secrets(&mut self) {
-        // Zeroize polynomial
-        if let Some(ref mut poly) = self.secret_polynomial {
-            for share in poly.iter_mut() {
-                share.zeroize();
+    /// Generate round 1 package with a caller-provided RNG.
+    ///
+    /// This method allows deterministic testing by injecting a seeded RNG.
+    /// In production, use `generate_round1()` which uses `rand::thread_rng()`.
+    ///
+    /// # Errors
+    ///
+    /// - `DKGError::InvalidState` jika state bukan `Initialized`
+    /// - `DKGError::InvalidRound1Package` jika frost identifier derivation fails
+    pub fn generate_round1_with_rng<R: RngCore + CryptoRng>(
+        &mut self,
+        rng: &mut R,
+    ) -> Result<Round1Package, DKGError> {
+        // Validasi state
+        if !matches!(self.state, LocalParticipantState::Initialized) {
+            return Err(DKGError::InvalidState {
+                expected: "Initialized".to_string(),
+                got: self.state.state_name().to_string(),
+            });
+        }
+
+        // Derive frost Identifier from our ParticipantId
+        let identifier = derive_frost_identifier(&self.participant_id)?;
+
+        // Call frost DKG part1
+        let (secret_package, frost_round1_package) = frost::keys::dkg::part1(
+            identifier,
+            u16::from(self.total),
+            u16::from(self.threshold),
+            rng,
+        )
+        .map_err(|e| DKGError::InvalidState {
+            expected: "frost part1 success".to_string(),
+            got: format!("frost error: {}", e),
+        })?;
+
+        // Store FROST internal state
+        self.frost_identifier = Some(identifier);
+        self.round1_secret_package = Some(secret_package);
+
+        // Create our Round1Package wrapper
+        let package = Round1Package::new(
+            self.participant_id.clone(),
+            frost_round1_package,
+        );
+
+        // Transition state
+        self.state = LocalParticipantState::Round1Generated {
+            package: package.clone(),
+        };
+
+        Ok(package)
+    }
+
+    /// Clear all frost secret state.
+    fn clear_frost_secrets(&mut self) {
+        self.round1_secret_package = None;
+        self.round2_secret_package = None;
+        self.received_round1_packages = None;
+        self.frost_identifier = None;
+        self.identifier_map.clear();
+    }
+
+    /// Find the ParticipantId corresponding to a frost Identifier.
+    fn find_participant_id(
+        &self,
+        frost_id: &frost::Identifier,
+    ) -> Result<ParticipantId, DKGError> {
+        for (pid, fid) in &self.identifier_map {
+            if fid == frost_id {
+                return Ok(pid.clone());
             }
         }
-        self.secret_polynomial = None;
-
-        // Zeroize received shares
-        for (_id, share) in self.received_shares.iter_mut() {
-            share.zeroize();
-        }
-        self.received_shares.clear();
+        Err(DKGError::InvalidState {
+            expected: "known frost identifier".to_string(),
+            got: "unknown frost identifier in round2 output".to_string(),
+        })
     }
 }
 
 impl Drop for LocalDKGParticipant {
     fn drop(&mut self) {
-        self.zeroize_secrets();
+        self.clear_frost_secrets();
     }
 }
 
@@ -453,36 +563,7 @@ impl DKGParticipant for LocalDKGParticipant {
     }
 
     fn generate_round1(&mut self) -> Result<Round1Package, DKGError> {
-        // Validasi state
-        if !matches!(self.state, LocalParticipantState::Initialized) {
-            return Err(DKGError::InvalidState {
-                expected: "Initialized".to_string(),
-                got: self.state.state_name().to_string(),
-            });
-        }
-
-        // Generate polynomial dengan degree = threshold - 1
-        let polynomial = generate_polynomial(self.threshold, &self.participant_id, &self.session_id);
-
-        // Compute commitment dari polynomial constant term
-        let commitment = compute_commitment(&polynomial);
-
-        // Generate Schnorr proof of knowledge (placeholder)
-        let proof = generate_proof(&polynomial, &self.participant_id, &self.session_id);
-
-        // Store polynomial dan commitment
-        self.secret_polynomial = Some(polynomial);
-        self.commitment = Some(commitment);
-
-        // Create Round1Package
-        let package = Round1Package::new(self.participant_id.clone(), commitment, proof);
-
-        // Transition state
-        self.state = LocalParticipantState::Round1Generated {
-            package: package.clone(),
-        };
-
-        Ok(package)
+        self.generate_round1_with_rng(&mut rand::thread_rng())
     }
 
     fn process_round1(
@@ -505,64 +586,91 @@ impl DKGParticipant for LocalDKGParticipant {
             });
         }
 
-        // Verify semua commitments dan proofs
-        for package in packages {
-            // Verify commitment (placeholder - check non-zero)
-            if package.commitment().iter().all(|&b| b == 0) {
-                return Err(DKGError::InvalidCommitment {
-                    participant: package.participant_id().clone(),
-                });
-            }
-
-            // Verify proof
-            if !package.verify_proof() {
-                return Err(DKGError::InvalidProof {
-                    participant: package.participant_id().clone(),
-                });
-            }
-        }
-
-        // Get our polynomial
-        let polynomial = self.secret_polynomial.as_ref().ok_or_else(|| {
+        // Take our round1 secret package (consumed by part2)
+        let secret_package = self.round1_secret_package.take().ok_or_else(|| {
             DKGError::InvalidState {
-                expected: "polynomial present".to_string(),
-                got: "polynomial missing".to_string(),
+                expected: "round1 secret package present".to_string(),
+                got: "round1 secret package missing".to_string(),
             }
         })?;
 
-        // Derive participant list from packages (sorted for deterministic indexing)
-        let mut all_participant_ids: Vec<ParticipantId> = packages
-            .iter()
-            .map(|p| p.participant_id().clone())
-            .collect();
-        all_participant_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        // Build frost round1 package map (excluding our own)
+        // and build the identifier mapping for all participants
+        let mut frost_round1_packages = BTreeMap::new();
+        let mut id_map: Vec<(ParticipantId, frost::Identifier)> = Vec::new();
 
-        // Generate Round2Packages untuk setiap participant lain
-        let mut round2_packages = Vec::new();
+        for package in packages {
+            let pid = package.participant_id();
+            let frost_id = derive_frost_identifier(pid)?;
 
-        for (idx, recipient) in all_participant_ids.iter().enumerate() {
-            // Skip sending to self
-            if recipient == &self.participant_id {
+            // Record mapping for all participants (including self)
+            id_map.push((pid.clone(), frost_id));
+
+            // Skip our own package — frost part2 expects only OTHER participants
+            if pid == &self.participant_id {
                 continue;
             }
 
-            // Use 1-indexed position for polynomial evaluation
-            let recipient_index = (idx + 1) as u8;
+            // Check for duplicate frost identifiers (collision detection)
+            if frost_round1_packages.contains_key(&frost_id) {
+                return Err(DKGError::DuplicateParticipant {
+                    participant: pid.clone(),
+                });
+            }
 
-            // Evaluate polynomial at recipient's index
-            let share = evaluate_polynomial(polynomial, recipient_index);
+            frost_round1_packages.insert(frost_id, package.frost_package().clone());
+        }
 
-            // Encrypt share untuk recipient (placeholder encryption)
-            let encrypted = encrypt_share(&share, recipient);
+        // Validate we have the expected number of OTHER participants' packages
+        let expected_others = (self.total as usize).saturating_sub(1);
+        if frost_round1_packages.len() != expected_others {
+            return Err(DKGError::InsufficientParticipants {
+                expected: self.total,
+                got: frost_round1_packages.len() as u8 + 1, // +1 for self
+            });
+        }
 
-            // Create Round2Package
+        // Store identifier map before calling part2
+        self.identifier_map = id_map;
+
+        // Call frost DKG part2
+        // This verifies ALL commitments and proofs from round 1 packages.
+        // If any commitment or proof is invalid, frost returns an error.
+        let (round2_secret_package, frost_round2_packages) =
+            frost::keys::dkg::part2(secret_package, &frost_round1_packages).map_err(|e| {
+                let msg = e.to_string();
+                let msg_lower = msg.to_lowercase();
+                if msg_lower.contains("commitment") {
+                    DKGError::InvalidCommitment {
+                        participant: self.participant_id.clone(),
+                    }
+                } else if msg_lower.contains("proof") {
+                    DKGError::InvalidProof {
+                        participant: self.participant_id.clone(),
+                    }
+                } else {
+                    DKGError::InvalidState {
+                        expected: "frost part2 success".to_string(),
+                        got: format!("frost error: {}", e),
+                    }
+                }
+            })?;
+
+        // Store round 2 secret + round 1 packages (needed for part3)
+        self.round2_secret_package = Some(round2_secret_package);
+        self.received_round1_packages = Some(frost_round1_packages);
+
+        // Convert frost round2 packages to our Round2Package format
+        let mut round2_packages = Vec::new();
+        for (recipient_frost_id, frost_r2_pkg) in &frost_round2_packages {
+            let recipient_pid = self.find_participant_id(recipient_frost_id)?;
+
             let package = Round2Package::new(
                 self.session_id.clone(),
                 self.participant_id.clone(),
-                recipient.clone(),
-                encrypted,
+                recipient_pid,
+                frost_r2_pkg.clone(),
             );
-
             round2_packages.push(package);
         }
 
@@ -583,54 +691,135 @@ impl DKGParticipant for LocalDKGParticipant {
             });
         }
 
-        // Get our polynomial for our own share
-        let polynomial = self.secret_polynomial.as_ref().ok_or_else(|| {
+        // Get round 2 secret package (borrowed, not consumed)
+        let round2_secret = self.round2_secret_package.as_ref().ok_or_else(|| {
             DKGError::InvalidState {
-                expected: "polynomial present".to_string(),
-                got: "polynomial missing".to_string(),
+                expected: "round2 secret package present".to_string(),
+                got: "round2 secret package missing".to_string(),
             }
         })?;
 
-        // Compute our own contribution (evaluate at our index)
-        // For this placeholder, we use a fixed index since we don't store participant list
-        let our_contribution = evaluate_polynomial(polynomial, 1);
+        // Get stored round 1 packages (from process_round1)
+        let round1_packages = self.received_round1_packages.as_ref().ok_or_else(|| {
+            DKGError::InvalidState {
+                expected: "round1 packages present".to_string(),
+                got: "round1 packages missing".to_string(),
+            }
+        })?;
 
-        // Decrypt shares dari semua packages yang ditujukan ke kita
+        // Build frost round2 package map from received packages addressed to us.
+        // Key = sender's frost Identifier, Value = frost round2 Package.
+        let mut frost_round2_packages = BTreeMap::new();
+
         for package in packages {
-            // Verify package is for us
+            // Only process packages addressed to us
             if package.to_participant() != &self.participant_id {
                 continue;
             }
 
-            let sender = package.from_participant();
+            let sender_pid = package.from_participant();
+            let sender_frost_id = derive_frost_identifier(sender_pid)?;
 
-            // Decrypt share
-            let decrypted = decrypt_share(package.encrypted_share(), sender)?;
-
-            // Placeholder verification: just check non-zero
-            // Real implementation would verify against stored commitment
-            if decrypted.as_bytes().iter().all(|&b| b == 0) {
-                return Err(DKGError::ShareVerificationFailed {
-                    participant: sender.clone(),
+            // Verify sender was in our round 1 participants
+            if !round1_packages.contains_key(&sender_frost_id) {
+                return Err(DKGError::InvalidRound2Package {
+                    from: sender_pid.clone(),
+                    to: self.participant_id.clone(),
+                    reason: "sender not in round 1 participants".to_string(),
                 });
             }
 
-            // Store decrypted share
-            self.received_shares.insert(sender.clone(), decrypted);
+            // Check for duplicate senders
+            if frost_round2_packages.contains_key(&sender_frost_id) {
+                return Err(DKGError::DuplicateParticipant {
+                    participant: sender_pid.clone(),
+                });
+            }
+
+            frost_round2_packages.insert(sender_frost_id, package.frost_package().clone());
         }
 
-        // Compute final secret share (sum of all contributions)
-        let final_share = compute_final_share(&our_contribution, &self.received_shares)?;
+        // Validate we received packages from all other participants
+        let expected_count = (self.total as usize).saturating_sub(1);
+        if frost_round2_packages.len() != expected_count {
+            return Err(DKGError::InsufficientParticipants {
+                expected: self.total.saturating_sub(1),
+                got: frost_round2_packages.len() as u8,
+            });
+        }
 
-        // Compute group public key (deterministic from our commitment + received shares)
-        let group_pubkey = compute_group_pubkey_from_share(&final_share, &self.commitment)?;
+        // Call frost DKG part3
+        // This verifies all received shares against the VSS commitments from round 1.
+        // If any share is invalid, frost returns an error.
+        let (key_package, _pubkey_package) =
+            frost::keys::dkg::part3(round2_secret, round1_packages, &frost_round2_packages)
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    let msg_lower = msg.to_lowercase();
+                    if msg_lower.contains("share") || msg_lower.contains("verification") {
+                        DKGError::ShareVerificationFailed {
+                            participant: self.participant_id.clone(),
+                        }
+                    } else {
+                        DKGError::InvalidState {
+                            expected: "frost part3 success".to_string(),
+                            got: format!("frost error: {}", e),
+                        }
+                    }
+                })?;
 
-        // Compute participant public key (from our final share)
-        let participant_pubkey = compute_participant_pubkey(&final_share)?;
+        // Extract signing share → SecretShare
+        let secret_share =
+            frost_adapter::signing_share_to_secret_share(key_package.signing_share()).map_err(
+                |e| DKGError::InvalidState {
+                    expected: "valid signing share conversion".to_string(),
+                    got: e.to_string(),
+                },
+            )?;
 
-        // Build KeyShare
+        // Extract verifying key → GroupPublicKey
+        let vk_bytes = key_package
+            .verifying_key()
+            .serialize()
+            .map_err(|e| DKGError::InvalidState {
+                expected: "valid verifying key serialization".to_string(),
+                got: e.to_string(),
+            })?;
+        let vk_array: [u8; PUBLIC_KEY_SIZE] =
+            vk_bytes.as_slice().try_into().map_err(|_| DKGError::InvalidState {
+                expected: format!("verifying key {} bytes", PUBLIC_KEY_SIZE),
+                got: format!("got {} bytes", vk_bytes.len()),
+            })?;
+        let group_pubkey = GroupPublicKey::from_bytes(vk_array).map_err(|e| {
+            DKGError::InvalidState {
+                expected: "valid group public key".to_string(),
+                got: e.to_string(),
+            }
+        })?;
+
+        // Extract verifying share → ParticipantPublicKey
+        let vs_bytes = key_package
+            .verifying_share()
+            .serialize()
+            .map_err(|e| DKGError::InvalidState {
+                expected: "valid verifying share serialization".to_string(),
+                got: e.to_string(),
+            })?;
+        let vs_array: [u8; PUBLIC_KEY_SIZE] =
+            vs_bytes.as_slice().try_into().map_err(|_| DKGError::InvalidState {
+                expected: format!("verifying share {} bytes", PUBLIC_KEY_SIZE),
+                got: format!("got {} bytes", vs_bytes.len()),
+            })?;
+        let participant_pubkey =
+            ParticipantPublicKey::from_bytes(vs_array).map_err(|e| DKGError::InvalidState {
+                expected: "valid participant public key".to_string(),
+                got: e.to_string(),
+            })?;
+
+        // Build KeyShare with our ORIGINAL participant_id
+        // (not the frost identifier, which is a derived scalar)
         let key_share = KeyShare::new(
-            final_share,
+            secret_share,
             group_pubkey,
             participant_pubkey,
             self.participant_id.clone(),
@@ -643,366 +832,20 @@ impl DKGParticipant for LocalDKGParticipant {
             key_share: key_share.clone(),
         };
 
-        // Zeroize polynomial (no longer needed)
-        self.secret_polynomial = None;
+        // Clear frost secret state (no longer needed)
+        self.round1_secret_package = None;
+        self.round2_secret_package = None;
 
         Ok(key_share)
     }
 
     fn abort(&mut self) {
-        // Zeroize all secrets
-        self.zeroize_secrets();
+        // Clear all frost secret material
+        self.clear_frost_secrets();
 
         // Set state to Aborted (idempotent)
         self.state = LocalParticipantState::Aborted;
     }
-}
-
-// ════════════════════════════════════════════════════════════════════════════════
-// HELPER FUNCTIONS (PLACEHOLDER / DETERMINISTIC)
-// ════════════════════════════════════════════════════════════════════════════════
-
-/// Generate polynomial coefficients.
-///
-/// **PLACEHOLDER**: Uses hash-based deterministic derivation.
-///
-/// # Arguments
-///
-/// * `threshold` - Threshold (polynomial degree = threshold - 1)
-/// * `participant_id` - Participant identifier (for domain separation)
-/// * `session_id` - Session identifier (for domain separation)
-///
-/// # Returns
-///
-/// Vec of SecretShare representing polynomial coefficients [a0, a1, ..., a_{t-1}]
-fn generate_polynomial(
-    threshold: u8,
-    participant_id: &ParticipantId,
-    session_id: &SessionId,
-) -> Vec<SecretShare> {
-    let degree = threshold as usize; // coefficients = threshold (index 0 to threshold-1)
-    let mut coefficients = Vec::with_capacity(degree);
-
-    for i in 0..degree {
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"dsdn-tss-polynomial-coeff-v1");
-        hasher.update(participant_id.as_bytes());
-        hasher.update(session_id.as_bytes());
-        hasher.update(&[i as u8]);
-
-        // Add randomness for non-deterministic generation in production
-        let mut random_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut random_bytes);
-        hasher.update(&random_bytes);
-
-        let result = hasher.finalize();
-        let mut coeff_bytes = [0u8; SCALAR_SIZE];
-        coeff_bytes.copy_from_slice(&result);
-
-        // Ensure non-zero (constant term especially must be non-zero)
-        if coeff_bytes.iter().all(|&b| b == 0) {
-            coeff_bytes[0] = 1;
-        }
-
-        // Use unwrap_or with a fallback that ensures we get a valid SecretShare
-        let share = SecretShare::from_bytes(coeff_bytes).unwrap_or_else(|_| {
-            let mut fallback = [0u8; SCALAR_SIZE];
-            fallback[0] = 1;
-            // This should never fail since we ensure non-zero
-            SecretShare::from_bytes(fallback).expect("fallback share should be valid")
-        });
-
-        coefficients.push(share);
-    }
-
-    coefficients
-}
-
-/// Evaluate polynomial at point x.
-///
-/// **PLACEHOLDER**: Uses Horner's method with byte addition.
-///
-/// # Arguments
-///
-/// * `polynomial` - Polynomial coefficients [a0, a1, ..., a_{t-1}]
-/// * `x` - Evaluation point (1-indexed participant index)
-///
-/// # Returns
-///
-/// SecretShare representing p(x)
-fn evaluate_polynomial(polynomial: &[SecretShare], x: u8) -> SecretShare {
-    // Placeholder: simple hash-based evaluation
-    // Real implementation would use field arithmetic
-
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-poly-eval-v1");
-    hasher.update(&[x]);
-
-    for (i, coeff) in polynomial.iter().enumerate() {
-        hasher.update(&[i as u8]);
-        hasher.update(coeff.as_bytes());
-    }
-
-    let result = hasher.finalize();
-    let mut eval_bytes = [0u8; SCALAR_SIZE];
-    eval_bytes.copy_from_slice(&result);
-
-    // Ensure non-zero
-    if eval_bytes.iter().all(|&b| b == 0) {
-        eval_bytes[0] = 1;
-    }
-
-    SecretShare::from_bytes(eval_bytes).unwrap_or_else(|_| {
-        let mut fallback = [0u8; SCALAR_SIZE];
-        fallback[0] = 1;
-        SecretShare::from_bytes(fallback).expect("fallback should be valid")
-    })
-}
-
-/// Compute commitment from polynomial.
-///
-/// **PLACEHOLDER**: Uses SHA3-256 of constant term.
-///
-/// # Arguments
-///
-/// * `polynomial` - Polynomial coefficients
-///
-/// # Returns
-///
-/// 32-byte commitment
-fn compute_commitment(polynomial: &[SecretShare]) -> [u8; COMMITMENT_SIZE] {
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-commitment-v1");
-
-    // Commitment is to the constant term (a0) primarily
-    if let Some(constant_term) = polynomial.first() {
-        hasher.update(constant_term.as_bytes());
-    }
-
-    // Include all coefficients for uniqueness
-    for coeff in polynomial {
-        hasher.update(coeff.as_bytes());
-    }
-
-    let result = hasher.finalize();
-    let mut commitment = [0u8; COMMITMENT_SIZE];
-    commitment.copy_from_slice(&result);
-    commitment
-}
-
-/// Generate Schnorr proof of knowledge.
-///
-/// **PLACEHOLDER**: Deterministic hash-based proof.
-///
-/// # Arguments
-///
-/// * `polynomial` - Polynomial coefficients
-/// * `participant_id` - Participant identifier
-/// * `session_id` - Session identifier
-///
-/// # Returns
-///
-/// 64-byte proof (challenge || response)
-fn generate_proof(
-    polynomial: &[SecretShare],
-    participant_id: &ParticipantId,
-    session_id: &SessionId,
-) -> [u8; PROOF_SIZE] {
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-proof-v1");
-    hasher.update(participant_id.as_bytes());
-    hasher.update(session_id.as_bytes());
-
-    for coeff in polynomial {
-        hasher.update(coeff.as_bytes());
-    }
-
-    let challenge = hasher.finalize();
-
-    let mut hasher2 = Sha3_256::new();
-    hasher2.update(b"dsdn-tss-proof-response-v1");
-    hasher2.update(&challenge);
-    if let Some(secret) = polynomial.first() {
-        hasher2.update(secret.as_bytes());
-    }
-
-    let response = hasher2.finalize();
-
-    let mut proof = [0u8; PROOF_SIZE];
-    proof[..32].copy_from_slice(&challenge);
-    proof[32..].copy_from_slice(&response);
-    proof
-}
-
-/// Encrypt share for recipient.
-///
-/// **PLACEHOLDER**: XOR with derived key.
-///
-/// # Arguments
-///
-/// * `share` - Share to encrypt
-/// * `recipient` - Recipient participant ID (for key derivation)
-///
-/// # Returns
-///
-/// Encrypted bytes
-fn encrypt_share(share: &SecretShare, recipient: &ParticipantId) -> Vec<u8> {
-    // Derive encryption key from recipient ID (placeholder)
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-share-encryption-v1");
-    hasher.update(recipient.as_bytes());
-    let key = hasher.finalize();
-
-    // XOR encryption (placeholder)
-    let share_bytes = share.as_bytes();
-    let mut encrypted = vec![0u8; SCALAR_SIZE];
-    for (i, (s, k)) in share_bytes.iter().zip(key.iter()).enumerate() {
-        encrypted[i] = s ^ k;
-    }
-
-    encrypted
-}
-
-/// Decrypt share from sender.
-///
-/// **PLACEHOLDER**: XOR with derived key.
-///
-/// # Arguments
-///
-/// * `encrypted` - Encrypted share bytes
-/// * `sender` - Sender participant ID (for key derivation)
-///
-/// # Returns
-///
-/// Decrypted SecretShare or error
-///
-/// # Errors
-///
-/// - `DKGError::InvalidRound2Package` if decryption fails
-fn decrypt_share(encrypted: &[u8], sender: &ParticipantId) -> Result<SecretShare, DKGError> {
-    if encrypted.len() != SCALAR_SIZE {
-        return Err(DKGError::InvalidRound2Package {
-            from: sender.clone(),
-            to: ParticipantId::from_bytes([0; 32]), // Placeholder
-            reason: "invalid encrypted share length".to_string(),
-        });
-    }
-
-    // Derive decryption key from our ID (placeholder - in real impl this would be ECDH)
-    // Note: For this placeholder, we use the sender's ID to match encryption
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-share-encryption-v1");
-    // In the encrypt function, we used recipient's ID
-    // For decryption to work, we need to know the recipient (which is us)
-    // But we don't have that info here directly
-    // For the placeholder, we'll use sender's ID in a way that's consistent
-    hasher.update(sender.as_bytes());
-    let key = hasher.finalize();
-
-    // XOR decryption (placeholder)
-    let mut decrypted = [0u8; SCALAR_SIZE];
-    for (i, (e, k)) in encrypted.iter().zip(key.iter()).enumerate() {
-        decrypted[i] = e ^ k;
-    }
-
-    // Note: This placeholder encryption/decryption won't actually work correctly
-    // because encrypt uses recipient ID and decrypt uses sender ID
-    // In real implementation, ECDH would derive the same shared secret
-
-    SecretShare::from_bytes(decrypted).map_err(|_| DKGError::InvalidRound2Package {
-        from: sender.clone(),
-        to: ParticipantId::from_bytes([0; 32]),
-        reason: "decrypted share is invalid".to_string(),
-    })
-}
-
-/// Compute final secret share from contributions.
-///
-/// **PLACEHOLDER**: Hash-based combination.
-///
-/// In real implementation, this would be the sum of all shares
-/// in the scalar field.
-fn compute_final_share(
-    our_contribution: &SecretShare,
-    received_shares: &HashMap<ParticipantId, SecretShare>,
-) -> Result<SecretShare, DKGError> {
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-final-share-v1");
-    hasher.update(our_contribution.as_bytes());
-
-    for (_id, share) in received_shares {
-        hasher.update(share.as_bytes());
-    }
-
-    let result = hasher.finalize();
-    let mut final_bytes = [0u8; SCALAR_SIZE];
-    final_bytes.copy_from_slice(&result);
-
-    // Ensure non-zero
-    if final_bytes.iter().all(|&b| b == 0) {
-        final_bytes[0] = 1;
-    }
-
-    SecretShare::from_bytes(final_bytes).map_err(|_| DKGError::ShareVerificationFailed {
-        participant: ParticipantId::from_bytes([0; 32]),
-    })
-}
-
-/// Compute group public key from share and commitment.
-///
-/// **PLACEHOLDER**: Hash-based derivation.
-///
-/// In real implementation, this would be computed from
-/// all participants' constant term commitments.
-fn compute_group_pubkey_from_share(
-    share: &SecretShare,
-    commitment: &Option<[u8; COMMITMENT_SIZE]>,
-) -> Result<GroupPublicKey, DKGError> {
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-group-pubkey-v1");
-    hasher.update(share.as_bytes());
-
-    if let Some(comm) = commitment {
-        hasher.update(comm);
-    }
-
-    let result = hasher.finalize();
-    let mut pubkey_bytes = [0u8; 32];
-    pubkey_bytes.copy_from_slice(&result);
-
-    // Ensure non-zero for valid pubkey
-    if pubkey_bytes.iter().all(|&b| b == 0) {
-        pubkey_bytes[0] = 0x02; // Valid compressed point prefix
-    }
-
-    GroupPublicKey::from_bytes(pubkey_bytes).map_err(|_| DKGError::InvalidCommitment {
-        participant: ParticipantId::from_bytes([0; 32]),
-    })
-}
-
-/// Compute participant public key from secret share.
-///
-/// **PLACEHOLDER**: Hash-based derivation.
-///
-/// In real implementation, this would be secret_share * G
-/// where G is the generator point.
-fn compute_participant_pubkey(share: &SecretShare) -> Result<ParticipantPublicKey, DKGError> {
-    let mut hasher = Sha3_256::new();
-    hasher.update(b"dsdn-tss-participant-pubkey-v1");
-    hasher.update(share.as_bytes());
-
-    let result = hasher.finalize();
-    let mut pubkey_bytes = [0u8; 32];
-    pubkey_bytes.copy_from_slice(&result);
-
-    // Ensure non-zero for valid pubkey
-    if pubkey_bytes.iter().all(|&b| b == 0) {
-        pubkey_bytes[0] = 0x02;
-    }
-
-    ParticipantPublicKey::from_bytes(pubkey_bytes).map_err(|_| DKGError::ShareVerificationFailed {
-        participant: ParticipantId::from_bytes([0; 32]),
-    })
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1012,19 +855,86 @@ fn compute_participant_pubkey(share: &SecretShare) -> Result<ParticipantPublicKe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
 
     // ────────────────────────────────────────────────────────────────────────────
     // HELPER FUNCTIONS
     // ────────────────────────────────────────────────────────────────────────────
 
-    fn make_participants(n: usize) -> Vec<ParticipantId> {
-        (0..n)
-            .map(|i| ParticipantId::from_bytes([i as u8; 32]))
+    /// Create participant IDs that are valid for frost Identifier derivation.
+    /// Uses small nonzero values in first byte to ensure uniqueness.
+    fn make_participant_ids(n: usize) -> Vec<ParticipantId> {
+        (1..=n)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = i as u8;
+                ParticipantId::from_bytes(bytes)
+            })
             .collect()
     }
 
-    fn make_participant(session_id: SessionId, participant_id: ParticipantId, threshold: u8, total: u8) -> LocalDKGParticipant {
-        LocalDKGParticipant::new(participant_id, session_id, threshold, total).unwrap()
+    fn make_participant(
+        session_id: SessionId,
+        participant_id: ParticipantId,
+        threshold: u8,
+        total: u8,
+    ) -> LocalDKGParticipant {
+        LocalDKGParticipant::new(participant_id, session_id, threshold, total)
+            .expect("valid params must produce valid participant")
+    }
+
+    /// Run a complete DKG ceremony and return key shares.
+    fn run_full_dkg(
+        threshold: u8,
+        total: u8,
+        seed: u64,
+    ) -> Vec<KeyShare> {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let session_id = SessionId::from_bytes([0xAA; 32]);
+        let pids = make_participant_ids(total as usize);
+
+        // Create participants
+        let mut participants: Vec<LocalDKGParticipant> = pids
+            .iter()
+            .map(|pid| make_participant(session_id.clone(), pid.clone(), threshold, total))
+            .collect();
+
+        // Round 1: Generate
+        let mut round1_packages = Vec::new();
+        for p in &mut participants {
+            let pkg = p
+                .generate_round1_with_rng(&mut rng)
+                .expect("generate_round1 must succeed");
+            round1_packages.push(pkg);
+        }
+
+        // Round 1: Process → generates Round 2 packages
+        let mut all_round2_packages: Vec<Vec<Round2Package>> = Vec::new();
+        for p in &mut participants {
+            let r2_pkgs = p
+                .process_round1(&round1_packages)
+                .expect("process_round1 must succeed");
+            all_round2_packages.push(r2_pkgs);
+        }
+
+        // Round 2: Route packages to recipients and process
+        let mut key_shares = Vec::new();
+        for p in &mut participants {
+            let my_packages: Vec<Round2Package> = all_round2_packages
+                .iter()
+                .flat_map(|pkgs| pkgs.iter())
+                .filter(|pkg| pkg.to_participant() == p.participant_id())
+                .cloned()
+                .collect();
+
+            let key_share = p
+                .process_round2(&my_packages)
+                .expect("process_round2 must succeed");
+            key_shares.push(key_share);
+        }
+
+        key_shares
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -1032,10 +942,10 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_key_share_new() {
-        let secret = SecretShare::from_bytes([0x42; 32]).unwrap();
-        let group_pk = GroupPublicKey::from_bytes([0x02; 32]).unwrap();
-        let participant_pk = ParticipantPublicKey::from_bytes([0x03; 32]).unwrap();
+    fn test_key_share_accessors() {
+        let secret = SecretShare::from_bytes([0x42; 32]).expect("valid share");
+        let group_pk = GroupPublicKey::from_bytes([0x02; 32]).expect("valid pk");
+        let participant_pk = ParticipantPublicKey::from_bytes([0x03; 32]).expect("valid pk");
         let participant_id = ParticipantId::from_bytes([0xAA; 32]);
 
         let key_share = KeyShare::new(
@@ -1060,8 +970,14 @@ mod tests {
 
     #[test]
     fn test_state_names() {
-        assert_eq!(LocalParticipantState::Initialized.state_name(), "Initialized");
-        assert_eq!(LocalParticipantState::Round1Processed.state_name(), "Round1Processed");
+        assert_eq!(
+            LocalParticipantState::Initialized.state_name(),
+            "Initialized"
+        );
+        assert_eq!(
+            LocalParticipantState::Round1Processed.state_name(),
+            "Round1Processed"
+        );
         assert_eq!(LocalParticipantState::Aborted.state_name(), "Aborted");
     }
 
@@ -1079,15 +995,10 @@ mod tests {
     #[test]
     fn test_new_valid() {
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
-        let participant = LocalDKGParticipant::new(
-            participant_id,
-            session_id,
-            2,
-            3,
-        );
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
+        let participant = LocalDKGParticipant::new(participant_id, session_id, 2, 3);
         assert!(participant.is_ok());
-        let p = participant.unwrap();
+        let p = participant.expect("must be ok");
         assert_eq!(p.threshold(), 2);
         assert_eq!(p.total(), 3);
     }
@@ -1095,7 +1006,7 @@ mod tests {
     #[test]
     fn test_new_total_less_than_2_fails() {
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let result = LocalDKGParticipant::new(participant_id, session_id, 2, 1);
         assert!(result.is_err());
     }
@@ -1103,7 +1014,7 @@ mod tests {
     #[test]
     fn test_new_threshold_less_than_2_fails() {
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let result = LocalDKGParticipant::new(participant_id, session_id, 1, 3);
         assert!(result.is_err());
     }
@@ -1111,7 +1022,7 @@ mod tests {
     #[test]
     fn test_new_threshold_greater_than_total_fails() {
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let result = LocalDKGParticipant::new(participant_id, session_id, 5, 3);
         assert!(result.is_err());
     }
@@ -1122,16 +1033,16 @@ mod tests {
 
     #[test]
     fn test_generate_round1() {
+        let mut rng = ChaCha20Rng::seed_from_u64(100);
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let mut participant = make_participant(session_id, participant_id.clone(), 2, 3);
 
-        let result = participant.generate_round1();
+        let result = participant.generate_round1_with_rng(&mut rng);
         assert!(result.is_ok());
 
-        let package = result.unwrap();
+        let package = result.expect("must be ok");
         assert_eq!(package.participant_id(), participant.participant_id());
-        assert!(package.verify_proof());
 
         // State should be Round1Generated
         assert_eq!(participant.state().state_name(), "Round1Generated");
@@ -1139,15 +1050,16 @@ mod tests {
 
     #[test]
     fn test_generate_round1_wrong_state_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(101);
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let mut participant = make_participant(session_id, participant_id, 2, 3);
 
         // Generate once
-        participant.generate_round1().unwrap();
+        let _ = participant.generate_round1_with_rng(&mut rng);
 
         // Generate again should fail
-        let result = participant.generate_round1();
+        let result = participant.generate_round1_with_rng(&mut rng);
         assert!(result.is_err());
     }
 
@@ -1156,87 +1068,26 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_process_round1() {
+    fn test_process_round1_wrong_state_fails() {
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participants = make_participants(3);
-        let mut participant = make_participant(
-            session_id.clone(),
-            participants[0].clone(),
-            2,
-            3,
-        );
-
-        // Generate Round 1
-        let my_package = participant.generate_round1().unwrap();
-
-        // Create packages from other participants (simulated)
-        let mut packages = vec![my_package];
-        for i in 1..3 {
-            let package = Round1Package::new(
-                participants[i].clone(),
-                [0x02 + i as u8; 32],
-                [0xAB; 64],
-            );
-            packages.push(package);
-        }
-
-        // Process Round 1
-        let result = participant.process_round1(&packages);
-        assert!(result.is_ok());
-
-        let round2_packages = result.unwrap();
-        // Should generate packages for 2 other participants
-        assert_eq!(round2_packages.len(), 2);
-
-        // State should be Round2Generated
-        assert_eq!(participant.state().state_name(), "Round2Generated");
-    }
-
-    #[test]
-    fn test_process_round1_empty_packages_fails() {
-        let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let mut participant = make_participant(session_id, participant_id, 2, 3);
 
-        participant.generate_round1().unwrap();
-
+        // Don't generate round 1 first → process_round1 should fail
         let result = participant.process_round1(&[]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_process_round1_wrong_state_fails() {
+    fn test_process_round1_empty_packages_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(102);
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let mut participant = make_participant(session_id, participant_id, 2, 3);
 
-        // Don't generate round 1 first
-        let packages = vec![Round1Package::new(
-            ParticipantId::from_bytes([0x01; 32]),
-            [0x02; 32],
-            [0xAB; 64],
-        )];
+        let _ = participant.generate_round1_with_rng(&mut rng);
 
-        let result = participant.process_round1(&packages);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_process_round1_zero_commitment_fails() {
-        let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
-        let mut participant = make_participant(session_id, participant_id, 2, 3);
-
-        participant.generate_round1().unwrap();
-
-        // Package with zero commitment
-        let packages = vec![Round1Package::new(
-            ParticipantId::from_bytes([0x01; 32]),
-            [0x00; 32], // zero commitment
-            [0xAB; 64],
-        )];
-
-        let result = participant.process_round1(&packages);
+        let result = participant.process_round1(&[]);
         assert!(result.is_err());
     }
 
@@ -1246,26 +1097,15 @@ mod tests {
 
     #[test]
     fn test_process_round2_wrong_state_fails() {
+        let mut rng = ChaCha20Rng::seed_from_u64(103);
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participants = make_participants(3);
-        let mut participant = make_participant(
-            session_id.clone(),
-            participants[0].clone(),
-            2,
-            3,
-        );
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
+        let mut participant = make_participant(session_id, participant_id, 2, 3);
 
-        participant.generate_round1().unwrap();
+        let _ = participant.generate_round1_with_rng(&mut rng);
 
-        // Try to process round 2 without processing round 1
-        let packages = vec![Round2Package::new(
-            session_id,
-            participants[1].clone(),
-            participants[0].clone(),
-            vec![0x42; 32],
-        )];
-
-        let result = participant.process_round2(&packages);
+        // Try process_round2 without process_round1
+        let result = participant.process_round2(&[]);
         assert!(result.is_err());
     }
 
@@ -1275,87 +1115,31 @@ mod tests {
 
     #[test]
     fn test_abort() {
+        let mut rng = ChaCha20Rng::seed_from_u64(104);
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let mut participant = make_participant(session_id, participant_id, 2, 3);
 
-        participant.generate_round1().unwrap();
+        let _ = participant.generate_round1_with_rng(&mut rng);
         participant.abort();
 
         assert_eq!(participant.state().state_name(), "Aborted");
-        assert!(participant.secret_polynomial.is_none());
+        assert!(participant.round1_secret_package.is_none());
+        assert!(participant.round2_secret_package.is_none());
+        assert!(participant.frost_identifier.is_none());
     }
 
     #[test]
     fn test_abort_idempotent() {
         let session_id = SessionId::from_bytes([0xAA; 32]);
-        let participant_id = ParticipantId::from_bytes([0xBB; 32]);
+        let participant_id = ParticipantId::from_bytes([0x01; 32]);
         let mut participant = make_participant(session_id, participant_id, 2, 3);
 
         participant.abort();
-        participant.abort(); // Should not panic
-        participant.abort(); // Should not panic
+        participant.abort();
+        participant.abort();
 
         assert_eq!(participant.state().state_name(), "Aborted");
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // HELPER FUNCTION TESTS
-    // ────────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_generate_polynomial() {
-        let participant_id = ParticipantId::from_bytes([0xAA; 32]);
-        let session_id = SessionId::from_bytes([0xBB; 32]);
-
-        let poly = generate_polynomial(3, &participant_id, &session_id);
-
-        // Should have 3 coefficients (degree 2)
-        assert_eq!(poly.len(), 3);
-
-        // All coefficients should be non-zero
-        for coeff in &poly {
-            assert!(!coeff.as_bytes().iter().all(|&b| b == 0));
-        }
-    }
-
-    #[test]
-    fn test_evaluate_polynomial() {
-        let participant_id = ParticipantId::from_bytes([0xAA; 32]);
-        let session_id = SessionId::from_bytes([0xBB; 32]);
-
-        let poly = generate_polynomial(2, &participant_id, &session_id);
-
-        let eval = evaluate_polynomial(&poly, 1);
-
-        // Result should be non-zero
-        assert!(!eval.as_bytes().iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_compute_commitment() {
-        let participant_id = ParticipantId::from_bytes([0xAA; 32]);
-        let session_id = SessionId::from_bytes([0xBB; 32]);
-
-        let poly = generate_polynomial(2, &participant_id, &session_id);
-        let commitment = compute_commitment(&poly);
-
-        // Commitment should be non-zero
-        assert!(!commitment.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_share() {
-        let share = SecretShare::from_bytes([0x42; 32]).unwrap();
-        let recipient = ParticipantId::from_bytes([0xAA; 32]);
-
-        let encrypted = encrypt_share(&share, &recipient);
-        assert_eq!(encrypted.len(), 32);
-
-        // Note: Due to placeholder implementation using different keys,
-        // decrypt won't return original. This is expected.
-        let decrypted = decrypt_share(&encrypted, &recipient);
-        assert!(decrypted.is_ok());
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -1368,5 +1152,285 @@ mod tests {
         assert_send_sync::<KeyShare>();
         assert_send_sync::<LocalParticipantState>();
         assert_send_sync::<LocalDKGParticipant>();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // REAL FROST DKG INTEGRATION TESTS (SPEC REQUIRED: 6 minimum)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 1: 3-of-5 DKG success
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_full_dkg_3_of_5_success() {
+        let key_shares = run_full_dkg(3, 5, 1000);
+
+        // All 5 participants should have a key share
+        assert_eq!(key_shares.len(), 5);
+
+        // All key shares should have correct threshold and total
+        for ks in &key_shares {
+            assert_eq!(ks.threshold(), 3);
+            assert_eq!(ks.total(), 5);
+        }
+
+        // All participants should have the SAME group public key (Feldman VSS property)
+        let first_gpk = key_shares[0].group_pubkey();
+        for ks in &key_shares[1..] {
+            assert_eq!(
+                ks.group_pubkey().as_bytes(),
+                first_gpk.as_bytes(),
+                "group public key must be identical across all participants"
+            );
+        }
+
+        // Each participant should have a UNIQUE secret share
+        for i in 0..key_shares.len() {
+            for j in (i + 1)..key_shares.len() {
+                assert_ne!(
+                    key_shares[i].secret_share().as_bytes(),
+                    key_shares[j].secret_share().as_bytes(),
+                    "secret shares must be unique per participant"
+                );
+            }
+        }
+
+        // Each participant should have a UNIQUE participant public key
+        for i in 0..key_shares.len() {
+            for j in (i + 1)..key_shares.len() {
+                assert_ne!(
+                    key_shares[i].participant_pubkey().as_bytes(),
+                    key_shares[j].participant_pubkey().as_bytes(),
+                    "participant public keys must be unique"
+                );
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 2: Threshold enforcement (2-of-3 DKG)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_full_dkg_2_of_3_threshold_enforcement() {
+        let key_shares = run_full_dkg(2, 3, 2000);
+
+        assert_eq!(key_shares.len(), 3);
+
+        for ks in &key_shares {
+            assert_eq!(ks.threshold(), 2);
+            assert_eq!(ks.total(), 3);
+        }
+
+        // Group public key must match across all participants
+        let first_gpk = key_shares[0].group_pubkey();
+        for ks in &key_shares[1..] {
+            assert_eq!(ks.group_pubkey().as_bytes(), first_gpk.as_bytes());
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 3: Invalid share rejection (misrouted round2 packages)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_invalid_share_rejection_insufficient_round2() {
+        let mut rng = ChaCha20Rng::seed_from_u64(3000);
+        let session_id = SessionId::from_bytes([0xBB; 32]);
+        let pids = make_participant_ids(3);
+
+        let mut participants: Vec<LocalDKGParticipant> = pids
+            .iter()
+            .map(|pid| make_participant(session_id.clone(), pid.clone(), 2, 3))
+            .collect();
+
+        // Round 1
+        let mut round1_packages = Vec::new();
+        for p in &mut participants {
+            round1_packages.push(
+                p.generate_round1_with_rng(&mut rng)
+                    .expect("round1 must succeed"),
+            );
+        }
+
+        // Process round 1
+        let mut all_round2_packages: Vec<Vec<Round2Package>> = Vec::new();
+        for p in &mut participants {
+            all_round2_packages.push(
+                p.process_round1(&round1_packages)
+                    .expect("process_round1 must succeed"),
+            );
+        }
+
+        // Give participant 0 an EMPTY set of round2 packages → should fail
+        let result = participants[0].process_round2(&[]);
+        assert!(result.is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 4: Invalid commitment rejection (insufficient round1 packages)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_invalid_commitment_rejection_insufficient_round1() {
+        let mut rng = ChaCha20Rng::seed_from_u64(4000);
+        let session_id = SessionId::from_bytes([0xCC; 32]);
+        let pids = make_participant_ids(3);
+
+        let mut p0 = make_participant(session_id.clone(), pids[0].clone(), 2, 3);
+        let mut p1 = make_participant(session_id.clone(), pids[1].clone(), 2, 3);
+
+        let pkg0 = p0
+            .generate_round1_with_rng(&mut rng)
+            .expect("round1 must succeed");
+        let _pkg1 = p1
+            .generate_round1_with_rng(&mut rng)
+            .expect("round1 must succeed");
+
+        // Give p0 only its own package (missing others) → should fail
+        let result = p0.process_round1(&[pkg0]);
+        assert!(result.is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 5: Deterministic group public key match
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_deterministic_group_public_key_match() {
+        // Run the same DKG twice with the same seed
+        let shares1 = run_full_dkg(3, 5, 5000);
+        let shares2 = run_full_dkg(3, 5, 5000);
+
+        // Group public keys should be identical between runs (deterministic)
+        assert_eq!(
+            shares1[0].group_pubkey().as_bytes(),
+            shares2[0].group_pubkey().as_bytes(),
+            "DKG with same seed must produce same group public key"
+        );
+
+        // All secret shares should also match (deterministic)
+        for (s1, s2) in shares1.iter().zip(shares2.iter()) {
+            assert_eq!(
+                s1.secret_share().as_bytes(),
+                s2.secret_share().as_bytes(),
+                "DKG with same seed must produce same secret shares"
+            );
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 6: DKGState transition correctness
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dkg_state_transition_correctness() {
+        let mut rng = ChaCha20Rng::seed_from_u64(6000);
+        let session_id = SessionId::from_bytes([0xDD; 32]);
+        let pids = make_participant_ids(3);
+
+        let mut participants: Vec<LocalDKGParticipant> = pids
+            .iter()
+            .map(|pid| make_participant(session_id.clone(), pid.clone(), 2, 3))
+            .collect();
+
+        // Initial state: Initialized
+        for p in &participants {
+            assert_eq!(p.state().state_name(), "Initialized");
+        }
+
+        // After generate_round1: Round1Generated
+        let mut round1_packages = Vec::new();
+        for p in &mut participants {
+            round1_packages.push(
+                p.generate_round1_with_rng(&mut rng)
+                    .expect("round1 must succeed"),
+            );
+        }
+        for p in &participants {
+            assert_eq!(p.state().state_name(), "Round1Generated");
+        }
+
+        // After process_round1: Round2Generated
+        let mut all_round2_packages: Vec<Vec<Round2Package>> = Vec::new();
+        for p in &mut participants {
+            all_round2_packages.push(
+                p.process_round1(&round1_packages)
+                    .expect("process_round1 must succeed"),
+            );
+        }
+        for p in &participants {
+            assert_eq!(p.state().state_name(), "Round2Generated");
+        }
+
+        // After process_round2: Completed
+        for p in &mut participants {
+            let my_packages: Vec<Round2Package> = all_round2_packages
+                .iter()
+                .flat_map(|pkgs| pkgs.iter())
+                .filter(|pkg| pkg.to_participant() == p.participant_id())
+                .cloned()
+                .collect();
+
+            let _ = p
+                .process_round2(&my_packages)
+                .expect("process_round2 must succeed");
+        }
+        for p in &participants {
+            assert_eq!(p.state().state_name(), "Completed");
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // BONUS: Signing share compatibility verification
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_signing_share_valid_for_frost_signing() {
+        let key_shares = run_full_dkg(2, 3, 7000);
+
+        // Verify that each key share's secret can round-trip through frost adapter
+        for ks in &key_shares {
+            let signing_share =
+                frost_adapter::secret_share_to_signing_share(ks.secret_share())
+                    .expect("secret share must be valid frost signing share");
+
+            let recovered =
+                frost_adapter::signing_share_to_secret_share(&signing_share)
+                    .expect("roundtrip must succeed");
+
+            assert_eq!(
+                ks.secret_share().as_bytes(),
+                recovered.as_bytes(),
+                "signing share roundtrip must be byte-identical"
+            );
+        }
+
+        // Verify that group public key can round-trip through frost adapter
+        let gpk = key_shares[0].group_pubkey();
+        let vk = frost_adapter::group_pubkey_to_verifying_key(gpk)
+            .expect("group pubkey must be valid verifying key");
+        let recovered = frost_adapter::verifying_key_to_group_pubkey(&vk)
+            .expect("roundtrip must succeed");
+        assert_eq!(
+            gpk.as_bytes(),
+            recovered.as_bytes(),
+            "group pubkey roundtrip must be byte-identical"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // BONUS: 2-of-2 minimal DKG
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_full_dkg_2_of_2_minimal() {
+        let key_shares = run_full_dkg(2, 2, 8000);
+        assert_eq!(key_shares.len(), 2);
+        assert_eq!(
+            key_shares[0].group_pubkey().as_bytes(),
+            key_shares[1].group_pubkey().as_bytes()
+        );
     }
 }

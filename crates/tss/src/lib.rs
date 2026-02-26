@@ -43,6 +43,21 @@
 //!
 //! ### Phase 1: Distributed Key Generation (DKG)
 //!
+//! DKG menggunakan real FROST DKG protocol (Pedersen DKG / Feldman VSS variant)
+//! dari `frost-ed25519` (ZCash Foundation). Protocol terdiri dari dua round:
+//!
+//! **Round 1** (`frost::keys::dkg::part1`): Setiap participant generate random
+//! polynomial, compute Feldman VSS commitments (t curve points), dan Schnorr
+//! proof of knowledge. Output di-broadcast ke semua participants.
+//!
+//! **Round 2** (`frost::keys::dkg::part2` + `part3`): Setiap participant
+//! memverifikasi semua commitments dan proofs dari Round 1, kemudian mengevaluasi
+//! polynomialnya di titik masing-masing peer. Shares dikirim secara private.
+//! Setelah menerima shares, setiap participant memverifikasi terhadap VSS
+//! commitments dan menghitung final signing share + group public key.
+//!
+//! Output DKG kompatibel dengan `frost-ed25519` threshold signing.
+//!
 //! ```text
 //! Participant A          Participant B          Participant C
 //!      │                      │                      │
@@ -197,9 +212,10 @@
 //!
 //! - Menggunakan SHA3-256 untuk hashing internal
 //! - Domain separation untuk semua hash operations
-//! - Real FROST cryptography via `frost-ed25519` (ZCash Foundation) adapter
+//! - Real FROST cryptography via `frost-ed25519` (ZCash Foundation)
+//! - DKG menggunakan real Feldman VSS (Pedersen DKG) dari `frost::keys::dkg`
 //! - `frost_adapter` module menyediakan konversi ke/dari real Ed25519 FROST types
-//! - Placeholder implementations untuk EC operations masih ada (akan diganti incremental)
+//! - DKG output (KeyShare) kompatibel dengan `frost-ed25519` threshold signing
 //!
 //! ## Feature Flags
 //!
@@ -447,10 +463,11 @@ mod tests {
     #[test]
     fn test_dkg_re_exports_available() {
         let _state = DKGState::Initialized;
-        let participant = ParticipantId::new();
-        let _package1 = Round1Package::new(participant.clone(), [0xAA; 32], [0xBB; 64]);
-        let session = SessionId::new();
-        let _package2 = Round2Package::new(session, participant.clone(), participant, vec![0xCC; 32]);
+        // Round1Package and Round2Package now wrap frost types;
+        // they are constructed internally by LocalDKGParticipant.
+        // Verify they are accessible as types.
+        fn _accepts_r1(_p: &Round1Package) {}
+        fn _accepts_r2(_p: &Round2Package) {}
     }
 
     #[test]

@@ -221,6 +221,9 @@ impl DKGState {
 mod tests {
     use super::*;
     use crate::types::ParticipantId;
+    use frost_ed25519 as frost;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
 
     // ────────────────────────────────────────────────────────────────────────────
     // IS_TERMINAL TESTS
@@ -565,9 +568,14 @@ mod tests {
 
     #[test]
     fn test_dkg_state_clone_with_data() {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let fid = frost::Identifier::try_from(1u16).expect("valid id");
+        let (_secret, frost_pkg) =
+            frost::keys::dkg::part1(fid, 3, 2, &mut rng).expect("part1 must succeed");
+
         let mut commitments = HashMap::new();
         let participant = ParticipantId::from_bytes([0xAA; 32]);
-        let package = Round1Package::new(participant.clone(), [0xBB; 32], [0xCC; 64]);
+        let package = Round1Package::new(participant.clone(), frost_pkg);
         commitments.insert(participant, package);
 
         let state = DKGState::Round1Complete { commitments };

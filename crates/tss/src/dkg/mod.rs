@@ -1,7 +1,8 @@
 //! # DKG (Distributed Key Generation) Module
 //!
 //! Module ini menyediakan types untuk Distributed Key Generation protocol
-//! dalam FROST Threshold Signature Scheme.
+//! dalam FROST Threshold Signature Scheme, menggunakan real FROST DKG
+//! dari `frost-ed25519` (ZCash Foundation).
 //!
 //! ## Peran DKG dalam TSS
 //!
@@ -11,6 +12,33 @@
 //!
 //! Tidak ada satu participant pun yang mengetahui full secret key.
 //! Threshold `t` shares diperlukan untuk menghasilkan valid signature.
+//!
+//! ## Implementasi Kriptografi
+//!
+//! DKG menggunakan **Pedersen DKG (Feldman VSS variant)** dari `frost-ed25519`:
+//!
+//! ### Round 1: Commitment Phase (`frost::keys::dkg::part1`)
+//!
+//! 1. Setiap participant generate random polynomial derajat t-1
+//! 2. Participant broadcast `Round1Package` berisi:
+//!    - Feldman VSS commitments: t compressed Edwards Y curve points
+//!    - Schnorr proof of knowledge of constant term
+//! 3. frost library memverifikasi semua commitments dan proofs
+//!
+//! ### Round 2: Share Distribution (`frost::keys::dkg::part2`)
+//!
+//! 1. Setiap participant mengevaluasi polynomialnya di titik setiap peer
+//! 2. `Round2Package` berisi polynomial evaluation (secret share) per recipient
+//! 3. frost library memverifikasi shares terhadap VSS commitments dari Round 1
+//!
+//! ### Completion (`frost::keys::dkg::part3`)
+//!
+//! Jika semua shares valid:
+//! - Setiap participant menghitung final `SigningShare`
+//! - Group `VerifyingKey` dihitung dari semua commitments
+//! - State menjadi `Completed` dengan `KeyShare`
+//!
+//! Output kompatibel untuk `frost-ed25519` threshold signing.
 //!
 //! ## Alur Protocol
 //!
@@ -40,45 +68,10 @@
 //!   Completed { group_pubkey }    Failed { error } ◄────────────┘
 //! ```
 //!
-//! ### Round 1: Commitment Phase
-//!
-//! 1. Setiap participant generate polynomial coefficients
-//! 2. Participant broadcast `Round1Package` berisi:
-//!    - Pedersen commitment ke polynomial
-//!    - Schnorr proof of knowledge
-//! 3. Semua participants collect dan verify commitments
-//!
-//! ### Round 2: Share Distribution
-//!
-//! 1. Setiap participant menghitung share untuk participant lain
-//! 2. Shares dienkripsi dengan `EncryptionKey` (derived via ECDH)
-//! 3. `Round2Package` dikirim secara private ke masing-masing recipient
-//! 4. Recipients verify shares terhadap commitments dari Round 1
-//!
-//! ### Completion
-//!
-//! Jika semua shares valid:
-//! - State menjadi `Completed` dengan `GroupPublicKey`
-//! - Setiap participant memiliki `SecretShare` untuk signing
-//!
-//! Jika ada kegagalan:
-//! - State menjadi `Failed` dengan `DKGError`
-//! - Protocol harus di-restart
-//!
-//! ## Catatan Implementasi
-//!
-//! Module ini hanya menyediakan **types dan state machine**.
-//! Kriptografi detail (polynomial evaluation, Schnorr proofs, etc.)
-//! akan diimplementasikan di tahap selanjutnya.
-//!
-//! Saat ini:
-//! - `verify_proof()` adalah stub yang selalu return true
-//! - `decrypt()` adalah stub dengan basic XOR simulation
-//!
 //! ## Contoh Penggunaan
 //!
 //! ```rust
-//! use dsdn_tss::dkg::{DKGState, Round1Package, Round2Package};
+//! use dsdn_tss::dkg::{DKGState, LocalDKGParticipant, DKGParticipant};
 //! use dsdn_tss::{ParticipantId, SessionId};
 //!
 //! // Create initial state
@@ -86,14 +79,15 @@
 //! assert!(!state.is_terminal());
 //! assert!(state.can_transition_to(&DKGState::Round1Commitment));
 //!
-//! // Create Round1Package
-//! let participant = ParticipantId::new();
-//! let commitment = [0x42u8; 32];
-//! let proof = [0xABu8; 64];
-//! let package = Round1Package::new(participant, commitment, proof);
+//! // Create a DKG participant for a 2-of-3 scheme
+//! let session_id = SessionId::new();
+//! let participant_id = ParticipantId::new();
+//! let mut participant = LocalDKGParticipant::new(
+//!     participant_id, session_id, 2, 3,
+//! ).unwrap();
 //!
-//! // Verify proof (stub - always true for now)
-//! assert!(package.verify_proof());
+//! // Generate Round 1 package (wraps frost::keys::dkg::part1)
+//! let round1_package = participant.generate_round1().unwrap();
 //! ```
 
 pub mod packages;

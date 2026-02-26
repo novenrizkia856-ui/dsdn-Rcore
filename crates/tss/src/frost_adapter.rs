@@ -37,6 +37,13 @@
 //!
 //! Konversi `ParticipantId → frost::Identifier` **dapat gagal** jika bytes
 //! ParticipantId bukan nonzero scalar valid pada Ed25519 scalar field.
+//!
+//! ## DKG Identifier Derivation
+//!
+//! Untuk DKG, `ParticipantId` dikonversi ke `frost::Identifier` menggunakan
+//! `frost::Identifier::derive()` (hash-to-field), yang menjamin nonzero scalar
+//! untuk input apapun. Ini berbeda dari `deserialize()` yang membutuhkan input
+//! berupa valid scalar bytes.
 
 use frost_ed25519 as frost;
 
@@ -502,6 +509,45 @@ pub fn key_package_to_key_share(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// 7) ParticipantId -> frost::Identifier (DKG derivation)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Derive a `frost::Identifier` from a [`ParticipantId`] using hash-to-field.
+///
+/// Menggunakan `frost::Identifier::derive()` yang menerapkan hash-to-field
+/// pada input bytes, menjamin output berupa nonzero scalar valid pada
+/// Ed25519 scalar field.
+///
+/// Fungsi ini **deterministic**: input `ParticipantId` yang sama selalu
+/// menghasilkan `Identifier` yang sama. Semua participants dalam DKG
+/// akan secara independen menghitung mapping yang identik.
+///
+/// ## Penggunaan
+///
+/// Digunakan oleh `LocalDKGParticipant` saat menjalankan FROST DKG:
+/// - `generate_round1()`: derive identifier untuk diri sendiri
+/// - `process_round1()`: derive identifier untuk semua peers
+/// - `process_round2()`: derive identifier untuk sender verifikasi
+///
+/// ## Perbedaan dengan `deserialize()`
+///
+/// | Method | Input | Guarantee |
+/// |--------|-------|-----------|
+/// | `deserialize()` | Valid LE scalar bytes | Dapat gagal jika bytes invalid |
+/// | `derive()` | Arbitrary bytes | Selalu menghasilkan valid nonzero scalar |
+///
+/// # Errors
+///
+/// Mengembalikan [`TSSError::Crypto`] jika derivation gagal (secara praktis
+/// tidak pernah terjadi untuk hash-to-field).
+pub fn participant_id_to_frost_identifier(
+    pid: &ParticipantId,
+) -> Result<frost::Identifier, TSSError> {
+    frost::Identifier::derive(pid.as_bytes())
+        .map_err(|e| crypto_err("participant_id_to_frost_identifier", &e.to_string()))
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // UNIT TESTS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -826,5 +872,49 @@ mod tests {
         let ss1 = signing_share_to_secret_share(kp.signing_share()).expect("must succeed");
         let ss2 = signing_share_to_secret_share(kp.signing_share()).expect("must succeed");
         assert_eq!(ss1.as_bytes(), ss2.as_bytes(), "must be deterministic");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 8: ParticipantId → frost Identifier derivation
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_participant_id_to_frost_identifier_deterministic() {
+        let pid = ParticipantId::from_bytes([0x42; 32]);
+
+        let id1 = participant_id_to_frost_identifier(&pid)
+            .expect("derivation must succeed");
+        let id2 = participant_id_to_frost_identifier(&pid)
+            .expect("derivation must succeed");
+
+        assert_eq!(
+            id1.serialize(), id2.serialize(),
+            "same ParticipantId must produce same frost Identifier"
+        );
+    }
+
+    #[test]
+    fn test_participant_id_to_frost_identifier_unique() {
+        let pid1 = ParticipantId::from_bytes([0x01; 32]);
+        let pid2 = ParticipantId::from_bytes([0x02; 32]);
+
+        let id1 = participant_id_to_frost_identifier(&pid1)
+            .expect("derivation must succeed");
+        let id2 = participant_id_to_frost_identifier(&pid2)
+            .expect("derivation must succeed");
+
+        assert_ne!(
+            id1.serialize(), id2.serialize(),
+            "different ParticipantIds must produce different frost Identifiers"
+        );
+    }
+
+    #[test]
+    fn test_participant_id_to_frost_identifier_zero_bytes_succeeds() {
+        // Identifier::derive uses hash-to-field, so even zero bytes
+        // should produce a valid nonzero identifier
+        let pid = ParticipantId::from_bytes([0x00; 32]);
+        let result = participant_id_to_frost_identifier(&pid);
+        assert!(result.is_ok(), "derive must succeed for any input");
     }
 }
