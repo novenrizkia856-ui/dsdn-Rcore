@@ -109,6 +109,9 @@
 //! **Aggregation** (`frost::aggregate`): Coordinator mengumpulkan minimal `t` partial
 //! signatures dan memanggil `frost::aggregate()` untuk menghasilkan valid Ed25519
 //! aggregate signature yang dapat diverifikasi menggunakan group public key.
+//! `aggregate_signatures()` membangun semua frost types yang diperlukan — `SigningPackage`,
+//! `BTreeMap<Identifier, SignatureShare>`, dan `PublicKeyPackage` — kemudian mendelegasikan
+//! ke `frost::aggregate()`. Hasil berupa 64-byte Ed25519 signature (R ‖ s).
 //!
 //! **Nonce Safety**: `frost::round1::SigningNonces` implements `Zeroize` — nonces
 //! secara otomatis di-clear saat di-drop. `LocalThresholdSigner` menjamin nonces
@@ -259,8 +262,9 @@
 //! - Signing menggunakan real FROST 2-round protocol:
 //!   - Round 1: `frost::round1::commit()` generates real hiding + binding nonces
 //!   - Round 2: `frost::round2::sign()` computes real partial signatures
-//!   - Aggregation: `frost::aggregate()` produces standard Ed25519 signatures
+//!   - Aggregation: `frost::aggregate()` produces standard Ed25519 signatures (64 bytes)
 //! - Nonces di-zeroize setelah sign via `Zeroize` trait pada `frost::round1::SigningNonces`
+//! - Aggregate signature = 64-byte Ed25519 signature (R ‖ s), verifiable via group public key
 //! - `frost_adapter` module menyediakan konversi ke/dari real Ed25519 FROST types
 //! - DKG output (KeyShare) kompatibel dengan `frost-ed25519` threshold signing
 //!
@@ -591,10 +595,12 @@ mod tests {
 
     #[test]
     fn test_aggregate_signatures_re_export() {
-        // Just verify the function is accessible
+        // Just verify the function is accessible with new real-FROST signature
         let _fn_ptr: fn(
+            &[u8],
             &[PartialSignature],
             &GroupPublicKey,
+            &[(SignerId, ParticipantPublicKey)],
             &[u8; 32],
         ) -> Result<AggregateSignature, SigningError> = aggregate_signatures;
     }

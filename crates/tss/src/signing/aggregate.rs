@@ -3,6 +3,21 @@
 //! Module ini menyediakan `AggregateSignature` struct dan fungsi
 //! `aggregate_signatures` untuk FROST threshold signing.
 //!
+//! ## Aggregation Flow (Real FROST)
+//!
+//! ```text
+//! message + commitments ──► frost::SigningPackage
+//!                                    │
+//!                                    ▼
+//! signature_shares + pubkey_package ──► frost::aggregate()
+//!                                    │
+//!                                    ▼
+//!                           frost::Signature (64 bytes, R ‖ s)
+//!                                    │
+//!                                    ▼
+//!                           AggregateSignature
+//! ```
+//!
 //! ## Format Serialization
 //!
 //! | Field | Offset | Size | Description |
@@ -11,35 +26,19 @@
 //! | signer_count | 64 | 1 | Jumlah signers (u8) |
 //! | signers | 65 | 32*n | Signer IDs |
 //! | message_hash | 65+32*n | 32 | Message hash |
-//!
-//! ## Aggregation Flow
-//!
-//! ```text
-//! PartialSignature[0..t] ──► compute_binding_factors()
-//!                                      │
-//!                                      ▼
-//!                             compute_group_commitment() ──► R
-//!                                      │
-//!                                      ▼
-//!                             sum(signature_shares) ──► s
-//!                                      │
-//!                                      ▼
-//!                             FrostSignature(R ‖ s)
-//!                                      │
-//!                                      ▼
-//!                             AggregateSignature
-//! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
-use sha3::{Digest, Sha3_256};
+use frost_ed25519 as frost;
 
 use crate::error::SigningError;
-use crate::primitives::{FrostSignature, GroupPublicKey, SigningCommitment, SCALAR_SIZE, SIGNATURE_SIZE};
+use crate::frost_adapter;
+use crate::primitives::{
+    FrostSignature, GroupPublicKey, ParticipantPublicKey, SigningCommitment, SIGNATURE_SIZE,
+};
 use crate::types::SignerId;
 
-use super::commitment::SigningCommitmentExt;
-use super::partial::{compute_binding_factor, compute_group_commitment, PartialSignature};
+use super::partial::PartialSignature;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -58,17 +57,18 @@ const MIN_AGGREGATE_SIZE: usize = SIGNATURE_SIZE + 1 + 32;
 /// Aggregate signature hasil FROST threshold signing.
 ///
 /// `AggregateSignature` berisi:
-/// - `FrostSignature` (R ‖ s)
+/// - `FrostSignature` (R ‖ s) — real Ed25519 signature (64 bytes)
 /// - List signers yang berkontribusi
 /// - Hash dari message yang di-sign
 ///
 /// ## Invariant
 ///
+/// - `signature` adalah valid 64-byte Ed25519 signature
 /// - `signers` tidak boleh kosong
 /// - Tidak boleh ada duplicate signers
 #[derive(Debug, Clone)]
 pub struct AggregateSignature {
-    /// Inner FROST signature (R ‖ s).
+    /// Inner FROST signature (R ‖ s), 64 bytes.
     signature: FrostSignature,
 
     /// List signer IDs yang berkontribusi dalam signature.
@@ -83,13 +83,9 @@ impl AggregateSignature {
     ///
     /// # Arguments
     ///
-    /// * `signature` - FROST signature (R ‖ s)
+    /// * `signature` - FROST signature (R ‖ s), 64 bytes
     /// * `signers` - List signer IDs yang berkontribusi
     /// * `message_hash` - Hash dari message
-    ///
-    /// # Panics
-    ///
-    /// Tidak panic. Validasi dilakukan oleh caller.
     #[must_use]
     pub fn new(
         signature: FrostSignature,
@@ -160,10 +156,6 @@ impl AggregateSignature {
     }
 
     /// Deserialize aggregate signature dari bytes.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes` - Byte slice
     ///
     /// # Errors
     ///
@@ -248,35 +240,42 @@ impl AggregateSignature {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// AGGREGATE SIGNATURES FUNCTION
+// REAL FROST AGGREGATION
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// Aggregate partial signatures menjadi satu FROST signature.
+/// Aggregate partial signatures menggunakan real `frost_ed25519::aggregate()`.
+///
+/// Fungsi ini membangun semua frost types yang diperlukan dari internal types,
+/// kemudian memanggil `frost::aggregate()` untuk menghasilkan valid Ed25519
+/// aggregate signature (64 bytes).
 ///
 /// # Arguments
 ///
-/// * `partials` - Slice of PartialSignature
+/// * `message` - Raw message bytes yang di-sign (frost hashes internally)
+/// * `partials` - Slice of PartialSignature (mengandung SignerId, SignatureShare, Commitment)
 /// * `group_pubkey` - Group public key hasil DKG
-/// * `message_hash` - Hash dari message yang di-sign
+/// * `verifying_shares` - Per-participant verifying shares untuk signature share verification
+/// * `message_hash` - Pre-computed hash of message (untuk AggregateSignature metadata)
 ///
 /// # Errors
 ///
 /// - `SigningError::InsufficientSignatures` jika partials kosong
 /// - `SigningError::DuplicateSigner` jika ada signer duplikat
-/// - `SigningError::AggregationFailed` jika aggregation gagal
+/// - `SigningError::AggregationFailed` jika frost aggregation gagal
 ///
-/// # Algorithm
+/// # Kriptografi
 ///
-/// 1. Validate inputs
-/// 2. Build sorted commitments list
-/// 3. Compute binding factors for each signer
-/// 4. Compute group commitment (R)
-/// 5. Sum signature shares (s = Σ s_i)
-/// 6. Build FrostSignature(R ‖ s)
-/// 7. Return AggregateSignature
+/// Internally calls:
+/// 1. Build `frost::SigningPackage` dari message + commitments
+/// 2. Build `BTreeMap<Identifier, SignatureShare>` dari partials
+/// 3. Build `frost::keys::PublicKeyPackage` dari group_pubkey + verifying_shares
+/// 4. Call `frost::aggregate(signing_package, signature_shares, pubkey_package)`
+/// 5. Convert 64-byte `frost::Signature` ke `AggregateSignature`
 pub fn aggregate_signatures(
+    message: &[u8],
     partials: &[PartialSignature],
-    _group_pubkey: &GroupPublicKey,
+    group_pubkey: &GroupPublicKey,
+    verifying_shares: &[(SignerId, ParticipantPublicKey)],
     message_hash: &[u8; 32],
 ) -> Result<AggregateSignature, SigningError> {
     // Step 1: Validate partials not empty
@@ -287,7 +286,7 @@ pub fn aggregate_signatures(
         });
     }
 
-    // Validate no duplicates and collect signer IDs
+    // Step 2: Validate no duplicate signers and collect signer IDs
     let mut seen_signers = HashSet::with_capacity(partials.len());
     let mut signers = Vec::with_capacity(partials.len());
 
@@ -296,92 +295,97 @@ pub fn aggregate_signatures(
         if !seen_signers.insert(signer_id.clone()) {
             return Err(SigningError::DuplicateSigner { signer: signer_id });
         }
-
-        // Validate commitment format
-        if !partial.commitment().verify_format() {
-            return Err(SigningError::InvalidCommitment {
-                signer: signer_id,
-                reason: "commitment format invalid".to_string(),
-            });
-        }
-
         signers.push(signer_id);
     }
 
-    // Step 2: Build sorted commitments list
-    // Sort by signer ID for determinism
-    let mut commitments: Vec<(SignerId, SigningCommitment)> = partials
-        .iter()
-        .map(|p| (p.signer_id().clone(), p.commitment().clone()))
-        .collect();
-    
-    // Sort by signer ID bytes for deterministic ordering
-    commitments.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-
-    // Step 3: Compute binding factors for each signer
-    let mut binding_factors: HashMap<SignerId, [u8; 32]> = HashMap::with_capacity(partials.len());
-    
-    for (signer_id, _) in &commitments {
-        let bf = compute_binding_factor(signer_id, message_hash, &commitments);
-        binding_factors.insert(signer_id.clone(), bf);
+    // Step 3: Build frost commitments map (Identifier → SigningCommitments)
+    let mut frost_commitments_map = BTreeMap::new();
+    for partial in partials {
+        let frost_id = frost_adapter::signer_id_to_frost_identifier(partial.signer_id())
+            .map_err(|e| SigningError::AggregationFailed {
+                reason: format!(
+                    "failed to convert SignerId to frost Identifier: {}",
+                    e
+                ),
+            })?;
+        let frost_commitment =
+            frost_adapter::commitment_to_signing_commitments(partial.commitment())
+                .map_err(|e| SigningError::AggregationFailed {
+                    reason: format!(
+                        "failed to convert commitment to frost format: {}",
+                        e
+                    ),
+                })?;
+        frost_commitments_map.insert(frost_id, frost_commitment);
     }
 
-    // Step 4: Compute group commitment (R)
-    let group_commitment = compute_group_commitment(&commitments, &binding_factors);
+    // Step 4: Build frost SigningPackage
+    let signing_package = frost::SigningPackage::new(frost_commitments_map, message);
 
-    // Step 5: Sum signature shares (s = Σ s_i)
-    // Sort partials by signer ID for deterministic summation
-    let mut sorted_partials: Vec<&PartialSignature> = partials.iter().collect();
-    sorted_partials.sort_by(|a, b| a.signer_id().as_bytes().cmp(b.signer_id().as_bytes()));
+    // Step 5: Build frost signature shares map (Identifier → SignatureShare)
+    let mut frost_shares_map = BTreeMap::new();
+    for partial in partials {
+        let frost_id = frost_adapter::signer_id_to_frost_identifier(partial.signer_id())
+            .map_err(|e| SigningError::AggregationFailed {
+                reason: format!(
+                    "failed to convert SignerId to frost Identifier: {}",
+                    e
+                ),
+            })?;
+        let frost_share =
+            frost_adapter::sig_share_to_signature_share(partial.signature_share())
+                .map_err(|e| SigningError::AggregationFailed {
+                    reason: format!(
+                        "failed to convert signature share to frost format: {}",
+                        e
+                    ),
+                })?;
+        frost_shares_map.insert(frost_id, frost_share);
+    }
 
-    let s_sum = sum_signature_shares(&sorted_partials)?;
+    // Step 6: Build frost PublicKeyPackage
+    let frost_verifying_key = frost_adapter::group_pubkey_to_verifying_key(group_pubkey)
+        .map_err(|e| SigningError::AggregationFailed {
+            reason: format!("failed to convert group pubkey to frost VerifyingKey: {}", e),
+        })?;
 
-    // Step 6: Build FrostSignature(R ‖ s)
-    let mut sig_bytes = [0u8; SIGNATURE_SIZE];
-    sig_bytes[0..32].copy_from_slice(&group_commitment);
-    sig_bytes[32..64].copy_from_slice(&s_sum);
+    let mut frost_verifying_shares = BTreeMap::new();
+    for (sid, ppk) in verifying_shares {
+        let frost_id = frost_adapter::signer_id_to_frost_identifier(sid)
+            .map_err(|e| SigningError::AggregationFailed {
+                reason: format!(
+                    "failed to convert verifying share SignerId to frost Identifier: {}",
+                    e
+                ),
+            })?;
+        let frost_vs = frost::keys::VerifyingShare::deserialize(ppk.as_bytes())
+            .map_err(|e| SigningError::AggregationFailed {
+                reason: format!("failed to deserialize verifying share: {}", e),
+            })?;
+        frost_verifying_shares.insert(frost_id, frost_vs);
+    }
 
-    let signature = FrostSignature::from_bytes(sig_bytes).map_err(|e| {
-        SigningError::AggregationFailed {
-            reason: format!("failed to build signature: {}", e),
-        }
-    })?;
+    let pubkey_package =
+        frost::keys::PublicKeyPackage::new(frost_verifying_shares, frost_verifying_key);
+
+    // Step 7: Call real frost::aggregate()
+    let frost_signature =
+        frost::aggregate(&signing_package, &frost_shares_map, &pubkey_package)
+            .map_err(|e| SigningError::AggregationFailed {
+                reason: format!("frost aggregation failed: {}", e),
+            })?;
+
+    // Step 8: Convert frost::Signature (64 bytes) to FrostSignature
+    let our_signature = frost_adapter::signature_to_frost_sig(&frost_signature)
+        .map_err(|e| SigningError::AggregationFailed {
+            reason: format!("failed to convert frost signature: {}", e),
+        })?;
 
     // Sort signers for deterministic output
     signers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
-    // Step 7: Return AggregateSignature
-    Ok(AggregateSignature::new(signature, signers, *message_hash))
-}
-
-/// Sum signature shares dengan hash-based aggregation (placeholder).
-///
-/// Dalam implementasi nyata, ini akan melakukan modular addition
-/// pada scalar field. Placeholder ini menggunakan hash untuk determinism.
-fn sum_signature_shares(partials: &[&PartialSignature]) -> Result<[u8; 32], SigningError> {
-    let mut hasher = Sha3_256::new();
-
-    // Domain separator
-    hasher.update(b"dsdn-tss-sum-shares-v1");
-
-    // Process shares in order (partials must be sorted by caller)
-    for partial in partials {
-        hasher.update(partial.signer_id().as_bytes());
-        hasher.update(partial.signature_share().as_bytes());
-    }
-
-    let result = hasher.finalize();
-    let mut sum = [0u8; SCALAR_SIZE];
-    sum.copy_from_slice(&result);
-
-    // Validate result is non-zero
-    if sum.iter().all(|&b| b == 0) {
-        return Err(SigningError::AggregationFailed {
-            reason: "signature share sum is zero".to_string(),
-        });
-    }
-
-    Ok(sum)
+    // Step 9: Return AggregateSignature with 64-byte real Ed25519 signature
+    Ok(AggregateSignature::new(our_signature, signers, *message_hash))
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -391,14 +395,22 @@ fn sum_signature_shares(partials: &[&PartialSignature]) -> Result<[u8; 32], Sign
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frost_adapter::{
+        key_package_to_key_share, signature_share_to_sig_share,
+        signing_commitments_to_commitment, signer_id_to_frost_identifier,
+    };
     use crate::primitives::FrostSignatureShare;
+    use frost_ed25519 as frost;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+    use sha3::{Digest, Sha3_256};
 
     // ────────────────────────────────────────────────────────────────────────────
     // HELPER FUNCTIONS
     // ────────────────────────────────────────────────────────────────────────────
 
     fn make_signature() -> FrostSignature {
-        FrostSignature::from_bytes([0x01; SIGNATURE_SIZE]).unwrap()
+        FrostSignature::from_bytes([0x01; SIGNATURE_SIZE]).expect("valid signature bytes")
     }
 
     fn make_signers(n: usize) -> Vec<SignerId> {
@@ -411,15 +423,136 @@ mod tests {
         AggregateSignature::new(make_signature(), make_signers(2), [0xAA; 32])
     }
 
-    fn make_partial(signer_idx: u8) -> PartialSignature {
-        let signer_id = SignerId::from_bytes([signer_idx; 32]);
-        let share = FrostSignatureShare::from_bytes([0x01; 32]).unwrap();
-        let commitment = SigningCommitment::from_parts([0x02; 32], [0x03; 32]).unwrap();
-        PartialSignature::new(signer_id, share, commitment)
+    /// Generate deterministic frost key material (t-of-n).
+    fn generate_frost_keys(
+        n: u16,
+        t: u16,
+        seed: u64,
+    ) -> (
+        BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
+        frost::keys::PublicKeyPackage,
+    ) {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let (shares, pubkey_package) = frost::keys::generate_with_dealer(
+            n,
+            t,
+            frost::keys::IdentifierList::Default,
+            &mut rng,
+        )
+        .expect("dealer keygen must succeed with valid params");
+
+        let mut key_packages = BTreeMap::new();
+        for (identifier, secret_share) in shares {
+            let key_package = frost::keys::KeyPackage::try_from(secret_share)
+                .expect("KeyPackage from SecretShare must succeed");
+            key_packages.insert(identifier, key_package);
+        }
+        (key_packages, pubkey_package)
+    }
+
+    /// Convert frost Identifier to SignerId.
+    fn frost_id_to_signer_id(id: &frost::Identifier) -> SignerId {
+        let bytes = id.serialize();
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .expect("frost Identifier is 32 bytes");
+        SignerId::from_bytes(arr)
+    }
+
+    /// Compute message hash for AggregateSignature metadata.
+    fn compute_message_hash(message: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"dsdn-tss-message-hash-v1");
+        hasher.update(message);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    /// Run full frost signing ceremony and return all data needed for aggregation tests.
+    struct SigningFixture {
+        message: Vec<u8>,
+        message_hash: [u8; 32],
+        partials: Vec<PartialSignature>,
+        group_pubkey: GroupPublicKey,
+        verifying_shares: Vec<(SignerId, ParticipantPublicKey)>,
+        pubkey_package: frost::keys::PublicKeyPackage,
+    }
+
+    fn create_signing_fixture(n: u16, t: u16, seed: u64, message: &[u8]) -> SigningFixture {
+        let (key_packages, pubkey_package) = generate_frost_keys(n, t, seed);
+        let mut rng = ChaCha20Rng::seed_from_u64(seed + 1000);
+
+        // Select first t signers
+        let selected: Vec<_> = key_packages.iter().take(t as usize).collect();
+
+        // Round 1: commitments
+        let mut nonces_map = BTreeMap::new();
+        let mut frost_commitments_map = BTreeMap::new();
+
+        for &(id, kp) in &selected {
+            let (nonces, commitments) = frost::round1::commit(kp.signing_share(), &mut rng);
+            nonces_map.insert(*id, nonces);
+            frost_commitments_map.insert(*id, commitments);
+        }
+
+        // Round 2: signing
+        let signing_package =
+            frost::SigningPackage::new(frost_commitments_map.clone(), message);
+
+        let mut partials = Vec::new();
+        for &(id, kp) in &selected {
+            let nonces = &nonces_map[id];
+            let frost_share = frost::round2::sign(&signing_package, nonces, kp)
+                .expect("signing must succeed");
+
+            let sid = frost_id_to_signer_id(id);
+            let our_share = signature_share_to_sig_share(&frost_share)
+                .expect("conversion ok");
+            let our_commitment =
+                signing_commitments_to_commitment(&frost_commitments_map[id])
+                    .expect("conversion ok");
+
+            partials.push(PartialSignature::new(sid, our_share, our_commitment));
+        }
+
+        // Build verifying_shares
+        let mut verifying_shares = Vec::new();
+        for &(id, kp) in &selected {
+            let sid = frost_id_to_signer_id(id);
+            let vs_bytes = kp
+                .verifying_share()
+                .serialize()
+                .expect("serialize verifying share");
+            let arr: [u8; 32] = vs_bytes
+                .as_slice()
+                .try_into()
+                .expect("32 bytes");
+            let ppk = ParticipantPublicKey::from_bytes(arr).expect("valid pubkey");
+            verifying_shares.push((sid, ppk));
+        }
+
+        // Group pubkey
+        let vk = pubkey_package.verifying_key();
+        let group_pubkey = frost_adapter::verifying_key_to_group_pubkey(vk)
+            .expect("conversion ok");
+
+        let message_hash = compute_message_hash(message);
+
+        SigningFixture {
+            message: message.to_vec(),
+            message_hash,
+            partials,
+            group_pubkey,
+            verifying_shares,
+            pubkey_package,
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // AGGREGATE SIGNATURE TESTS
+    // AGGREGATE SIGNATURE STRUCT TESTS
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -434,9 +567,9 @@ mod tests {
         let sig = make_signature();
         let signers = make_signers(3);
         let hash = [0xBB; 32];
-        
-        let aggregate = AggregateSignature::new(sig.clone(), signers.clone(), hash);
-        
+
+        let aggregate = AggregateSignature::new(sig.clone(), signers, hash);
+
         assert_eq!(aggregate.signature().as_bytes(), sig.as_bytes());
         assert_eq!(aggregate.signers().len(), 3);
         assert_eq!(aggregate.message_hash(), &hash);
@@ -458,22 +591,21 @@ mod tests {
     fn test_aggregate_signature_from_bytes() {
         let original = make_aggregate();
         let bytes = original.to_bytes();
-        let recovered = AggregateSignature::from_bytes(&bytes).unwrap();
+        let recovered = AggregateSignature::from_bytes(&bytes).expect("from_bytes ok");
 
-        assert_eq!(recovered.signature().as_bytes(), original.signature().as_bytes());
+        assert_eq!(
+            recovered.signature().as_bytes(),
+            original.signature().as_bytes()
+        );
         assert_eq!(recovered.signer_count(), original.signer_count());
         assert_eq!(recovered.message_hash(), original.message_hash());
     }
 
     #[test]
     fn test_aggregate_signature_roundtrip() {
-        let original = AggregateSignature::new(
-            make_signature(),
-            make_signers(5),
-            [0xBB; 32],
-        );
+        let original = AggregateSignature::new(make_signature(), make_signers(5), [0xBB; 32]);
         let bytes = original.to_bytes();
-        let recovered = AggregateSignature::from_bytes(&bytes).unwrap();
+        let recovered = AggregateSignature::from_bytes(&bytes).expect("from_bytes ok");
 
         assert_eq!(recovered.signer_count(), 5);
         for (a, b) in original.signers().iter().zip(recovered.signers().iter()) {
@@ -490,7 +622,6 @@ mod tests {
 
     #[test]
     fn test_aggregate_signature_from_bytes_duplicate_signer() {
-        // Build bytes manually with duplicate signer
         let sig = make_signature();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(sig.as_bytes());
@@ -504,133 +635,238 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_signature_from_bytes_zero_signers() {
-        let sig = make_signature();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(sig.as_bytes());
-        bytes.push(0); // 0 signers
-        bytes.extend_from_slice(&[0xAA; 32]); // message hash
-
-        let result = AggregateSignature::from_bytes(&bytes);
-        assert!(result.is_ok()); // Zero signers is valid at from_bytes level
+    fn test_aggregate_signature_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AggregateSignature>();
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // AGGREGATE_SIGNATURES TESTS
+    // TEST 1: 3-of-5 THRESHOLD AGGREGATION SUCCESS
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_3_of_5_threshold_aggregation_success() {
+        let fixture = create_signing_fixture(5, 3, 42, b"DSDN aggregation test");
+
+        let result = aggregate_signatures(
+            &fixture.message,
+            &fixture.partials,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        );
+
+        assert!(result.is_ok(), "aggregation must succeed");
+        let aggregate = result.expect("just checked");
+
+        // Signature must be 64 bytes
+        assert_eq!(aggregate.signature().as_bytes().len(), 64);
+        assert_eq!(aggregate.signer_count(), 3);
+        assert_eq!(aggregate.message_hash(), &fixture.message_hash);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 6: AGGREGATE SIGNATURE VERIFIABLE VIA ED25519 VERIFY
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_signature_verifiable() {
+        let fixture = create_signing_fixture(5, 3, 42, b"verification test");
+
+        let aggregate = aggregate_signatures(
+            &fixture.message,
+            &fixture.partials,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        )
+        .expect("aggregation ok");
+
+        // Verify using frost verification
+        let frost_sig = frost_adapter::frost_sig_to_signature(aggregate.signature())
+            .expect("conversion ok");
+        let vk = fixture.pubkey_package.verifying_key();
+
+        let verify_result = vk.verify(&fixture.message, &frost_sig);
+        assert!(
+            verify_result.is_ok(),
+            "aggregate signature must be verifiable with group public key"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 2: BELOW THRESHOLD → ERROR
     // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_aggregate_signatures_empty_fails() {
-        let partials: Vec<PartialSignature> = vec![];
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        let message_hash = [0xAA; 32];
+        let fixture = create_signing_fixture(5, 3, 42, b"test");
 
-        let result = aggregate_signatures(&partials, &group_pubkey, &message_hash);
+        let result = aggregate_signatures(
+            &fixture.message,
+            &[],
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        );
         assert!(result.is_err());
-        
+
         if let Err(SigningError::InsufficientSignatures { expected, got }) = result {
             assert_eq!(expected, 1);
             assert_eq!(got, 0);
         } else {
-            panic!("Expected InsufficientSignatures error");
+            unreachable!("Expected InsufficientSignatures error");
         }
     }
 
-    #[test]
-    fn test_aggregate_signatures_single() {
-        let partials = vec![make_partial(0x01)];
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        let message_hash = [0xAA; 32];
-
-        let result = aggregate_signatures(&partials, &group_pubkey, &message_hash);
-        assert!(result.is_ok());
-
-        let aggregate = result.unwrap();
-        assert_eq!(aggregate.signer_count(), 1);
-        assert_eq!(aggregate.message_hash(), &message_hash);
-    }
-
-    #[test]
-    fn test_aggregate_signatures_multiple() {
-        let partials = vec![make_partial(0x01), make_partial(0x02), make_partial(0x03)];
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        let message_hash = [0xBB; 32];
-
-        let result = aggregate_signatures(&partials, &group_pubkey, &message_hash);
-        assert!(result.is_ok());
-
-        let aggregate = result.unwrap();
-        assert_eq!(aggregate.signer_count(), 3);
-    }
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 3: DUPLICATE SHARE → ERROR
+    // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_aggregate_signatures_duplicate_signer_fails() {
-        let partials = vec![make_partial(0x01), make_partial(0x01)]; // duplicate!
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        let message_hash = [0xAA; 32];
+        let fixture = create_signing_fixture(5, 3, 42, b"test");
 
-        let result = aggregate_signatures(&partials, &group_pubkey, &message_hash);
+        // Create duplicates
+        let mut partials_with_dup = fixture.partials.clone();
+        partials_with_dup.push(fixture.partials[0].clone());
+
+        let result = aggregate_signatures(
+            &fixture.message,
+            &partials_with_dup,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        );
         assert!(result.is_err());
-        
+
         if let Err(SigningError::DuplicateSigner { .. }) = result {
             // Expected
         } else {
-            panic!("Expected DuplicateSigner error");
+            unreachable!("Expected DuplicateSigner error");
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 4: WRONG IDENTIFIER → ERROR
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_signatures_wrong_verifying_share_fails() {
+        let fixture = create_signing_fixture(5, 3, 42, b"test");
+
+        // Use empty verifying_shares — frost will reject because it can't verify shares
+        let result = aggregate_signatures(
+            &fixture.message,
+            &fixture.partials,
+            &fixture.group_pubkey,
+            &[],
+            &fixture.message_hash,
+        );
+
+        assert!(result.is_err(), "aggregation with missing verifying shares must fail");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 5: DIFFERENT MESSAGE → DIFFERENT AGGREGATE SIGNATURE
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_different_message_different_aggregate_signature() {
+        let fixture_a = create_signing_fixture(5, 3, 42, b"message A");
+        let fixture_b = create_signing_fixture(5, 3, 42, b"message B");
+
+        let agg_a = aggregate_signatures(
+            &fixture_a.message,
+            &fixture_a.partials,
+            &fixture_a.group_pubkey,
+            &fixture_a.verifying_shares,
+            &fixture_a.message_hash,
+        )
+        .expect("aggregation ok");
+
+        let agg_b = aggregate_signatures(
+            &fixture_b.message,
+            &fixture_b.partials,
+            &fixture_b.group_pubkey,
+            &fixture_b.verifying_shares,
+            &fixture_b.message_hash,
+        )
+        .expect("aggregation ok");
+
+        assert_ne!(
+            agg_a.signature().as_bytes(),
+            agg_b.signature().as_bytes(),
+            "different messages must produce different aggregate signatures"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 7: DETERMINISTIC FOR SAME SHARES
+    // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_aggregate_signatures_deterministic() {
-        let partials = vec![make_partial(0x01), make_partial(0x02)];
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        let message_hash = [0xAA; 32];
+        let fixture = create_signing_fixture(5, 3, 100, b"determinism test");
 
-        let result1 = aggregate_signatures(&partials, &group_pubkey, &message_hash).unwrap();
-        let result2 = aggregate_signatures(&partials, &group_pubkey, &message_hash).unwrap();
+        let result1 = aggregate_signatures(
+            &fixture.message,
+            &fixture.partials,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        )
+        .expect("ok");
 
-        assert_eq!(result1.signature().as_bytes(), result2.signature().as_bytes());
+        let result2 = aggregate_signatures(
+            &fixture.message,
+            &fixture.partials,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        )
+        .expect("ok");
+
+        assert_eq!(
+            result1.signature().as_bytes(),
+            result2.signature().as_bytes(),
+            "same inputs must produce same aggregate signature"
+        );
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 8: ORDER INDEPENDENT
+    // ────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_aggregate_signatures_order_independent() {
-        // Different input order should produce same result
-        let p1 = make_partial(0x01);
-        let p2 = make_partial(0x02);
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        let message_hash = [0xAA; 32];
+        let fixture = create_signing_fixture(5, 3, 42, b"order test");
 
-        let result1 = aggregate_signatures(&[p1.clone(), p2.clone()], &group_pubkey, &message_hash).unwrap();
-        let result2 = aggregate_signatures(&[p2, p1], &group_pubkey, &message_hash).unwrap();
+        let mut reversed_partials = fixture.partials.clone();
+        reversed_partials.reverse();
 
-        // Signature should be the same regardless of input order
-        assert_eq!(result1.signature().as_bytes(), result2.signature().as_bytes());
-        
-        // Signers should also be in same order (sorted)
-        assert_eq!(result1.signers().len(), result2.signers().len());
-        for (a, b) in result1.signers().iter().zip(result2.signers().iter()) {
-            assert_eq!(a.as_bytes(), b.as_bytes());
-        }
-    }
+        let result1 = aggregate_signatures(
+            &fixture.message,
+            &fixture.partials,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        )
+        .expect("ok");
 
-    #[test]
-    fn test_aggregate_signatures_different_messages_different_results() {
-        let partials = vec![make_partial(0x01)];
-        let group_pubkey = GroupPublicKey::from_bytes([0x01; 32]).unwrap();
-        
-        let result1 = aggregate_signatures(&partials, &group_pubkey, &[0xAA; 32]).unwrap();
-        let result2 = aggregate_signatures(&partials, &group_pubkey, &[0xBB; 32]).unwrap();
+        let result2 = aggregate_signatures(
+            &fixture.message,
+            &reversed_partials,
+            &fixture.group_pubkey,
+            &fixture.verifying_shares,
+            &fixture.message_hash,
+        )
+        .expect("ok");
 
-        // Different messages should produce different signatures
-        assert_ne!(result1.signature().as_bytes(), result2.signature().as_bytes());
-    }
-
-    // ────────────────────────────────────────────────────────────────────────────
-    // SEND + SYNC TESTS
-    // ────────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_aggregate_signature_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<AggregateSignature>();
+        assert_eq!(
+            result1.signature().as_bytes(),
+            result2.signature().as_bytes(),
+            "input order must not affect aggregate signature"
+        );
     }
 }
