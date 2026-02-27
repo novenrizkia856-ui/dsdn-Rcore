@@ -46,6 +46,19 @@
 //! `select_committee_with_gating` applies gating as a pre-filter before
 //! the existing deterministic selection algorithm runs unchanged.
 //!
+//! ## Reward Tracker (14C.C.9)
+//!
+//! Types and read-only queries for per-validator reward accounting.
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `ValidatorRewardEntry` | Per-validator reward state (pending, claimed, epoch, receipt count) |
+//! | `ValidatorRewardTracker` | Aggregate tracker with invariant-safe getters, deterministic ordering |
+//!
+//! Invariants: `total_pending()` always equals `SUM(entry.pending_rewards)`;
+//! `total_distributed >= total_claimed`; all arithmetic is checked/saturating;
+//! `active_validators()` returns IDs sorted lexicographically.
+//!
 //! # QuorumDA Architecture
 //!
 //! ## Peran dalam Sistem DSDN
@@ -468,6 +481,9 @@ pub mod coordinator_selection
 
 // Gating Verifiers (14B)
 pub mod gating
+
+// Reward Tracker (14C.C.9)
+pub mod reward_tracker
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
