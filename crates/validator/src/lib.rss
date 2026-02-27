@@ -93,6 +93,23 @@
 //! challenge period expiry (`current_time >= expires_at`) with no active challenge.
 //! All epoch accounting uses checked arithmetic with no partial updates.
 //!
+//! ## Reward Query Interface (14C.C.13)
+//!
+//! Pure read-only query functions for validator reward state.
+//!
+//! | Type / Function | Description |
+//! |-----------------|-------------|
+//! | `ValidatorRewardSummary` | Per-validator summary: pending, claimed, total_earned, receipt_count |
+//! | `RewardHistoryEntry` | Distribution history entry: epoch, receipt_hash, amount, timestamp |
+//! | `RewardQueryEngine` | Full-featured query engine with epoch summaries and distribution history |
+//! | `query_validator_rewards` | Single validator summary (returns `None` if not found or overflow) |
+//! | `query_all_validators` | All validators sorted lexicographically, overflow entries skipped |
+//! | `query_epoch_summary` | Epoch summary lookup (use `RewardQueryEngine` for full support) |
+//! | `query_distribution_history` | History with limit, descending by epoch (use engine for full support) |
+//!
+//! Invariants: all functions pure read-only; deterministic ordering;
+//! `total_earned` uses `checked_add` (overflow → skip/None); no panic.
+//!
 //! # QuorumDA Architecture
 //!
 //! ## Peran dalam Sistem DSDN
@@ -524,6 +541,9 @@ pub mod reward_distributor
 
 // Finalization Gate (14C.C.11)
 pub mod finalization_gate
+
+// Reward Query Interface (14C.C.13)
+pub mod reward_query
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
