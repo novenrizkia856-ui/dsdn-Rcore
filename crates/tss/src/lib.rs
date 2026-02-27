@@ -273,6 +273,74 @@
 //! - `frost_adapter` module menyediakan konversi ke/dari real Ed25519 FROST types
 //! - DKG output (KeyShare) kompatibel dengan `frost-ed25519` threshold signing
 //!
+//! ### Committee Formation & BFT Threshold
+//!
+//! Committee threshold menggunakan Byzantine fault tolerance formula:
+//!
+//! ```text
+//! t = ceil(2n/3) + 1
+//! ```
+//!
+//! Dimana `n` adalah jumlah total committee members dan `t` adalah jumlah minimum
+//! signatures yang diperlukan. Formula ini menjamin:
+//! - Selalu > 2/3 dari committee (safety terhadap Byzantine failures)
+//! - Selalu >= 2 (minimum untuk threshold signatures)
+//! - Selalu <= n (clamped)
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │ Committee Size (n) │ Threshold (t) │ Max Offline     │
+//! ├────────────────────┼───────────────┼─────────────────┤
+//! │         3          │       3       │       0         │
+//! │         4          │       4       │       0         │
+//! │         5          │       5       │       0         │
+//! │         6          │       5       │       1         │
+//! │         7          │       6       │       1         │
+//! │        10          │       8       │       2         │
+//! │        15          │      11       │       4         │
+//! │        20          │      15       │       5         │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ### Failure Handling & Recovery
+//!
+//! **DKG Failures:**
+//! - `InvalidThreshold`: threshold < 2, threshold > total, atau total < 2
+//! - `DuplicateParticipant`: ParticipantId sama terdeteksi
+//! - `InvalidPackage`: Round 1/2 package gagal verifikasi (corrupt/tampered)
+//! - `MissingPackages`: Tidak semua packages diterima
+//! - Recovery: Restart DKG session dari awal dengan SessionId baru
+//!
+//! **Signing Failures:**
+//! - `BelowThreshold`: Kurang dari `t` signers berpartisipasi
+//! - `InvalidPartialSignature`: Partial signature gagal verifikasi
+//! - `NonceReuse`: Nonces sudah digunakan (fatal — abort session)
+//! - `AggregationError`: `frost::aggregate()` gagal
+//! - Recovery: Retry signing session dengan nonces baru (JANGAN reuse nonces)
+//!
+//! **Verification Failures:**
+//! - `InvalidSignature`: Signature bytes bukan valid Ed25519 signature
+//! - `InvalidPublicKey`: Public key bukan valid Ed25519 point
+//! - `MessageMismatch`: Signature tidak cocok dengan message
+//! - Semua verification functions mengembalikan `bool` (tidak panic)
+//!
+//! **KeyShare Serialization Failures:**
+//! - `DecryptionError`: Wrong encryption key atau corrupted ciphertext
+//! - `InvalidFormat`: Data tidak mengikuti expected layout
+//! - Recovery: Re-derive key dari DKG backup atau re-run DKG
+//!
+//! ### Known Identifier Derivation Behavior
+//!
+//! DKG menggunakan `frost::Identifier::derive()` (hash-to-field) untuk mengkonversi
+//! `ParticipantId` → `frost::Identifier`, sementara signing path di
+//! `LocalThresholdSigner` menggunakan `Identifier::deserialize()` (raw bytes).
+//! Kedua metode ini menghasilkan identifier yang **berbeda** untuk input yang sama.
+//!
+//! Untuk end-to-end correctness (DKG → Sign → Verify), pastikan:
+//! 1. Gunakan `participant_id_to_frost_identifier()` untuk derive identifier DKG
+//! 2. Build `KeyPackage` secara manual dengan derived identifier yang benar
+//! 3. Atau gunakan `generate_with_dealer()` untuk testing yang konsisten
+//!
 //! ## Feature Flags
 //!
 //! Crate ini tidak memiliki feature flags saat ini.
