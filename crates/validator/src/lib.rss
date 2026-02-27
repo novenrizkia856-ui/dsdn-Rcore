@@ -74,6 +74,21 @@
 //! All arithmetic is checked; 256-bit widening multiplication prevents intermediate overflow.
 //! Tracker mutations are atomic: pre-checked before applying.
 //!
+//! ## Finalization Gate (14C.C.11)
+//!
+//! Receipt finalization checks and epoch accounting.
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `ReceiptFinalizationStatus` | Enum: `Finalized`, `PendingChallenge`, `Challenged`, `Rejected` |
+//! | `ChainState` | Receipt registry for finalization lookups |
+//! | `EpochRewardSummary` | Per-epoch distribution summary (finalized count, total reward, distribution count) |
+//! | `EpochAccounting` | Accumulator with atomic pre-checked mutations |
+//!
+//! Rules: Storage receipts finalize immediately. Compute receipts require
+//! challenge period expiry (`current_time >= expires_at`) with no active challenge.
+//! All epoch accounting uses checked arithmetic with no partial updates.
+//!
 //! # QuorumDA Architecture
 //!
 //! ## Peran dalam Sistem DSDN
@@ -502,6 +517,9 @@ pub mod reward_tracker
 
 // Reward Distributor (14C.C.10)
 pub mod reward_distributor
+
+// Finalization Gate (14C.C.11)
+pub mod finalization_gate
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
