@@ -31,10 +31,10 @@
 //! against `ReceiptV1::compute_signable_hash()`, which excludes signature
 //! fields to avoid circular dependency.
 //!
-//! The threshold signature currently uses Ed25519 verification against the
+//! The threshold signature uses Ed25519 verification against the
 //! coordinator group public key stored in `ChainState::coordinator_group_pubkey`.
-//! This will be upgraded to native FROST aggregate verification in a future
-//! release without changing the verification interface.
+//! FROST aggregate signatures are standard 64-byte Ed25519 signatures (R ‖ s)
+//! and are verified using standard Ed25519 verification with the group public key.
 
 use dsdn_common::claim_validation::ClaimValidationError;
 use dsdn_common::economic_constants::{MAX_RECEIPT_AGE_SECS, MIN_REWARD_BASE, MAX_REWARD_BASE};
@@ -279,29 +279,33 @@ pub fn verify_node_signature(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// CHECK 7: THRESHOLD SIGNATURE (FROST / Ed25519 PLACEHOLDER)
+// CHECK 7: THRESHOLD SIGNATURE (FROST Ed25519)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// Verifies the coordinator's threshold signature over the signable hash.
+/// Verifies the coordinator's FROST threshold signature over the signable hash.
 ///
-/// Currently uses Ed25519 verification against the coordinator group
-/// public key stored in `ChainState::coordinator_group_pubkey`.
+/// FROST aggregate signatures are standard 64-byte Ed25519 signatures (R ‖ s)
+/// produced by `frost::aggregate()`. They are verified using standard Ed25519
+/// verification with the coordinator group public key from DKG.
 ///
-/// ## FROST Upgrade Path
+/// ## Signature Format
 ///
-/// When native FROST aggregate verification is implemented, this function
-/// will be updated to use `frost::verify_aggregate(group_key, msg, sig)`
-/// instead of Ed25519. The function signature remains the same.
+/// Expected: exactly 64 bytes (R ‖ s), where:
+/// - R: 32-byte compressed Edwards Y point (group commitment)
+/// - s: 32-byte scalar (aggregated signature shares)
+///
+/// Signatures of any other length are rejected immediately.
 ///
 /// ## Errors
 ///
 /// [`ClaimValidationError::InvalidThresholdSignature`] if:
 /// - `coordinator_group_pubkey` is `None` (not configured).
-/// - Signature verification fails or crypto returns an error.
+/// - Signature length ≠ 64 bytes.
+/// - Signature verification fails.
 ///
 /// ## Complexity
 ///
-/// O(1) but expensive — Ed25519 (future: FROST) signature verification.
+/// O(1) but expensive — Ed25519 signature verification.
 pub fn verify_threshold_signature(
     coordinator_pubkey: Option<&[u8; 32]>,
     signable_hash: &[u8; 32],
@@ -315,6 +319,12 @@ pub fn verify_threshold_signature(
         }
     };
 
+    // Validate FROST signature length = 64 bytes (R ‖ s)
+    if threshold_signature.len() != 64 {
+        return Err(ClaimValidationError::InvalidThresholdSignature);
+    }
+
+    // Verify using Ed25519 verification (FROST aggregate = standard Ed25519)
     let valid = crypto::verify_signature(pubkey, signable_hash, threshold_signature)
         .unwrap_or(false);
 

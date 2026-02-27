@@ -552,6 +552,56 @@ pub fn participant_id_to_frost_identifier(
 // 8) SignerId -> frost::Identifier (signing round conversion)
 // ════════════════════════════════════════════════════════════════════════════════
 
+/// Mengkonversi [`ParticipantPublicKey`] ke [`frost::keys::VerifyingShare`].
+///
+/// Digunakan untuk partial signature verification dan building
+/// `frost::keys::PublicKeyPackage` untuk aggregate verification.
+///
+/// `ParticipantPublicKey` menyimpan 32-byte compressed Edwards Y point,
+/// identik dengan format `frost::keys::VerifyingShare`.
+///
+/// # Errors
+///
+/// Mengembalikan [`TSSError::Crypto`] jika bytes bukan valid Ed25519 curve point.
+pub fn participant_pubkey_to_verifying_share(
+    pubkey: &ParticipantPublicKey,
+) -> Result<frost::keys::VerifyingShare, TSSError> {
+    frost::keys::VerifyingShare::deserialize(pubkey.as_bytes())
+        .map_err(|e| crypto_err(
+            "participant_pubkey_to_verifying_share",
+            &e.to_string(),
+        ))
+}
+
+/// Mengkonversi [`frost::keys::VerifyingShare`] ke [`ParticipantPublicKey`].
+///
+/// # Errors
+///
+/// Mengembalikan [`TSSError`] jika serialization gagal atau bytes tidak valid.
+pub fn verifying_share_to_participant_pubkey(
+    share: &frost::keys::VerifyingShare,
+) -> Result<ParticipantPublicKey, TSSError> {
+    let bytes = share.serialize().map_err(map_frost_error)?;
+
+    let byte_array: [u8; PUBLIC_KEY_SIZE] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| serialization_err(
+            "verifying_share_to_participant_pubkey",
+            &format!(
+                "unexpected serialized length: expected {}, got {}",
+                PUBLIC_KEY_SIZE,
+                bytes.len()
+            ),
+        ))?;
+
+    ParticipantPublicKey::from_bytes(byte_array)
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// 9) SignerId -> frost::Identifier (signing round conversion)
+// ════════════════════════════════════════════════════════════════════════════════
+
 /// Mengkonversi [`SignerId`] ke [`frost::Identifier`] via deserialization.
 ///
 /// Berbeda dari [`participant_id_to_frost_identifier`] yang menggunakan `derive()`,
@@ -1010,5 +1060,52 @@ mod tests {
         let result = signer_id_to_frost_identifier(&sid);
         // frost Identifier::deserialize rejects the zero scalar
         assert!(result.is_err(), "zero bytes must be rejected as Identifier");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // TEST 10: ParticipantPublicKey ↔ frost VerifyingShare (verification helper)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_participant_pubkey_to_verifying_share_roundtrip() {
+        let (key_packages, _) = generate_test_keys();
+        let kp = key_packages.values().next().expect("must have key package");
+
+        let vs = kp.verifying_share();
+        let ppk = verifying_share_to_participant_pubkey(vs).expect("conversion must succeed");
+        let vs_back = participant_pubkey_to_verifying_share(&ppk).expect("roundtrip must succeed");
+
+        let orig_bytes = vs.serialize().expect("serialize");
+        let rt_bytes = vs_back.serialize().expect("serialize");
+        assert_eq!(orig_bytes, rt_bytes, "roundtrip must be byte-identical");
+    }
+
+    #[test]
+    fn test_participant_pubkey_to_verifying_share_rejects_identity() {
+        let zero_pubkey = ParticipantPublicKey::from_bytes([0x00; 32]);
+        // Zero bytes = identity point → should be rejected by frost
+        if let Ok(ppk) = zero_pubkey {
+            let result = participant_pubkey_to_verifying_share(&ppk);
+            assert!(result.is_err(), "identity point must be rejected");
+        }
+        // If from_bytes itself rejects zero bytes, that's also correct
+    }
+
+    #[test]
+    fn test_participant_pubkey_to_verifying_share_deterministic() {
+        let (key_packages, _) = generate_test_keys();
+        let kp = key_packages.values().next().expect("must have key package");
+
+        let vs = kp.verifying_share();
+        let ppk = verifying_share_to_participant_pubkey(vs).expect("ok");
+
+        let vs1 = participant_pubkey_to_verifying_share(&ppk).expect("ok");
+        let vs2 = participant_pubkey_to_verifying_share(&ppk).expect("ok");
+
+        assert_eq!(
+            vs1.serialize().expect("ok"),
+            vs2.serialize().expect("ok"),
+            "conversion must be deterministic"
+        );
     }
 }

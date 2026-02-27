@@ -214,13 +214,16 @@
 //! ### Verification
 //!
 //! ```rust,ignore
-//! use dsdn_tss::verify::{verify_aggregate, verify_partial};
+//! use dsdn_tss::verify::{verify_aggregate, verify_partial, verify_frost_signature_bytes};
 //!
-//! // Verify aggregate signature
+//! // Verify aggregate signature (real frost_ed25519::VerifyingKey::verify)
 //! let is_valid = verify_aggregate(&aggregate_sig, b"message", &group_pubkey);
 //!
-//! // Verify partial signature
+//! // Verify partial signature (structural + frost type validation)
 //! let is_valid = verify_partial(&partial_sig, b"message", &participant_pk, &all_commitments);
+//!
+//! // Verify from raw bytes (chain integration)
+//! let is_valid = verify_frost_signature_bytes(&pubkey_bytes, b"message", &sig_bytes);
 //! ```
 //!
 //! ### KeyShare Serialization
@@ -265,6 +268,8 @@
 //!   - Aggregation: `frost::aggregate()` produces standard Ed25519 signatures (64 bytes)
 //! - Nonces di-zeroize setelah sign via `Zeroize` trait pada `frost::round1::SigningNonces`
 //! - Aggregate signature = 64-byte Ed25519 signature (R ‖ s), verifiable via group public key
+//! - Verification: `frost_ed25519::VerifyingKey::verify()` — standard Ed25519 verification
+//! - `verify_frost_signature_bytes()` provides raw-bytes verification for chain integration
 //! - `frost_adapter` module menyediakan konversi ke/dari real Ed25519 FROST types
 //! - DKG output (KeyShare) kompatibel dengan `frost-ed25519` threshold signing
 //!
@@ -335,9 +340,11 @@ pub mod signing;
 /// Signature verification functions.
 ///
 /// Module ini menyediakan:
-/// - `verify_aggregate`: Verify final aggregate signature
-/// - `verify_partial`: Verify individual partial signature
-/// - `verify_partials_batch`: Batch verification
+/// - `verify_aggregate`: Verify final aggregate signature via `frost::VerifyingKey::verify()`
+/// - `verify_aggregate_with_hash`: Verify with pre-computed hash (no re-hash)
+/// - `verify_partial`: Structural verification of individual partial signature
+/// - `verify_partials_batch`: Batch structural verification
+/// - `verify_frost_signature_bytes`: Raw bytes verification for chain integration
 pub mod verify;
 
 /// KeyShare serialization dan encryption.
@@ -396,8 +403,8 @@ pub use signing::{
 
 // Verification functions (14A.2B.1.10)
 pub use verify::{
-    verify_aggregate, verify_aggregate_with_hash, verify_partial, verify_partial_with_hash,
-    verify_partials_batch,
+    verify_aggregate, verify_aggregate_with_hash, verify_frost_signature_bytes,
+    verify_partial, verify_partial_with_hash, verify_partials_batch,
 };
 
 // KeyShare serialization (14A.2B.1.10)
@@ -619,8 +626,9 @@ mod tests {
     fn test_verify_functions_re_export() {
         // Verify functions are accessible
         let _fn1: fn(&AggregateSignature, &[u8], &GroupPublicKey) -> bool = verify_aggregate;
-        let _fn2: fn(&AggregateSignature, &[u8; 32], &GroupPublicKey) -> bool = verify_aggregate_with_hash;
+        let _fn2: fn(&AggregateSignature, &[u8], &[u8; 32], &GroupPublicKey) -> bool = verify_aggregate_with_hash;
         let _fn3: fn(&PartialSignature, &[u8], &ParticipantPublicKey, &[(SignerId, SigningCommitment)]) -> bool = verify_partial;
+        let _fn4: fn(&[u8; 32], &[u8], &[u8]) -> bool = verify_frost_signature_bytes;
     }
 
     // ────────────────────────────────────────────────────────────────────────────
