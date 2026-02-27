@@ -1,26 +1,31 @@
-//! # Validator Reward Tracker (14C.C.9)
+//! # Validator Reward Tracker (14C.C.9 + 14C.C.12)
 //!
-//! Types and read-only queries for tracking per-validator reward accounting.
+//! Types and queries for per-validator reward accounting, including the
+//! claim flow for converting pending rewards to claimed.
 //!
 //! ## Structs
 //!
 //! - [`ValidatorRewardEntry`]: Per-validator reward state (pending, claimed, epoch, count).
-//! - [`ValidatorRewardTracker`]: Aggregate tracker holding all entries with invariant-safe getters.
+//! - [`ValidatorRewardTracker`]: Aggregate tracker with invariant-safe getters and claim processing.
+//! - [`ClaimRequest`]: Parameters for a reward claim.
+//! - [`ClaimResponse`]: Successful claim outcome with deterministic claim hash.
 //!
 //! ## Invariants
 //!
 //! 1. `total_pending()` always equals the sum of all `entry.pending_rewards` (computed on-the-fly).
 //! 2. `total_distributed >= total_claimed` at all times.
 //! 3. All internal arithmetic uses `checked_*` to prevent overflow.
-//! 4. `active_validators()` returns validators sorted lexicographically by `[u8; 32]` ID —
-//!    never dependent on `HashMap` iteration order.
+//! 4. `active_validators()` returns validators sorted lexicographically by `[u8; 32]` ID.
+//! 5. `processed_claims` prevents duplicate claims via deterministic SHA3-256 hash.
+//! 6. Claim mutations are atomic: all pre-checked before any state changes.
 //!
 //! ## Current Scope
 //!
-//! This module defines **types and read-only getters only**. Distribution / claim
-//! mutations will be added in a subsequent stage.
+//! This module defines types, read-only getters, crate-internal distribution
+//! mutations (14C.C.10), and the public claim flow (14C.C.12).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use sha3::{Sha3_256, Digest};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -59,6 +64,7 @@ pub struct ValidatorRewardTracker {
     total_distributed: u128,
     total_claimed: u128,
     current_epoch: u64,
+    processed_claims: HashSet<[u8; 32]>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -77,6 +83,70 @@ impl core::fmt::Display for RewardOverflowError {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// CLAIM TYPES (14C.C.12)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Request to claim pending rewards for a validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRequest {
+    /// 32-byte validator identifier.
+    pub validator_id: [u8; 32],
+    /// Amount to claim. `None` means claim all pending rewards.
+    pub amount: Option<u128>,
+    /// Epoch in which this claim is being made. Must match the tracker's
+    /// current epoch.
+    pub claim_epoch: u64,
+}
+
+/// Successful claim response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimResponse {
+    /// Amount actually transferred from pending to claimed.
+    pub claimed_amount: u128,
+    /// Pending balance remaining after this claim.
+    pub remaining_pending: u128,
+    /// Deterministic SHA3-256 hash identifying this claim.
+    pub claim_hash: [u8; 32],
+}
+
+/// Errors that can occur during a reward claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimError {
+    /// The requested amount exceeds the validator's pending balance.
+    InsufficientPending {
+        /// Currently available pending rewards.
+        available: u128,
+        /// Amount that was requested.
+        requested: u128,
+    },
+    /// The validator ID is not present in the tracker.
+    ValidatorNotFound,
+    /// The effective claim amount resolved to zero.
+    ZeroAmount,
+    /// `claim_epoch` does not match the tracker's current epoch.
+    EpochMismatch,
+    /// The computed claim hash was already processed (duplicate claim).
+    DuplicateClaim,
+    /// A checked arithmetic operation would overflow.
+    Overflow,
+}
+
+impl core::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InsufficientPending { available, requested } => {
+                write!(f, "insufficient pending: available={available}, requested={requested}")
+            }
+            Self::ValidatorNotFound => f.write_str("validator not found"),
+            Self::ZeroAmount => f.write_str("claim amount is zero"),
+            Self::EpochMismatch => f.write_str("epoch mismatch"),
+            Self::DuplicateClaim => f.write_str("duplicate claim"),
+            Self::Overflow => f.write_str("arithmetic overflow"),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API — READ-ONLY
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -88,6 +158,7 @@ impl ValidatorRewardTracker {
             total_distributed: 0,
             total_claimed: 0,
             current_epoch: 0,
+            processed_claims: HashSet::new(),
         }
     }
 
@@ -224,6 +295,130 @@ impl ValidatorRewardTracker {
             .ok_or(RewardOverflowError)?;
         Ok(())
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC CLAIM FLOW (14C.C.12)
+// ════════════════════════════════════════════════════════════════════════════════
+
+impl ValidatorRewardTracker {
+    /// Process a validator reward claim.
+    ///
+    /// Moves tokens from `pending_rewards` to `claimed_rewards` atomically.
+    /// All overflow checks are performed before any state mutation. If any
+    /// check fails, the tracker is left completely unchanged.
+    ///
+    /// # Claim Hash
+    ///
+    /// A deterministic SHA3-256 hash is computed from:
+    /// `validator_id || amount (16 bytes BE) || claim_epoch (8 bytes BE) || receipt_count (8 bytes BE)`
+    ///
+    /// This hash serves as a unique identifier and duplicate-prevention key.
+    pub fn claim_reward(
+        &mut self,
+        request: ClaimRequest,
+    ) -> Result<ClaimResponse, ClaimError> {
+        // ── 1. Epoch validation ─────────────────────────────────────────
+        if request.claim_epoch != self.current_epoch {
+            return Err(ClaimError::EpochMismatch);
+        }
+
+        // ── 2. Validator lookup ─────────────────────────────────────────
+        let entry = self
+            .entries
+            .get(&request.validator_id)
+            .ok_or(ClaimError::ValidatorNotFound)?;
+
+        // ── 3. Determine effective amount ───────────────────────────────
+        let amount = match request.amount {
+            None => entry.pending_rewards,
+            Some(a) => a,
+        };
+
+        // ── 4. Amount validation ────────────────────────────────────────
+        if amount == 0 {
+            return Err(ClaimError::ZeroAmount);
+        }
+        if amount > entry.pending_rewards {
+            return Err(ClaimError::InsufficientPending {
+                available: entry.pending_rewards,
+                requested: amount,
+            });
+        }
+
+        // ── 5. Compute deterministic claim hash ─────────────────────────
+        let receipt_count = entry.receipt_count;
+        let claim_hash = compute_claim_hash(
+            &request.validator_id,
+            amount,
+            request.claim_epoch,
+            receipt_count,
+        );
+
+        // ── 6. Duplicate check ──────────────────────────────────────────
+        if self.processed_claims.contains(&claim_hash) {
+            return Err(ClaimError::DuplicateClaim);
+        }
+
+        // ── 7. Pre-check all arithmetic (atomicity guarantee) ───────────
+        let new_pending = entry
+            .pending_rewards
+            .checked_sub(amount)
+            .ok_or(ClaimError::Overflow)?;
+        let new_claimed = entry
+            .claimed_rewards
+            .checked_add(amount)
+            .ok_or(ClaimError::Overflow)?;
+        let new_total_claimed = self
+            .total_claimed
+            .checked_add(amount)
+            .ok_or(ClaimError::Overflow)?;
+
+        // ── 8. Apply mutations (safe: all pre-checked) ──────────────────
+        if let Some(e) = self.entries.get_mut(&request.validator_id) {
+            e.pending_rewards = new_pending;
+            e.claimed_rewards = new_claimed;
+        }
+        self.total_claimed = new_total_claimed;
+        self.processed_claims.insert(claim_hash);
+
+        Ok(ClaimResponse {
+            claimed_amount: amount,
+            remaining_pending: new_pending,
+            claim_hash,
+        })
+    }
+
+    /// Check whether a claim hash has already been processed.
+    pub fn is_duplicate(&self, claim_hash: &[u8; 32]) -> bool {
+        self.processed_claims.contains(claim_hash)
+    }
+}
+
+/// Compute a deterministic SHA3-256 claim hash.
+///
+/// Input layout (64 bytes total):
+/// ```text
+/// [ validator_id: 32 bytes ]
+/// [ amount:       16 bytes (big-endian u128) ]
+/// [ claim_epoch:   8 bytes (big-endian u64) ]
+/// [ receipt_count: 8 bytes (big-endian u64) ]
+/// ```
+fn compute_claim_hash(
+    validator_id: &[u8; 32],
+    amount: u128,
+    claim_epoch: u64,
+    receipt_count: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(validator_id);
+    hasher.update(amount.to_be_bytes());
+    hasher.update(claim_epoch.to_be_bytes());
+    hasher.update(receipt_count.to_be_bytes());
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -471,5 +666,265 @@ mod tests {
 
         tracker.set_epoch_for_test(u64::MAX);
         assert_eq!(tracker.current_epoch(), u64::MAX);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CLAIM FLOW TESTS (14C.C.12)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper: seeded tracker with one validator having pending rewards.
+    fn seeded_tracker(pending: u128, claimed: u128, epoch: u64) -> ValidatorRewardTracker {
+        let mut t = ValidatorRewardTracker::new();
+        t.set_epoch_for_test(epoch);
+        t.set_totals_for_test(pending + claimed, claimed);
+        t.insert_entry_for_test(ValidatorRewardEntry {
+            validator_id: vid(1),
+            pending_rewards: pending,
+            claimed_rewards: claimed,
+            last_receipt_epoch: epoch,
+            receipt_count: 5,
+        });
+        t
+    }
+
+    macro_rules! ok {
+        ($e:expr) => {{
+            let r = $e;
+            assert!(r.is_ok(), "expected Ok, got {:?}", r);
+            match r { Ok(v) => v, Err(_) => return }
+        }};
+    }
+
+    // ── 11. claim_all_success ────────────────────────────────────────────
+    #[test]
+    fn claim_all_success() {
+        let mut t = seeded_tracker(1000, 0, 5);
+        let resp = ok!(t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: None,
+            claim_epoch: 5,
+        }));
+        assert_eq!(resp.claimed_amount, 1000);
+        assert_eq!(resp.remaining_pending, 0);
+        assert_eq!(t.get_pending(&vid(1)), 0);
+        assert_eq!(t.get_claimed(&vid(1)), 1000);
+    }
+
+    // ── 12. claim_partial_success ────────────────────────────────────────
+    #[test]
+    fn claim_partial_success() {
+        let mut t = seeded_tracker(1000, 0, 5);
+        let resp = ok!(t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(400),
+            claim_epoch: 5,
+        }));
+        assert_eq!(resp.claimed_amount, 400);
+        assert_eq!(resp.remaining_pending, 600);
+        assert_eq!(t.get_pending(&vid(1)), 600);
+        assert_eq!(t.get_claimed(&vid(1)), 400);
+    }
+
+    // ── 13. claim_insufficient_pending ───────────────────────────────────
+    #[test]
+    fn claim_insufficient_pending() {
+        let mut t = seeded_tracker(500, 0, 5);
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(999),
+            claim_epoch: 5,
+        });
+        assert_eq!(result, Err(ClaimError::InsufficientPending {
+            available: 500,
+            requested: 999,
+        }));
+        assert_eq!(t.get_pending(&vid(1)), 500);
+    }
+
+    // ── 14. claim_zero_amount_error ──────────────────────────────────────
+    #[test]
+    fn claim_zero_amount_error() {
+        let mut t = seeded_tracker(1000, 0, 5);
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(0),
+            claim_epoch: 5,
+        });
+        assert_eq!(result, Err(ClaimError::ZeroAmount));
+    }
+
+    // ── 15. claim_zero_via_none_on_empty_pending ─────────────────────────
+    #[test]
+    fn claim_zero_via_none_on_empty_pending() {
+        let mut t = seeded_tracker(0, 100, 5);
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: None,
+            claim_epoch: 5,
+        });
+        assert_eq!(result, Err(ClaimError::ZeroAmount));
+    }
+
+    // ── 16. claim_validator_not_found ────────────────────────────────────
+    #[test]
+    fn claim_validator_not_found() {
+        let mut t = seeded_tracker(1000, 0, 5);
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(99),
+            amount: None,
+            claim_epoch: 5,
+        });
+        assert_eq!(result, Err(ClaimError::ValidatorNotFound));
+    }
+
+    // ── 17. claim_epoch_mismatch ─────────────────────────────────────────
+    #[test]
+    fn claim_epoch_mismatch() {
+        let mut t = seeded_tracker(1000, 0, 5);
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: None,
+            claim_epoch: 4,
+        });
+        assert_eq!(result, Err(ClaimError::EpochMismatch));
+        assert_eq!(t.get_pending(&vid(1)), 1000);
+    }
+
+    // ── 18. duplicate_claim_rejected ─────────────────────────────────────
+    #[test]
+    fn duplicate_claim_rejected() {
+        let mut t = seeded_tracker(1000, 0, 5);
+        let resp1 = ok!(t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(500),
+            claim_epoch: 5,
+        }));
+        assert!(t.is_duplicate(&resp1.claim_hash));
+
+        // Restore pending to simulate new distribution, same receipt_count
+        t.insert_entry_for_test(ValidatorRewardEntry {
+            validator_id: vid(1),
+            pending_rewards: 500,
+            claimed_rewards: 500,
+            last_receipt_epoch: 5,
+            receipt_count: 5, // same → same hash
+        });
+
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(500),
+            claim_epoch: 5,
+        });
+        assert_eq!(result, Err(ClaimError::DuplicateClaim));
+    }
+
+    // ── 19. claim_hash_deterministic ─────────────────────────────────────
+    #[test]
+    fn claim_hash_deterministic() {
+        let h1 = compute_claim_hash(&vid(1), 1000, 5, 10);
+        let h2 = compute_claim_hash(&vid(1), 1000, 5, 10);
+        assert_eq!(h1, h2);
+
+        // Different inputs → different hashes
+        assert_ne!(h1, compute_claim_hash(&vid(1), 999, 5, 10));
+        assert_ne!(h1, compute_claim_hash(&vid(1), 1000, 6, 10));
+        assert_ne!(h1, compute_claim_hash(&vid(1), 1000, 5, 11));
+        assert_ne!(h1, compute_claim_hash(&vid(2), 1000, 5, 10));
+    }
+
+    // ── 20. total_claimed_updated ────────────────────────────────────────
+    #[test]
+    fn total_claimed_updated() {
+        let mut t = seeded_tracker(1000, 200, 5);
+        assert_eq!(t.total_claimed(), 200);
+
+        let _ = ok!(t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(300),
+            claim_epoch: 5,
+        }));
+        assert_eq!(t.total_claimed(), 500);
+    }
+
+    // ── 21. no_partial_update_on_claim_error ─────────────────────────────
+    #[test]
+    fn no_partial_update_on_claim_error() {
+        let mut t = seeded_tracker(500, 0, 5);
+        let pending_before = t.get_pending(&vid(1));
+        let claimed_before = t.get_claimed(&vid(1));
+        let total_before = t.total_claimed();
+
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(999),
+            claim_epoch: 5,
+        });
+        assert!(result.is_err());
+
+        assert_eq!(t.get_pending(&vid(1)), pending_before);
+        assert_eq!(t.get_claimed(&vid(1)), claimed_before);
+        assert_eq!(t.total_claimed(), total_before);
+    }
+
+    // ── 22. overflow_prevented ───────────────────────────────────────────
+    #[test]
+    fn overflow_prevented_claim() {
+        let mut t = ValidatorRewardTracker::new();
+        t.set_epoch_for_test(1);
+        t.set_totals_for_test(1000, u128::MAX - 5);
+        t.insert_entry_for_test(ValidatorRewardEntry {
+            validator_id: vid(1),
+            pending_rewards: 1000,
+            claimed_rewards: u128::MAX - 5,
+            last_receipt_epoch: 1,
+            receipt_count: 1,
+        });
+
+        // total_claimed overflow: (u128::MAX - 5) + 10
+        let result = t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(10),
+            claim_epoch: 1,
+        });
+        assert_eq!(result, Err(ClaimError::Overflow));
+        assert_eq!(t.get_pending(&vid(1)), 1000);
+    }
+
+    // ── 23. remaining_pending_correct ────────────────────────────────────
+    #[test]
+    fn remaining_pending_correct() {
+        let mut t = seeded_tracker(1000, 0, 5);
+
+        let r1 = ok!(t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(300),
+            claim_epoch: 5,
+        }));
+        assert_eq!(r1.remaining_pending, 700);
+        assert_eq!(t.get_pending(&vid(1)), 700);
+
+        // Different receipt_count to avoid duplicate hash
+        t.insert_entry_for_test(ValidatorRewardEntry {
+            validator_id: vid(1),
+            pending_rewards: 700,
+            claimed_rewards: 300,
+            last_receipt_epoch: 5,
+            receipt_count: 6,
+        });
+
+        let r2 = ok!(t.claim_reward(ClaimRequest {
+            validator_id: vid(1),
+            amount: Some(200),
+            claim_epoch: 5,
+        }));
+        assert_eq!(r2.remaining_pending, 500);
+        assert_eq!(t.get_pending(&vid(1)), 500);
+    }
+
+    // ── 24. is_duplicate_false_for_unknown ───────────────────────────────
+    #[test]
+    fn is_duplicate_false_for_unknown() {
+        let t = ValidatorRewardTracker::new();
+        assert!(!t.is_duplicate(&[0u8; 32]));
     }
 }

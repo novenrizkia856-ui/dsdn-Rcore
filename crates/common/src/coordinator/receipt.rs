@@ -773,7 +773,7 @@ impl ThresholdReceipt {
         // Step 5: verify_signature
         let message_hash = self.receipt_data.receipt_data_hash();
         let is_valid =
-            verify_aggregate_with_hash(&self.aggregate_signature, &message_hash, committee.group_pubkey());
+            verify_aggregate_with_hash(&self.aggregate_signature, &message_hash, self.committee_hash(), committee.group_pubkey());
         if !is_valid {
             return Err(ReceiptVerificationError::InvalidSignature);
         }
@@ -879,7 +879,7 @@ impl ThresholdReceipt {
     #[must_use]
     pub fn verify_signature(&self, committee: &CoordinatorCommittee) -> bool {
         let message_hash = self.receipt_data.receipt_data_hash();
-        verify_aggregate_with_hash(&self.aggregate_signature, &message_hash, committee.group_pubkey())
+        verify_aggregate_with_hash(&self.aggregate_signature, &message_hash, self.committee_hash(), committee.group_pubkey())
     }
 }
 

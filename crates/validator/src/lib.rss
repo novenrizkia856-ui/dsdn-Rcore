@@ -46,18 +46,22 @@
 //! `select_committee_with_gating` applies gating as a pre-filter before
 //! the existing deterministic selection algorithm runs unchanged.
 //!
-//! ## Reward Tracker (14C.C.9)
+//! ## Reward Tracker (14C.C.9 + 14C.C.12)
 //!
-//! Types and read-only queries for per-validator reward accounting.
+//! Per-validator reward accounting with claim flow.
 //!
 //! | Type | Description |
 //! |------|-------------|
 //! | `ValidatorRewardEntry` | Per-validator reward state (pending, claimed, epoch, receipt count) |
-//! | `ValidatorRewardTracker` | Aggregate tracker with invariant-safe getters, deterministic ordering |
+//! | `ValidatorRewardTracker` | Aggregate tracker with invariant-safe getters, deterministic ordering, and claim processing |
+//! | `ClaimRequest` | Claim parameters: validator ID, optional amount, epoch |
+//! | `ClaimResponse` | Claim outcome: amount, remaining pending, deterministic SHA3-256 hash |
+//! | `ClaimError` | `InsufficientPending`, `ValidatorNotFound`, `ZeroAmount`, `EpochMismatch`, `DuplicateClaim`, `Overflow` |
 //!
 //! Invariants: `total_pending()` always equals `SUM(entry.pending_rewards)`;
 //! `total_distributed >= total_claimed`; all arithmetic is checked/saturating;
-//! `active_validators()` returns IDs sorted lexicographically.
+//! `active_validators()` returns IDs sorted lexicographically;
+//! `processed_claims` prevents duplicate claims; mutations are atomic.
 //!
 //! ## Reward Distributor (14C.C.10)
 //!
