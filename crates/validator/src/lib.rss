@@ -110,6 +110,24 @@
 //! Invariants: all functions pure read-only; deterministic ordering;
 //! `total_earned` uses `checked_add` (overflow → skip/None); no panic.
 //!
+//! ## Chain Integration — Reward Pool (14C.C.14)
+//!
+//! Connects the validator reward pipeline to the on-chain `reward_pool`.
+//!
+//! | Type / Trait | Description |
+//! |--------------|-------------|
+//! | `RewardPoolReader` | Async read-only trait for chain reward pool queries |
+//! | `ValidatorInfo` | Validator identity, stake, and activity status |
+//! | `ValidatorStatus` | `Active` or `Inactive` |
+//! | `ReceiptInfo` | Finalized receipt: hash, reward, epoch, compute flag |
+//! | `ProcessResult` | Processing outcome: receipts processed, total share, new epoch |
+//! | `ChainIntegrationError` | `ReaderError`, `DistributionError`, `Overflow` |
+//! | `process_new_finalized_receipts` | Main entry: query chain → compute 20% share → distribute |
+//!
+//! Invariants: `validator_share = total_reward * 20 / 100` (checked);
+//! only active validators receive distributions; no partial update on failure
+//! (clone-swap atomicity); deterministic receipt ordering.
+//!
 //! # QuorumDA Architecture
 //!
 //! ## Peran dalam Sistem DSDN
@@ -544,6 +562,9 @@ pub mod finalization_gate
 
 // Reward Query Interface (14C.C.13)
 pub mod reward_query
+
+// Chain Integration — Reward Pool (14C.C.14)
+pub mod chain_integration
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)
