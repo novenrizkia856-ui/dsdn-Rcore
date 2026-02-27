@@ -59,6 +59,21 @@
 //! `total_distributed >= total_claimed`; all arithmetic is checked/saturating;
 //! `active_validators()` returns IDs sorted lexicographically.
 //!
+//! ## Reward Distributor (14C.C.10)
+//!
+//! Deterministic reward distribution with equal-split and stake-weighted strategies.
+//!
+//! | Type | Description |
+//! |------|-------------|
+//! | `DistributionStrategy` | Enum: `EqualSplit`, `StakeWeighted` |
+//! | `DistributionConfig` | Strategy + `min_distribution` threshold |
+//! | `DistributionResult` | Per-validator distributions (sorted), remainder, total |
+//! | `DistributionError` | `NoActiveValidators`, `InvalidRewardAmount`, `OverflowError` |
+//!
+//! Invariant: `total_distributed + remainder == reward_amount` for every successful call.
+//! All arithmetic is checked; 256-bit widening multiplication prevents intermediate overflow.
+//! Tracker mutations are atomic: pre-checked before applying.
+//!
 //! # QuorumDA Architecture
 //!
 //! ## Peran dalam Sistem DSDN
@@ -484,6 +499,9 @@ pub mod gating
 
 // Reward Tracker (14C.C.9)
 pub mod reward_tracker
+
+// Reward Distributor (14C.C.10)
+pub mod reward_distributor
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - QuorumDA (14A.1A.21 - 14A.1A.28)

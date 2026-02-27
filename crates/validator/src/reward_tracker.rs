@@ -62,6 +62,21 @@ pub struct ValidatorRewardTracker {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// ERROR TYPES
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Error returned when a checked arithmetic operation overflows during
+/// reward accounting mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewardOverflowError;
+
+impl core::fmt::Display for RewardOverflowError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("reward arithmetic overflow")
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API — READ-ONLY
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -155,6 +170,59 @@ impl ValidatorRewardTracker {
 impl Default for ValidatorRewardTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CRATE-INTERNAL MUTATION API (14C.C.10)
+// ════════════════════════════════════════════════════════════════════════════════
+//
+// These methods allow sibling modules (e.g. `reward_distributor`) to update
+// tracker state with checked arithmetic. They are NOT part of the public API.
+
+impl ValidatorRewardTracker {
+    /// Add reward amount to a validator's pending balance.
+    ///
+    /// Creates the entry if it doesn't exist. Updates `last_receipt_epoch`
+    /// and increments `receipt_count`. Returns [`RewardOverflowError`] if
+    /// any checked arithmetic overflows.
+    pub(crate) fn add_pending_reward(
+        &mut self,
+        validator_id: [u8; 32],
+        amount: u128,
+        epoch: u64,
+    ) -> Result<(), RewardOverflowError> {
+        let entry = self.entries.entry(validator_id).or_insert(ValidatorRewardEntry {
+            validator_id,
+            pending_rewards: 0,
+            claimed_rewards: 0,
+            last_receipt_epoch: 0,
+            receipt_count: 0,
+        });
+        entry.pending_rewards = entry
+            .pending_rewards
+            .checked_add(amount)
+            .ok_or(RewardOverflowError)?;
+        entry.last_receipt_epoch = epoch;
+        entry.receipt_count = entry
+            .receipt_count
+            .checked_add(1)
+            .ok_or(RewardOverflowError)?;
+        Ok(())
+    }
+
+    /// Add to the global `total_distributed` counter.
+    ///
+    /// Returns [`RewardOverflowError`] if the addition would overflow `u128`.
+    pub(crate) fn add_total_distributed(
+        &mut self,
+        amount: u128,
+    ) -> Result<(), RewardOverflowError> {
+        self.total_distributed = self
+            .total_distributed
+            .checked_add(amount)
+            .ok_or(RewardOverflowError)?;
+        Ok(())
     }
 }
 
