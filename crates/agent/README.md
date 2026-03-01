@@ -1,10 +1,10 @@
-# DSDN Agent CLI (14A–14B)
+# DSDN Agent CLI (14A–14C)
 
 Command-line interface for DSDN (Distributed Storage and Data Network).
 
 ## Overview
 
-The DSDN Agent provides a comprehensive CLI for interacting with the DSDN network. It supports key management, data operations, state verification, health monitoring, identity management, and service node gating — all with first-class DA (Data Availability) layer integration.
+The DSDN Agent provides a comprehensive CLI for interacting with the DSDN network. It supports key management, data operations, state verification, health monitoring, identity management, service node gating, and a full economic lifecycle — all with first-class DA (Data Availability) layer integration.
 
 ## Installation
 
@@ -125,7 +125,7 @@ Manage the cryptographic identity of a DSDN service node, including Ed25519 keyp
 # Generate persistent identity to a directory
 agent identity generate --out-dir ./my-identity
 
-# Generate persistent identity with operator address override
+# Generate with operator address override
 agent identity generate --out-dir ./my-identity --operator aabbccddeeff00112233aabbccddeeff00112233
 
 # Generate ephemeral identity (printed to stdout, not saved)
@@ -173,7 +173,7 @@ Service node gating operations: stake verification, on-chain registration, statu
 
 ```bash
 # Check stake status
-agent gating stake-check --address aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+agent gating stake-check --address aaaa...aaaa
 
 # Check stake status (JSON)
 agent gating stake-check --address aaaa...aaaa --json
@@ -243,6 +243,171 @@ The `gating diagnose` command runs 5 checks:
 
 Decision: APPROVED if all non-skipped checks pass, REJECTED if any check fails.
 
+### Economic Commands (14C)
+
+Full economic lifecycle management for service receipts — from workload dispatch through execution monitoring, proof building, receipt submission, and reward claiming.
+
+#### Receipt Status Tracking (14C.C.16)
+
+Track the lifecycle state of service receipts through a 9-state machine:
+
+```text
+Dispatched → Executing → ProofBuilt → Submitted → Pending → Finalized
+     │            │           │            │          │
+     └→Failed     └→Failed    └→Failed     ├→Rejected ├→Challenged → Finalized
+                                           └→Failed              └→Rejected
+```
+
+| Command | Description |
+|---------|-------------|
+| `economic status <receipt_hash>` | Show receipt lifecycle status |
+| `economic list` | List all tracked receipts (sorted by receipt_hash) |
+| `economic summary` | Show aggregate summary by state |
+
+```bash
+# Show status of a specific receipt
+agent economic status abc123def
+
+# List all tracked receipts
+agent economic list
+
+# Show aggregate summary
+agent economic summary
+```
+
+#### Workload Dispatch + Execution Monitoring (14C.C.18)
+
+Dispatch workloads to service nodes and monitor execution status with retry and timeout enforcement.
+
+| Command | Description |
+|---------|-------------|
+| `economic dispatch --type <type> --node <addr> <file>` | Dispatch a workload to a service node |
+| `economic monitor <workload_id>` | Monitor execution status of a dispatched workload |
+
+```bash
+# Dispatch a storage workload
+agent economic dispatch --type storage --node 127.0.0.1:50051 payload.bin
+
+# Dispatch a compute workload
+agent economic dispatch --type compute --node 10.0.0.5:50051 model.bin
+
+# Monitor execution status
+agent economic monitor wk-abc123
+```
+
+**Dispatch Arguments:**
+
+| Flag | Description | Required |
+|------|-------------|----------|
+| `--type <type>` | Workload type: `storage` or `compute` | Yes |
+| `--node <addr>` | Target node address (host:port) | Yes |
+| `<file>` | File containing workload data | Yes |
+
+**Execution Status Values:**
+
+| Status | Description |
+|--------|-------------|
+| `Running` | Execution in progress (includes progress 0.0–1.0) |
+| `Completed` | Execution finished (includes output_hash, duration_ms) |
+| `Failed` | Execution failed (includes error message) |
+
+#### Receipt Submission + Chain Claim (14C.C.19)
+
+Submit receipt claims to the chain and poll claim status with double-claim protection.
+
+| Command | Description |
+|---------|-------------|
+| `economic claim <receipt_hash>` | Submit a receipt claim to the chain |
+| `economic claim-status <receipt_hash>` | Poll claim status on-chain |
+
+```bash
+# Submit a claim for a receipt
+agent economic claim abc123def456
+
+# Check claim status
+agent economic claim-status abc123def456
+```
+
+**Claim Results:**
+
+| Result | Description |
+|--------|-------------|
+| `ImmediateReward` | Reward granted immediately (amount + tx_hash) |
+| `ChallengePeriodStarted` | Challenge period opened (challenge_id + expires_at) |
+| `Rejected` | Claim rejected by chain (reason) |
+
+**Claim Status Values:**
+
+| Status | Description |
+|--------|-------------|
+| `Pending` | Claim is pending processing |
+| `InChallengePeriod` | Claim is in challenge period (expires_at) |
+| `Finalized` | Claim finalized with reward |
+| `Rejected` | Claim was rejected (reason) |
+
+**Error Classification:**
+
+| Error | Description |
+|-------|-------------|
+| `AlreadyClaimed` | Receipt has already been claimed on-chain |
+| `IngressUnavailable` | Ingress endpoint is not reachable |
+| `InvalidReceipt` | Receipt data is empty or malformed |
+| `NetworkError` | Network-level failure (retryable) |
+
+#### Full Lifecycle Orchestration (14C.C.20)
+
+Run the complete economic flow as a single command — from workload dispatch through reward claiming.
+
+| Command | Description |
+|---------|-------------|
+| `economic run --type <type> [--auto-claim] [--node <addr>] <file>` | Run full economic lifecycle |
+
+```bash
+# Run full flow (no auto-claim)
+agent economic run --type storage payload.bin
+
+# Run full flow with auto-claim enabled
+agent economic run --type compute --auto-claim model.bin
+
+# Run with custom node address
+agent economic run --type storage --auto-claim --node 10.0.0.5:50051 payload.bin
+```
+
+**Run Arguments:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--type <type>` | Workload type: `storage` or `compute` | Required |
+| `--auto-claim` | Automatically submit claim after receipt | `false` |
+| `--node <addr>` | Target node address (host:port) | `127.0.0.1:50051` |
+| `<file>` | File containing workload data | Required |
+
+**Flow Steps (strict order, no skipping):**
+
+```text
+Step 1: Dispatch        → Send workload to service node
+Step 2: Monitor         → Poll execution until Completed or Failed
+Step 3: Build Proof     → Generate proof from execution output
+Step 4: Submit Receipt  → Submit proof receipt to coordinator
+Step 5: Claim (opt)     → Submit reward claim + poll until terminal
+```
+
+**Flow Result:**
+
+The `economic run` command outputs:
+
+| Field | Description |
+|-------|-------------|
+| `Workload ID` | Identifier assigned by the coordinator |
+| `Receipt Hash` | Hash of the submitted receipt |
+| `Claim` | Claim result (if `--auto-claim`) |
+| `Duration` | Total wall-clock time (milliseconds) |
+| `Steps` | Ordered list of completed steps |
+
+**Error Recovery:**
+
+Each step uses exponential backoff retry. If a step fails after exhausting retries, the flow stops immediately, the state tracker is updated to `Failed`, and the specific error is reported.
+
 ### Maintenance
 
 | Command | Description |
@@ -265,13 +430,70 @@ agent health coordinator
 agent health nodes
 ```
 
+## Retry Logic (14C.C.17)
+
+All network operations in the economic pipeline use configurable retry with exponential backoff:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_retries` | 3 | Maximum number of attempts |
+| `initial_delay_ms` | 500 | Delay before first retry (ms) |
+| `max_delay_ms` | 10,000 | Maximum delay cap (ms) |
+| `backoff_multiplier` | 2.0 | Exponential multiplier per attempt |
+| `jitter` | true | Deterministic jitter to avoid thundering herd |
+
+**Delay formula:** `delay = min(initial_delay_ms × multiplier^(attempt−1), max_delay_ms) + jitter`
+
+**Error classification:**
+- **Retryable:** network errors, connection refused, timeout, DNS failure
+- **Non-retryable:** validation errors, invalid response, already claimed — stop immediately
+
+## Validator Reward System (14C.C.15)
+
+Comprehensive documentation and integration tests for the validator reward pipeline:
+
+- **20% validator share** of service receipt fees
+- **Overflow-safe** total_earned computation (u128)
+- **Deterministic** sorting of reward summaries
+- **Full pipeline testing:** receipt finalization → reward calculation → distribution → query
+- **Trust model:** validators trust the chain for receipt finalization; rewards are computed locally
+
+### Architecture
+
+```text
+Chain (DA)          Agent               Reward Pool
+   │                  │                     │
+   ├─FinReceipt──────►├─process_receipts───►├─calculate_share()
+   │                  │                     ├─add_reward()
+   │                  ├─query_summary()◄────├─get_summary()
+   │                  ├─query_history()◄────├─get_history()
+```
+
+## Economic Flow State Machine
+
+The receipt status tracker enforces a validated state machine:
+
+```text
+Dispatched → Executing → ProofBuilt → Submitted → Pending → Finalized
+     │            │           │            │          │
+     └→Failed     └→Failed    └→Failed     ├→Rejected ├→Challenged → Finalized
+                                           └→Failed              └→Rejected
+```
+
+**Invariants:**
+1. State transitions are validated; invalid transitions return `TrackerError::InvalidTransition`
+2. Terminal states (`Finalized`, `Rejected`, `Failed`) block further transitions
+3. `list_pending()` and `list_by_status()` return results sorted by `receipt_hash` (deterministic)
+4. `summary()` is computed from counts, independent of `HashMap` iteration order
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DSDN_DA_ENDPOINT` | `http://127.0.0.1:26658` | DA layer endpoint |
 | `DSDN_DA_NAMESPACE` | `dsdn` | DA namespace |
-| `DSDN_COORDINATOR_ENDPOINT` | `http://127.0.0.1:45831` | Coordinator endpoint |
+| `DSDN_COORDINATOR_ENDPOINT` | `http://127.0.0.1:45831` | Coordinator endpoint (dispatch, monitor, receipt submission) |
+| `DSDN_INGRESS_ENDPOINT` | `http://127.0.0.1:45832` | Ingress endpoint (claim submission, claim status polling) |
 | `DSDN_CHAIN_RPC` | `http://127.0.0.1:8545` | Chain RPC endpoint for gating commands |
 
 **Chain RPC Resolution Order (gating commands):**
@@ -281,47 +503,6 @@ agent health nodes
 3. Default: `http://127.0.0.1:8545`
 
 Note: `gating register` requires `--chain-rpc` explicitly; there is no fallback.
-
-## Examples
-
-### Example 1: Generate Identity
-
-```bash
-# Create identity directory and generate persistent identity
-mkdir -p ./my-node-identity
-agent identity generate --out-dir ./my-node-identity
-
-# Verify identity was created
-agent identity show --dir ./my-node-identity
-```
-
-### Example 2: Register Service Node
-
-```bash
-# Ensure identity exists
-agent identity show --dir ./my-node-identity
-
-# Register as a storage node on mainnet
-agent gating register \
-  --identity-dir ./my-node-identity \
-  --class storage \
-  --chain-rpc https://mainnet.dsdn.io:8545 \
-  --keyfile ./wallet.key
-```
-
-### Example 3: Diagnose Node Gating
-
-```bash
-# Quick diagnosis (chain data only)
-agent gating diagnose \
-  --address aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-
-# Full diagnosis with identity and TLS verification
-agent gating diagnose \
-  --address aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --identity-dir ./my-node-identity \
-  --json
-```
 
 ## DA Integration
 
@@ -342,6 +523,81 @@ The agent understands the following DA event types:
 - `ReplicaAdded`: Replica assigned to node
 - `ReplicaRemoved`: Replica removed from node
 - `DeleteRequested`: Chunk deletion requested
+
+## Examples
+
+### Example 1: Generate Identity & Register Node
+
+```bash
+# Create identity directory and generate persistent identity
+mkdir -p ./my-node-identity
+agent identity generate --out-dir ./my-node-identity
+
+# Verify identity was created
+agent identity show --dir ./my-node-identity
+
+# Register as a storage node on mainnet
+agent gating register \
+  --identity-dir ./my-node-identity \
+  --class storage \
+  --chain-rpc https://mainnet.dsdn.io:8545 \
+  --keyfile ./wallet.key
+```
+
+### Example 2: Diagnose Node Gating
+
+```bash
+# Quick diagnosis (chain data only)
+agent gating diagnose \
+  --address aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# Full diagnosis with identity and TLS verification
+agent gating diagnose \
+  --address aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --identity-dir ./my-node-identity \
+  --json
+```
+
+### Example 3: Run Full Economic Flow
+
+```bash
+# Dispatch a storage workload and auto-claim the reward
+agent economic run \
+  --type storage \
+  --auto-claim \
+  --node 10.0.0.5:50051 \
+  payload.bin
+
+# Output:
+# Flow completed:
+#   Workload ID:  wk-abc123
+#   Receipt Hash: receipt-ohash
+#   Claim:        Immediate reward 5000 (tx: 0xabc...)
+#   Duration:     4230ms
+#   Steps:        dispatch → monitor → proof → submit_receipt → claim
+```
+
+### Example 4: Step-by-Step Economic Flow
+
+```bash
+# Step 1: Dispatch workload
+agent economic dispatch --type compute --node 10.0.0.5:50051 model.bin
+
+# Step 2: Monitor execution
+agent economic monitor wk-abc123
+
+# Step 3: Check receipt status
+agent economic status receipt-ohash
+
+# Step 4: Submit claim
+agent economic claim receipt-ohash
+
+# Step 5: Poll claim status
+agent economic claim-status receipt-ohash
+
+# Check overall summary
+agent economic summary
+```
 
 ## Exit Codes
 
@@ -364,6 +620,22 @@ agent gating status --address aaaa...aaaa --json
 agent gating diagnose --address aaaa...aaaa --json
 ```
 
+## Development Stages
+
+| Stage | Module | Description |
+|-------|--------|-------------|
+| 14A | Core CLI | Key management, data ops, DA, verification, node/chunk info, health |
+| 14B.51–52 | Identity | Ed25519 keypair generation, operator binding, export |
+| 14B.53–59 | Gating | Stake check, registration, status, slashing, diagnosis |
+| 14C.C.13 | Reward Query | Read-only reward query interface with overflow-safe computation |
+| 14C.C.14 | Chain Integration | Async reward pool reader, 20% validator share, atomic state updates |
+| 14C.C.15 | Reward Tests + Docs | 20 integration tests, comprehensive architecture documentation |
+| 14C.C.16 | Economic Flow Types | 9-state lifecycle enum, validated transitions, CLI (status/list/summary) |
+| 14C.C.17 | Retry Logic | Exponential backoff, deterministic jitter, error classification |
+| 14C.C.18 | Workload Dispatch | Dispatch + monitor with retry integration, timeout, response validation |
+| 14C.C.19 | Receipt Claim | Claim submission, polling, double-claim protection, ingress handling |
+| 14C.C.20 | Orchestration | Full lifecycle: dispatch → monitor → proof → submit → claim |
+
 ## License
 
-Copyright BITEVA. All rights reserved.
+MIT LICENSE
