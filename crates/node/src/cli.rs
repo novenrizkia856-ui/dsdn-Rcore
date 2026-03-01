@@ -1,7 +1,9 @@
 //! # DSDN Node CLI Module
 //!
+//! Full clap-based CLI for the DSDN storage node.
+//!
 //! All CLI configuration, subcommands, HTTP/gRPC server setup,
-//! storage backend, and DA helpers extracted from the main entry point.
+//! storage backend, and DA helpers.
 
 use std::env;
 use std::net::SocketAddr;
@@ -14,6 +16,7 @@ use axum::extract::{Path as AxumPath, State as AxumState};
 use axum::http::StatusCode;
 use axum::routing::{get, put as axum_put};
 use axum::{Json, Router};
+use clap::{Parser, Subcommand, Args};
 use parking_lot::RwLock;
 use serde::Serialize;
 use tokio::sync::Notify;
@@ -33,241 +36,343 @@ use dsdn_storage::store::Storage as StorageTrait;
 use crate::{NODE_VERSION, NODE_NAME, DEFAULT_GRPC_PORT_OFFSET};
 
 // ════════════════════════════════════════════════════════════════════════════
-// CLI CONFIGURATION
+// CLI DEFINITIONS (clap)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Node configuration parsed from CLI arguments or environment.
+/// DSDN Node — Distributed Storage and Data Network
+///
+/// Storage node that receives ALL commands via DA events (Celestia).
+/// Provides chunk storage (gRPC + HTTP) and observability endpoints.
+///
+/// Running without a subcommand defaults to 'run' (starts the node server).
+#[derive(Parser)]
+#[command(
+    name = "dsdn-node",
+    version,
+    about = "DSDN Node — Distributed Storage and Data Network",
+    long_about = "Storage node that receives ALL commands via DA events.\n\
+                  Provides chunk storage (gRPC + HTTP) and observability endpoints.\n\n\
+                  Running without a subcommand defaults to 'run' (starts the node)."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Start the node server
+    Run(RunArgs),
+
+    /// Query a running node's status
+    Status(QueryArgs),
+
+    /// Query a running node's health
+    Health(QueryArgs),
+
+    /// Show build and configuration info
+    Info,
+
+    /// Show version string
+    Version,
+
+    /// Storage operations (local and remote)
+    #[command(subcommand)]
+    Store(StoreCommand),
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `run` subcommand
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for the `run` subcommand — starts the node server.
+///
+/// All flags have environment variable fallbacks. CLI flags take precedence.
+#[derive(Args)]
+pub struct RunArgs {
+    // ── Node Identity ───────────────────────────────────────────────────
+
+    /// Unique node identifier (use 'auto' to generate a UUID)
+    #[arg(long, env = "NODE_ID", default_value = "auto")]
+    pub node_id: String,
+
+    // ── Storage ─────────────────────────────────────────────────────────
+
+    /// Storage directory path
+    #[arg(long, env = "NODE_STORAGE_PATH", default_value = "./data")]
+    pub storage_path: String,
+
+    /// Storage capacity in GB
+    #[arg(long, env = "NODE_STORAGE_CAPACITY_GB", default_value_t = 100)]
+    pub storage_capacity_gb: u64,
+
+    // ── Network Ports ───────────────────────────────────────────────────
+
+    /// HTTP server port (observability + storage data-plane endpoints)
+    #[arg(long, env = "NODE_HTTP_PORT", default_value_t = 45832)]
+    pub http_port: u16,
+
+    /// gRPC storage server port (default: http-port + 1000)
+    #[arg(long, env = "NODE_GRPC_PORT")]
+    pub grpc_port: Option<u16>,
+
+    // ── Primary DA (Celestia) ───────────────────────────────────────────
+
+    /// Celestia light node RPC endpoint
+    #[arg(long, env = "DA_RPC_URL", required_unless_present = "mock_da")]
+    pub da_rpc_url: Option<String>,
+
+    /// DA namespace (58-character hex string, 29 bytes)
+    #[arg(long, env = "DA_NAMESPACE", required_unless_present = "mock_da")]
+    pub da_namespace: Option<String>,
+
+    /// DA authentication token (required for mainnet)
+    #[arg(long, env = "DA_AUTH_TOKEN")]
+    pub da_auth_token: Option<String>,
+
+    /// DA network identifier
+    #[arg(long, env = "DA_NETWORK", default_value = "mainnet")]
+    pub da_network: String,
+
+    /// DA operation timeout in milliseconds
+    #[arg(long, env = "DA_TIMEOUT_MS", default_value_t = 30000)]
+    pub da_timeout_ms: u64,
+
+    /// DA retry count for failed operations
+    #[arg(long, env = "DA_RETRY_COUNT", default_value_t = 3)]
+    pub da_retry_count: u8,
+
+    /// DA retry delay in milliseconds
+    #[arg(long, env = "DA_RETRY_DELAY_MS", default_value_t = 1000)]
+    pub da_retry_delay_ms: u64,
+
+    /// DA max connections (connection pooling)
+    #[arg(long, env = "DA_MAX_CONNECTIONS", default_value_t = 10)]
+    pub da_max_connections: u16,
+
+    /// DA idle timeout in milliseconds
+    #[arg(long, env = "DA_IDLE_TIMEOUT_MS", default_value_t = 60000)]
+    pub da_idle_timeout_ms: u64,
+
+    /// Enable DA connection pooling
+    #[arg(long, env = "DA_ENABLE_POOLING", default_value_t = true)]
+    pub da_enable_pooling: bool,
+
+    /// Use mock DA layer for development (skips real Celestia connection)
+    #[arg(long, env = "USE_MOCK_DA", default_value_t = false)]
+    pub mock_da: bool,
+
+    // ── Environment File ────────────────────────────────────────────────
+
+    /// Path to environment file (auto: .env.mainnet → .env)
+    #[arg(long, env = "DSDN_ENV_FILE")]
+    pub env_file: Option<String>,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `status` / `health` query args
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Arguments for querying a running node (status, health).
+#[derive(Args)]
+pub struct QueryArgs {
+    /// HTTP port of the running node
+    #[arg(long, short = 'p', env = "NODE_HTTP_PORT", default_value_t = 45832)]
+    pub port: u16,
+
+    /// Host of the running node
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `store` subcommands
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum StoreCommand {
+    /// Chunk a file and store locally
+    Put(StorePutArgs),
+
+    /// Retrieve a chunk from local storage
+    Get(StoreGetArgs),
+
+    /// Check if a chunk exists in local storage
+    Has(StoreHasArgs),
+
+    /// Show local storage statistics
+    Stats,
+
+    /// Send file chunks to a remote node via gRPC
+    Send(StoreSendArgs),
+
+    /// Fetch a chunk from a remote node via gRPC
+    Fetch(StoreFetchArgs),
+}
+
+#[derive(Args)]
+pub struct StorePutArgs {
+    /// File to chunk and store
+    pub file: String,
+
+    /// Chunk size in bytes
+    #[arg(long, default_value_t = chunker::DEFAULT_CHUNK_SIZE)]
+    pub chunk_size: usize,
+}
+
+#[derive(Args)]
+pub struct StoreGetArgs {
+    /// Chunk content hash
+    pub hash: String,
+
+    /// Output file path (prints info if omitted)
+    #[arg(long, short = 'o')]
+    pub output: Option<String>,
+}
+
+#[derive(Args)]
+pub struct StoreHasArgs {
+    /// Chunk content hash
+    pub hash: String,
+}
+
+#[derive(Args)]
+pub struct StoreSendArgs {
+    /// Remote node gRPC address (host:port)
+    pub grpc_addr: String,
+
+    /// File to send
+    pub file: String,
+}
+
+#[derive(Args)]
+pub struct StoreFetchArgs {
+    /// Remote node gRPC address (host:port)
+    pub grpc_addr: String,
+
+    /// Chunk content hash to fetch
+    pub hash: String,
+
+    /// Output file path (prints info if omitted)
+    #[arg(long, short = 'o')]
+    pub output: Option<String>,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// INTERNAL NODE CONFIGURATION (built from RunArgs)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Node configuration parsed from clap RunArgs.
 #[derive(Debug, Clone)]
 pub(crate) struct NodeConfig {
-    /// Unique node identifier.
     pub node_id: String,
-    /// DA configuration.
     pub da_config: DAConfig,
-    /// Storage directory path.
     pub storage_path: String,
-    /// HTTP port for health endpoint.
+    pub storage_capacity_gb: u64,
     pub http_port: u16,
-    /// gRPC port for storage server.
     pub grpc_port: u16,
-    /// Whether to use mock DA for testing.
     pub use_mock_da: bool,
-    /// Configuration source (cli or env).
-    pub config_source: String,
 }
 
 impl NodeConfig {
-    /// Parse configuration from CLI arguments for `run` subcommand.
-    ///
-    /// Usage: dsdn-node run <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>
-    ///    OR: dsdn-node run env   (default if no args after `run`)
-    ///    OR: dsdn-node run       (defaults to env mode)
-    pub fn from_run_args(args: &[String]) -> Result<Self, String> {
-        // No extra args or "env" → env mode
-        if args.is_empty() || (args.len() == 1 && args[0] == "env") {
-            return Self::from_env();
-        }
-
-        // CLI mode requires exactly 4 arguments after `run`
-        if args.len() < 4 {
-            return Err(
-                "CLI mode requires: dsdn-node run <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>".to_string()
-            );
-        }
-
-        // Parse node_id
-        let node_id = if args[0] == "auto" {
+    /// Build configuration from clap RunArgs.
+    pub fn from_args(args: &RunArgs) -> Result<Self, String> {
+        // Resolve node_id
+        let node_id = if args.node_id == "auto" {
             Uuid::new_v4().to_string()
         } else {
-            args[0].clone()
+            args.node_id.clone()
         };
 
-        // Parse DA endpoint
-        let da_endpoint = args[1].clone();
-        let use_mock_da = da_endpoint == "mock";
-
-        // Build DA config for CLI mode.
-        // CLI provides the RPC URL; auth_token, namespace, and other DA
-        // settings are picked up from environment (.env.mainnet already
-        // loaded by load_env_file() before we get here).
-        let da_config = if use_mock_da {
+        // Build DA config
+        let da_config = if args.mock_da {
             DAConfig::default()
         } else {
-            // --- namespace from env ---
-            let namespace = match env::var("DA_NAMESPACE") {
-                Ok(hex_str) => {
-                    let hex_str = hex_str.trim();
-                    if hex_str.len() == 58 {
-                        let mut ns = [0u8; 29];
-                        let mut valid = true;
-                        for i in 0..29 {
-                            match u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
-                                Ok(b) => ns[i] = b,
-                                Err(_) => { valid = false; break; }
-                            }
-                        }
-                        if valid { ns } else {
-                            eprintln!("⚠️  Invalid DA_NAMESPACE hex, using zeroed namespace");
-                            [0u8; 29]
-                        }
-                    } else {
-                        eprintln!("⚠️  DA_NAMESPACE must be 58 hex chars (got {}), using zeroed namespace", hex_str.len());
-                        [0u8; 29]
-                    }
-                }
-                Err(_) => [0u8; 29],
-            };
-
-            // --- auth token from env ---
-            let auth_token = env::var("DA_AUTH_TOKEN").ok().filter(|s| !s.trim().is_empty());
-            if auth_token.is_none() {
-                eprintln!("⚠️  DA_AUTH_TOKEN not set — Celestia will reject requests that need 'read' permission");
-            }
-
-            // --- other DA settings from env with sane defaults ---
-            let network = env::var("DA_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
-            let timeout_ms = env::var("DA_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30000u64);
-            let retry_count = env::var("DA_RETRY_COUNT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3u8);
+            let rpc_url = args.da_rpc_url.clone().ok_or(
+                "Missing --da-rpc-url (or DA_RPC_URL env). Use --mock-da for development."
+            )?;
+            let namespace_hex = args.da_namespace.clone().ok_or(
+                "Missing --da-namespace (or DA_NAMESPACE env). Use --mock-da for development."
+            )?;
+            let namespace = parse_namespace_hex(&namespace_hex)?;
 
             DAConfig {
-                rpc_url: da_endpoint,
+                rpc_url,
                 namespace,
-                auth_token,
-                timeout_ms,
-                retry_count,
-                retry_delay_ms: 1000,
-                network,
-                enable_pooling: true,
-                max_connections: 10,
-                idle_timeout_ms: 60000,
+                auth_token: args.da_auth_token.clone().filter(|s| !s.trim().is_empty()),
+                timeout_ms: args.da_timeout_ms,
+                retry_count: args.da_retry_count,
+                retry_delay_ms: args.da_retry_delay_ms,
+                network: args.da_network.clone(),
+                enable_pooling: args.da_enable_pooling,
+                max_connections: args.da_max_connections,
+                idle_timeout_ms: args.da_idle_timeout_ms,
             }
         };
 
-        // Parse storage path
-        let storage_path = args[2].clone();
-
-        // Parse HTTP port
-        let http_port: u16 = args[3]
-            .parse()
-            .map_err(|_| format!("Invalid HTTP port: {}", args[3]))?;
-
-        // gRPC port: from env or http_port + offset
-        let grpc_port = Self::resolve_grpc_port(http_port);
+        // Resolve gRPC port
+        let grpc_port = args.grpc_port
+            .unwrap_or_else(|| args.http_port.saturating_add(DEFAULT_GRPC_PORT_OFFSET));
 
         Ok(Self {
             node_id,
             da_config,
-            storage_path,
-            http_port,
+            storage_path: args.storage_path.clone(),
+            storage_capacity_gb: args.storage_capacity_gb,
+            http_port: args.http_port,
             grpc_port,
-            use_mock_da,
-            config_source: "cli".to_string(),
+            use_mock_da: args.mock_da,
         })
-    }
-
-    /// Parse configuration from environment variables.
-    pub fn from_env() -> Result<Self, String> {
-        // Set default DA_NETWORK to mainnet if not specified
-        // DSDN defaults to mainnet (same as coordinator)
-        if env::var("DA_NETWORK").is_err() {
-            env::set_var("DA_NETWORK", "mainnet");
-        }
-
-        // Check if using mock DA
-        let use_mock_da = env::var("USE_MOCK_DA")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
-
-        // Load DA config
-        let da_config = if use_mock_da {
-            DAConfig::default()
-        } else {
-            DAConfig::from_env().map_err(|e| format!("DA config error: {}", e))?
-        };
-
-        // Required: NODE_ID
-        let node_id_raw = env::var("NODE_ID")
-            .map_err(|_| "NODE_ID environment variable not set")?;
-        let node_id = if node_id_raw == "auto" {
-            Uuid::new_v4().to_string()
-        } else {
-            node_id_raw
-        };
-
-        // Required: NODE_STORAGE_PATH
-        let storage_path = env::var("NODE_STORAGE_PATH")
-            .map_err(|_| "NODE_STORAGE_PATH environment variable not set")?;
-
-        // Required: NODE_HTTP_PORT
-        let http_port: u16 = env::var("NODE_HTTP_PORT")
-            .map_err(|_| "NODE_HTTP_PORT environment variable not set")?
-            .parse()
-            .map_err(|_| "NODE_HTTP_PORT must be a valid port number")?;
-
-        // gRPC port: from env or http_port + offset
-        let grpc_port = Self::resolve_grpc_port(http_port);
-
-        Ok(Self {
-            node_id,
-            da_config,
-            storage_path,
-            http_port,
-            grpc_port,
-            use_mock_da,
-            config_source: "env".to_string(),
-        })
-    }
-
-    /// Resolve gRPC port from env or derive from HTTP port.
-    fn resolve_grpc_port(http_port: u16) -> u16 {
-        env::var("NODE_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| http_port.saturating_add(DEFAULT_GRPC_PORT_OFFSET))
     }
 
     /// Validate configuration.
     pub fn validate(&self) -> Result<(), String> {
-        // Validate node_id
         if self.node_id.is_empty() {
             return Err("Node ID cannot be empty".to_string());
         }
-
-        // Validate storage path (basic check)
         if self.storage_path.is_empty() {
             return Err("Storage path cannot be empty".to_string());
         }
-
-        // Validate port range
         if self.http_port == 0 {
             return Err("HTTP port cannot be 0".to_string());
         }
-
         if self.grpc_port == 0 {
             return Err("gRPC port cannot be 0".to_string());
         }
-
         if self.http_port == self.grpc_port {
             return Err(format!(
                 "HTTP port ({}) and gRPC port ({}) cannot be the same",
                 self.http_port, self.grpc_port
             ));
         }
-
-        // Validate for production if mainnet
         if self.da_config.is_mainnet() {
             self.da_config
                 .validate_for_production()
                 .map_err(|e| format!("Production validation failed: {}", e))?;
         }
-
         Ok(())
     }
+}
+
+/// Parse a 58-character hex namespace string into [u8; 29].
+fn parse_namespace_hex(hex_str: &str) -> Result<[u8; 29], String> {
+    let hex_str = hex_str.trim();
+    if hex_str.len() != 58 {
+        return Err(format!(
+            "DA namespace must be 58 hex chars (got {}). \
+             Example: 0000000000000000000000000000000000000000000064736E6474657374",
+            hex_str.len()
+        ));
+    }
+    let mut ns = [0u8; 29];
+    for i in 0..29 {
+        ns[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!(
+                "Invalid hex at position {}: '{}'",
+                i * 2, &hex_str[i * 2..i * 2 + 2]
+            ))?;
+    }
+    Ok(ns)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -276,32 +381,29 @@ impl NodeConfig {
 
 /// Load environment variables from .env.mainnet or custom env file.
 ///
-/// Priority order:
+/// Priority:
 /// 1. `DSDN_ENV_FILE` environment variable (custom path)
-/// 2. `.env.mainnet` (production default - DSDN defaults to mainnet)
+/// 2. `.env.mainnet` (production default)
 /// 3. `.env` (fallback for development)
 pub fn load_env_file() {
     let env_file = env::var("DSDN_ENV_FILE").unwrap_or_else(|_| {
-        if std::path::Path::new(".env.mainnet").exists() {
+        if Path::new(".env.mainnet").exists() {
             ".env.mainnet".to_string()
-        } else if std::path::Path::new(".env").exists() {
+        } else if Path::new(".env").exists() {
             ".env".to_string()
         } else {
-            ".env.mainnet".to_string() // Will fail gracefully if not exists
+            ".env.mainnet".to_string()
         }
     });
 
     match dotenvy::from_filename(&env_file) {
         Ok(path) => {
-            // Store which file was loaded for later logging (tracing not initialized yet)
             env::set_var("_DSDN_LOADED_ENV_FILE", path.display().to_string());
         }
         Err(e) => {
-            // File not found is acceptable, other errors are warnings
             if !matches!(e, dotenvy::Error::Io(_)) {
                 eprintln!("⚠️  Warning: Failed to load {}: {}", env_file, e);
             }
-            // Continue without env file - will use environment variables directly
         }
     }
 }
@@ -313,43 +415,23 @@ pub fn load_env_file() {
 /// Cache duration for storage metrics (30 seconds).
 const STORAGE_METRICS_CACHE_SECS: u64 = 30;
 
-/// Real storage backend that wraps `LocalFsStorage` from dsdn_storage.
-///
-/// Implements `HealthStorage` for health/metrics reporting and provides
-/// access to the underlying `LocalFsStorage` for chunk operations.
+/// Real storage backend wrapping `LocalFsStorage` from dsdn_storage.
 pub(crate) struct NodeStorageBackend {
-    /// Underlying local filesystem storage.
     local_fs: Arc<LocalFsStorage>,
-    /// Objects directory path (for calculating disk usage).
     objects_dir: PathBuf,
-    /// Cached used bytes + last calculation time.
     cached_used: RwLock<(u64, Instant)>,
-    /// Storage capacity in bytes (configurable or detected).
     capacity_bytes: u64,
 }
 
 impl NodeStorageBackend {
-    /// Create a new storage backend rooted at `storage_path`.
-    ///
-    /// This creates the directory structure if needed and performs an
-    /// initial scan of existing data to calculate used bytes.
-    pub fn new(storage_path: &str) -> Result<Self, String> {
+    pub fn new(storage_path: &str, capacity_gb: u64) -> Result<Self, String> {
         let local_fs = Arc::new(
             LocalFsStorage::new(storage_path)
                 .map_err(|e| format!("Failed to initialize LocalFsStorage: {}", e))?
         );
-
         let objects_dir = PathBuf::from(storage_path).join("objects");
-
-        // Initial scan for used bytes
         let initial_used = calculate_dir_size(&objects_dir);
-
-        // Capacity from env or default 100 GB
-        let capacity_bytes: u64 = env::var("NODE_STORAGE_CAPACITY_GB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(100)
-            * 1024 * 1024 * 1024;
+        let capacity_bytes = capacity_gb * 1024 * 1024 * 1024;
 
         Ok(Self {
             local_fs,
@@ -359,26 +441,21 @@ impl NodeStorageBackend {
         })
     }
 
-    /// Get reference to underlying LocalFsStorage.
     pub fn local_fs(&self) -> &Arc<LocalFsStorage> {
         &self.local_fs
     }
 
-    /// Invalidate the usage cache (call after writes).
     pub fn invalidate_cache(&self) {
         let mut cache = self.cached_used.write();
-        // Set timestamp to epoch so next read recalculates
         cache.1 = Instant::now() - Duration::from_secs(STORAGE_METRICS_CACHE_SECS + 1);
     }
 
-    /// Get current used bytes (with caching).
     fn used_bytes_cached(&self) -> u64 {
         let cache = self.cached_used.read();
         if cache.1.elapsed().as_secs() < STORAGE_METRICS_CACHE_SECS {
             return cache.0;
         }
         drop(cache);
-
         let size = calculate_dir_size(&self.objects_dir);
         let mut cache = self.cached_used.write();
         *cache = (size, Instant::now());
@@ -390,7 +467,6 @@ impl HealthStorage for NodeStorageBackend {
     fn storage_used_bytes(&self) -> u64 {
         self.used_bytes_cached()
     }
-
     fn storage_capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
@@ -434,12 +510,9 @@ pub(crate) fn count_files(path: &Path) -> u64 {
 
 /// Wrapper for DA layer to implement DAInfo trait.
 pub(crate) struct DAInfoWrapper {
-    /// DA layer reference.
     #[allow(dead_code)]
     da: Arc<dyn DALayer>,
-    /// Latest sequence (updated by follower).
     latest_sequence: RwLock<u64>,
-    /// Connection status.
     connected: RwLock<bool>,
 }
 
@@ -468,7 +541,6 @@ impl DAInfo for DAInfoWrapper {
     fn is_connected(&self) -> bool {
         *self.connected.read()
     }
-
     fn latest_sequence(&self) -> u64 {
         *self.latest_sequence.read()
     }
@@ -497,7 +569,7 @@ async fn startup_da_health_check(da: &dyn DALayer) -> Result<(), DAError> {
             }
             Ok(DAHealthStatus::Unavailable) => {
                 if attempt < max_attempts {
-                    warn!("DA unavailable, retrying in {} seconds...", retry_delay.as_secs());
+                    warn!("DA unavailable, retrying in {}s...", retry_delay.as_secs());
                     tokio::time::sleep(retry_delay).await;
                 } else {
                     return Err(DAError::Unavailable);
@@ -521,24 +593,20 @@ async fn startup_da_health_check(da: &dyn DALayer) -> Result<(), DAError> {
 // STORAGE HTTP ENDPOINTS (Data Plane)
 // ════════════════════════════════════════════════════════════════════════════
 //
-// These endpoints handle chunk data transfer via HTTP.
-// They are data plane operations — NOT control plane instructions.
-// Control plane commands still come exclusively via DA events.
+// These are DATA PLANE operations — NOT control plane instructions.
+// Control plane commands come exclusively via DA events.
 
-/// Shared state for storage HTTP endpoints.
 #[derive(Clone)]
 struct StorageHttpState {
     store: Arc<LocalFsStorage>,
     objects_dir: PathBuf,
 }
 
-/// Path parameter for hash-based routes.
 #[derive(Debug, serde::Deserialize)]
 struct HashParam {
     hash: String,
 }
 
-/// Response for chunk operations.
 #[derive(Debug, Serialize)]
 struct ChunkResponse {
     hash: String,
@@ -546,7 +614,6 @@ struct ChunkResponse {
     status: String,
 }
 
-/// Response for storage stats.
 #[derive(Debug, Serialize)]
 struct StorageStatsResponse {
     total_chunks: u64,
@@ -583,19 +650,10 @@ async fn http_put_chunk(
     if body.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-
     let hash = sha256_hex(&body);
     let size = body.len();
-
-    st.store
-        .put_chunk(&hash, &body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(ChunkResponse {
-        hash,
-        size,
-        status: "ok".to_string(),
-    }))
+    st.store.put_chunk(&hash, &body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ChunkResponse { hash, size, status: "ok".to_string() }))
 }
 
 /// GET /storage/stats — Storage statistics.
@@ -604,7 +662,6 @@ async fn http_storage_stats(
 ) -> Json<StorageStatsResponse> {
     let total_bytes = calculate_dir_size(&st.objects_dir);
     let total_chunks = count_files(&st.objects_dir);
-
     Json(StorageStatsResponse {
         total_chunks,
         total_bytes,
@@ -623,7 +680,7 @@ fn build_storage_router(state: Arc<StorageHttpState>) -> Router {
         .route("/storage/has/:hash", get(http_has_chunk))
         .route("/storage/chunk", axum_put(http_put_chunk))
         .route("/storage/stats", get(http_storage_stats))
-        // Backward compatibility aliases without prefix
+        // Backward compatibility aliases
         .route("/chunks/:hash", get(http_get_chunk))
         .route("/has/:hash", get(http_has_chunk))
         .route("/chunks", axum_put(http_put_chunk))
@@ -634,38 +691,20 @@ fn build_storage_router(state: Arc<StorageHttpState>) -> Router {
 // HTTP SERVER (AXUM)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Start HTTP server using Axum with full observability endpoints.
-///
-/// Endpoints:
-///   Observability: /health /ready /info /status /state /state/fallback
-///                  /state/assignments /da/status /metrics /metrics/prometheus
-///   Storage:       /storage/chunk/:hash (GET) /storage/chunk (PUT)
-///                  /storage/has/:hash (GET) /storage/stats (GET)
-///                  /chunks/:hash (GET) /chunks (PUT) /has/:hash (GET)
-///                  (aliases for backward compatibility)
-///
-/// Control plane commands come via DA events, NOT via HTTP.
-/// Storage endpoints are data plane operations.
-async fn start_axum_server(
-    addr: SocketAddr,
-    router: Router,
-    shutdown: Arc<Notify>,
-) {
+async fn start_axum_server(addr: SocketAddr, router: Router, shutdown: Arc<Notify>) {
     info!("🌐 Starting HTTP server on http://{}", addr);
     info!("   Observability: /health /ready /info /status /state /da/status /metrics");
     info!("   Storage:       /storage/chunk/:hash /storage/chunk /storage/has/:hash /storage/stats");
-    info!("   Aliases:       /chunks/:hash /chunks /has/:hash (backward compatibility)");
 
     let listener = match bind_with_reuse(addr).await {
         Ok(l) => l,
         Err(e) => {
             error!("❌ Failed to bind HTTP server to {}: {}", addr, e);
-            error!("   Hint: kill the previous node process, or use a different --port");
+            error!("   Hint: kill the previous node process, or use a different --http-port");
             return;
         }
     };
 
-    // Serve with graceful shutdown
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown.notified().await;
@@ -677,11 +716,9 @@ async fn start_axum_server(
         });
 }
 
-/// Bind TCP listener with SO_REUSEADDR and retry.
-/// Handles Windows TIME_WAIT issue after rapid restart.
+/// Bind TCP listener with SO_REUSEADDR and retry (handles Windows TIME_WAIT).
 async fn bind_with_reuse(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
     let max_attempts = 5;
-
     for attempt in 1..=max_attempts {
         match try_bind_reuse(addr) {
             Ok(listener) => {
@@ -692,16 +729,12 @@ async fn bind_with_reuse(addr: SocketAddr) -> Result<tokio::net::TcpListener, St
             }
             Err(e) => {
                 if attempt < max_attempts {
-                    warn!(
-                        "Port {} busy (attempt {}/{}): {} — retrying in 2s...",
-                        addr.port(), attempt, max_attempts, e
-                    );
+                    warn!("Port {} busy (attempt {}/{}): {} — retrying in 2s...",
+                        addr.port(), attempt, max_attempts, e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 } else {
-                    return Err(format!(
-                        "port {} still busy after {} attempts: {}",
-                        addr.port(), max_attempts, e
-                    ));
+                    return Err(format!("port {} still busy after {} attempts: {}",
+                        addr.port(), max_attempts, e));
                 }
             }
         }
@@ -709,81 +742,30 @@ async fn bind_with_reuse(addr: SocketAddr) -> Result<tokio::net::TcpListener, St
     unreachable!()
 }
 
-/// Single bind attempt using socket2 for SO_REUSEADDR.
 fn try_bind_reuse(addr: SocketAddr) -> Result<tokio::net::TcpListener, String> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-
+    let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
         .map_err(|e| format!("socket create: {}", e))?;
-
     socket.set_reuse_address(true).map_err(|e| format!("SO_REUSEADDR: {}", e))?;
     socket.set_nonblocking(true).map_err(|e| format!("nonblocking: {}", e))?;
-
     let sock_addr: socket2::SockAddr = addr.into();
     socket.bind(&sock_addr).map_err(|e| format!("bind: {}", e))?;
     socket.listen(1024).map_err(|e| format!("listen: {}", e))?;
-
     let std_listener: std::net::TcpListener = socket.into();
     tokio::net::TcpListener::from_std(std_listener).map_err(|e| format!("tokio wrap: {}", e))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CLI SUBCOMMANDS
+// COMMAND IMPLEMENTATIONS
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Print usage/help message.
-pub fn print_usage(prog: &str) {
-    eprintln!("DSDN Node v{}", NODE_VERSION);
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  {} run [env]                                          Start node (env mode, default)", prog);
-    eprintln!("  {} run <node-id|auto> <da-endpoint|mock> <storage-path> <http-port>", prog);
-    eprintln!("                                                          Start node (CLI mode)");
-    eprintln!("  {} status [--port PORT]                               Query running node status", prog);
-    eprintln!("  {} health [--port PORT]                               Query running node health", prog);
-    eprintln!("  {} info                                               Show build/config info", prog);
-    eprintln!("  {} version                                            Show version", prog);
-    eprintln!();
-    eprintln!("Storage commands:");
-    eprintln!("  {} store put <file> [chunk_size]                      Chunk file & store locally", prog);
-    eprintln!("  {} store get <hash> [output_file]                     Get chunk from local store", prog);
-    eprintln!("  {} store has <hash>                                   Check if chunk exists", prog);
-    eprintln!("  {} store stats                                        Show storage statistics", prog);
-    eprintln!("  {} store send <grpc-addr> <file>                      Send file chunks via gRPC", prog);
-    eprintln!("  {} store fetch <grpc-addr> <hash> [output]            Fetch chunk from remote via gRPC", prog);
-    eprintln!();
-    eprintln!("Environment variables (env mode):");
-    eprintln!("  NODE_ID             Unique node identifier (or 'auto')");
-    eprintln!("  NODE_STORAGE_PATH   Storage directory path");
-    eprintln!("  NODE_HTTP_PORT      HTTP server port");
-    eprintln!("  NODE_GRPC_PORT      gRPC storage server port (default: HTTP_PORT + 1000)");
-    eprintln!("  DA_RPC_URL          Celestia light node RPC endpoint");
-    eprintln!("  DA_NAMESPACE        58-character hex namespace");
-    eprintln!("  DA_AUTH_TOKEN       Authentication token (required for mainnet)");
-    eprintln!();
-    eprintln!("Optional:");
-    eprintln!("  DA_NETWORK              Network identifier (default: mainnet)");
-    eprintln!("  DA_TIMEOUT_MS           Operation timeout in milliseconds");
-    eprintln!("  USE_MOCK_DA             Use mock DA for development");
-    eprintln!("  DSDN_ENV_FILE           Custom env file path (default: .env.mainnet)");
-    eprintln!("  NODE_STORAGE_CAPACITY_GB  Storage capacity in GB (default: 100)");
-    eprintln!();
-    eprintln!("Environment file loading (automatic):");
-    eprintln!("  Priority: DSDN_ENV_FILE > .env.mainnet > .env");
-}
-
-/// Execute `version` subcommand.
+/// `version` — print version string.
 pub fn cmd_version() {
     println!("{} v{}", NODE_NAME, NODE_VERSION);
 }
 
-/// Execute `info` subcommand — show build info and current env config.
+/// `info` — show build and configuration info.
 pub fn cmd_info() {
-    // Load env file so we can display config
     load_env_file();
 
     println!("═══════════════════════════════════════════════════════════════");
@@ -811,25 +793,9 @@ pub fn cmd_info() {
     println!("═══════════════════════════════════════════════════════════════");
 }
 
-/// Parse --port flag from args, default to 45831.
-pub fn parse_port_flag(args: &[String]) -> u16 {
-    for i in 0..args.len() {
-        if args[i] == "--port" || args[i] == "-p" {
-            if let Some(port_str) = args.get(i + 1) {
-                return port_str.parse().unwrap_or(45831);
-            }
-        }
-    }
-    // Also try from NODE_HTTP_PORT env
-    env::var("NODE_HTTP_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(45831)
-}
-
-/// Execute `status` subcommand — query a running node's /status endpoint.
-pub async fn cmd_status(port: u16) {
-    let url = format!("http://127.0.0.1:{}/status", port);
+/// `status` — query a running node's /status endpoint.
+pub async fn cmd_status(args: &QueryArgs) {
+    let url = format!("http://{}:{}/status", args.host, args.port);
     println!("Querying node status at {}...", url);
 
     match reqwest::get(&url).await {
@@ -846,22 +812,22 @@ pub async fn cmd_status(port: u16) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to read response body: {}", e);
+                    eprintln!("Failed to read response: {}", e);
                     std::process::exit(1);
                 }
             }
         }
         Err(e) => {
-            eprintln!("Failed to connect to node at port {}: {}", port, e);
-            eprintln!("Is the node running? Start it with: dsdn-node run");
+            eprintln!("Failed to connect to node at {}:{}: {}", args.host, args.port, e);
+            eprintln!("Is the node running? Start with: dsdn-node run --mock-da");
             std::process::exit(1);
         }
     }
 }
 
-/// Execute `health` subcommand — query a running node's /health endpoint.
-pub async fn cmd_health(port: u16) {
-    let url = format!("http://127.0.0.1:{}/health", port);
+/// `health` — query a running node's /health endpoint.
+pub async fn cmd_health(args: &QueryArgs) {
+    let url = format!("http://{}:{}/health", args.host, args.port);
     println!("Querying node health at {}...", url);
 
     match reqwest::get(&url).await {
@@ -882,46 +848,46 @@ pub async fn cmd_health(port: u16) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to read response body: {}", e);
+                    eprintln!("Failed to read response: {}", e);
                     std::process::exit(1);
                 }
             }
         }
         Err(e) => {
-            eprintln!("❌ Failed to connect to node at port {}: {}", port, e);
-            eprintln!("Is the node running? Start it with: dsdn-node run");
+            eprintln!("❌ Failed to connect to node at {}:{}: {}", args.host, args.port, e);
+            eprintln!("Is the node running? Start with: dsdn-node run --mock-da");
             std::process::exit(1);
         }
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// STORE SUBCOMMANDS
+// STORE SUBCOMMAND IMPLEMENTATIONS
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Get storage path from env or default.
+/// Resolve storage path from env or default.
 fn resolve_storage_path() -> String {
     env::var("NODE_STORAGE_PATH").unwrap_or_else(|_| "./data".to_string())
 }
 
-/// Execute `store put <file> [chunk_size]`
-pub fn cmd_store_put(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: dsdn-node store put <file> [chunk_size]");
-        std::process::exit(2);
+/// Dispatch store subcommands.
+pub async fn cmd_store(cmd: StoreCommand) {
+    match cmd {
+        StoreCommand::Put(args)   => cmd_store_put(&args),
+        StoreCommand::Get(args)   => cmd_store_get(&args),
+        StoreCommand::Has(args)   => cmd_store_has(&args),
+        StoreCommand::Stats       => cmd_store_stats(),
+        StoreCommand::Send(args)  => cmd_store_send(&args).await,
+        StoreCommand::Fetch(args) => cmd_store_fetch(&args).await,
     }
+}
 
-    let file = Path::new(&args[0]);
+fn cmd_store_put(args: &StorePutArgs) {
+    let file = Path::new(&args.file);
     if !file.exists() {
         eprintln!("❌ File not found: {:?}", file);
         std::process::exit(1);
     }
-
-    let chunk_size: usize = if args.len() >= 2 {
-        args[1].parse().unwrap_or(chunker::DEFAULT_CHUNK_SIZE)
-    } else {
-        chunker::DEFAULT_CHUNK_SIZE
-    };
 
     let storage_path = resolve_storage_path();
     let store = match LocalFsStorage::new(&storage_path) {
@@ -940,7 +906,7 @@ pub fn cmd_store_put(args: &[String]) {
         }
     };
 
-    let chunks = match chunker::chunk_reader(&mut f, chunk_size) {
+    let chunks = match chunker::chunk_reader(&mut f, args.chunk_size) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("❌ Failed to chunk file: {}", e);
@@ -948,7 +914,8 @@ pub fn cmd_store_put(args: &[String]) {
         }
     };
 
-    println!("📦 Storing {} chunks (chunk_size = {}) from {:?}", chunks.len(), chunk_size, file);
+    println!("📦 Storing {} chunks (chunk_size = {}) from {:?}",
+        chunks.len(), args.chunk_size, file);
     for (i, chunk) in chunks.into_iter().enumerate() {
         let h = sha256_hex(&chunk);
         if let Err(e) = store.put_chunk(&h, &chunk) {
@@ -960,14 +927,7 @@ pub fn cmd_store_put(args: &[String]) {
     println!("✅ Done. Storage path: {}", storage_path);
 }
 
-/// Execute `store get <hash> [output_file]`
-pub fn cmd_store_get(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: dsdn-node store get <hash> [output_file]");
-        std::process::exit(2);
-    }
-
-    let hash = &args[0];
+fn cmd_store_get(args: &StoreGetArgs) {
     let storage_path = resolve_storage_path();
     let store = match LocalFsStorage::new(&storage_path) {
         Ok(s) => s,
@@ -977,25 +937,21 @@ pub fn cmd_store_get(args: &[String]) {
         }
     };
 
-    match store.get_chunk(hash) {
+    match store.get_chunk(&args.hash) {
         Ok(Some(data)) => {
-            if args.len() >= 2 {
-                // Write to file
-                let output = &args[1];
+            if let Some(ref output) = args.output {
                 if let Err(e) = std::fs::write(output, &data) {
                     eprintln!("❌ Failed to write to {}: {}", output, e);
                     std::process::exit(1);
                 }
-                println!("✅ Chunk {} ({} bytes) written to {}", hash, data.len(), output);
+                println!("✅ Chunk {} ({} bytes) written to {}", args.hash, data.len(), output);
             } else {
-                // Print info
-                println!("✅ Chunk found: {} ({} bytes)", hash, data.len());
-                // If data is small and looks like text, print it
+                println!("✅ Chunk found: {} ({} bytes)", args.hash, data.len());
                 if data.len() <= 1024 {
                     if let Ok(text) = std::str::from_utf8(&data) {
                         println!("Content (text): {}", text);
                     } else {
-                        println!("Content (hex, first 64 bytes): {}", hex_preview(&data, 64));
+                        println!("Content (hex): {}", hex_preview(&data, 64));
                     }
                 } else {
                     println!("Content (hex, first 64 bytes): {}", hex_preview(&data, 64));
@@ -1003,7 +959,7 @@ pub fn cmd_store_get(args: &[String]) {
             }
         }
         Ok(None) => {
-            eprintln!("❌ Chunk not found: {}", hash);
+            eprintln!("❌ Chunk not found: {}", args.hash);
             std::process::exit(1);
         }
         Err(e) => {
@@ -1013,14 +969,7 @@ pub fn cmd_store_get(args: &[String]) {
     }
 }
 
-/// Execute `store has <hash>`
-pub fn cmd_store_has(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: dsdn-node store has <hash>");
-        std::process::exit(2);
-    }
-
-    let hash = &args[0];
+fn cmd_store_has(args: &StoreHasArgs) {
     let storage_path = resolve_storage_path();
     let store = match LocalFsStorage::new(&storage_path) {
         Ok(s) => s,
@@ -1030,10 +979,10 @@ pub fn cmd_store_has(args: &[String]) {
         }
     };
 
-    match store.has_chunk(hash) {
-        Ok(true) => println!("✅ Chunk exists: {}", hash),
+    match store.has_chunk(&args.hash) {
+        Ok(true) => println!("✅ Chunk exists: {}", args.hash),
         Ok(false) => {
-            println!("❌ Chunk not found: {}", hash);
+            println!("❌ Chunk not found: {}", args.hash);
             std::process::exit(1);
         }
         Err(e) => {
@@ -1043,8 +992,7 @@ pub fn cmd_store_has(args: &[String]) {
     }
 }
 
-/// Execute `store stats`
-pub fn cmd_store_stats() {
+fn cmd_store_stats() {
     let storage_path = resolve_storage_path();
     let objects_dir = PathBuf::from(&storage_path).join("objects");
 
@@ -1067,16 +1015,8 @@ pub fn cmd_store_stats() {
     println!("═══════════════════════════════════════════════════════════════");
 }
 
-/// Execute `store send <addr> <file>`
-pub async fn cmd_store_send(args: &[String]) {
-    if args.len() < 2 {
-        eprintln!("Usage: dsdn-node store send <grpc-addr> <file>");
-        eprintln!("  e.g. dsdn-node store send 127.0.0.1:9080 myfile.dat");
-        std::process::exit(2);
-    }
-
-    let addr = &args[0];
-    let file = Path::new(&args[1]);
+async fn cmd_store_send(args: &StoreSendArgs) {
+    let file = Path::new(&args.file);
     if !file.exists() {
         eprintln!("❌ File not found: {:?}", file);
         std::process::exit(1);
@@ -1085,10 +1025,10 @@ pub async fn cmd_store_send(args: &[String]) {
     let mut f = std::fs::File::open(file).expect("open file");
     let chunks = chunker::chunk_reader(&mut f, chunker::DEFAULT_CHUNK_SIZE).expect("chunk file");
 
-    println!("📤 Sending {} chunks to {}", chunks.len(), addr);
+    println!("📤 Sending {} chunks to {}", chunks.len(), args.grpc_addr);
     for (i, chunk) in chunks.into_iter().enumerate() {
         let h = sha256_hex(&chunk);
-        match rpc::client_put(format!("http://{}", addr), h.clone(), chunk).await {
+        match rpc::client_put(format!("http://{}", args.grpc_addr), h.clone(), chunk).await {
             Ok(returned) => println!("  chunk {:>4}: sent → {}", i, returned),
             Err(e) => {
                 eprintln!("❌ Failed to send chunk {}: {}", i, e);
@@ -1099,24 +1039,14 @@ pub async fn cmd_store_send(args: &[String]) {
     println!("✅ File transfer done.");
 }
 
-/// Execute `store fetch <addr> <hash> [output]`
-pub async fn cmd_store_fetch(args: &[String]) {
-    if args.len() < 2 {
-        eprintln!("Usage: dsdn-node store fetch <grpc-addr> <hash> [output_file]");
-        std::process::exit(2);
-    }
-
-    let addr = &args[0];
-    let hash = &args[1];
-
-    match rpc::client_get(format!("http://{}", addr), hash.clone()).await {
+async fn cmd_store_fetch(args: &StoreFetchArgs) {
+    match rpc::client_get(format!("http://{}", args.grpc_addr), args.hash.clone()).await {
         Ok(Some(data)) => {
-            if args.len() >= 3 {
-                let output = &args[2];
+            if let Some(ref output) = args.output {
                 std::fs::write(output, &data).expect("write output");
-                println!("✅ Fetched chunk {} ({} bytes) → {}", hash, data.len(), output);
+                println!("✅ Fetched chunk {} ({} bytes) → {}", args.hash, data.len(), output);
             } else {
-                println!("✅ Fetched chunk {} ({} bytes)", hash, data.len());
+                println!("✅ Fetched chunk {} ({} bytes)", args.hash, data.len());
                 if data.len() <= 1024 {
                     if let Ok(text) = std::str::from_utf8(&data) {
                         println!("Content: {}", text);
@@ -1125,7 +1055,7 @@ pub async fn cmd_store_fetch(args: &[String]) {
             }
         }
         Ok(None) => {
-            eprintln!("❌ Chunk not found on remote: {}", hash);
+            eprintln!("❌ Chunk not found on remote: {}", args.hash);
             std::process::exit(1);
         }
         Err(e) => {
@@ -1135,66 +1065,49 @@ pub async fn cmd_store_fetch(args: &[String]) {
     }
 }
 
-/// Helper: hex preview of bytes.
+// ════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
 pub(crate) fn hex_preview(data: &[u8], max: usize) -> String {
     let limit = data.len().min(max);
     let hex: String = data[..limit].iter().map(|b| format!("{:02x}", b)).collect();
-    if data.len() > max {
-        format!("{}...", hex)
-    } else {
-        hex
-    }
+    if data.len() > max { format!("{}...", hex) } else { hex }
 }
 
-/// Helper: human-readable byte sizes.
 pub(crate) fn human_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
 
-    if bytes >= GIB {
-        format!("{:.2} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.2} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.2} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
+    if bytes >= GIB { format!("{:.2} GiB", bytes as f64 / GIB as f64) }
+    else if bytes >= MIB { format!("{:.2} MiB", bytes as f64 / MIB as f64) }
+    else if bytes >= KIB { format!("{:.2} KiB", bytes as f64 / KIB as f64) }
+    else { format!("{} B", bytes) }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // RUN SUBCOMMAND (main node loop)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Execute `run` subcommand — start the node.
-pub async fn cmd_run(run_args: &[String]) {
-    // Parse configuration
-    let config = match NodeConfig::from_run_args(run_args) {
+/// Execute `run` subcommand — start the full node server.
+pub async fn cmd_run(args: &RunArgs) {
+    // Build config from clap args
+    let config = match NodeConfig::from_args(args) {
         Ok(c) => c,
         Err(e) => {
-            error!("{}", e);
+            error!("Configuration error: {}", e);
             error!("");
-            error!("Required environment variables:");
-            error!("  NODE_ID             - Unique node identifier (or 'auto')");
-            error!("  NODE_STORAGE_PATH   - Storage directory path");
-            error!("  NODE_HTTP_PORT      - HTTP server port");
-            error!("  DA_RPC_URL          - Celestia light node RPC endpoint");
-            error!("  DA_NAMESPACE        - 58-character hex namespace");
-            error!("  DA_AUTH_TOKEN       - Authentication token (required for mainnet)");
+            error!("Required (or use --mock-da):");
+            error!("  --da-rpc-url <URL>        Celestia RPC endpoint");
+            error!("  --da-namespace <HEX>      58-character hex namespace");
+            error!("  --da-auth-token <TOKEN>   Auth token (mainnet)");
             error!("");
-            error!("Optional:");
-            error!("  DA_NETWORK              - Network identifier (default: mainnet)");
-            error!("  DA_TIMEOUT_MS           - Operation timeout (default: 30000)");
-            error!("  USE_MOCK_DA             - Use mock DA for development");
-            error!("  DSDN_ENV_FILE           - Custom env file path (default: .env.mainnet)");
-            error!("  NODE_GRPC_PORT          - gRPC storage port (default: HTTP_PORT + 1000)");
-            error!("  NODE_STORAGE_CAPACITY_GB - Storage capacity in GB (default: 100)");
+            error!("Run 'dsdn-node run --help' for all options.");
             std::process::exit(1);
         }
     };
 
-    // Validate configuration
     if let Err(e) = config.validate() {
         error!("Configuration error: {}", e);
         std::process::exit(1);
@@ -1204,13 +1117,11 @@ pub async fn cmd_run(run_args: &[String]) {
     info!("               DSDN Node v{} (Mainnet Ready)                   ", NODE_VERSION);
     info!("═══════════════════════════════════════════════════════════════");
 
-    // Log which env file was loaded (if any)
     if let Ok(loaded_file) = env::var("_DSDN_LOADED_ENV_FILE") {
         info!("Env File:     {}", loaded_file);
     }
 
     info!("Node ID:      {}", config.node_id);
-    info!("Config Mode:  {}", config.config_source);
     info!("DA Network:   {}", config.da_config.network);
     info!("DA Endpoint:  {}", config.da_config.rpc_url);
     info!("DA Auth:      {}", if config.da_config.auth_token.is_some() { "present ✅" } else { "MISSING ❌" });
@@ -1229,11 +1140,10 @@ pub async fn cmd_run(run_args: &[String]) {
             Ok(da) => Arc::new(da),
             Err(e) => {
                 error!("❌ Failed to connect to DA: {}", e);
-                error!("");
                 error!("Troubleshooting:");
                 error!("  1. Ensure Celestia light node is running");
-                error!("  2. Verify DA_RPC_URL is correct");
-                error!("  3. Check DA_AUTH_TOKEN is valid");
+                error!("  2. Verify --da-rpc-url is correct");
+                error!("  3. Check --da-auth-token is valid");
                 error!("  4. Verify network connectivity");
                 std::process::exit(1);
             }
@@ -1254,7 +1164,7 @@ pub async fn cmd_run(run_args: &[String]) {
     // Step 3: Initialize REAL storage (LocalFsStorage)
     info!("Initializing storage at {}", config.storage_path);
     let storage_backend = Arc::new(
-        match NodeStorageBackend::new(&config.storage_path) {
+        match NodeStorageBackend::new(&config.storage_path, config.storage_capacity_gb) {
             Ok(s) => s,
             Err(e) => {
                 error!("❌ Failed to initialize storage: {}", e);
@@ -1307,13 +1217,11 @@ pub async fn cmd_run(run_args: &[String]) {
     });
     let storage_router = build_storage_router(storage_http_state);
 
-    // Merge routers directly (both already Router<()> after .with_state())
     let combined_router = observability_router
         .merge(storage_router)
         .fallback(|| async {
             (StatusCode::NOT_FOUND, "Route not found - check route registration")
         });
-
 
     // Step 10: Start gRPC storage server
     let grpc_addr: SocketAddr = format!("0.0.0.0:{}", config.grpc_port)
@@ -1404,8 +1312,6 @@ pub async fn cmd_run(run_args: &[String]) {
                                         error!("❌ DA connection lost, will retry...");
                                     }
                                     da_info.set_connected(false);
-
-                                    // Wait before reconnect attempt
                                     tokio::time::sleep(reconnect_delay).await;
                                 }
                                 Err(e) => {
@@ -1458,12 +1364,6 @@ pub async fn cmd_run(run_args: &[String]) {
 mod tests {
     use super::*;
     use dsdn_common::MockDA;
-    use std::sync::Mutex;
-
-    /// Serializes all tests that touch process-global env vars.
-    /// Rust tests run in parallel by default — `env::set_var` / `env::remove_var`
-    /// mutate shared process state, causing flaky failures when tests race.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_config_validation_empty_node_id() {
@@ -1471,10 +1371,10 @@ mod tests {
             node_id: String::new(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
-            http_port: 45831,
+            storage_capacity_gb: 100,
+            http_port: 45832,
             grpc_port: 9080,
             use_mock_da: true,
-            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -1485,10 +1385,10 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: String::new(),
-            http_port: 45831,
+            storage_capacity_gb: 100,
+            http_port: 45832,
             grpc_port: 9080,
             use_mock_da: true,
-            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -1499,10 +1399,10 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
+            storage_capacity_gb: 100,
             http_port: 0,
             grpc_port: 9080,
             use_mock_da: true,
-            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -1513,10 +1413,10 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
-            http_port: 45831,
-            grpc_port: 45831,
+            storage_capacity_gb: 100,
+            http_port: 45832,
+            grpc_port: 45832,
             use_mock_da: true,
-            config_source: "test".to_string(),
         };
         assert!(config.validate().is_err());
     }
@@ -1527,10 +1427,10 @@ mod tests {
             node_id: "node-1".to_string(),
             da_config: DAConfig::default(),
             storage_path: "./data".to_string(),
-            http_port: 45831,
+            storage_capacity_gb: 100,
+            http_port: 45832,
             grpc_port: 9080,
             use_mock_da: true,
-            config_source: "test".to_string(),
         };
         assert!(config.validate().is_ok());
     }
@@ -1539,23 +1439,19 @@ mod tests {
     fn test_node_storage_backend() {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let backend = NodeStorageBackend::new(
-            tmp.path().to_str().unwrap()
+            tmp.path().to_str().unwrap(), 100,
         ).expect("create backend");
 
-        // Initially empty
         assert_eq!(backend.storage_used_bytes(), 0);
         assert!(backend.storage_capacity_bytes() > 0);
 
-        // Put a chunk
         let data = b"test chunk data";
         let hash = sha256_hex(data);
         backend.local_fs().put_chunk(&hash, data).expect("put");
 
-        // Invalidate cache and check
         backend.invalidate_cache();
         assert!(backend.storage_used_bytes() > 0);
 
-        // Get chunk back
         let got = backend.local_fs().get_chunk(&hash).expect("get").expect("exists");
         assert_eq!(got.as_slice(), data);
     }
@@ -1576,144 +1472,22 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        env::set_var("USE_MOCK_DA", "true");
-        env::set_var("NODE_ID", "test-node");
-        env::set_var("NODE_STORAGE_PATH", "./test-data");
-        env::set_var("NODE_HTTP_PORT", "9090");
-
-        let config = NodeConfig::from_env().unwrap();
-
-        assert_eq!(config.node_id, "test-node");
-        assert_eq!(config.storage_path, "./test-data");
-        assert_eq!(config.http_port, 9090);
-        assert_eq!(config.grpc_port, 9090 + DEFAULT_GRPC_PORT_OFFSET);
-        assert!(config.use_mock_da);
-        assert_eq!(config.config_source, "env");
-
-        // Cleanup
-        env::remove_var("USE_MOCK_DA");
-        env::remove_var("NODE_ID");
-        env::remove_var("NODE_STORAGE_PATH");
-        env::remove_var("NODE_HTTP_PORT");
+    fn test_parse_namespace_hex_valid() {
+        let hex = "0000000000000000000000000000000000000000000064736E6474657374";
+        let ns = parse_namespace_hex(hex).unwrap();
+        assert_eq!(ns.len(), 29);
+        assert_eq!(ns[28], 0x74); // 't' in "dsdntest"
     }
 
     #[test]
-    fn test_config_grpc_port_from_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        env::set_var("USE_MOCK_DA", "true");
-        env::set_var("NODE_ID", "test-grpc");
-        env::set_var("NODE_STORAGE_PATH", "./test-grpc");
-        env::set_var("NODE_HTTP_PORT", "45831");
-        env::set_var("NODE_GRPC_PORT", "5555");
-
-        let config = NodeConfig::from_env().unwrap();
-        assert_eq!(config.grpc_port, 5555);
-
-        // Cleanup
-        env::remove_var("USE_MOCK_DA");
-        env::remove_var("NODE_ID");
-        env::remove_var("NODE_STORAGE_PATH");
-        env::remove_var("NODE_HTTP_PORT");
-        env::remove_var("NODE_GRPC_PORT");
+    fn test_parse_namespace_hex_invalid_length() {
+        assert!(parse_namespace_hex("abc").is_err());
     }
 
     #[test]
-    fn test_config_auto_node_id() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        env::set_var("USE_MOCK_DA", "true");
-        env::set_var("NODE_ID", "auto");
-        env::set_var("NODE_STORAGE_PATH", "./test-data");
-        env::set_var("NODE_HTTP_PORT", "9090");
-
-        let config = NodeConfig::from_env().unwrap();
-
-        // Should be a UUID
-        assert!(config.node_id.len() >= 32);
-        assert_ne!(config.node_id, "auto");
-
-        // Cleanup
-        env::remove_var("USE_MOCK_DA");
-        env::remove_var("NODE_ID");
-        env::remove_var("NODE_STORAGE_PATH");
-        env::remove_var("NODE_HTTP_PORT");
-    }
-
-    #[test]
-    fn test_run_args_empty_defaults_to_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        env::set_var("USE_MOCK_DA", "true");
-        env::set_var("NODE_ID", "test-run");
-        env::set_var("NODE_STORAGE_PATH", "./test-run-data");
-        env::set_var("NODE_HTTP_PORT", "9091");
-
-        let config = NodeConfig::from_run_args(&[]).unwrap();
-        assert_eq!(config.node_id, "test-run");
-        assert_eq!(config.config_source, "env");
-
-        // Cleanup
-        env::remove_var("USE_MOCK_DA");
-        env::remove_var("NODE_ID");
-        env::remove_var("NODE_STORAGE_PATH");
-        env::remove_var("NODE_HTTP_PORT");
-    }
-
-    #[test]
-    fn test_run_args_env_keyword() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        env::set_var("USE_MOCK_DA", "true");
-        env::set_var("NODE_ID", "test-env-kw");
-        env::set_var("NODE_STORAGE_PATH", "./test-env");
-        env::set_var("NODE_HTTP_PORT", "9092");
-
-        let args = vec!["env".to_string()];
-        let config = NodeConfig::from_run_args(&args).unwrap();
-        assert_eq!(config.node_id, "test-env-kw");
-        assert_eq!(config.config_source, "env");
-
-        // Cleanup
-        env::remove_var("USE_MOCK_DA");
-        env::remove_var("NODE_ID");
-        env::remove_var("NODE_STORAGE_PATH");
-        env::remove_var("NODE_HTTP_PORT");
-    }
-
-    #[test]
-    fn test_run_args_cli_mode() {
-        let args = vec![
-            "node-1".to_string(),
-            "mock".to_string(),
-            "./data/node1".to_string(),
-            "45831".to_string(),
-        ];
-        let config = NodeConfig::from_run_args(&args).unwrap();
-        assert_eq!(config.node_id, "node-1");
-        assert!(config.use_mock_da);
-        assert_eq!(config.storage_path, "./data/node1");
-        assert_eq!(config.http_port, 45831);
-        assert_eq!(config.config_source, "cli");
-    }
-
-    #[test]
-    fn test_parse_port_flag() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
-        let args = vec!["--port".to_string(), "9999".to_string()];
-        assert_eq!(parse_port_flag(&args), 9999);
-
-        let args = vec!["-p".to_string(), "7777".to_string()];
-        assert_eq!(parse_port_flag(&args), 7777);
-
-        let args: Vec<String> = vec![];
-        // Will fall back to NODE_HTTP_PORT env or 45831
-        let port = parse_port_flag(&args);
-        assert!(port > 0);
+    fn test_parse_namespace_hex_invalid_chars() {
+        let bad = "GGGG000000000000000000000000000000000000000064736E6474657374";
+        assert!(parse_namespace_hex(bad).is_err());
     }
 
     #[test]
@@ -1727,14 +1501,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let dir = tmp.path();
 
-        // Empty dir = 0
         assert_eq!(calculate_dir_size(dir), 0);
 
-        // Write a file
         std::fs::write(dir.join("test.dat"), b"hello world").unwrap();
         assert_eq!(calculate_dir_size(dir), 11);
 
-        // Nested dir
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/test2.dat"), b"more data").unwrap();
         assert_eq!(calculate_dir_size(dir), 11 + 9);
@@ -1754,5 +1525,4 @@ mod tests {
         assert_eq!(hex_preview(&[0xab, 0xcd, 0xef], 10), "abcdef");
         assert_eq!(hex_preview(&[0xab, 0xcd, 0xef], 2), "abcd...");
     }
-
 }
