@@ -90,6 +90,12 @@
 //! - `economic list`: List all tracked receipts (sorted by receipt_hash)
 //! - `economic summary`: Show aggregate summary by state
 //!
+//! ### Retry Logic (14C.C.17)
+//! - `retry` module: Exponential backoff with deterministic jitter
+//! - `RetryConfig`: max_retries, initial_delay_ms, max_delay_ms, backoff_multiplier, jitter
+//! - `retry_with_backoff`: Async retry with non-retryable error short-circuit
+//! - `is_retryable`: Classifies errors as network (retryable) vs validation (non-retryable)
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -113,6 +119,7 @@ mod cmd_health;
 mod cmd_identity;
 mod cmd_gating;
 mod cmd_economic;
+mod retry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
