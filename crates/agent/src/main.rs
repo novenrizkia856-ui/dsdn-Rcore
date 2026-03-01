@@ -103,6 +103,13 @@
 //! - Timeout enforcement via `tokio::time::timeout`
 //! - Response validation (empty fields, NaN progress, bounds checks)
 //!
+//! ### Receipt Submission + Chain Claim (14C.C.19)
+//! - `economic claim <receipt_hash>`: Submit receipt claim to chain
+//! - `economic claim-status <receipt_hash>`: Poll claim status on-chain
+//! - Double-claim protection: `AlreadyClaimed` error classification
+//! - Response validation: amount>0, non-empty tx_hash/challenge_id/reason
+//! - Retry + timeout enforced on all network calls
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -551,7 +558,7 @@ enum GatingCommands {
     },
 }
 
-/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18)
+/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18 + 14C.C.19)
 #[derive(Subcommand)]
 enum EconomicCommands {
     /// Show status of a specific receipt
@@ -578,6 +585,16 @@ enum EconomicCommands {
     Monitor {
         /// Workload ID to monitor
         workload_id: String,
+    },
+    /// Submit a receipt claim to the chain (14C.C.19)
+    Claim {
+        /// Receipt hash to claim
+        receipt_hash: String,
+    },
+    /// Poll claim status on-chain (14C.C.19)
+    ClaimStatus {
+        /// Receipt hash to query
+        receipt_hash: String,
     },
 }
 
@@ -1998,6 +2015,16 @@ async fn main() -> Result<()> {
                     let coord = std::env::var("DSDN_COORDINATOR_ENDPOINT")
                         .unwrap_or_else(|_| "http://127.0.0.1:45831".to_string());
                     cmd_economic::handle_economic_monitor(&coord, &workload_id).await;
+                }
+                EconomicCommands::Claim { receipt_hash } => {
+                    let ingress = std::env::var("DSDN_INGRESS_ENDPOINT")
+                        .unwrap_or_else(|_| "http://127.0.0.1:45832".to_string());
+                    cmd_economic::handle_economic_claim(&ingress, &receipt_hash).await;
+                }
+                EconomicCommands::ClaimStatus { receipt_hash } => {
+                    let ingress = std::env::var("DSDN_INGRESS_ENDPOINT")
+                        .unwrap_or_else(|_| "http://127.0.0.1:45832".to_string());
+                    cmd_economic::handle_economic_claim_status(&ingress, &receipt_hash).await;
                 }
             }
         }

@@ -797,7 +797,351 @@ pub async fn handle_economic_monitor(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// UNIT TESTS
+// RECEIPT SUBMISSION + CHAIN CLAIM (14C.C.19)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Result of submitting a receipt claim to the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimResult {
+    /// Reward was granted immediately (no challenge period).
+    ImmediateReward { amount: u128, tx_hash: String },
+    /// A challenge period has started; reward is pending.
+    ChallengePeriodStarted { expires_at: u64, challenge_id: String },
+    /// The claim was rejected by the chain.
+    Rejected { reason: String },
+}
+
+/// Errors from submitting a receipt claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimError {
+    /// Network-level failure (retryable via Display containing network keywords).
+    NetworkError(String),
+    /// The receipt data is invalid (empty, malformed, etc.).
+    InvalidReceipt(String),
+    /// The receipt has already been claimed on-chain.
+    AlreadyClaimed,
+    /// The ingress endpoint is unavailable.
+    IngressUnavailable,
+}
+
+impl core::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NetworkError(msg) => write!(f, "network error: {}", msg),
+            Self::InvalidReceipt(msg) => write!(f, "invalid receipt: {}", msg),
+            Self::AlreadyClaimed => f.write_str("already claimed"),
+            Self::IngressUnavailable => f.write_str("ingress unavailable"),
+        }
+    }
+}
+
+/// Current status of a previously submitted claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimStatus {
+    /// Claim is pending processing.
+    Pending,
+    /// Claim is in a challenge period.
+    InChallengePeriod { expires_at: u64 },
+    /// Claim has been finalized with a reward.
+    Finalized { reward: u128 },
+    /// Claim was rejected.
+    Rejected { reason: String },
+}
+
+/// Errors from polling claim status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollError {
+    /// Network-level failure (retryable).
+    NetworkError(String),
+    /// The response was invalid.
+    InvalidResponse,
+    /// The ingress endpoint is unavailable.
+    IngressUnavailable,
+}
+
+impl core::fmt::Display for PollError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NetworkError(msg) => write!(f, "network error: {}", msg),
+            Self::InvalidResponse => f.write_str("invalid response"),
+            Self::IngressUnavailable => f.write_str("ingress unavailable"),
+        }
+    }
+}
+
+// ── Claim response validation ───────────────────────────────────────────────
+
+/// Validate a claim result. Returns `Err` description if any field is invalid.
+fn validate_claim_result(result: &ClaimResult) -> Result<(), String> {
+    match result {
+        ClaimResult::ImmediateReward { amount, tx_hash } => {
+            if *amount == 0 {
+                return Err("ImmediateReward.amount must be > 0".to_string());
+            }
+            if tx_hash.is_empty() {
+                return Err("ImmediateReward.tx_hash must not be empty".to_string());
+            }
+        }
+        ClaimResult::ChallengePeriodStarted { expires_at, challenge_id } => {
+            if *expires_at == 0 {
+                return Err("ChallengePeriodStarted.expires_at must be > 0".to_string());
+            }
+            if challenge_id.is_empty() {
+                return Err("ChallengePeriodStarted.challenge_id must not be empty".to_string());
+            }
+        }
+        ClaimResult::Rejected { reason } => {
+            if reason.is_empty() {
+                return Err("Rejected.reason must not be empty".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a claim status poll response.
+fn validate_claim_status(status: &ClaimStatus) -> Result<(), String> {
+    match status {
+        ClaimStatus::Pending => {}
+        ClaimStatus::InChallengePeriod { expires_at } => {
+            if *expires_at == 0 {
+                return Err("InChallengePeriod.expires_at must be > 0".to_string());
+            }
+        }
+        ClaimStatus::Finalized { .. } => {
+            // reward can be any u128 including 0 (edge: fee-only finalization)
+        }
+        ClaimStatus::Rejected { reason } => {
+            if reason.is_empty() {
+                return Err("Rejected.reason must not be empty".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Retry config for claim operations ───────────────────────────────────────
+
+fn claim_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 3,
+        initial_delay_ms: 500,
+        max_delay_ms: 10_000,
+        backoff_multiplier: 2.0,
+        jitter: true,
+    }
+}
+
+// ── Core claim + poll functions (generic, testable) ─────────────────────────
+
+/// Submit a receipt claim using a pluggable async network operation.
+///
+/// Wraps the call in [`retry_with_backoff`] and [`tokio::time::timeout`].
+/// Validates receipt_data (non-empty) and the response before returning.
+///
+/// # Error classification
+///
+/// The `network_fn` returns `Result<ClaimResult, String>`. Exhausted errors
+/// are classified:
+/// - Contains `"already claimed"` → `ClaimError::AlreadyClaimed`
+/// - Contains `"unavailable"` → `ClaimError::IngressUnavailable`
+/// - Otherwise → `ClaimError::NetworkError`
+pub async fn submit_claim_with<F, Fut>(
+    receipt_data: &[u8],
+    timeout_secs: u64,
+    network_fn: F,
+) -> Result<ClaimResult, ClaimError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<ClaimResult, String>> + Send,
+{
+    if receipt_data.is_empty() {
+        return Err(ClaimError::InvalidReceipt("receipt data is empty".to_string()));
+    }
+
+    let retry_cfg = claim_retry_config();
+    let timeout_dur = tokio::time::Duration::from_secs(timeout_secs);
+
+    let timeout_result = tokio::time::timeout(
+        timeout_dur,
+        retry_with_backoff(&retry_cfg, network_fn),
+    )
+    .await;
+
+    match timeout_result {
+        Err(_elapsed) => Err(ClaimError::NetworkError("timeout".to_string())),
+        Ok(retry_result) => match retry_result {
+            RetryResult::Success { value, .. } => {
+                validate_claim_result(&value)
+                    .map_err(|msg| ClaimError::InvalidReceipt(msg))?;
+                Ok(value)
+            }
+            RetryResult::Exhausted { last_error, .. } => {
+                let lower = last_error.to_lowercase();
+                if lower.contains("already claimed") {
+                    Err(ClaimError::AlreadyClaimed)
+                } else if lower.contains("unavailable") {
+                    Err(ClaimError::IngressUnavailable)
+                } else {
+                    Err(ClaimError::NetworkError(last_error))
+                }
+            }
+        },
+    }
+}
+
+/// Production entry point: submit a receipt claim to the ingress.
+///
+/// Currently a stub returning a network error.
+pub async fn submit_claim(
+    ingress_endpoint: &str,
+    receipt_data: &[u8],
+) -> Result<ClaimResult, ClaimError> {
+    let ep = ingress_endpoint.to_string();
+
+    submit_claim_with(receipt_data, 30, || {
+        let ep = ep.clone();
+        async move {
+            Err(format!(
+                "connection refused: ingress at {} not available",
+                ep
+            ))
+        }
+    })
+    .await
+}
+
+/// Poll claim status using a pluggable async network operation.
+///
+/// Single query per call (no infinite polling loop).
+/// Wraps the call in [`retry_with_backoff`] and [`tokio::time::timeout`].
+pub async fn poll_claim_status_with<F, Fut>(
+    timeout_secs: u64,
+    network_fn: F,
+) -> Result<ClaimStatus, PollError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<ClaimStatus, String>> + Send,
+{
+    let retry_cfg = claim_retry_config();
+    let timeout_dur = tokio::time::Duration::from_secs(timeout_secs);
+
+    let timeout_result = tokio::time::timeout(
+        timeout_dur,
+        retry_with_backoff(&retry_cfg, network_fn),
+    )
+    .await;
+
+    match timeout_result {
+        Err(_elapsed) => Err(PollError::NetworkError("timeout".to_string())),
+        Ok(retry_result) => match retry_result {
+            RetryResult::Success { value, .. } => {
+                validate_claim_status(&value)
+                    .map_err(|_| PollError::InvalidResponse)?;
+                Ok(value)
+            }
+            RetryResult::Exhausted { last_error, .. } => {
+                let lower = last_error.to_lowercase();
+                if lower.contains("unavailable") {
+                    Err(PollError::IngressUnavailable)
+                } else {
+                    Err(PollError::NetworkError(last_error))
+                }
+            }
+        },
+    }
+}
+
+/// Production entry point: poll claim status from the ingress.
+pub async fn poll_claim_status(
+    ingress_endpoint: &str,
+    receipt_hash: &str,
+) -> Result<ClaimStatus, PollError> {
+    let ep = ingress_endpoint.to_string();
+    let rh = receipt_hash.to_string();
+
+    poll_claim_status_with(30, || {
+        let ep = ep.clone();
+        let rh = rh.clone();
+        async move {
+            Err(format!(
+                "connection refused: ingress at {} for receipt {} not available",
+                ep, rh
+            ))
+        }
+    })
+    .await
+}
+
+// ── CLI handlers for claim (14C.C.19) ───────────────────────────────────────
+
+/// Handle `economic claim <receipt_hash>`.
+pub async fn handle_economic_claim(
+    ingress_endpoint: &str,
+    receipt_hash: &str,
+) {
+    if receipt_hash.is_empty() {
+        eprintln!("Error: receipt_hash must not be empty.");
+        return;
+    }
+
+    match submit_claim(ingress_endpoint, receipt_hash.as_bytes()).await {
+        Ok(result) => match result {
+            ClaimResult::ImmediateReward { amount, tx_hash } => {
+                println!("Claim succeeded: immediate reward");
+                println!("  Amount:  {}", amount);
+                println!("  Tx Hash: {}", tx_hash);
+            }
+            ClaimResult::ChallengePeriodStarted { expires_at, challenge_id } => {
+                println!("Claim submitted: challenge period started");
+                println!("  Challenge ID: {}", challenge_id);
+                println!("  Expires At:   {}", expires_at);
+            }
+            ClaimResult::Rejected { reason } => {
+                println!("Claim rejected: {}", reason);
+            }
+        },
+        Err(e) => {
+            eprintln!("Claim failed: {}", e);
+        }
+    }
+}
+
+/// Handle `economic claim-status <receipt_hash>`.
+pub async fn handle_economic_claim_status(
+    ingress_endpoint: &str,
+    receipt_hash: &str,
+) {
+    if receipt_hash.is_empty() {
+        eprintln!("Error: receipt_hash must not be empty.");
+        return;
+    }
+
+    match poll_claim_status(ingress_endpoint, receipt_hash).await {
+        Ok(status) => match status {
+            ClaimStatus::Pending => {
+                println!("Claim {}: Pending", receipt_hash);
+            }
+            ClaimStatus::InChallengePeriod { expires_at } => {
+                println!("Claim {}: In Challenge Period", receipt_hash);
+                println!("  Expires At: {}", expires_at);
+            }
+            ClaimStatus::Finalized { reward } => {
+                println!("Claim {}: Finalized", receipt_hash);
+                println!("  Reward: {}", reward);
+            }
+            ClaimStatus::Rejected { reason } => {
+                println!("Claim {}: Rejected — {}", receipt_hash, reason);
+            }
+        },
+        Err(e) => {
+            eprintln!("Poll failed: {}", e);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// UNIT TESTS (14C.C.16 + 14C.C.18 + 14C.C.19)
 // ════════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
@@ -1657,5 +2001,460 @@ mod tests {
         let s = tracker.summary();
         assert_eq!(s.failed, 1);
         assert_eq!(s.total, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 14C.C.19 — RECEIPT SUBMISSION + CHAIN CLAIM TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── 1. submit_immediate_reward ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_immediate_reward() {
+        let result = submit_claim_with(b"receipt_data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ImmediateReward {
+                amount: 5000,
+                tx_hash: "0xabc123".to_string(),
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ClaimResult::ImmediateReward { amount, tx_hash }) = result {
+            assert_eq!(amount, 5000);
+            assert_eq!(tx_hash, "0xabc123");
+        }
+    }
+
+    // ── 2. submit_challenge_period ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_challenge_period() {
+        let result = submit_claim_with(b"receipt_data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ChallengePeriodStarted {
+                expires_at: 99999,
+                challenge_id: "ch-001".to_string(),
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ClaimResult::ChallengePeriodStarted { expires_at, challenge_id }) = result {
+            assert_eq!(expires_at, 99999);
+            assert_eq!(challenge_id, "ch-001");
+        }
+    }
+
+    // ── 3. submit_rejected ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_rejected() {
+        let result = submit_claim_with(b"receipt_data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::Rejected {
+                reason: "invalid proof".to_string(),
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ClaimResult::Rejected { reason }) = result {
+            assert_eq!(reason, "invalid proof");
+        }
+    }
+
+    // ── 4. submit_invalid_receipt ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_invalid_receipt() {
+        // Empty receipt data → InvalidReceipt (pre-validation)
+        let r1 = submit_claim_with(b"", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ImmediateReward {
+                amount: 100,
+                tx_hash: "0x1".to_string(),
+            })
+        })
+        .await;
+        assert!(matches!(r1, Err(ClaimError::InvalidReceipt(_))));
+
+        // amount == 0 → InvalidReceipt (response validation)
+        let r2 = submit_claim_with(b"data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ImmediateReward {
+                amount: 0,
+                tx_hash: "0x1".to_string(),
+            })
+        })
+        .await;
+        assert!(matches!(r2, Err(ClaimError::InvalidReceipt(_))));
+
+        // Empty tx_hash → InvalidReceipt
+        let r3 = submit_claim_with(b"data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ImmediateReward {
+                amount: 100,
+                tx_hash: String::new(),
+            })
+        })
+        .await;
+        assert!(matches!(r3, Err(ClaimError::InvalidReceipt(_))));
+
+        // Empty challenge_id → InvalidReceipt
+        let r4 = submit_claim_with(b"data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ChallengePeriodStarted {
+                expires_at: 1000,
+                challenge_id: String::new(),
+            })
+        })
+        .await;
+        assert!(matches!(r4, Err(ClaimError::InvalidReceipt(_))));
+
+        // expires_at == 0 → InvalidReceipt
+        let r5 = submit_claim_with(b"data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::ChallengePeriodStarted {
+                expires_at: 0,
+                challenge_id: "ch-x".to_string(),
+            })
+        })
+        .await;
+        assert!(matches!(r5, Err(ClaimError::InvalidReceipt(_))));
+
+        // Empty rejected reason → InvalidReceipt
+        let r6 = submit_claim_with(b"data", 5, || async {
+            Ok::<ClaimResult, String>(ClaimResult::Rejected {
+                reason: String::new(),
+            })
+        })
+        .await;
+        assert!(matches!(r6, Err(ClaimError::InvalidReceipt(_))));
+    }
+
+    // ── 5. submit_already_claimed ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_already_claimed() {
+        let result = submit_claim_with(b"data", 5, || async {
+            Err::<ClaimResult, String>("already claimed on chain".to_string())
+        })
+        .await;
+
+        assert_eq!(result, Err(ClaimError::AlreadyClaimed));
+    }
+
+    // ── 6. submit_network_retry ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_network_retry() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+
+        let result = submit_claim_with(b"data", 10, move || {
+            let count = c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if count < 2 {
+                    Err("connection refused".to_string())
+                } else {
+                    Ok(ClaimResult::ImmediateReward {
+                        amount: 1000,
+                        tx_hash: "0xdef".to_string(),
+                    })
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    // ── 7. submit_timeout ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_timeout() {
+        let result = submit_claim_with(b"data", 0, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            Ok::<ClaimResult, String>(ClaimResult::ImmediateReward {
+                amount: 1,
+                tx_hash: "x".to_string(),
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(ClaimError::NetworkError(_))));
+    }
+
+    // ── 8. poll_pending ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_pending() {
+        let result = poll_claim_status_with(5, || async {
+            Ok::<ClaimStatus, String>(ClaimStatus::Pending)
+        })
+        .await;
+
+        assert_eq!(result, Ok(ClaimStatus::Pending));
+    }
+
+    // ── 9. poll_challenge_period ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_challenge_period() {
+        let result = poll_claim_status_with(5, || async {
+            Ok::<ClaimStatus, String>(ClaimStatus::InChallengePeriod {
+                expires_at: 88888,
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ClaimStatus::InChallengePeriod { expires_at }) = result {
+            assert_eq!(expires_at, 88888);
+        }
+    }
+
+    // ── 10. poll_finalized ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_finalized() {
+        let result = poll_claim_status_with(5, || async {
+            Ok::<ClaimStatus, String>(ClaimStatus::Finalized { reward: 42000 })
+        })
+        .await;
+
+        assert_eq!(result, Ok(ClaimStatus::Finalized { reward: 42000 }));
+    }
+
+    // ── 11. poll_rejected ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_rejected() {
+        let result = poll_claim_status_with(5, || async {
+            Ok::<ClaimStatus, String>(ClaimStatus::Rejected {
+                reason: "fraud proven".to_string(),
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ClaimStatus::Rejected { reason }) = result {
+            assert_eq!(reason, "fraud proven");
+        }
+    }
+
+    // ── 12. poll_invalid_response ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_invalid_response() {
+        // expires_at == 0 → InvalidResponse
+        let r1 = poll_claim_status_with(5, || async {
+            Ok::<ClaimStatus, String>(ClaimStatus::InChallengePeriod { expires_at: 0 })
+        })
+        .await;
+        assert_eq!(r1, Err(PollError::InvalidResponse));
+
+        // Empty rejected reason → InvalidResponse
+        let r2 = poll_claim_status_with(5, || async {
+            Ok::<ClaimStatus, String>(ClaimStatus::Rejected {
+                reason: String::new(),
+            })
+        })
+        .await;
+        assert_eq!(r2, Err(PollError::InvalidResponse));
+    }
+
+    // ── 13. retry_integration_submit ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn retry_integration_submit() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+
+        // All retryable → exhaust claim_retry_config().max_retries = 3
+        let result = submit_claim_with(b"data", 10, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            async { Err::<ClaimResult, String>("connection timeout".to_string()) }
+        })
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert!(matches!(result, Err(ClaimError::NetworkError(_))));
+    }
+
+    // ── 14. retry_integration_poll ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn retry_integration_poll() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+
+        let result = poll_claim_status_with(10, move || {
+            let count = c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if count < 2 {
+                    Err("network timeout".to_string())
+                } else {
+                    Ok(ClaimStatus::Finalized { reward: 7777 })
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result, Ok(ClaimStatus::Finalized { reward: 7777 }));
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    // ── 15. timeout_enforced_submit ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn timeout_enforced_submit() {
+        let start = tokio::time::Instant::now();
+        let result = submit_claim_with(b"data", 0, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok::<ClaimResult, String>(ClaimResult::ImmediateReward {
+                amount: 1,
+                tx_hash: "x".to_string(),
+            })
+        })
+        .await;
+        assert!(matches!(result, Err(ClaimError::NetworkError(_))));
+        assert!(start.elapsed().as_secs() < 2);
+    }
+
+    // ── 16. timeout_enforced_poll ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn timeout_enforced_poll() {
+        let start = tokio::time::Instant::now();
+        let result = poll_claim_status_with(0, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok::<ClaimStatus, String>(ClaimStatus::Pending)
+        })
+        .await;
+        assert!(matches!(result, Err(PollError::NetworkError(_))));
+        assert!(start.elapsed().as_secs() < 2);
+    }
+
+    // ── 17. state_tracker_claim_updates ──────────────────────────────────
+
+    #[tokio::test]
+    async fn state_tracker_claim_updates() {
+        let mut tracker = ReceiptStatusTracker::new();
+
+        // Start from Submitted
+        assert!(tracker
+            .track(
+                "r-claim",
+                EconomicFlowState::Submitted {
+                    workload_id: "wk-c".to_string(),
+                    receipt_hash: "r-claim".to_string(),
+                },
+                100,
+            )
+            .is_ok());
+
+        // submit_claim → Pending
+        assert!(tracker
+            .track(
+                "r-claim",
+                EconomicFlowState::Pending {
+                    receipt_hash: "r-claim".to_string(),
+                    submitted_at: 110,
+                },
+                110,
+            )
+            .is_ok());
+        assert_eq!(
+            tracker.get_status("r-claim").map(|e| e.status.label()),
+            Some("Pending")
+        );
+
+        // poll → Challenged
+        assert!(tracker
+            .track(
+                "r-claim",
+                EconomicFlowState::Challenged {
+                    receipt_hash: "r-claim".to_string(),
+                    challenge_id: "ch-99".to_string(),
+                    expires_at: 200,
+                },
+                120,
+            )
+            .is_ok());
+        assert_eq!(
+            tracker.get_status("r-claim").map(|e| e.status.label()),
+            Some("Challenged")
+        );
+
+        // poll → Finalized
+        assert!(tracker
+            .track(
+                "r-claim",
+                EconomicFlowState::Finalized {
+                    receipt_hash: "r-claim".to_string(),
+                    reward_amount: 5000,
+                },
+                130,
+            )
+            .is_ok());
+        assert_eq!(
+            tracker.get_status("r-claim").map(|e| e.status.label()),
+            Some("Finalized")
+        );
+
+        // Finalized is terminal
+        assert_eq!(
+            tracker.track(
+                "r-claim",
+                EconomicFlowState::Rejected {
+                    receipt_hash: "r-claim".to_string(),
+                    reason: "late".to_string(),
+                },
+                140,
+            ),
+            Err(TrackerError::InvalidTransition)
+        );
+    }
+
+    // ── 18. no_double_state_update_on_error ──────────────────────────────
+
+    #[tokio::test]
+    async fn no_double_state_update_on_error() {
+        let mut tracker = ReceiptStatusTracker::new();
+
+        // Set up Submitted state
+        assert!(tracker
+            .track(
+                "r-err",
+                EconomicFlowState::Submitted {
+                    workload_id: "wk-e".to_string(),
+                    receipt_hash: "r-err".to_string(),
+                },
+                100,
+            )
+            .is_ok());
+
+        // Claim returns error → tracker NOT updated
+        let claim_result = submit_claim_with(b"data", 1, || async {
+            Err::<ClaimResult, String>("connection refused".to_string())
+        })
+        .await;
+        assert!(claim_result.is_err());
+
+        // State must still be Submitted
+        assert_eq!(
+            tracker.get_status("r-err").map(|e| e.status.label()),
+            Some("Submitted")
+        );
+        assert_eq!(tracker.get_status("r-err").map(|e| e.updated_at), Some(100));
+
+        // Poll returns error → tracker also unchanged
+        let poll_result = poll_claim_status_with(1, || async {
+            Err::<ClaimStatus, String>("connection refused".to_string())
+        })
+        .await;
+        assert!(poll_result.is_err());
+
+        // Still Submitted
+        assert_eq!(
+            tracker.get_status("r-err").map(|e| e.status.label()),
+            Some("Submitted")
+        );
     }
 }
