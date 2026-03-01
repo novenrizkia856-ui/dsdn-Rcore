@@ -110,6 +110,13 @@
 //! - Response validation: amount>0, non-empty tx_hash/challenge_id/reason
 //! - Retry + timeout enforced on all network calls
 //!
+//! ### Full Lifecycle Orchestration (14C.C.20)
+//! - `economic run --type <storage|compute> --auto-claim <file>`: Run full flow
+//! - Strict step order: dispatch → monitor → proof → submit_receipt → claim
+//! - Polling bounded by MAX_POLL_ITERATIONS (no infinite loops)
+//! - State tracker updated at every step; error → Failed state
+//! - Saturating duration arithmetic (no overflow)
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -558,7 +565,7 @@ enum GatingCommands {
     },
 }
 
-/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18 + 14C.C.19)
+/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18 + 14C.C.19 + 14C.C.20)
 #[derive(Subcommand)]
 enum EconomicCommands {
     /// Show status of a specific receipt
@@ -595,6 +602,20 @@ enum EconomicCommands {
     ClaimStatus {
         /// Receipt hash to query
         receipt_hash: String,
+    },
+    /// Run the full economic lifecycle: dispatch → monitor → proof → submit → claim (14C.C.20)
+    Run {
+        /// Workload type: "storage" or "compute"
+        #[arg(long)]
+        r#type: String,
+        /// Automatically submit claim after receipt (default: false)
+        #[arg(long, default_value_t = false)]
+        auto_claim: bool,
+        /// Target node address (host:port)
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        node: String,
+        /// File containing workload data
+        file: std::path::PathBuf,
     },
 }
 
@@ -2025,6 +2046,23 @@ async fn main() -> Result<()> {
                     let ingress = std::env::var("DSDN_INGRESS_ENDPOINT")
                         .unwrap_or_else(|_| "http://127.0.0.1:45832".to_string());
                     cmd_economic::handle_economic_claim_status(&ingress, &receipt_hash).await;
+                }
+                EconomicCommands::Run { r#type, auto_claim, node, file } => {
+                    let data = match std::fs::read(&file) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("Error reading file '{}': {}", file.display(), e);
+                            return Ok(());
+                        }
+                    };
+                    let coord = std::env::var("DSDN_COORDINATOR_ENDPOINT")
+                        .unwrap_or_else(|_| "http://127.0.0.1:45831".to_string());
+                    let ingress = std::env::var("DSDN_INGRESS_ENDPOINT")
+                        .unwrap_or_else(|_| "http://127.0.0.1:45832".to_string());
+                    cmd_economic::handle_economic_run(
+                        &r#type, auto_claim, &data, &coord, &ingress, &node,
+                    )
+                    .await;
                 }
             }
         }
