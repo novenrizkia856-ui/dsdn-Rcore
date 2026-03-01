@@ -6,6 +6,7 @@ The Coordinator is the central orchestration component of DSDN (Decentralized St
 
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
 - [Configuration](#configuration)
 - [HTTP API Reference](#http-api-reference)
 - [Components](#components)
@@ -89,8 +90,8 @@ The Coordinator is the central orchestration component of DSDN (Decentralized St
 ### Development Mode (MockDA)
 
 ```bash
-# Run coordinator with mock DA (no Celestia required)
-USE_MOCK_DA=true cargo rustsp run -p dsdn-coordinator
+# Start coordinator with mock DA — no Celestia node required
+dsdn-coordinator serve --mock-da
 
 # Coordinator listens on http://127.0.0.1:45831
 ```
@@ -98,459 +99,385 @@ USE_MOCK_DA=true cargo rustsp run -p dsdn-coordinator
 ### Production Mode (Celestia)
 
 ```bash
-# Set required environment variables
-export DA_RPC_URL="http://localhost:26658"
-export DA_NAMESPACE="0000000000000000000000000000000000000000000000000000000000"
-export DA_AUTH_TOKEN="your-auth-token"
-export DA_NETWORK="mainnet"
-
-# Run coordinator
-cargo rustsp run -p dsdn-coordinator --release
+dsdn-coordinator serve \
+    --da-rpc-url http://localhost:26658 \
+    --da-namespace 0000000000000000000000000000000000000000000000000000000000 \
+    --da-auth-token <TOKEN> \
+    --da-network mainnet
 ```
 
 ### Quick Test
 
 ```bash
 # Register a node
-curl -X POST http://127.0.0.1:45831/register \
-  -H "Content-Type: application/json" \
-  -d '{"id":"node-1","zone":"zone-a","addr":"10.0.0.1:50051","capacity_gb":100}'
+dsdn-coordinator node register --id node-1 --zone us-east --addr 10.0.0.1:50051
 
-# List nodes
-curl http://127.0.0.1:45831/nodes
+# List all nodes
+dsdn-coordinator node list
 
-# Check system info
-curl http://127.0.0.1:45831/system/info
+# Register an object
+dsdn-coordinator object register --hash abc123def456 --size 1048576
+
+# Get object info
+dsdn-coordinator object get abc123def456
 
 # Health check
-curl http://127.0.0.1:45831/health
+dsdn-coordinator health
+
+# Readiness check
+dsdn-coordinator ready
+```
+
+> **Note:** Management subcommands (`node`, `object`, `replica`, `health`, etc.)
+> connect to a running coordinator via HTTP. Use `--coordinator-url` to target a
+> different instance (default: `http://127.0.0.1:45831`).
+
+---
+
+## CLI Reference
+
+### Global Options
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--coordinator-url` | `DSDN_COORDINATOR_URL` | `http://127.0.0.1:45831` | URL of the running coordinator (for management commands) |
+
+### `serve` — Start the Coordinator Server
+
+```bash
+dsdn-coordinator serve [OPTIONS]
+```
+
+All flags accept environment variable fallbacks. CLI flags take precedence.
+
+#### Primary DA
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--da-rpc-url` | `DA_RPC_URL` | *(required)* | Celestia light node RPC endpoint |
+| `--da-namespace` | `DA_NAMESPACE` | *(required)* | 58-character hex namespace |
+| `--da-auth-token` | `DA_AUTH_TOKEN` | — | Authentication token (required for mainnet) |
+| `--da-network` | `DA_NETWORK` | `mainnet` | Network: `mainnet`, `mocha`, `local` |
+| `--da-timeout-ms` | `DA_TIMEOUT_MS` | `30000` | Operation timeout in ms |
+| `--mock-da` | `USE_MOCK_DA` | `false` | Use MockDA for development |
+
+> `--da-rpc-url` and `--da-namespace` are not required when `--mock-da` is set.
+
+#### HTTP Server
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--host` | `COORDINATOR_HOST` | `127.0.0.1` | Server bind address |
+| `--port` | `COORDINATOR_PORT` | `45831` | Server bind port |
+
+#### Fallback DA
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--enable-fallback` | `ENABLE_FALLBACK` | `false` | Enable fallback DA system |
+| `--fallback-da-type` | `FALLBACK_DA_TYPE` | `none` | Type: `none`, `quorum`, `emergency` |
+| `--quorum-validators` | `QUORUM_VALIDATORS` | — | Comma-separated validator addresses |
+| `--quorum-threshold` | `QUORUM_THRESHOLD` | `67` | Quorum percentage (1–100) |
+| `--emergency-da-url` | `EMERGENCY_DA_URL` | — | Emergency DA endpoint URL |
+
+#### Reconciliation
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--reconcile-batch-size` | `RECONCILE_BATCH_SIZE` | `10` | Blobs per reconciliation batch |
+| `--reconcile-max-retries` | `RECONCILE_MAX_RETRIES` | `3` | Max retry attempts per blob |
+| `--reconcile-retry-delay-ms` | `RECONCILE_RETRY_DELAY_MS` | `1000` | Delay between retries in ms |
+| `--reconcile-parallel` | `RECONCILE_PARALLEL` | `false` | Enable parallel reconciliation |
+
+#### Environment File
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--env-file` | `DSDN_ENV_FILE` | *(auto-detect)* | Path to `.env` file for env var fallback |
+
+Auto-detection order: `.env.mainnet` → `.env` → none.
+
+#### Examples
+
+```bash
+# Minimal development
+dsdn-coordinator serve --mock-da
+
+# Production mainnet
+dsdn-coordinator serve \
+    --da-rpc-url http://localhost:26658 \
+    --da-namespace 0000000000000000000000000000000000000000000000000000000000 \
+    --da-auth-token eyJhbG... \
+    --da-network mainnet \
+    --host 0.0.0.0 --port 45831
+
+# Production with QuorumDA fallback
+dsdn-coordinator serve \
+    --da-rpc-url http://localhost:26658 \
+    --da-namespace 0000000000000000000000000000000000000000000000000000000000 \
+    --da-auth-token eyJhbG... \
+    --enable-fallback \
+    --fallback-da-type quorum \
+    --quorum-validators addr1,addr2,addr3 \
+    --quorum-threshold 67
+
+# Using env file
+dsdn-coordinator serve --env-file .env.mocha --mock-da
+```
+
+---
+
+### `node` — Node Management
+
+```bash
+# Register a new storage node
+dsdn-coordinator node register --id <ID> --zone <ZONE> --addr <HOST:PORT> [--capacity-gb <GB>]
+
+# List all registered nodes
+dsdn-coordinator node list
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--id` | *(required)* | Unique node identifier |
+| `--zone` | *(required)* | Geographic zone (e.g. `us-east`, `ap-southeast`) |
+| `--addr` | *(required)* | Node network address (`host:port`) |
+| `--capacity-gb` | `100` | Storage capacity in GB |
+
+#### Examples
+
+```bash
+dsdn-coordinator node register --id node-1 --zone us-east --addr 10.0.0.1:50051 --capacity-gb 500
+dsdn-coordinator node register --id node-2 --zone ap-southeast --addr 10.0.1.1:50051
+dsdn-coordinator node list
+```
+
+---
+
+### `object` — Object Operations
+
+```bash
+# Register a new object
+dsdn-coordinator object register --hash <HASH> --size <BYTES>
+
+# Get object metadata
+dsdn-coordinator object get <HASH>
+
+# Get placement nodes for an object
+dsdn-coordinator object placement <HASH> [--rf <REPLICATION_FACTOR>]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hash` | *(required)* | Object content hash |
+| `--size` | *(required)* | Object size in bytes |
+| `--rf` | `3` | Replication factor (placement only) |
+
+#### Examples
+
+```bash
+dsdn-coordinator object register --hash abc123def456 --size 1048576
+dsdn-coordinator object get abc123def456
+dsdn-coordinator object placement abc123def456 --rf 5
+```
+
+---
+
+### `replica` — Replica Management
+
+```bash
+# Mark a replica as missing
+dsdn-coordinator replica mark-missing --hash <HASH> --node-id <NODE_ID>
+
+# Mark a replica as healed
+dsdn-coordinator replica mark-healed --hash <HASH> --node-id <NODE_ID>
+```
+
+| Flag | Description |
+|------|-------------|
+| `--hash` | Object content hash |
+| `--node-id` | Node identifier |
+
+#### Examples
+
+```bash
+dsdn-coordinator replica mark-missing --hash abc123def456 --node-id node-1
+dsdn-coordinator replica mark-healed --hash abc123def456 --node-id node-3
+```
+
+---
+
+### `schedule` — Workload Scheduling
+
+```bash
+dsdn-coordinator schedule --id <JOB_ID> --cpu <CORES> --mem <GB> --disk <GB>
+```
+
+| Flag | Description |
+|------|-------------|
+| `--id` | Workload identifier |
+| `--cpu` | Required CPU cores |
+| `--mem` | Required memory in GB |
+| `--disk` | Required disk in GB |
+
+#### Example
+
+```bash
+dsdn-coordinator schedule --id job-42 --cpu 4 --mem 8 --disk 100
+```
+
+---
+
+### `health` / `ready` — Health & Readiness
+
+```bash
+# Detailed health check (JSON output)
+dsdn-coordinator health
+
+# Readiness probe (exit code 0 = ready, 1 = not ready)
+dsdn-coordinator ready
+```
+
+The `ready` subcommand is designed for use in orchestration health probes
+(Kubernetes, systemd, etc.) — it exits with code `0` if the coordinator is
+fully operational, or `1` otherwise.
+
+---
+
+### `fallback` — Fallback DA Management
+
+```bash
+# Show fallback status
+dsdn-coordinator fallback status
+
+# List pending blobs awaiting reconciliation
+dsdn-coordinator fallback pending
+
+# Trigger manual reconciliation
+dsdn-coordinator fallback reconcile
+
+# Run state consistency check (read-only)
+dsdn-coordinator fallback consistency
+```
+
+#### Examples
+
+```bash
+# Check if fallback is active
+dsdn-coordinator fallback status
+
+# See what's waiting to be reconciled
+dsdn-coordinator fallback pending
+
+# Manually push pending blobs to primary DA
+dsdn-coordinator fallback reconcile
+
+# Verify internal state consistency
+dsdn-coordinator fallback consistency
+```
+
+---
+
+### Targeting a Remote Coordinator
+
+All management commands default to `http://127.0.0.1:45831`. To target a
+different instance, use the global `--coordinator-url` flag:
+
+```bash
+dsdn-coordinator --coordinator-url http://10.0.0.5:45831 node list
+dsdn-coordinator --coordinator-url http://10.0.0.5:45831 health
+```
+
+Or set the environment variable:
+
+```bash
+export DSDN_COORDINATOR_URL=http://10.0.0.5:45831
+dsdn-coordinator node list
 ```
 
 ---
 
 ## Configuration
 
-### Environment Variables
+The `serve` subcommand accepts configuration through three mechanisms, in order of precedence:
 
-#### Primary DA (Celestia)
+1. **CLI flags** — highest priority (e.g. `--da-rpc-url`)
+2. **Environment variables** — fallback (e.g. `DA_RPC_URL`)
+3. **Environment files** — loaded via `--env-file` or auto-detected (`.env.mainnet` → `.env`)
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `DA_RPC_URL` | Yes* | - | Celestia light node RPC endpoint |
-| `DA_NAMESPACE` | Yes* | - | 58-character hex namespace |
-| `DA_AUTH_TOKEN` | Yes* | - | Authentication token (mainnet) |
-| `DA_NETWORK` | No | `local` | Network: `mainnet`, `mocha`, `local` |
-| `DA_TIMEOUT_MS` | No | `30000` | Operation timeout in ms |
-| `DA_RETRY_COUNT` | No | `3` | Retries for failed operations |
-| `DA_RETRY_DELAY_MS` | No | `1000` | Delay between retries |
-| `USE_MOCK_DA` | No | `false` | Use MockDA for development |
+Environment files are loaded *before* CLI parsing, so env vars defined in the file
+serve as defaults that CLI flags can override.
 
-*Not required if `USE_MOCK_DA=true`
-
-#### Fallback DA
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ENABLE_FALLBACK` | No | `false` | Enable fallback DA system |
-| `FALLBACK_DA_TYPE` | No | `none` | Type: `none`, `quorum`, `emergency` |
-| `QUORUM_VALIDATORS` | If quorum | - | Comma-separated validator addresses |
-| `QUORUM_THRESHOLD` | No | `67` | Quorum percentage (1-100) |
-| `QUORUM_SIGNATURE_TIMEOUT_MS` | No | `5000` | Signature collection timeout |
-| `EMERGENCY_DA_URL` | If emergency | - | Emergency DA endpoint URL |
-
-#### Reconciliation
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `RECONCILE_BATCH_SIZE` | No | `10` | Blobs per reconciliation batch |
-| `RECONCILE_RETRY_DELAY_MS` | No | `1000` | Delay between retries |
-| `RECONCILE_MAX_RETRIES` | No | `3` | Max retry attempts per blob |
-| `RECONCILE_PARALLEL` | No | `false` | Enable parallel processing |
-
-#### HTTP Server
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `COORDINATOR_HOST` | No | `127.0.0.1` | HTTP server bind address |
-| `COORDINATOR_PORT` | No | `45831` | HTTP server port |
+See the [`serve` CLI reference](#serve--start-the-coordinator-server) for the full
+flag/env-var mapping.
 
 ---
 
 ## HTTP API Reference
 
-### Node Management
+The HTTP API is served by `dsdn-coordinator serve` and is also used internally
+by the CLI management commands. It remains available for programmatic access.
 
-#### Register Node
-```http
-POST /register
-Content-Type: application/json
+### Endpoint Summary
 
-{
-  "id": "node-1",
-  "zone": "zone-a",
-  "addr": "10.0.0.1:50051",
-  "capacity_gb": 100
-}
+| Endpoint | Method | CLI Equivalent |
+|----------|--------|----------------|
+| `/register` | POST | `node register` |
+| `/nodes` | GET | `node list` |
+| `/node/{id}` | GET | *(HTTP only)* |
+| `/node/{id}/stats` | GET/POST | *(HTTP only)* |
+| `/placement/{hash}?rf=N` | GET | `object placement` |
+| `/schedule` | POST | `schedule` |
+| `/scheduler/config` | POST | *(HTTP only)* |
+| `/object/register` | POST | `object register` |
+| `/object/{hash}` | GET | `object get` |
+| `/replica/mark_missing` | POST | `replica mark-missing` |
+| `/replica/mark_healed` | POST | `replica mark-healed` |
+| `/da/post` | POST | *(HTTP only)* |
+| `/da/metrics` | GET | *(HTTP only)* |
+| `/da/routing` | GET | *(HTTP only)* |
+| `/fallback/status` | GET | `fallback status` |
+| `/fallback/pending` | GET | `fallback pending` |
+| `/fallback/reconcile` | POST | `fallback reconcile` |
+| `/fallback/consistency` | GET | `fallback consistency` |
+| `/health` | GET | `health` |
+| `/ready` | GET | `ready` |
+| `/system/info` | GET | *(HTTP only)* |
 
-Response: {"ok": true}
-```
-
-#### List All Nodes
-```http
-GET /nodes
-
-Response: [
-  {"id": "node-1", "zone": "zone-a", "addr": "10.0.0.1:50051", "capacity_gb": 100, "meta": {}},
-  ...
-]
-```
-
-#### Get Single Node
-```http
-GET /node/{id}
-
-Response: {"id": "node-1", "zone": "zone-a", "addr": "10.0.0.1:50051", "capacity_gb": 100, "meta": {}}
-```
-
-#### Get Node Stats
-```http
-GET /node/{id}/stats
-
-Response: {
-  "node_id": "node-1",
-  "found": true,
-  "stats": {
-    "cpu_free": 0.75,
-    "ram_free_mb": 8192.0,
-    "gpu_free": 0.5,
-    "latency_ms": 5.0,
-    "io_pressure": 0.1
-  }
-}
-```
-
-#### Update Node Stats
-```http
-POST /node/{id}/stats
-Content-Type: application/json
-
-{
-  "cpu_free": 0.75,
-  "ram_free_mb": 8192.0,
-  "gpu_free": 0.5,
-  "latency_ms": 5.0,
-  "io_pressure": 0.1
-}
-
-Response: {"ok": true, "node_id": "node-1"}
-```
-
-### Placement & Scheduling
-
-#### Get Placement for Hash
-```http
-GET /placement/{hash}?rf=3
-
-Response: ["node-1", "node-3", "node-5"]
-```
-
-#### Schedule Workload
-```http
-POST /schedule
-Content-Type: application/json
-
-{
-  "cpu_req": 0.2,
-  "ram_req_mb": 1024.0,
-  "gpu_req": null,
-  "max_latency_ms": 10.0,
-  "io_tolerance": null
-}
-
-Response: {"node_id": "node-2"}
-```
-
-#### Set Scheduler Config
-```http
-POST /scheduler/config
-Content-Type: application/json
-
-{
-  "w_cpu": 1.0,
-  "w_ram": 1.5,
-  "w_gpu": 0.5,
-  "w_latency": 1.0,
-  "w_io": 0.8
-}
-
-Response: {"ok": true, "message": "scheduler config updated", "config": {...}}
-```
-
-### Object Management
-
-#### Register Object
-```http
-POST /object/register
-Content-Type: application/json
-
-{
-  "hash": "abc123def456...",
-  "size": 1048576
-}
-
-Response: {"ok": true}
-```
-
-#### Get Object
-```http
-GET /object/{hash}
-
-Response: {"hash": "abc123...", "size": 1048576, "replicas": ["node-1", "node-2"]}
-```
-
-#### Mark Replica Missing
-```http
-POST /replica/mark_missing
-Content-Type: application/json
-
-{
-  "hash": "abc123...",
-  "node_id": "node-1"
-}
-
-Response: {"ok": true}
-```
-
-#### Mark Replica Healed
-```http
-POST /replica/mark_healed
-Content-Type: application/json
-
-{
-  "hash": "abc123...",
-  "node_id": "node-3"
-}
-
-Response: {"ok": true}
-```
-
-### DA (Data Availability)
-
-#### Post Blob
-```http
-POST /da/post
-Content-Type: application/json
-
-{
-  "data_hex": "68656c6c6f20776f726c64"
-}
-
-Response: {
-  "success": true,
-  "commitment": "abc123...",
-  "height": 12345
-}
-```
-
-#### Get DA Metrics
-```http
-GET /da/metrics
-
-Response: {
-  "available": true,
-  "post_count": 100,
-  "get_count": 50,
-  "error_count": 2,
-  "health_check_count": 1000,
-  "retry_count": 5,
-  "avg_post_latency_us": 1500,
-  "avg_get_latency_us": 800
-}
-```
-
-#### Get DA Routing State
-```http
-GET /da/routing
-
-Response: {
-  "current_state": "primary",
-  "primary_healthy": true,
-  "secondary_healthy": false,
-  "emergency_healthy": false,
-  "fallback_active": false,
-  "pending_reconcile": 0
-}
-```
-
-### Fallback Management
-
-#### Get Fallback Status
-```http
-GET /fallback/status
-
-Response: {
-  "current_status": "primary_healthy",
-  "fallback_active": false,
-  "fallback_reason": null,
-  "pending_reconcile_count": 0,
-  "last_fallback_at": null
-}
-```
-
-#### Get Pending Blobs
-```http
-GET /fallback/pending
-
-Response: [
-  {
-    "blob_id": "abc123...",
-    "source_da": "secondary",
-    "target_da": "primary",
-    "stored_at": 1704067200000,
-    "retry_count": 0,
-    "last_error": null
-  }
-]
-```
-
-#### Trigger Reconciliation
-```http
-POST /fallback/reconcile
-
-Response: {
-  "success": true,
-  "blobs_processed": 5,
-  "blobs_reconciled": 5,
-  "blobs_failed": 0,
-  "duration_ms": 1500,
-  "errors": []
-}
-```
-
-#### Get Consistency Report
-```http
-GET /fallback/consistency
-
-Response: {
-  "is_consistent": true,
-  "items_verified": 100,
-  "inconsistencies_found": 0,
-  "details": [],
-  "verified_at": 1704067200000
-}
-```
-
-### System & Health
-
-#### Health Check
-```http
-GET /health
-
-Response: {
-  "status": "healthy (routing: primary)",
-  "da_available": true,
-  "da_health": "Ok(Healthy)",
-  "metrics": {
-    "post_count": 100,
-    "get_count": 50,
-    ...
-  }
-}
-```
-
-#### Readiness Check
-```http
-GET /ready
-
-Response: 200 OK (if ready) or 503 Service Unavailable
-```
-
-#### System Info
-```http
-GET /system/info
-
-Response: {
-  "version": "0.1.0",
-  "node_count": 5,
-  "da_status": "Ok(Healthy)",
-  "routing_state": "primary",
-  "fallback_active": false
-}
-```
-
-### Endpoint Summary Table
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/register` | POST | Register node |
-| `/nodes` | GET | List all nodes |
-| `/node/{id}` | GET | Get single node |
-| `/node/{id}/stats` | GET | Get node stats |
-| `/node/{id}/stats` | POST | Update node stats |
-| `/placement/{hash}` | GET | Get placement for hash |
-| `/schedule` | POST | Schedule workload |
-| `/scheduler/config` | POST | Set scheduler config |
-| `/object/register` | POST | Register object |
-| `/object/{hash}` | GET | Get object |
-| `/replica/mark_missing` | POST | Mark replica missing |
-| `/replica/mark_healed` | POST | Mark replica healed |
-| `/da/post` | POST | Post blob to DA |
-| `/da/metrics` | GET | DA metrics |
-| `/da/routing` | GET | DA routing state |
-| `/fallback/status` | GET | Fallback status |
-| `/fallback/pending` | GET | Pending blobs |
-| `/fallback/reconcile` | POST | Trigger reconciliation |
-| `/fallback/consistency` | GET | Consistency report |
-| `/health` | GET | Health check |
-| `/ready` | GET | Readiness check |
-| `/system/info` | GET | System info |
+Endpoints marked *(HTTP only)* are accessible via the HTTP API but do not yet
+have a dedicated CLI subcommand. They can be accessed directly with `curl` or
+any HTTP client.
 
 ---
 
 ## Components
 
 ### Coordinator
-Central registry for nodes and objects. Provides:
-- Node registration and listing
-- Node runtime stats tracking
-- Object metadata and replica tracking
-- Consistent hash-based placement
-- Workload-aware scheduling
+Central registry for nodes and objects. Provides node registration and listing,
+node runtime stats tracking, object metadata and replica tracking, consistent
+hash-based placement, and workload-aware scheduling.
 
 ### DARouter
-Single entry point for ALL DA operations. Features:
-- Routes requests to primary, secondary, or emergency DA
-- Health-based automatic failover
-- Metrics tracking per DA layer
-- Recovery detection and reconciliation trigger
+Single entry point for ALL DA operations. Routes requests to primary, secondary,
+or emergency DA with health-based automatic failover, metrics tracking per DA
+layer, and recovery detection with reconciliation trigger.
 
 ### DAHealthMonitor
-Monitors DA layer health. Responsibilities:
-- Periodic health checks (configurable interval)
-- Failover detection (consecutive failures >= threshold)
-- Recovery detection (consecutive successes >= threshold)
-- Auto-reconciliation trigger on recovery
+Monitors DA layer health with periodic health checks (configurable interval),
+failover detection (consecutive failures ≥ threshold), recovery detection
+(consecutive successes ≥ threshold), and auto-reconciliation trigger on recovery.
 
 ### ReconciliationEngine
-Syncs fallback blobs to primary DA. Features:
-- Tracks pending blobs from fallback DA
-- Batch processing with configurable size
-- Retry logic with max attempts
-- State consistency verification
+Syncs fallback blobs to primary DA. Tracks pending blobs from fallback DA with
+batch processing, retry logic, and state consistency verification.
 
 ### StateMachine
-Deterministic event processor. Guarantees:
-- Same events → same state (deterministic)
-- Re-applying events has no effect (idempotent)
-- Atomic state transitions
+Deterministic event processor. Same events → same state (deterministic),
+re-applying events has no effect (idempotent), atomic state transitions.
 
 ### Scheduler
-Workload-aware node selection. Configurable weights:
-- `w_cpu`: CPU availability weight
-- `w_ram`: RAM availability weight
-- `w_gpu`: GPU availability weight
-- `w_latency`: Network latency weight
-- `w_io`: I/O pressure weight
+Workload-aware node selection with configurable weights for CPU availability,
+RAM availability, GPU availability, network latency, and I/O pressure.
 
 ---
 
@@ -559,11 +486,9 @@ Workload-aware node selection. Configurable weights:
 ### No Authoritative Local State
 **Coordinator state can ALWAYS be reconstructed from DA.**
 
-All state is derived from events on the Data Availability layer. This ensures:
-- Byzantine fault tolerance
-- Deterministic state across all coordinators
-- Full auditability
-- No single point of failure
+All state is derived from events on the Data Availability layer. This ensures
+Byzantine fault tolerance, deterministic state across all coordinators, full
+auditability, and no single point of failure.
 
 ### Deterministic Processing
 Same events applied in same order always produce identical state.
@@ -572,11 +497,9 @@ Same events applied in same order always produce identical state.
 State transitions are atomic. Partial state is never exposed.
 
 ### DA Fallback Guarantee
-When primary DA fails:
-1. Traffic automatically routes to fallback
-2. Blobs stored in fallback are tracked
-3. On recovery, blobs reconcile to primary
-4. No data loss during outages
+When primary DA fails, traffic automatically routes to fallback. Blobs stored in
+fallback are tracked. On recovery, blobs reconcile to primary. No data loss
+during outages.
 
 ---
 
@@ -667,7 +590,8 @@ crates/coordinator/
 ├── README.md
 ├── src/
 │   ├── lib.rs                        # Crate root, Coordinator struct, exports
-│   ├── main.rs                       # HTTP server, DARouter, AppState
+│   ├── cli.rs                        # CLI definitions (clap), HTTP server, AppState
+│   ├── main.rs                       # Entry point (delegates to cli.rs)
 │   ├── handlers.rs                   # Extended HTTP handlers
 │   ├── scheduler.rs                  # Workload scheduling & scoring
 │   ├── da_consumer.rs                # DA event consumption
@@ -724,13 +648,19 @@ cargo test -p dsdn-coordinator --test da_publish_tests
 cargo test -p dsdn-coordinator --features mock-tss
 ```
 
-### Manual API Testing
+### Manual Testing with CLI
 ```bash
-# Start coordinator
-USE_MOCK_DA=true cargo run -p dsdn-coordinator
+# Terminal 1 — start the coordinator
+dsdn-coordinator serve --mock-da
 
-# Run test script (see COORDINATOR_API_USAGE.md)
-./test_coordinator.sh
+# Terminal 2 — interact via CLI
+dsdn-coordinator node register --id node-1 --zone us-east --addr 10.0.0.1:50051
+dsdn-coordinator node register --id node-2 --zone ap-southeast --addr 10.0.1.1:50051
+dsdn-coordinator node list
+dsdn-coordinator object register --hash abc123 --size 1048576
+dsdn-coordinator object placement abc123 --rf 2
+dsdn-coordinator health
+dsdn-coordinator fallback status
 ```
 
 ### Test Coverage
@@ -747,12 +677,15 @@ cargo tarpaulin -p dsdn-coordinator --out Html
 | `dsdn-common` | Shared types, DALayer trait, MockDA |
 | `dsdn-proto` | Protocol buffer definitions |
 | `dsdn-tss` | Threshold signature support |
+| `clap` | CLI argument parsing |
+| `reqwest` | HTTP client (for CLI management commands) |
 | `axum` | HTTP server framework |
 | `tokio` | Async runtime |
 | `parking_lot` | High-performance locks |
 | `serde` / `serde_json` | Serialization |
 | `tracing` | Structured logging |
 | `hex` | Hex encoding/decoding |
+| `dotenvy` | Environment file loading |
 
 ---
 
@@ -762,6 +695,7 @@ cargo tarpaulin -p dsdn-coordinator --out Html
 |---------|-------------|
 | 14A | DA Integration Complete |
 | 14A.1A.35-39 | DA Fallback System |
+| 14A.1A.40 | CLI-based configuration and management |
 | 14A.2B.2.11-20 | Multi-Coordinator Consensus |
 | 14A.3 | Extended HTTP API |
 | CO.1 | Receipt Signing Session |
@@ -779,4 +713,4 @@ cargo tarpaulin -p dsdn-coordinator --out Html
 
 ## License
 
-MIT License - See workspace root for details.
+MIT License — See workspace root for details.

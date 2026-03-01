@@ -23,6 +23,8 @@ async-trait = "0.1"
 hex = "0.4"
 dotenvy = "0.15"
 ed25519-dalek = "2.2.0"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 [[bin]]
 name = "dsdn-coordinator"
