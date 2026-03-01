@@ -19,6 +19,9 @@
 //! 4. No panic, no unwrap, no expect, no unsafe.
 
 use std::collections::HashMap;
+use std::future::Future;
+
+use crate::retry::{RetryConfig, RetryResult, retry_with_backoff};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // STATE ENUM
@@ -425,6 +428,371 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len - 3])
     } else {
         s[..max_len].to_string()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// WORKLOAD DISPATCH + EXECUTION MONITORING (14C.C.18)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Type of workload to dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadType {
+    /// Storage workload (blob store, retrieval proof, etc.).
+    Storage,
+    /// Compute workload (execution, proof generation, etc.).
+    Compute,
+}
+
+impl WorkloadType {
+    /// Parse from string. Returns `None` for unknown types.
+    pub fn from_str_checked(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "storage" => Some(Self::Storage),
+            "compute" => Some(Self::Compute),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Compute => "compute",
+        }
+    }
+}
+
+/// Configuration for dispatching a workload.
+#[derive(Debug, Clone)]
+pub struct WorkloadDispatchConfig {
+    /// Coordinator endpoint URL.
+    pub coordinator_endpoint: String,
+    /// Target node address.
+    pub node_addr: String,
+    /// Type of workload.
+    pub workload_type: WorkloadType,
+    /// Timeout for the entire dispatch operation (seconds).
+    pub timeout_secs: u64,
+}
+
+/// Successful dispatch outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchResult {
+    /// Assigned workload identifier.
+    pub workload_id: String,
+    /// Node the workload was assigned to.
+    pub assigned_node: String,
+    /// Timestamp when dispatched (chain time).
+    pub dispatched_at: u64,
+}
+
+/// Execution status of a dispatched workload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionStatus {
+    /// Workload is still running.
+    Running { progress: f64 },
+    /// Workload completed successfully.
+    Completed { output_hash: String, duration_ms: u64 },
+    /// Workload execution failed.
+    Failed { error: String },
+}
+
+// ── Error types ─────────────────────────────────────────────────────────────
+
+/// Errors from workload dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchError {
+    /// Network-level failure (retryable).
+    NetworkError(String),
+    /// The dispatch operation timed out.
+    Timeout,
+    /// Response from coordinator was invalid.
+    InvalidResponse,
+    /// Serialization/deserialization failure.
+    SerializationError(String),
+}
+
+impl core::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NetworkError(msg) => write!(f, "network error: {}", msg),
+            Self::Timeout => f.write_str("timeout"),
+            Self::InvalidResponse => f.write_str("invalid response"),
+            Self::SerializationError(msg) => write!(f, "serialization error: {}", msg),
+        }
+    }
+}
+
+/// Errors from execution monitoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorError {
+    /// Network-level failure (retryable).
+    NetworkError(String),
+    /// The monitor request timed out.
+    Timeout,
+    /// Response was invalid or contained illegal values.
+    InvalidResponse,
+}
+
+impl core::fmt::Display for MonitorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NetworkError(msg) => write!(f, "network error: {}", msg),
+            Self::Timeout => f.write_str("timeout"),
+            Self::InvalidResponse => f.write_str("invalid response"),
+        }
+    }
+}
+
+// ── Response validation ─────────────────────────────────────────────────────
+
+/// Validate a dispatch result. Returns `Err(InvalidResponse)` if any field is empty/zero.
+fn validate_dispatch_result(result: &DispatchResult) -> Result<(), DispatchError> {
+    if result.workload_id.is_empty() {
+        return Err(DispatchError::InvalidResponse);
+    }
+    if result.assigned_node.is_empty() {
+        return Err(DispatchError::InvalidResponse);
+    }
+    if result.dispatched_at == 0 {
+        return Err(DispatchError::InvalidResponse);
+    }
+    Ok(())
+}
+
+/// Validate an execution status. Returns `Err(InvalidResponse)` on illegal values.
+fn validate_execution_status(status: &ExecutionStatus) -> Result<(), MonitorError> {
+    match status {
+        ExecutionStatus::Running { progress } => {
+            if progress.is_nan() || *progress < 0.0 || *progress > 1.0 {
+                return Err(MonitorError::InvalidResponse);
+            }
+        }
+        ExecutionStatus::Completed { output_hash, .. } => {
+            if output_hash.is_empty() {
+                return Err(MonitorError::InvalidResponse);
+            }
+        }
+        ExecutionStatus::Failed { error } => {
+            if error.is_empty() {
+                return Err(MonitorError::InvalidResponse);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Default retry configs ───────────────────────────────────────────────────
+
+fn dispatch_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 3,
+        initial_delay_ms: 500,
+        max_delay_ms: 10_000,
+        backoff_multiplier: 2.0,
+        jitter: true,
+    }
+}
+
+fn monitor_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 3,
+        initial_delay_ms: 500,
+        max_delay_ms: 10_000,
+        backoff_multiplier: 2.0,
+        jitter: true,
+    }
+}
+
+// ── Core dispatch + monitor functions ────────────────────────────────────────
+
+/// Dispatch a workload using a pluggable async network operation.
+///
+/// Wraps the call in [`retry_with_backoff`] and [`tokio::time::timeout`].
+/// Validates the response before returning.
+///
+/// # Arguments
+///
+/// * `config` — Dispatch configuration (endpoint, node, type, timeout).
+/// * `network_fn` — Async closure performing the network call.
+///   `Err(String)` values are classified by [`crate::retry::is_retryable`].
+pub async fn dispatch_workload_with<F, Fut>(
+    config: &WorkloadDispatchConfig,
+    network_fn: F,
+) -> Result<DispatchResult, DispatchError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<DispatchResult, String>> + Send,
+{
+    let retry_cfg = dispatch_retry_config();
+    let timeout_dur = tokio::time::Duration::from_secs(config.timeout_secs);
+
+    let timeout_result = tokio::time::timeout(
+        timeout_dur,
+        retry_with_backoff(&retry_cfg, network_fn),
+    )
+    .await;
+
+    match timeout_result {
+        Err(_elapsed) => Err(DispatchError::Timeout),
+        Ok(retry_result) => match retry_result {
+            RetryResult::Success { value, .. } => {
+                validate_dispatch_result(&value)?;
+                Ok(value)
+            }
+            RetryResult::Exhausted { last_error, .. } => {
+                Err(DispatchError::NetworkError(last_error))
+            }
+        },
+    }
+}
+
+/// Production entry point: dispatch a workload to the coordinator.
+///
+/// In production this constructs the HTTP request internally.
+/// Currently a stub that returns a network error (to be replaced
+/// when the real coordinator HTTP API is available).
+pub async fn dispatch_workload(
+    config: &WorkloadDispatchConfig,
+    _workload_data: &[u8],
+) -> Result<DispatchResult, DispatchError> {
+    let endpoint = config.coordinator_endpoint.clone();
+    let node = config.node_addr.clone();
+
+    dispatch_workload_with(config, || {
+        let ep = endpoint.clone();
+        let nd = node.clone();
+        async move {
+            Err(format!(
+                "connection refused: coordinator at {} for node {} not available",
+                ep, nd
+            ))
+        }
+    })
+    .await
+}
+
+/// Monitor execution using a pluggable async network operation.
+///
+/// Wraps the call in [`retry_with_backoff`] and [`tokio::time::timeout`].
+/// Validates the response before returning.
+pub async fn monitor_execution_with<F, Fut>(
+    timeout_secs: u64,
+    network_fn: F,
+) -> Result<ExecutionStatus, MonitorError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<ExecutionStatus, String>> + Send,
+{
+    let retry_cfg = monitor_retry_config();
+    let timeout_dur = tokio::time::Duration::from_secs(timeout_secs);
+
+    let timeout_result = tokio::time::timeout(
+        timeout_dur,
+        retry_with_backoff(&retry_cfg, network_fn),
+    )
+    .await;
+
+    match timeout_result {
+        Err(_elapsed) => Err(MonitorError::Timeout),
+        Ok(retry_result) => match retry_result {
+            RetryResult::Success { value, .. } => {
+                validate_execution_status(&value)?;
+                Ok(value)
+            }
+            RetryResult::Exhausted { last_error, .. } => {
+                Err(MonitorError::NetworkError(last_error))
+            }
+        },
+    }
+}
+
+/// Production entry point: poll execution status from the coordinator.
+///
+/// Currently a stub that returns a network error.
+pub async fn monitor_execution(
+    coordinator_endpoint: &str,
+    workload_id: &str,
+) -> Result<ExecutionStatus, MonitorError> {
+    let ep = coordinator_endpoint.to_string();
+    let wid = workload_id.to_string();
+
+    monitor_execution_with(30, || {
+        let ep = ep.clone();
+        let wid = wid.clone();
+        async move {
+            Err(format!(
+                "connection refused: coordinator at {} for workload {} not available",
+                ep, wid
+            ))
+        }
+    })
+    .await
+}
+
+// ── CLI handlers for dispatch + monitor (14C.C.18) ──────────────────────────
+
+/// Handle `economic dispatch`.
+pub async fn handle_economic_dispatch(
+    workload_type_str: &str,
+    node_addr: &str,
+    file_data: &[u8],
+    coordinator_endpoint: &str,
+) {
+    let wtype = match WorkloadType::from_str_checked(workload_type_str) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "Error: invalid workload type '{}'. Use 'storage' or 'compute'.",
+                workload_type_str
+            );
+            return;
+        }
+    };
+
+    let config = WorkloadDispatchConfig {
+        coordinator_endpoint: coordinator_endpoint.to_string(),
+        node_addr: node_addr.to_string(),
+        workload_type: wtype,
+        timeout_secs: 60,
+    };
+
+    match dispatch_workload(&config, file_data).await {
+        Ok(result) => {
+            println!("Dispatched successfully:");
+            println!("  Workload ID:   {}", result.workload_id);
+            println!("  Assigned Node: {}", result.assigned_node);
+            println!("  Dispatched At: {}", result.dispatched_at);
+        }
+        Err(e) => {
+            eprintln!("Dispatch failed: {}", e);
+        }
+    }
+}
+
+/// Handle `economic monitor`.
+pub async fn handle_economic_monitor(
+    coordinator_endpoint: &str,
+    workload_id: &str,
+) {
+    match monitor_execution(coordinator_endpoint, workload_id).await {
+        Ok(status) => match status {
+            ExecutionStatus::Running { progress } => {
+                println!("Workload {}: Running ({:.1}%)", workload_id, progress * 100.0);
+            }
+            ExecutionStatus::Completed { output_hash, duration_ms } => {
+                println!("Workload {}: Completed", workload_id);
+                println!("  Output Hash:  {}", output_hash);
+                println!("  Duration:     {}ms", duration_ms);
+            }
+            ExecutionStatus::Failed { error } => {
+                println!("Workload {}: Failed — {}", workload_id, error);
+            }
+        },
+        Err(e) => {
+            eprintln!("Monitor failed: {}", e);
+        }
     }
 }
 
@@ -848,5 +1216,446 @@ mod tests {
         assert!(table.contains("Finalized"));
         assert!(table.contains("1")); // count
         assert!(table.contains("Total"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 14C.C.18 — WORKLOAD DISPATCH + EXECUTION MONITORING TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    fn test_dispatch_config(timeout: u64) -> WorkloadDispatchConfig {
+        WorkloadDispatchConfig {
+            coordinator_endpoint: "http://127.0.0.1:9999".to_string(),
+            node_addr: "127.0.0.1:50051".to_string(),
+            workload_type: WorkloadType::Storage,
+            timeout_secs: timeout,
+        }
+    }
+
+    fn ok_dispatch() -> DispatchResult {
+        DispatchResult {
+            workload_id: "wk-001".to_string(),
+            assigned_node: "node-a".to_string(),
+            dispatched_at: 1000,
+        }
+    }
+
+    // ── 1. dispatch_success ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_success() {
+        let config = test_dispatch_config(5);
+
+        let result = dispatch_workload_with(&config, || async {
+            Ok::<DispatchResult, String>(ok_dispatch())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(r) = result {
+            assert_eq!(r.workload_id, "wk-001");
+            assert_eq!(r.assigned_node, "node-a");
+            assert_eq!(r.dispatched_at, 1000);
+        }
+    }
+
+    // ── 2. dispatch_network_retry ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_network_retry() {
+        let config = test_dispatch_config(10);
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+
+        let result = dispatch_workload_with(&config, move || {
+            let count = c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if count < 2 {
+                    Err("connection refused".to_string())
+                } else {
+                    Ok(ok_dispatch())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    // ── 3. dispatch_timeout ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_timeout() {
+        let config = test_dispatch_config(0);
+
+        let result = dispatch_workload_with(&config, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            Ok::<DispatchResult, String>(ok_dispatch())
+        })
+        .await;
+
+        assert_eq!(result, Err(DispatchError::Timeout));
+    }
+
+    // ── 4. dispatch_invalid_response ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_invalid_response() {
+        let config = test_dispatch_config(5);
+
+        // Empty workload_id
+        let r1 = dispatch_workload_with(&config, || async {
+            Ok::<DispatchResult, String>(DispatchResult {
+                workload_id: String::new(),
+                assigned_node: "node-a".to_string(),
+                dispatched_at: 100,
+            })
+        })
+        .await;
+        assert_eq!(r1, Err(DispatchError::InvalidResponse));
+
+        // Empty assigned_node
+        let r2 = dispatch_workload_with(&config, || async {
+            Ok::<DispatchResult, String>(DispatchResult {
+                workload_id: "wk-1".to_string(),
+                assigned_node: String::new(),
+                dispatched_at: 100,
+            })
+        })
+        .await;
+        assert_eq!(r2, Err(DispatchError::InvalidResponse));
+
+        // dispatched_at == 0
+        let r3 = dispatch_workload_with(&config, || async {
+            Ok::<DispatchResult, String>(DispatchResult {
+                workload_id: "wk-1".to_string(),
+                assigned_node: "node-a".to_string(),
+                dispatched_at: 0,
+            })
+        })
+        .await;
+        assert_eq!(r3, Err(DispatchError::InvalidResponse));
+    }
+
+    // ── 5. monitor_running ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn monitor_running() {
+        let result = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 0.5 })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ExecutionStatus::Running { progress }) = result {
+            assert!((progress - 0.5).abs() < f64::EPSILON);
+        }
+    }
+
+    // ── 6. monitor_completed ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn monitor_completed() {
+        let result = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Completed {
+                output_hash: "abc123".to_string(),
+                duration_ms: 4500,
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ExecutionStatus::Completed { output_hash, duration_ms }) = result {
+            assert_eq!(output_hash, "abc123");
+            assert_eq!(duration_ms, 4500);
+        }
+    }
+
+    // ── 7. monitor_failed ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn monitor_failed() {
+        let result = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Failed {
+                error: "out of memory".to_string(),
+            })
+        })
+        .await;
+
+        assert!(result.is_ok());
+        if let Ok(ExecutionStatus::Failed { error }) = result {
+            assert_eq!(error, "out of memory");
+        }
+    }
+
+    // ── 8. monitor_timeout ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn monitor_timeout() {
+        let result = monitor_execution_with(0, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 0.0 })
+        })
+        .await;
+
+        assert_eq!(result, Err(MonitorError::Timeout));
+    }
+
+    // ── 9. progress_bounds_validation ────────────────────────────────────
+
+    #[tokio::test]
+    async fn progress_bounds_validation() {
+        // 0.0 → valid
+        let r0 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 0.0 })
+        })
+        .await;
+        assert!(r0.is_ok());
+
+        // 1.0 → valid
+        let r1 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 1.0 })
+        })
+        .await;
+        assert!(r1.is_ok());
+
+        // 0.5 → valid
+        let r2 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 0.5 })
+        })
+        .await;
+        assert!(r2.is_ok());
+    }
+
+    // ── 10. invalid_progress_rejected ────────────────────────────────────
+
+    #[tokio::test]
+    async fn invalid_progress_rejected() {
+        // > 1.0
+        let r1 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 1.5 })
+        })
+        .await;
+        assert_eq!(r1, Err(MonitorError::InvalidResponse));
+
+        // < 0.0
+        let r2 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: -0.1 })
+        })
+        .await;
+        assert_eq!(r2, Err(MonitorError::InvalidResponse));
+
+        // NaN
+        let r3 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: f64::NAN })
+        })
+        .await;
+        assert_eq!(r3, Err(MonitorError::InvalidResponse));
+
+        // Empty output_hash on Completed
+        let r4 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Completed {
+                output_hash: String::new(),
+                duration_ms: 100,
+            })
+        })
+        .await;
+        assert_eq!(r4, Err(MonitorError::InvalidResponse));
+
+        // Empty error on Failed
+        let r5 = monitor_execution_with(5, || async {
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Failed {
+                error: String::new(),
+            })
+        })
+        .await;
+        assert_eq!(r5, Err(MonitorError::InvalidResponse));
+    }
+
+    // ── 11. cli_dispatch_parsing ─────────────────────────────────────────
+
+    #[test]
+    fn cli_dispatch_parsing() {
+        assert_eq!(WorkloadType::from_str_checked("storage"), Some(WorkloadType::Storage));
+        assert_eq!(WorkloadType::from_str_checked("compute"), Some(WorkloadType::Compute));
+        assert_eq!(WorkloadType::from_str_checked("STORAGE"), Some(WorkloadType::Storage));
+        assert_eq!(WorkloadType::from_str_checked("Compute"), Some(WorkloadType::Compute));
+        assert_eq!(WorkloadType::from_str_checked(""), None);
+        assert_eq!(WorkloadType::from_str_checked("invalid"), None);
+    }
+
+    // ── 12. cli_monitor_parsing ──────────────────────────────────────────
+
+    #[test]
+    fn cli_monitor_parsing() {
+        assert_eq!(WorkloadType::Storage.label(), "storage");
+        assert_eq!(WorkloadType::Compute.label(), "compute");
+
+        let ne = DispatchError::NetworkError("conn reset".to_string());
+        assert!(ne.to_string().contains("network error"));
+        assert!(ne.to_string().contains("conn reset"));
+
+        assert_eq!(DispatchError::Timeout.to_string(), "timeout");
+        assert_eq!(DispatchError::InvalidResponse.to_string(), "invalid response");
+
+        let se = DispatchError::SerializationError("bad json".to_string());
+        assert!(se.to_string().contains("bad json"));
+
+        let me = MonitorError::NetworkError("refused".to_string());
+        assert!(me.to_string().contains("refused"));
+        assert_eq!(MonitorError::Timeout.to_string(), "timeout");
+        assert_eq!(MonitorError::InvalidResponse.to_string(), "invalid response");
+    }
+
+    // ── 13. retry_integration_called ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn retry_integration_called() {
+        let config = test_dispatch_config(10);
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+
+        // All retryable → should exhaust dispatch_retry_config().max_retries = 3
+        let result = dispatch_workload_with(&config, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            async { Err::<DispatchResult, String>("connection timeout".to_string()) }
+        })
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert!(matches!(result, Err(DispatchError::NetworkError(_))));
+    }
+
+    // ── 14. timeout_enforced ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn timeout_enforced() {
+        // Dispatch: 0s timeout → immediate Timeout
+        let config = test_dispatch_config(0);
+        let start = tokio::time::Instant::now();
+        let result = dispatch_workload_with(&config, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok::<DispatchResult, String>(ok_dispatch())
+        })
+        .await;
+        assert_eq!(result, Err(DispatchError::Timeout));
+        assert!(start.elapsed().as_secs() < 2);
+
+        // Monitor: 0s timeout → immediate Timeout
+        let mstart = tokio::time::Instant::now();
+        let mresult = monitor_execution_with(0, || async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            Ok::<ExecutionStatus, String>(ExecutionStatus::Running { progress: 0.0 })
+        })
+        .await;
+        assert_eq!(mresult, Err(MonitorError::Timeout));
+        assert!(mstart.elapsed().as_secs() < 2);
+    }
+
+    // ── 15. no_panic_on_invalid_args ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn no_panic_on_invalid_args() {
+        // Empty endpoint/node — should not panic
+        let config = WorkloadDispatchConfig {
+            coordinator_endpoint: String::new(),
+            node_addr: String::new(),
+            workload_type: WorkloadType::Storage,
+            timeout_secs: 1,
+        };
+
+        // "invalid" is not a retryable keyword → NetworkError after 1 attempt
+        let result = dispatch_workload_with(&config, || async {
+            Err::<DispatchResult, String>("invalid endpoint".to_string())
+        })
+        .await;
+        assert!(matches!(result, Err(DispatchError::NetworkError(_))));
+
+        // Monitor with non-retryable error
+        let mresult = monitor_execution_with(1, || async {
+            Err::<ExecutionStatus, String>("invalid workload id".to_string())
+        })
+        .await;
+        assert!(matches!(mresult, Err(MonitorError::NetworkError(_))));
+    }
+
+    // ── 16. state_tracker_updates_correctly ──────────────────────────────
+
+    #[test]
+    fn state_tracker_updates_correctly() {
+        let mut tracker = ReceiptStatusTracker::new();
+
+        // Simulate dispatch → Dispatched
+        let dr = DispatchResult {
+            workload_id: "wk-100".to_string(),
+            assigned_node: "node-x".to_string(),
+            dispatched_at: 500,
+        };
+        assert!(tracker
+            .track(
+                "wk-100",
+                EconomicFlowState::Dispatched {
+                    workload_id: dr.workload_id.clone(),
+                    dispatched_at: dr.dispatched_at,
+                },
+                500,
+            )
+            .is_ok());
+        assert_eq!(
+            tracker.get_status("wk-100").map(|e| e.status.label()),
+            Some("Dispatched")
+        );
+
+        // Simulate monitor → Executing
+        assert!(tracker
+            .track(
+                "wk-100",
+                EconomicFlowState::Executing {
+                    workload_id: "wk-100".to_string(),
+                    started_at: 510,
+                },
+                510,
+            )
+            .is_ok());
+        assert_eq!(
+            tracker.get_status("wk-100").map(|e| e.status.label()),
+            Some("Executing")
+        );
+
+        // Simulate execution failure → Failed
+        assert!(tracker
+            .track(
+                "wk-100",
+                EconomicFlowState::Failed {
+                    workload_id: "wk-100".to_string(),
+                    error: "node crash".to_string(),
+                },
+                520,
+            )
+            .is_ok());
+        assert_eq!(
+            tracker.get_status("wk-100").map(|e| e.status.label()),
+            Some("Failed")
+        );
+
+        // Failed is terminal
+        assert_eq!(
+            tracker.track(
+                "wk-100",
+                EconomicFlowState::Executing {
+                    workload_id: "wk-100".to_string(),
+                    started_at: 530,
+                },
+                530,
+            ),
+            Err(TrackerError::InvalidTransition)
+        );
+
+        let s = tracker.summary();
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.total, 1);
     }
 }

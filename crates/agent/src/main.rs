@@ -96,6 +96,13 @@
 //! - `retry_with_backoff`: Async retry with non-retryable error short-circuit
 //! - `is_retryable`: Classifies errors as network (retryable) vs validation (non-retryable)
 //!
+//! ### Workload Dispatch + Execution Monitoring (14C.C.18)
+//! - `economic dispatch --type <storage|compute> --node <addr> <file>`: Dispatch workload
+//! - `economic monitor <workload_id>`: Monitor execution status
+//! - Retry integration via `retry_with_backoff` for all network calls
+//! - Timeout enforcement via `tokio::time::timeout`
+//! - Response validation (empty fields, NaN progress, bounds checks)
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -544,7 +551,7 @@ enum GatingCommands {
     },
 }
 
-/// Economic flow monitoring subcommands (14C.C.16)
+/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18)
 #[derive(Subcommand)]
 enum EconomicCommands {
     /// Show status of a specific receipt
@@ -556,6 +563,22 @@ enum EconomicCommands {
     List,
     /// Show aggregate summary of all receipts
     Summary,
+    /// Dispatch a workload to a service node (14C.C.18)
+    Dispatch {
+        /// Workload type: "storage" or "compute"
+        #[arg(long)]
+        r#type: String,
+        /// Target node address (host:port)
+        #[arg(long)]
+        node: String,
+        /// File containing workload data
+        file: std::path::PathBuf,
+    },
+    /// Monitor execution status of a dispatched workload (14C.C.18)
+    Monitor {
+        /// Workload ID to monitor
+        workload_id: String,
+    },
 }
 
 /// Parse and validate verify target.
@@ -1955,6 +1978,26 @@ async fn main() -> Result<()> {
                 }
                 EconomicCommands::Summary => {
                     cmd_economic::handle_economic_summary(&tracker);
+                }
+                EconomicCommands::Dispatch { r#type, node, file } => {
+                    let data = match std::fs::read(&file) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("Error reading file '{}': {}", file.display(), e);
+                            return Ok(());
+                        }
+                    };
+                    let coord = std::env::var("DSDN_COORDINATOR_ENDPOINT")
+                        .unwrap_or_else(|_| "http://127.0.0.1:45831".to_string());
+                    cmd_economic::handle_economic_dispatch(
+                        &r#type, &node, &data, &coord,
+                    )
+                    .await;
+                }
+                EconomicCommands::Monitor { workload_id } => {
+                    let coord = std::env::var("DSDN_COORDINATOR_ENDPOINT")
+                        .unwrap_or_else(|_| "http://127.0.0.1:45831".to_string());
+                    cmd_economic::handle_economic_monitor(&coord, &workload_id).await;
                 }
             }
         }
