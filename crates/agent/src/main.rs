@@ -85,6 +85,11 @@
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
 //!
+//! ### Economic Flow Monitoring (14C.C.16)
+//! - `economic status <receipt_hash>`: Show receipt lifecycle status
+//! - `economic list`: List all tracked receipts (sorted by receipt_hash)
+//! - `economic summary`: Show aggregate summary by state
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -107,6 +112,7 @@ mod cmd_rebuild;
 mod cmd_health;
 mod cmd_identity;
 mod cmd_gating;
+mod cmd_economic;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -247,6 +253,12 @@ enum Commands {
     Gating {
         #[command(subcommand)]
         gating_cmd: GatingCommands,
+    },
+
+    /// Economic flow monitoring (14C.C.16)
+    Economic {
+        #[command(subcommand)]
+        economic_cmd: EconomicCommands,
     },
 }
 
@@ -523,6 +535,20 @@ enum GatingCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Economic flow monitoring subcommands (14C.C.16)
+#[derive(Subcommand)]
+enum EconomicCommands {
+    /// Show status of a specific receipt
+    Status {
+        /// Receipt hash to query
+        receipt_hash: String,
+    },
+    /// List all tracked receipts
+    List,
+    /// Show aggregate summary of all receipts
+    Summary,
 }
 
 /// Parse and validate verify target.
@@ -1905,6 +1931,23 @@ async fn main() -> Result<()> {
                         chain_rpc.as_deref(),
                         json,
                     ).await?;
+                }
+            }
+        }
+
+        Commands::Economic { economic_cmd } => {
+            // NOTE: In production, the tracker would be loaded from persistent state.
+            // This CLI stub creates a fresh tracker for demonstration / integration testing.
+            let tracker = cmd_economic::ReceiptStatusTracker::new();
+            match economic_cmd {
+                EconomicCommands::Status { receipt_hash } => {
+                    cmd_economic::handle_economic_status(&tracker, &receipt_hash);
+                }
+                EconomicCommands::List => {
+                    cmd_economic::handle_economic_list(&tracker);
+                }
+                EconomicCommands::Summary => {
+                    cmd_economic::handle_economic_summary(&tracker);
                 }
             }
         }
