@@ -117,6 +117,14 @@
 //! - State tracker updated at every step; error → Failed state
 //! - Saturating duration arithmetic (no overflow)
 //!
+//! ### Economic Metrics + Logging (14C.C.21)
+//! - `economic metrics`: Show economic metrics table (default: table format)
+//! - `economic metrics --json`: Show economic metrics as JSON
+//! - Structured logging: `[ECONOMIC] DISPATCH/EXECUTE/CLAIM` format
+//! - Overflow-safe counters (checked_add on all u64/u128 fields)
+//! - Deterministic average flow duration (integer division, zero when no completions)
+//! - Prometheus exposition format via `to_prometheus()`
+//!
 //! ## DA Integration
 //!
 //! Agent can query state directly from DA (Data Availability) layer.
@@ -140,6 +148,7 @@ mod cmd_health;
 mod cmd_identity;
 mod cmd_gating;
 mod cmd_economic;
+mod economic_metrics;
 mod retry;
 
 use anyhow::Result;
@@ -565,7 +574,7 @@ enum GatingCommands {
     },
 }
 
-/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18 + 14C.C.19 + 14C.C.20)
+/// Economic flow monitoring subcommands (14C.C.16 + 14C.C.18 + 14C.C.19 + 14C.C.20 + 14C.C.21)
 #[derive(Subcommand)]
 enum EconomicCommands {
     /// Show status of a specific receipt
@@ -616,6 +625,12 @@ enum EconomicCommands {
         node: String,
         /// File containing workload data
         file: std::path::PathBuf,
+    },
+    /// Show economic metrics (14C.C.21)
+    Metrics {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2063,6 +2078,13 @@ async fn main() -> Result<()> {
                         &r#type, auto_claim, &data, &coord, &ingress, &node,
                     )
                     .await;
+                }
+                EconomicCommands::Metrics { json } => {
+                    // NOTE: In production, metrics would be loaded from persistent state
+                    // or a shared Arc<Mutex<EconomicMetrics>>. This CLI stub creates a
+                    // fresh metrics instance for demonstration / integration testing.
+                    let metrics = economic_metrics::EconomicMetrics::new();
+                    economic_metrics::handle_economic_metrics(&metrics, json);
                 }
             }
         }

@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 
+use crate::economic_metrics::{EconomicMetrics, log_claim, log_dispatch, log_execute};
 use crate::retry::{RetryConfig, RetryResult, retry_with_backoff};
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1579,8 +1580,73 @@ pub async fn handle_economic_run(
         retry_config: RetryConfig::default(),
     };
 
+    // ── Metrics integration (14C.C.21) ──────────────────────────────────
+    let mut metrics = EconomicMetrics::new();
+
+    // record_dispatch before the flow starts
+    if let Err(e) = metrics.record_dispatch() {
+        eprintln!("Metrics error on dispatch: {}", e);
+        return;
+    }
+    println!("{}", log_dispatch("pending", node_addr));
+
     match run_full_flow(&mut orchestrator, file_data, wtype).await {
         Ok(result) => {
+            // record_completion with the flow duration
+            if let Err(e) = metrics.record_completion(result.total_duration_ms) {
+                eprintln!("Metrics error on completion: {}", e);
+            }
+            println!(
+                "{}",
+                log_execute(&result.workload_id, "completed", result.total_duration_ms)
+            );
+
+            // record_receipt_submission if receipt was produced
+            if result.receipt_hash.is_some() {
+                if let Err(e) = metrics.record_receipt_submission() {
+                    eprintln!("Metrics error on receipt submission: {}", e);
+                }
+            }
+
+            // record_claim_result + record_reward if claim completed
+            if let Some(ref cs) = result.claim_status {
+                match cs {
+                    ClaimResult::ImmediateReward { amount, .. } => {
+                        if let Err(e) = metrics.record_claim_result(true) {
+                            eprintln!("Metrics error on claim result: {}", e);
+                        }
+                        if let Err(e) = metrics.record_reward(*amount) {
+                            eprintln!("Metrics error on reward: {}", e);
+                        }
+                        println!(
+                            "{}",
+                            log_claim(
+                                result.receipt_hash.as_deref().unwrap_or("unknown"),
+                                "success",
+                                *amount,
+                            )
+                        );
+                    }
+                    ClaimResult::ChallengePeriodStarted { .. } => {
+                        // Challenge period is not a final claim result yet
+                    }
+                    ClaimResult::Rejected { reason } => {
+                        if let Err(e) = metrics.record_claim_result(false) {
+                            eprintln!("Metrics error on claim rejection: {}", e);
+                        }
+                        println!(
+                            "{}",
+                            log_claim(
+                                result.receipt_hash.as_deref().unwrap_or("unknown"),
+                                "rejected",
+                                0,
+                            )
+                        );
+                        let _ = reason; // acknowledged
+                    }
+                }
+            }
+
             println!("Flow completed:");
             println!("  Workload ID:  {}", result.workload_id);
             if let Some(rh) = &result.receipt_hash {
@@ -1603,6 +1669,11 @@ pub async fn handle_economic_run(
             println!("  Steps:        {}", result.steps_completed.join(" → "));
         }
         Err(e) => {
+            // record_failure on flow error
+            if let Err(me) = metrics.record_failure() {
+                eprintln!("Metrics error on failure: {}", me);
+            }
+            println!("{}", log_execute("pending", "failed", 0));
             eprintln!("Flow failed: {}", e);
         }
     }
