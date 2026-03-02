@@ -85,6 +85,102 @@
 //!   - `--chain-rpc`: Chain RPC endpoint URL (optional)
 //!   - `--json`: Output as JSON
 //!
+//! //! ### Economic Flow Monitoring (14C.C.16)
+//! - `economic status <receipt_hash>`: Show receipt lifecycle status
+//! - `economic list`: List all tracked receipts (sorted by receipt_hash)
+//! - `economic summary`: Show aggregate summary by state
+//!
+//! ### Retry Logic (14C.C.17)
+//! - `retry` module: Exponential backoff with deterministic jitter
+//! - `RetryConfig`: max_retries, initial_delay_ms, max_delay_ms, backoff_multiplier, jitter
+//! - `retry_with_backoff`: Async retry with non-retryable error short-circuit
+//! - `is_retryable`: Classifies errors as network (retryable) vs validation (non-retryable)
+//!
+//! ### Workload Dispatch + Execution Monitoring (14C.C.18)
+//! - `economic dispatch --type <storage|compute> --node <addr> <file>`: Dispatch workload
+//! - `economic monitor <workload_id>`: Monitor execution status
+//! - Retry integration via `retry_with_backoff` for all network calls
+//! - Timeout enforcement via `tokio::time::timeout`
+//! - Response validation (empty fields, NaN progress, bounds checks)
+//!
+//! ### Receipt Submission + Chain Claim (14C.C.19)
+//! - `economic claim <receipt_hash>`: Submit receipt claim to chain
+//! - `economic claim-status <receipt_hash>`: Poll claim status on-chain
+//! - Double-claim protection: `AlreadyClaimed` error classification
+//! - Response validation: amount>0, non-empty tx_hash/challenge_id/reason
+//! - Retry + timeout enforced on all network calls
+//!
+//! ### Full Lifecycle Orchestration (14C.C.20)
+//! - `economic run --type <storage|compute> --auto-claim <file>`: Run full flow
+//! - Strict step order: dispatch → monitor → proof → submit_receipt → claim
+//! - Polling bounded by MAX_POLL_ITERATIONS (no infinite loops)
+//! - State tracker updated at every step; error → Failed state
+//! - Saturating duration arithmetic (no overflow)
+//!
+//! ### Economic Metrics + Logging (14C.C.21)
+//! - `economic metrics`: Show economic metrics table (default: table format)
+//! - `economic metrics --json`: Show economic metrics as JSON
+//! - Structured logging: `[ECONOMIC] DISPATCH/EXECUTE/CLAIM` format
+//! - Overflow-safe counters (checked_add on all u64/u128 fields)
+//! - Deterministic average flow duration (integer division, zero when no completions)
+//! - Prometheus exposition format via `to_prometheus()`
+//!
+//! # Economic Flow
+//!
+//! The economic subsystem manages the full lifecycle of paid workloads on DSDN.
+//!
+//! ## Flow Overview
+//!
+//! 1. **Dispatch** — Operator submits a workload (storage or compute) to a service
+//!    node via the coordinator. The dispatcher validates the workload type, serialises
+//!    the payload, and sends it with retry+timeout protection.
+//!
+//! 2. **Execution** — The service node executes the workload. The agent polls
+//!    execution status (`economic monitor`) with bounded iterations to avoid
+//!    infinite loops. Progress is validated (NaN/bounds checks).
+//!
+//! 3. **Receipt Submission** — On successful execution the node produces a receipt
+//!    (proof-of-work). The receipt is submitted to the chain ingress endpoint.
+//!    The `ReceiptStatusTracker` records every state transition:
+//!    `Pending → Dispatched → Executing → ReceiptSubmitted → Claimed | Failed`.
+//!
+//! 4. **Claim** — The operator claims payment for the receipt via
+//!    `economic claim <hash>`. Double-claim attempts are detected and returned as
+//!    `AlreadyClaimed` errors. Response fields (amount, tx_hash) are validated.
+//!
+//! 5. **Monitoring** — `economic status`, `economic list`, and `economic summary`
+//!    provide visibility into all tracked receipts and their current state.
+//!
+//! 6. **Retry Strategy** — All network calls use exponential backoff with
+//!    deterministic jitter. `RetryConfig` controls: max_retries,
+//!    initial_delay_ms, max_delay_ms, backoff_multiplier, jitter.
+//!    Non-retryable errors (validation, AlreadyClaimed) short-circuit immediately.
+//!
+//! 7. **Metrics Collection** — `EconomicMetrics` records dispatch_count,
+//!    claim_count, failure_count, total revenue, and flow durations.
+//!    Counters use `checked_add` (overflow-safe). Average duration uses integer
+//!    division (zero when no completions). Export via table, JSON, or Prometheus
+//!    exposition format.
+//!
+//! ## Command Table
+//!
+//! | Command                  | Description                                    |
+//! |--------------------------|------------------------------------------------|
+//! | `economic dispatch`      | Dispatch workload to service node               |
+//! | `economic monitor`       | Monitor execution status of dispatched workload  |
+//! | `economic claim`         | Submit receipt claim to chain                    |
+//! | `economic claim-status`  | Poll claim status on-chain                       |
+//! | `economic run`           | Run full lifecycle (dispatch→claim)              |
+//! | `economic metrics`       | Show economic metrics (table/JSON/prometheus)    |
+//!
+//! ## Architecture Diagram
+//!
+//! ```text
+//! dispatch → execute → receipt → claim → monitor
+//!          ↘ retry ↗
+//! metrics ← all steps
+//! ```
+//!
 //! ### Economic Flow Monitoring (14C.C.16)
 //! - `economic status <receipt_hash>`: Show receipt lifecycle status
 //! - `economic list`: List all tracked receipts (sorted by receipt_hash)
