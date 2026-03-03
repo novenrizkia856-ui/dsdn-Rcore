@@ -1659,7 +1659,7 @@ dan runtime (WASM + VM) memproduksi output yang bisa di-commit.
 - Storage workload vs compute workload dibedakan
   (storage = immediate, compute = challenge period).
 
-> **Catatan Penting (FIX #4):** Challenge period pada tahap ini bersifat **timer-only**. Receipt compute akan auto-finalize setelah challenge window habis tanpa kemungkinan challenge apapun. Actual fraud proof submission dan verification diimplementasi di Tahap 18.8. Node dan chain cukup mengimplementasi timer countdown — bukan fraud proof verification logic.
+> **Catatan Penting (FIX #4):** Challenge period pada tahap ini bersifat **timer-only**. Receipt compute akan auto-finalize setelah challenge window habis tanpa kemungkinan challenge apapun. Actual fraud proof submission dan verification diimplementasi di Tahap 18.1. Node dan chain cukup mengimplementasi timer countdown — bukan fraud proof verification logic.
 
 ---
 
@@ -1686,7 +1686,7 @@ agent/ingress routing, dan DA log sinkronisasi.
    - Pastikan validator reward hanya dari receipt yang sudah finalized
      (compute: setelah challenge period lewat).
 
-> **Catatan Penting (FIX #4):** Pada tahap ini, "finalized" untuk compute receipt berarti challenge timer habis (auto-finalize). Belum ada mekanisme fraud proof yang bisa membatalkan receipt. Fraud proof integration ke reward finalization diimplementasi di Tahap 18.8.
+> **Catatan Penting (FIX #4):** Pada tahap ini, "finalized" untuk compute receipt berarti challenge timer habis (auto-finalize). Belum ada mekanisme fraud proof yang bisa membatalkan receipt. Fraud proof integration ke reward finalization diimplementasi di Tahap 18.1.
 
 3. **`agent`** — Orchestrasi flow ekonomi end-to-end:
    - Agent mengelola lifecycle: workload dispatch → execution → receipt → claim.
@@ -1700,7 +1700,7 @@ agent/ingress routing, dan DA log sinkronisasi.
    - Expose endpoint untuk fraud proof submission (placeholder — accept dan log, tapi belum process/verify).
    - Rate limiting dan basic validation sebelum forward ke chain.
 
-> **Catatan Penting (FIX #4):** Fraud proof endpoint di ingress pada tahap ini adalah **placeholder only**. Endpoint menerima submission dan menyimpan ke log, tapi tidak memicu arbitration atau slashing. Full fraud proof processing diaktifkan di Tahap 18.8.
+> **Catatan Penting (FIX #4):** Fraud proof endpoint di ingress pada tahap ini adalah **placeholder only**. Endpoint menerima submission dan menyimpan ke log, tapi tidak memicu arbitration atau slashing. Full fraud proof processing diaktifkan di Tahap 18.1.
 
 ### Coordinator Committee Formation (FIX #7)
 
@@ -1793,7 +1793,7 @@ enum FormationMethod {
 - Governance proposal + delay window.
 - Coordinator committee rotation events. *(FIX #5: Producer aktif setelah committee rotation diimplementasi post-Tahap 20. Pada tahap ini, definisikan log schema dan hook. Hook akan dipanggil saat rotation mechanism aktif.)*
 - DA fallback activation/deactivation events. *(FIX #5: Producer aktif setelah DA fallback diimplementasi di Tahap 15.1. Pada tahap ini, definisikan log schema dan hook.)*
-- Compute challenge events. *(FIX #5: Producer aktif setelah fraud proof system diimplementasi di Tahap 18.8. Pada tahap ini, definisikan log schema dan hook. Hook menerima event tapi hanya log — belum trigger action.)*
+- Compute challenge events. *(FIX #5: Producer aktif setelah fraud proof system diimplementasi di Tahap 18.1. Pada tahap ini, definisikan log schema dan hook. Hook menerima event tapi hanya log — belum trigger action.)*
 
 > **Catatan Implementasi (FIX #5):** Untuk setiap log type yang producer-nya belum exist, implementasi pada tahap ini meliputi:
 > 1. Definisikan `LogEventType` enum variant dan schema struct.
@@ -1913,181 +1913,7 @@ struct StateCheckpoint {
 
 ---
 
-## Tahap 18.1 --- User Intent Model (Intent > Config)
-
-**Tujuan:** Mengganti config eksplisit dengan intent deklaratif.
-
-User tidak: memilih node, memilih RF, memilih zona, memilih class.
-
-User hanya menyatakan:
-
-```yaml
-intent:
-  type: web_app | batch | static | ai
-  priority: low | normal | high
-  visibility: private | public
-```
-
-### Implementasi Teknis
-
-Crate baru: `crates/ux_intent/`
-
-Struktur: `IntentSpec`, `IntentValidator`, `IntentCompiler`.
-
-**Flow:**
-
-```
-IntentSpec -> validate() -> compile() -> InternalWorkloadSpec
-```
-
-`InternalWorkloadSpec` berisi: class preference, SLA tier, replication hint, cost ceiling (soft).
-
-User tidak bisa override hasil compile, kecuali advanced mode (belum aktif).
-
-**Crates terlibat:** `agent`, `ingress`, `coordinator`, `common`, `ux_intent` (baru).
-
-**Selesai jika:** User hanya mengisi intent, sistem menghasilkan workload spec lengkap, tidak ada config teknis di UX.
-
----
-
-## Tahap 18.2 --- Smart Default Engine (Auto Decision Core)
-
-**Tujuan:** Menghilangkan decision fatigue user.
-
-**Prinsip:** Kalau user tidak bilang apa-apa --- sistem memilih aman + murah + stabil.
-
-Komponen baru: `crates/ux_defaults/`
-
-**Default Rules (contoh):**
-
-- `visibility = private` --- encrypted + no ingress.
-- `ai workload` --- prefer node DC.
-- `priority = low` --- allow latency tradeoff.
-- `batch job` --- spot-style scheduling.
-
-**Integrasi:** Dipanggil oleh `IntentCompiler`. Output --- `ResolvedWorkloadSpec`.
-
-**Crates terlibat:** `coordinator`, `node`, `runtime_wasm`, `runtime_vm`, `ux_defaults`.
-
-**Selesai jika:** Semua intent valid tanpa config tambahan, tidak ada mandatory flag selain intent.
-
----
-
-## Tahap 18.3 --- Auto Resource Classification
-
-**Tujuan:** User tidak memilih CPU/RAM/GPU.
-
-**Mekanisme:**
-
-1. Dry-run execution (sandboxed).
-2. Estimate: CPU cycles, memory peak, IO pressure.
-3. Tentukan: node class, runtime, billing tier (internal).
-
-**Tambahan struct:**
-
-```rust
-ResourceEstimate {
-    cpu,
-    mem,
-    io,
-    gpu_optional,
-}
-```
-
-**Crates yang dilibatkan:** `runtime_wasm`, `runtime_vm`, `coordinator`, `node`.
-
-**Selesai jika:** User tidak pernah set resource manual, scheduler dapat input akurat.
-
----
-
-## Tahap 18.4 --- One-Command Deploy Pipeline (Agent Side)
-
-**Tujuan:** User deploy cukup:
-
-```bash
-dsdn deploy .
-```
-
-**Flow:**
-
-Agent melakukan: detect project type, build artifact (WASM / VM), generate `IntentSpec`, upload, run, return endpoint / `job_id`.
-
-**Implementasi:** Tambahan di agent: `deploy.rs`, `detect.rs`, `packager.rs`.
-
-**Crates terlibat:** `agent`, `ux_intent`, `ux_defaults`, `ingress`, `coordinator`.
-
-**Selesai jika:** Satu command = deploy, tidak ada file config wajib.
-
----
-
-## Tahap 18.5 --- Human Error Translation Layer
-
-**Tujuan:** Error tidak bocorkan arsitektur internal.
-
-**Contoh:**
-
-- Sebelum: `replica quorum not met`
-- Sesudah: `Sistem sedang memindahkan workload. Estimasi 30-60 detik.`
-
-**Implementasi:** Crate baru: `crates/ux_errors/`. Mapping: `InternalError -> UserFacingError`.
-
-**Crates terlibat:** `coordinator`, `node`, `ingress`, `agent`, `ux_errors`.
-
-**Selesai jika:** Tidak ada error teknis mentah ke user, semua error punya message manusiawi.
-
----
-
-## Tahap 18.6 --- Progressive Disclosure UI Contract
-
-**Tujuan:** Transparan tanpa menakut-nakuti.
-
-**Level Output:**
-
-- Level 0: "Running"
-- Level 1: latency, status
-- Level 2: receipt hash, DA ref
-- Level 3: full audit trace
-
-**Implementasi:** Semua API response punya:
-
-```json
-{
-  "summary": {},
-  "details": {},
-  "audit": {}
-}
-```
-
-UI memilih level.
-
-**Crates terlibat:** `ingress`, `agent`, `proto`, `common`.
-
-**Selesai jika:** UX simpel default, auditor tetap dapat semua data.
-
----
-
-## Tahap 18.7 --- Zero-Knowledge UX Contract (No Trust Leak)
-
-**Tujuan:** UX tidak menjadi trust surface baru.
-
-**Aturan Wajib:**
-
-- UX tidak simpan state.
-- UX tidak tanda tangan receipt.
-- UX hanya consumer DA-derived state.
-
-**Validasi:**
-
-- Kill UX layer --- sistem tetap hidup.
-- Replay DA --- UX tampil identik.
-
-**Crates terlibat:** `ingress`, `agent`, `coordinator`, `common`.
-
-**Selesai jika:** UX sepenuhnya stateless, tidak ada authority baru.
-
----
-
-## Tahap 18.8 --- Compute Fraud Proof System [Critical]
+## Tahap 18.1 --- Compute Fraud Proof System [Critical]
 
 **Tujuan:** Mengimplementasikan sistem fraud proof untuk verifikasi compute, menghilangkan blind spot terbesar dalam arsitektur DSDN.
 
@@ -2324,133 +2150,6 @@ Untuk workload critical, user bisa request redundant execution:
 
 ---
 
-## Tahap 18.9 --- SDK dan Developer Experience
-
-**Tujuan:** Membangun SDK dan tooling yang membuat development di DSDN lebih mudah dari AWS/GCP, sebagai competitive moat.
-
-**Prinsip Penting:**
-
-- Developer experience adalah moat yang susah ditiru.
-- Documentation dalam Bahasa Indonesia dan English.
-- One-click deployment untuk common use cases.
-- Error messages yang helpful.
-
-### Komponen
-
-#### 1. DSDN SDK (Multi-language)
-
-**(FIX #8)** Semua SDK berada di directory `sdks/` untuk konsistensi. Rust SDK adalah wrapper/re-export dari internal crates.
-
-```
-sdks/sdk_rust/       -- Rust SDK (public API, wraps internal crates)
-sdks/sdk_python/     -- Python SDK
-sdks/sdk_js/         -- JavaScript/TypeScript SDK
-sdks/sdk_go/         -- Go SDK
-```
-
-> **Catatan (FIX #8):** `sdks/sdk_rust/` bukan crate internal — ia adalah public-facing SDK yang re-exports dan simplifies API dari internal crates. Internal crates (`crates/*`) tetap digunakan dalam DSDN codebase sendiri. SDK Rust ini ditujukan untuk developer eksternal yang membangun di atas DSDN.
-
-#### 2. SDK Core Features
-
-```rust
-// Rust SDK example
-use dsdn_sdk::prelude::*;
-
-#[tokio::main]
-async fn main() {
-    let client = DSDN::connect("mainnet").await?;
-
-    // Storage
-    let cid = client.storage()
-        .upload_file("./my_data.csv")
-        .encrypted(true)
-        .build()
-        .await?;
-
-    // Compute
-    let result = client.compute()
-        .deploy_wasm("./my_module.wasm")
-        .intent(Intent::Batch { priority: Priority::Normal })
-        .build()
-        .await?;
-
-    // Wait for result
-    let output = result.wait_with_progress(|p| {
-        println!("Progress: {}%", p.percent);
-    }).await?;
-}
-```
-
-#### 3. Project Templates
-
-```bash
-dsdn init --template web-app       # Static site + API
-dsdn init --template ai-inference  # AI model serving
-dsdn init --template data-pipeline # Batch processing
-dsdn init --template storage-only  # Just storage
-```
-
-#### 4. Local Development Environment
-
-```bash
-dsdn dev start   # Start local DSDN network
-dsdn dev deploy  # Deploy to local
-dsdn dev logs    # Stream logs
-dsdn dev shell   # Interactive shell
-```
-
-#### 5. Documentation Site
-
-```
-docs/
-├── id/                 # Indonesian docs
-│   ├── quickstart.md
-│   ├── tutorials/
-│   ├── api-reference/
-│   └── troubleshooting/
-├── en/                 # English docs
-└── examples/           # Code examples
-```
-
-#### 6. Error Message System
-
-```rust
-// Instead of: "QUORUM_NOT_MET"
-// Show: "Sistem sedang memproses workload Anda. Estimasi: 30-60 detik."
-
-struct UserFriendlyError {
-    code: ErrorCode,
-    message_id: String,
-    message_en: String,
-    suggestion_id: Option<String>,
-    suggestion_en: Option<String>,
-    docs_link: Option<String>,
-}
-```
-
-#### 7. CLI Improvements
-
-```bash
-# Simplified commands
-dsdn deploy .                    # Deploy current directory
-dsdn upload ./data --encrypt     # Upload with encryption
-dsdn status                      # Show all deployments
-dsdn logs <deployment>           # Stream logs
-dsdn exec <deployment> -- bash   # Interactive shell
-
-# Progress indicators
-dsdn deploy .
-# Building artifact...
-# Uploading to DSDN...
-# Scheduling workload...
-# Waiting for nodes...
-# Deployed! https://abc123.dsdn.id
-```
-
-#### 8. Playground / Web IDE
-
----
-
 ## Tahap 19 --- Receipt System v2 (Economic-Aware)
 
 **Tujuan:** Mengintegrasikan sistem receipt dengan model ekonomi adaptif, fraud proof, dan deflasi terkontrol.
@@ -2468,7 +2167,7 @@ Compute Receipt (Standard):
   -> ExecutionCommitment verified
   -> Challenge period (1-4 hours)
   -> If no challenge -> reward distributed
-  -> If challenge -> arbitration (via fraud proof system, Tahap 18.8)
+  -> If challenge -> arbitration (via fraud proof system, Tahap 18.1)
 
 Compute Receipt (Redundant):
   -> Multi-node execution
@@ -3594,7 +3293,7 @@ Tahap 22 (Mainnet Launch) — semua komponen DSDN fully P2P
 | 1 | CRITICAL | Circular dependency 20.A ↔ 21 | Split 20.A into 20.A-Core (before 21) and 20.A-Bootstrap (after 21.1.C). Updated dependency chain. |
 | 2 | HIGH | Bootstrap variant missing in 21.1.A NodeRole enum | Added `Bootstrap` to NodeRole enum in 21.1.A. Updated RoleDependencyMatrix with PEX_ONLY. Updated handshake validation, PEX, peers.dat throughout 21.1.A/B/C. |
 | 3 | HIGH | Tahap 16 stake check missing Validator 50,000 | Added complete stake table (500/5000/50000) and combined role+stake validation to Tahap 16. |
-| 4 | MEDIUM | Challenge period ambiguous before fraud proof exists | Added explicit notes in 14C.B, 14C.C that challenge period is timer-only. Added integration checklist in 18.8 for activating real fraud proof. |
+| 4 | MEDIUM | Challenge period ambiguous before fraud proof exists | Added explicit notes in 14C.B, 14C.C that challenge period is timer-only. Added integration checklist in 18.1 for activating real fraud proof. |
 | 5 | MEDIUM | Tahap 15 references events from future stages | Added per-log-type annotations marking which producer is from which tahap. Defined hook-based approach with mock event testing. |
 | 6 | MEDIUM | DA fallback has no dedicated implementation stage | Created new Tahap 15.1 with DA health monitor, fallback buffer, reconciliation, and activation events. |
 | 7 | MEDIUM | Coordinator committee formation undefined | Added committee formation section to 14C.C with protocol, quorum, failure handling, and structs. |
@@ -4009,7 +3708,316 @@ Benchmark juga memeriksa: stake-weight scheduling performance, anti-self-dealing
 > Benchmark difokuskan pada validasi determinisme, konsistensi, dan overhead trust model, bukan pada klaim performa komersial.
 ---
 
-## Tahap 28 NOTE:DI BAGIAN INI DIHAPUS DAN DI PINDAH DI ANTARA 20 dan 21
+## Tahap 28 --- UX/DX Foundation (Post-Mainnet)
+
+**Tujuan:** Membangun layer UX/DX yang nyaman dan intuitif setelah mainnet stabil. Semua komponen ini sebelumnya direncanakan pre-mainnet, namun dipindahkan ke post-mainnet agar rilis mainnet lebih cepat.
+
+**Prinsip Penting:**
+
+- UX/DX tidak mengubah trust model atau arsitektur inti.
+- Semua komponen UX bersifat stateless dan consumer dari DA-derived state.
+- Implementasi dilakukan setelah infrastruktur post-mainnet (Tahap 23--27) stabil.
+
+---
+
+## Tahap 28.1 --- User Intent Model (Intent > Config)
+
+**Tujuan:** Mengganti config eksplisit dengan intent deklaratif.
+
+User tidak: memilih node, memilih RF, memilih zona, memilih class.
+
+User hanya menyatakan:
+
+```yaml
+intent:
+  type: web_app | batch | static | ai
+  priority: low | normal | high
+  visibility: private | public
+```
+
+### Implementasi Teknis
+
+Crate baru: `crates/ux_intent/`
+
+Struktur: `IntentSpec`, `IntentValidator`, `IntentCompiler`.
+
+**Flow:**
+
+```
+IntentSpec -> validate() -> compile() -> InternalWorkloadSpec
+```
+
+`InternalWorkloadSpec` berisi: class preference, SLA tier, replication hint, cost ceiling (soft).
+
+User tidak bisa override hasil compile, kecuali advanced mode (belum aktif).
+
+**Crates terlibat:** `agent`, `ingress`, `coordinator`, `common`, `ux_intent` (baru).
+
+**Selesai jika:** User hanya mengisi intent, sistem menghasilkan workload spec lengkap, tidak ada config teknis di UX.
+
+---
+
+## Tahap 28.2 --- Smart Default Engine (Auto Decision Core)
+
+**Tujuan:** Menghilangkan decision fatigue user.
+
+**Prinsip:** Kalau user tidak bilang apa-apa --- sistem memilih aman + murah + stabil.
+
+Komponen baru: `crates/ux_defaults/`
+
+**Default Rules (contoh):**
+
+- `visibility = private` --- encrypted + no ingress.
+- `ai workload` --- prefer node DC.
+- `priority = low` --- allow latency tradeoff.
+- `batch job` --- spot-style scheduling.
+
+**Integrasi:** Dipanggil oleh `IntentCompiler`. Output --- `ResolvedWorkloadSpec`.
+
+**Crates terlibat:** `coordinator`, `node`, `runtime_wasm`, `runtime_vm`, `ux_defaults`.
+
+**Selesai jika:** Semua intent valid tanpa config tambahan, tidak ada mandatory flag selain intent.
+
+---
+
+## Tahap 28.3 --- Auto Resource Classification
+
+**Tujuan:** User tidak memilih CPU/RAM/GPU.
+
+**Mekanisme:**
+
+1. Dry-run execution (sandboxed).
+2. Estimate: CPU cycles, memory peak, IO pressure.
+3. Tentukan: node class, runtime, billing tier (internal).
+
+**Tambahan struct:**
+
+```rust
+ResourceEstimate {
+    cpu,
+    mem,
+    io,
+    gpu_optional,
+}
+```
+
+**Crates yang dilibatkan:** `runtime_wasm`, `runtime_vm`, `coordinator`, `node`.
+
+**Selesai jika:** User tidak pernah set resource manual, scheduler dapat input akurat.
+
+---
+
+## Tahap 28.4 --- One-Command Deploy Pipeline (Agent Side)
+
+**Tujuan:** User deploy cukup:
+
+```bash
+dsdn deploy .
+```
+
+**Flow:**
+
+Agent melakukan: detect project type, build artifact (WASM / VM), generate `IntentSpec`, upload, run, return endpoint / `job_id`.
+
+**Implementasi:** Tambahan di agent: `deploy.rs`, `detect.rs`, `packager.rs`.
+
+**Crates terlibat:** `agent`, `ux_intent`, `ux_defaults`, `ingress`, `coordinator`.
+
+**Selesai jika:** Satu command = deploy, tidak ada file config wajib.
+
+---
+
+## Tahap 28.5 --- Human Error Translation Layer
+
+**Tujuan:** Error tidak bocorkan arsitektur internal.
+
+**Contoh:**
+
+- Sebelum: `replica quorum not met`
+- Sesudah: `Sistem sedang memindahkan workload. Estimasi 30-60 detik.`
+
+**Implementasi:** Crate baru: `crates/ux_errors/`. Mapping: `InternalError -> UserFacingError`.
+
+**Crates terlibat:** `coordinator`, `node`, `ingress`, `agent`, `ux_errors`.
+
+**Selesai jika:** Tidak ada error teknis mentah ke user, semua error punya message manusiawi.
+
+---
+
+## Tahap 28.6 --- Progressive Disclosure UI Contract
+
+**Tujuan:** Transparan tanpa menakut-nakuti.
+
+**Level Output:**
+
+- Level 0: "Running"
+- Level 1: latency, status
+- Level 2: receipt hash, DA ref
+- Level 3: full audit trace
+
+**Implementasi:** Semua API response punya:
+
+```json
+{
+  "summary": {},
+  "details": {},
+  "audit": {}
+}
+```
+
+UI memilih level.
+
+**Crates terlibat:** `ingress`, `agent`, `proto`, `common`.
+
+**Selesai jika:** UX simpel default, auditor tetap dapat semua data.
+
+---
+
+## Tahap 28.7 --- Zero-Knowledge UX Contract (No Trust Leak)
+
+**Tujuan:** UX tidak menjadi trust surface baru.
+
+**Aturan Wajib:**
+
+- UX tidak simpan state.
+- UX tidak tanda tangan receipt.
+- UX hanya consumer DA-derived state.
+
+**Validasi:**
+
+- Kill UX layer --- sistem tetap hidup.
+- Replay DA --- UX tampil identik.
+
+**Crates terlibat:** `ingress`, `agent`, `coordinator`, `common`.
+
+**Selesai jika:** UX sepenuhnya stateless, tidak ada authority baru.
+
+---
+
+## Tahap 28.8 --- SDK dan Developer Experience
+
+**Tujuan:** Membangun SDK dan tooling yang membuat development di DSDN lebih mudah dari AWS/GCP, sebagai competitive moat.
+
+**Prinsip Penting:**
+
+- Developer experience adalah moat yang susah ditiru.
+- Documentation dalam Bahasa Indonesia dan English.
+- One-click deployment untuk common use cases.
+- Error messages yang helpful.
+
+### Komponen
+
+#### 1. DSDN SDK (Multi-language)
+
+**(FIX #8)** Semua SDK berada di directory `sdks/` untuk konsistensi. Rust SDK adalah wrapper/re-export dari internal crates.
+
+```
+sdks/sdk_rust/       -- Rust SDK (public API, wraps internal crates)
+sdks/sdk_python/     -- Python SDK
+sdks/sdk_js/         -- JavaScript/TypeScript SDK
+sdks/sdk_go/         -- Go SDK
+```
+
+> **Catatan (FIX #8):** `sdks/sdk_rust/` bukan crate internal — ia adalah public-facing SDK yang re-exports dan simplifies API dari internal crates. Internal crates (`crates/*`) tetap digunakan dalam DSDN codebase sendiri. SDK Rust ini ditujukan untuk developer eksternal yang membangun di atas DSDN.
+
+#### 2. SDK Core Features
+
+```rust
+// Rust SDK example
+use dsdn_sdk::prelude::*;
+
+#[tokio::main]
+async fn main() {
+    let client = DSDN::connect("mainnet").await?;
+
+    // Storage
+    let cid = client.storage()
+        .upload_file("./my_data.csv")
+        .encrypted(true)
+        .build()
+        .await?;
+
+    // Compute
+    let result = client.compute()
+        .deploy_wasm("./my_module.wasm")
+        .intent(Intent::Batch { priority: Priority::Normal })
+        .build()
+        .await?;
+
+    // Wait for result
+    let output = result.wait_with_progress(|p| {
+        println!("Progress: {}%", p.percent);
+    }).await?;
+}
+```
+
+#### 3. Project Templates
+
+```bash
+dsdn init --template web-app       # Static site + API
+dsdn init --template ai-inference  # AI model serving
+dsdn init --template data-pipeline # Batch processing
+dsdn init --template storage-only  # Just storage
+```
+
+#### 4. Local Development Environment
+
+```bash
+dsdn dev start   # Start local DSDN network
+dsdn dev deploy  # Deploy to local
+dsdn dev logs    # Stream logs
+dsdn dev shell   # Interactive shell
+```
+
+#### 5. Documentation Site
+
+```
+docs/
+├── id/                 # Indonesian docs
+│   ├── quickstart.md
+│   ├── tutorials/
+│   ├── api-reference/
+│   └── troubleshooting/
+├── en/                 # English docs
+└── examples/           # Code examples
+```
+
+#### 6. Error Message System
+
+```rust
+// Instead of: "QUORUM_NOT_MET"
+// Show: "Sistem sedang memproses workload Anda. Estimasi: 30-60 detik."
+
+struct UserFriendlyError {
+    code: ErrorCode,
+    message_id: String,
+    message_en: String,
+    suggestion_id: Option<String>,
+    suggestion_en: Option<String>,
+    docs_link: Option<String>,
+}
+```
+
+#### 7. CLI Improvements
+
+```bash
+# Simplified commands
+dsdn deploy .                    # Deploy current directory
+dsdn upload ./data --encrypt     # Upload with encryption
+dsdn status                      # Show all deployments
+dsdn logs <deployment>           # Stream logs
+dsdn exec <deployment> -- bash   # Interactive shell
+
+# Progress indicators
+dsdn deploy .
+# Building artifact...
+# Uploading to DSDN...
+# Scheduling workload...
+# Waiting for nodes...
+# Deployed! https://abc123.dsdn.id
+```
+
+#### 8. Playground / Web IDE
 
 ---
 
