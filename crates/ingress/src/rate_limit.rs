@@ -132,6 +132,29 @@ impl LimitConfig {
     pub fn global(requests_per_second: u32, burst_size: u32) -> Self {
         Self::new(requests_per_second, burst_size, RateLimitKey::Global)
     }
+
+    /// Membuat LimitConfig untuk per-IP limiting with per-minute semantics.
+    ///
+    /// The `burst_size` controls how many requests can fire immediately.
+    /// `requests_per_second` is derived as `max(1, rpm / 60)`.
+    ///
+    /// For sub-60 RPM values, burst_size is the primary enforcement
+    /// mechanism (e.g. 10 RPM = burst 10, refill ~1/s).
+    pub fn per_ip_per_minute(requests_per_minute: u32, burst_size: u32) -> Self {
+        let rps = if requests_per_minute >= 60 {
+            requests_per_minute / 60
+        } else {
+            1
+        };
+        Self::new(rps, burst_size, RateLimitKey::Ip)
+    }
+
+    /// Compute the effective rate per second as an f64.
+    ///
+    /// Useful for testing that per-minute configs map correctly.
+    pub fn effective_rate_per_second(&self) -> f64 {
+        self.requests_per_second as f64
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

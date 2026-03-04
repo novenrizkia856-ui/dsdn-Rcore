@@ -234,6 +234,7 @@
 //! | `economic_handlers` | Receipt status query endpoints (14C.C.24)     |
 //! |                     | Reward balance query endpoints (14C.C.25)     |
 //! |                     | Fraud proof submission placeholder (14C.C.26) |
+//! | `economic_validation` | Validation layer & chain forwarding (14C.C.27) |
 //!
 //! ## DA Integration
 //!
@@ -281,6 +282,7 @@ mod rate_limit;
 mod fallback_health;
 mod alerting;
 pub mod economic_handlers;
+pub mod economic_validation;
 pub use fallback_health::FallbackHealthInfo;
 pub use alerting::{AlertHandler, AlertDispatcher, LoggingAlertHandler, ReconcileReport};
 
@@ -1024,6 +1026,7 @@ fn da_router_ttl_from_env() -> u64 {
 /// receipt-status endpoint.  HTTP routes, validation, and batch logic are
 /// fully functional regardless.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct CoordinatorReceiptQueryStub {
     _coord: Arc<CoordinatorClient>,
 }
@@ -1068,6 +1071,7 @@ impl economic_handlers::ReceiptQueryService for CoordinatorReceiptQueryStub {
 /// exposes real reward-state endpoints.  HTTP routes, validation, and sorting
 /// logic are fully functional regardless.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct CoordinatorRewardQueryStub {
     _coord: Arc<CoordinatorClient>,
 }
@@ -1165,43 +1169,47 @@ async fn main() {
     info!(da_router_ttl_ms = da_ttl, "DA router TTL configured");
 
     // Create app state with metrics
-    let app_state = AppState::new(coord.clone());
+    let app_state = AppState::new(coord);
 
     // Receipt status query routes (14C.C.24)
-    // Separate sub-router with its own state type, merged into main router.
+    // Uses ChainForwarder (14C.C.27) — all queries go through forwarding layer.
+    let chain_forwarder = Arc::new(economic_validation::ChainForwarder::new(
+        "http://localhost:26657".to_string(),
+        std::time::Duration::from_secs(10),
+    ));
     let economic_state = economic_handlers::EconomicState {
-        service: Arc::new(CoordinatorReceiptQueryStub::new(coord.clone())),
+        service: Arc::clone(&chain_forwarder),
     };
     let economic_router = axum::Router::new()
         .route(
             "/receipt/:hash",
-            get(economic_handlers::handle_receipt_status::<CoordinatorReceiptQueryStub>),
+            get(economic_handlers::handle_receipt_status::<economic_validation::ChainForwarder>),
         )
         .route(
             "/receipts/status",
-            post(economic_handlers::handle_batch_receipt_status::<CoordinatorReceiptQueryStub>),
+            post(economic_handlers::handle_batch_receipt_status::<economic_validation::ChainForwarder>),
         )
         .with_state(economic_state);
 
     // Reward balance query routes (14C.C.25)
-    // Separate sub-router with its own state type, merged into main router.
+    // Uses same ChainForwarder (14C.C.27) — no direct chain access from handlers.
     // NOTE: Static routes (/rewards/validators, /rewards/treasury) registered
     // BEFORE parameterized route (/rewards/:address) for correct matching.
     let reward_state = economic_handlers::EconomicRewardState {
-        service: Arc::new(CoordinatorRewardQueryStub::new(coord)),
+        service: chain_forwarder,
     };
     let reward_router = axum::Router::new()
         .route(
             "/rewards/validators",
-            get(economic_handlers::handle_validator_rewards::<CoordinatorRewardQueryStub>),
+            get(economic_handlers::handle_validator_rewards::<economic_validation::ChainForwarder>),
         )
         .route(
             "/rewards/treasury",
-            get(economic_handlers::handle_treasury_rewards::<CoordinatorRewardQueryStub>),
+            get(economic_handlers::handle_treasury_rewards::<economic_validation::ChainForwarder>),
         )
         .route(
             "/rewards/:address",
-            get(economic_handlers::handle_reward_balance::<CoordinatorRewardQueryStub>),
+            get(economic_handlers::handle_reward_balance::<economic_validation::ChainForwarder>),
         )
         .with_state(reward_state);
 
@@ -1221,8 +1229,19 @@ async fn main() {
         )
         .with_state(fraud_proof_state);
 
-    // Create rate limiter with default limits
-    let rate_limiter = Arc::new(RateLimiter::with_defaults());
+    // Create rate limiter with default + economic-specific limits (14C.C.27).
+    // Mutation endpoints (claim, fraud-proof): 10 req/min per IP.
+    // Query endpoints (status, balance, rewards, treasury): 60 req/min per IP.
+    let mut rate_limiter_inner = RateLimiter::with_defaults();
+    rate_limiter_inner.add_limit(
+        "econ_mutation",
+        rate_limit::LimitConfig::per_ip_per_minute(10, 10),
+    );
+    rate_limiter_inner.add_limit(
+        "econ_query",
+        rate_limit::LimitConfig::per_ip_per_minute(60, 60),
+    );
+    let rate_limiter = Arc::new(rate_limiter_inner);
     let rate_limit_state = RateLimitState::new(rate_limiter);
 
     // Shutdown channel for background task lifecycle

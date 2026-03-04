@@ -234,31 +234,13 @@ pub const BATCH_LIMIT: usize = 100;
 /// 5. All characters valid hex (`0-9`, `a-f`, `A-F`)
 ///
 /// Returns `Ok(())` on success, `Err(reason)` on failure.
+///
+/// Delegates to [`crate::economic_validation::validate_receipt_hash`].
+/// No duplicate validation logic — this is a thin adapter.
 pub fn validate_receipt_hash(hash: &str) -> Result<(), String> {
-    if hash.is_empty() {
-        return Err("hash must not be empty".to_string());
-    }
-
-    if hash.chars().any(|c| c.is_whitespace()) {
-        return Err("hash must not contain whitespace".to_string());
-    }
-
-    if hash.starts_with("0x") || hash.starts_with("0X") {
-        return Err("hash must not have 0x prefix".to_string());
-    }
-
-    if hash.len() != 64 {
-        return Err(format!(
-            "hash must be exactly 64 hex characters, got {}",
-            hash.len()
-        ));
-    }
-
-    if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("hash contains non-hex characters".to_string());
-    }
-
-    Ok(())
+    crate::economic_validation::validate_receipt_hash(hash)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -630,31 +612,13 @@ pub struct TreasuryRewardResponse {
 /// 5. All characters valid hex (`0-9`, `a-f`, `A-F`)
 ///
 /// Returns `Ok(())` on success, `Err(reason)` on failure.
+///
+/// Delegates to [`crate::economic_validation::validate_address`].
+/// No duplicate validation logic — this is a thin adapter.
 pub fn validate_address(address: &str) -> Result<(), String> {
-    if address.is_empty() {
-        return Err("address must not be empty".to_string());
-    }
-
-    if address.chars().any(|c| c.is_whitespace()) {
-        return Err("address must not contain whitespace".to_string());
-    }
-
-    if address.starts_with("0x") || address.starts_with("0X") {
-        return Err("address must not have 0x prefix".to_string());
-    }
-
-    if address.len() != 40 {
-        return Err(format!(
-            "address must be exactly 40 hex characters, got {}",
-            address.len()
-        ));
-    }
-
-    if !address.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("address contains non-hex characters".to_string());
-    }
-
-    Ok(())
+    crate::economic_validation::validate_address(address)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -883,6 +847,10 @@ pub type FraudProofLog = Arc<RwLock<Vec<FraudProofLogEntry>>>;
 pub const FRAUD_PROOF_PLACEHOLDER_NOTE: &str = "placeholder \u{2014} not processed until Tahap 18.8";
 
 /// Allowed proof type values.
+///
+/// Canonical list defined in [`crate::economic_validation`].
+/// Kept here for reference only; validation delegates to that module.
+#[allow(dead_code)]
 const VALID_PROOF_TYPES: [&str; 3] = [
     "execution_mismatch",
     "invalid_commitment",
@@ -895,19 +863,12 @@ const VALID_PROOF_TYPES: [&str; 3] = [
 
 /// Validate a fraud proof type string.
 ///
-/// Must be exactly one of:
-/// - `"execution_mismatch"`
-/// - `"invalid_commitment"`
-/// - `"resource_inflation"`
+/// Delegates to [`crate::economic_validation::validate_proof_type`].
+/// No duplicate validation logic — this is a thin adapter.
 pub fn validate_proof_type(proof_type: &str) -> Result<(), String> {
-    if VALID_PROOF_TYPES.contains(&proof_type) {
-        Ok(())
-    } else {
-        Err(format!(
-            "invalid proof_type '{}': must be one of execution_mismatch, invalid_commitment, resource_inflation",
-            proof_type
-        ))
-    }
+    crate::economic_validation::validate_proof_type(proof_type)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ════════════════════════════════════════════════════════════════════════════
