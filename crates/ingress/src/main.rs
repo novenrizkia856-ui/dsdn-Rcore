@@ -57,6 +57,26 @@
 //! |---------------------|--------|------------------------------------------|
 //! | `/fallback/status`  | GET    | Fallback status (source of truth)        |
 //!
+//! ### Receipt Status Endpoints (14C.C.24)
+//!
+//! | Endpoint              | Method | Description                              |
+//! |-----------------------|--------|------------------------------------------|
+//! | `/receipt/:hash`      | GET    | Query single receipt status by hash      |
+//! | `/receipts/status`    | POST   | Batch query up to 100 receipt hashes     |
+//!
+//! #### Receipt Status Values
+//!
+//! `pending` · `challenge_period` · `finalized` · `challenged` · `rejected` · `not_found`
+//!
+//! #### Hash Validation
+//!
+//! Hex-only, exactly 64 chars, no whitespace, no `0x` prefix.
+//! Invalid hash → HTTP 400.
+//!
+//! #### Batch Rules
+//!
+//! Min 1, max 100 hashes. Response order matches input order.
+//!
 //! ## Endpoint Details
 //!
 //! ### GET /health
@@ -182,6 +202,7 @@
 //! | `alerting`       | Alert hooks for fallback events (14A.1A.68)      |
 //! | `metrics`        | Observability & Prometheus metrics               |
 //! | `rate_limit`     | Rate limiting middleware                         |
+//! | `economic_handlers` | Receipt status query endpoints (14C.C.24)     |
 //!
 //! ## DA Integration
 //!
@@ -206,7 +227,7 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    routing::get,
+    routing::{get, post},
     Router,
     response::IntoResponse,
     Json,
@@ -228,6 +249,7 @@ mod metrics;
 mod rate_limit;
 mod fallback_health;
 mod alerting;
+pub mod economic_handlers;
 pub use fallback_health::FallbackHealthInfo;
 pub use alerting::{AlertHandler, AlertDispatcher, LoggingAlertHandler, ReconcileReport};
 
@@ -955,6 +977,54 @@ fn da_router_ttl_from_env() -> u64 {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// RECEIPT QUERY STUB (14C.C.24)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Stub implementation of [`economic_handlers::ReceiptQueryService`] backed
+/// by `CoordinatorClient`.
+///
+/// Returns `not_found` for all queries until coordinator RPC exposes a real
+/// receipt-status endpoint.  HTTP routes, validation, and batch logic are
+/// fully functional regardless.
+#[derive(Clone)]
+struct CoordinatorReceiptQueryStub {
+    _coord: Arc<CoordinatorClient>,
+}
+
+impl CoordinatorReceiptQueryStub {
+    fn new(coord: Arc<CoordinatorClient>) -> Self {
+        Self { _coord: coord }
+    }
+}
+
+impl economic_handlers::ReceiptQueryService for CoordinatorReceiptQueryStub {
+    fn query_receipt(
+        &self,
+        _receipt_hash: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<economic_handlers::ChainReceiptInfo, String>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            // NOTE(14C.C.24): Replace with real coordinator RPC call.
+            //   e.g. self._coord.query_receipt_status(receipt_hash).await
+            Ok(economic_handlers::ChainReceiptInfo {
+                status: economic_handlers::ReceiptStatus::NotFound,
+                reward_amount: None,
+                challenge_expires_at: None,
+                node_id: None,
+                workload_type: None,
+                submitted_at: None,
+            })
+        })
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -978,7 +1048,23 @@ async fn main() {
     info!(da_router_ttl_ms = da_ttl, "DA router TTL configured");
 
     // Create app state with metrics
-    let app_state = AppState::new(coord);
+    let app_state = AppState::new(coord.clone());
+
+    // Receipt status query routes (14C.C.24)
+    // Separate sub-router with its own state type, merged into main router.
+    let economic_state = economic_handlers::EconomicState {
+        service: Arc::new(CoordinatorReceiptQueryStub::new(coord)),
+    };
+    let economic_router = axum::Router::new()
+        .route(
+            "/receipt/:hash",
+            get(economic_handlers::handle_receipt_status::<CoordinatorReceiptQueryStub>),
+        )
+        .route(
+            "/receipts/status",
+            post(economic_handlers::handle_batch_receipt_status::<CoordinatorReceiptQueryStub>),
+        )
+        .with_state(economic_state);
 
     // Create rate limiter with default limits
     let rate_limiter = Arc::new(RateLimiter::with_defaults());
@@ -994,6 +1080,7 @@ async fn main() {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_endpoint))
         .route("/fallback/status", get(fallback_status))
+        .merge(economic_router)
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit_middleware,
