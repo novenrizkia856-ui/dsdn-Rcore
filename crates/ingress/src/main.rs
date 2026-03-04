@@ -94,6 +94,18 @@
 //!
 //! Sorted by `validator_id` (lexicographic). Deterministic order guaranteed.
 //!
+//! ### Fraud Proof Endpoints (14C.C.26)
+//!
+//! | Endpoint              | Method | Description                              |
+//! |-----------------------|--------|------------------------------------------|
+//! | `/fraud-proof`        | POST   | Submit fraud proof (placeholder only)    |
+//! | `/fraud-proofs`       | GET    | List all fraud proof submissions         |
+//!
+//! #### Placeholder Note
+//!
+//! All submissions are logged but NOT processed. Verification, arbitration,
+//! slashing, and challenge resolution deferred to Tahap 18.8.
+//!
 //! ## Endpoint Details
 //!
 //! ### GET /health
@@ -221,6 +233,7 @@
 //! | `rate_limit`     | Rate limiting middleware                         |
 //! | `economic_handlers` | Receipt status query endpoints (14C.C.24)     |
 //! |                     | Reward balance query endpoints (14C.C.25)     |
+//! |                     | Fraud proof submission placeholder (14C.C.26) |
 //!
 //! ## DA Integration
 //!
@@ -575,6 +588,8 @@ pub struct AppState {
     pub metrics: Arc<IngressMetrics>,
     /// Alert dispatcher untuk notifikasi fallback events (14A.1A.68).
     pub alert_dispatcher: AlertDispatcher,
+    /// Fraud proof submission log (14C.C.26). Thread-safe via `RwLock`.
+    pub fraud_proof_log: economic_handlers::FraudProofLog,
 }
 
 impl AppState {
@@ -587,6 +602,7 @@ impl AppState {
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics: Arc::new(IngressMetrics::new()),
             alert_dispatcher: AlertDispatcher::with_logging(),
+            fraud_proof_log: economic_handlers::new_fraud_proof_log(),
         }
     }
 
@@ -600,6 +616,7 @@ impl AppState {
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics: Arc::new(IngressMetrics::new()),
             alert_dispatcher: AlertDispatcher::with_logging(),
+            fraud_proof_log: economic_handlers::new_fraud_proof_log(),
         }
     }
 
@@ -613,6 +630,7 @@ impl AppState {
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics,
             alert_dispatcher: AlertDispatcher::with_logging(),
+            fraud_proof_log: economic_handlers::new_fraud_proof_log(),
         }
     }
 
@@ -626,6 +644,7 @@ impl AppState {
             da_last_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics: Arc::new(IngressMetrics::new()),
             alert_dispatcher: dispatcher,
+            fraud_proof_log: economic_handlers::new_fraud_proof_log(),
         }
     }
 
@@ -1186,6 +1205,22 @@ async fn main() {
         )
         .with_state(reward_state);
 
+    // Fraud proof submission placeholder routes (14C.C.26)
+    // Uses fraud_proof_log from AppState, wrapped in FraudProofState.
+    let fraud_proof_state = economic_handlers::FraudProofState {
+        log: app_state.fraud_proof_log.clone(),
+    };
+    let fraud_proof_router = axum::Router::new()
+        .route(
+            "/fraud-proof",
+            post(economic_handlers::handle_fraud_proof_submit),
+        )
+        .route(
+            "/fraud-proofs",
+            get(economic_handlers::handle_fraud_proofs_list),
+        )
+        .with_state(fraud_proof_state);
+
     // Create rate limiter with default limits
     let rate_limiter = Arc::new(RateLimiter::with_defaults());
     let rate_limit_state = RateLimitState::new(rate_limiter);
@@ -1202,6 +1237,7 @@ async fn main() {
         .route("/fallback/status", get(fallback_status))
         .merge(economic_router)
         .merge(reward_router)
+        .merge(fraud_proof_router)
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit_middleware,

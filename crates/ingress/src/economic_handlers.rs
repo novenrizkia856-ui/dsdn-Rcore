@@ -82,7 +82,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use tracing::info;
 
 // ════════════════════════════════════════════════════════════════════════════
 // RECEIPT STATUS ENUM
@@ -799,6 +800,299 @@ pub async fn handle_treasury_rewards<R: RewardQueryService>(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorBody {
                 error: format!("internal query error: {}", err),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FRAUD PROOF DATA MODELS (14C.C.26)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Fraud proof log entry stored in application state.
+///
+/// Contains the original request fields plus a generated `fraud_proof_id`.
+/// This is the "log struct equivalent" returned by `GET /fraud-proofs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FraudProofLogEntry {
+    /// Receipt hash being challenged (hex, 64 chars).
+    pub receipt_hash: String,
+
+    /// Type of fraud proof.
+    /// Must be: `"execution_mismatch"`, `"invalid_commitment"`, or `"resource_inflation"`.
+    pub proof_type: String,
+
+    /// Raw proof data bytes. Must not be empty.
+    pub proof_data: Vec<u8>,
+
+    /// Address of the submitter (hex, 40 chars).
+    pub submitter_address: String,
+
+    /// Optional challenge identifier.
+    pub challenge_id: Option<String>,
+
+    /// Generated fraud proof identifier (deterministic).
+    pub fraud_proof_id: String,
+}
+
+/// Request body for `POST /fraud-proof`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FraudProofRequest {
+    /// Receipt hash being challenged (hex, 64 chars).
+    pub receipt_hash: String,
+
+    /// Type of fraud proof.
+    /// Must be: `"execution_mismatch"`, `"invalid_commitment"`, or `"resource_inflation"`.
+    pub proof_type: String,
+
+    /// Raw proof data bytes. Must not be empty.
+    pub proof_data: Vec<u8>,
+
+    /// Address of the submitter (hex, 40 chars).
+    pub submitter_address: String,
+
+    /// Optional challenge identifier.
+    pub challenge_id: Option<String>,
+}
+
+/// Response for `POST /fraud-proof`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FraudProofResponse {
+    /// Always `true` for placeholder acceptance.
+    pub accepted: bool,
+
+    /// Generated fraud proof identifier.
+    pub fraud_proof_id: String,
+
+    /// Human-readable message.
+    pub message: String,
+
+    /// Placeholder note — always `"placeholder — not processed until Tahap 18.8"`.
+    pub note: String,
+}
+
+/// Thread-safe fraud proof log type.
+///
+/// Uses `RwLock` for concurrent read access on `GET /fraud-proofs`.
+pub type FraudProofLog = Arc<RwLock<Vec<FraudProofLogEntry>>>;
+
+/// Placeholder note constant.
+///
+/// Returned verbatim in every `FraudProofResponse`.
+pub const FRAUD_PROOF_PLACEHOLDER_NOTE: &str = "placeholder \u{2014} not processed until Tahap 18.8";
+
+/// Allowed proof type values.
+const VALID_PROOF_TYPES: [&str; 3] = [
+    "execution_mismatch",
+    "invalid_commitment",
+    "resource_inflation",
+];
+
+// ════════════════════════════════════════════════════════════════════════════
+// FRAUD PROOF VALIDATION (14C.C.26)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Validate a fraud proof type string.
+///
+/// Must be exactly one of:
+/// - `"execution_mismatch"`
+/// - `"invalid_commitment"`
+/// - `"resource_inflation"`
+pub fn validate_proof_type(proof_type: &str) -> Result<(), String> {
+    if VALID_PROOF_TYPES.contains(&proof_type) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid proof_type '{}': must be one of execution_mismatch, invalid_commitment, resource_inflation",
+            proof_type
+        ))
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FRAUD PROOF ID GENERATION (14C.C.26)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Generate a deterministic fraud proof ID from request fields and log index.
+///
+/// Format: `fp-{receipt_hash[0..8]}-{submitter[0..8]}-{index:08x}`
+///
+/// Deterministic given the same sequence of submissions.
+fn generate_fraud_proof_id(receipt_hash: &str, submitter: &str, index: usize) -> String {
+    // Both receipt_hash and submitter are pre-validated hex, safe to slice.
+    let rh = if receipt_hash.len() >= 8 {
+        &receipt_hash[..8]
+    } else {
+        receipt_hash
+    };
+    let sa = if submitter.len() >= 8 {
+        &submitter[..8]
+    } else {
+        submitter
+    };
+    format!("fp-{}-{}-{:08x}", rh, sa, index)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FRAUD PROOF STATE (14C.C.26)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Shared state for fraud proof handlers.
+///
+/// Holds thread-safe reference to the fraud proof log.
+/// Manual `Clone` — only clones `Arc`, does NOT require inner `Clone`.
+pub struct FraudProofState {
+    pub log: FraudProofLog,
+}
+
+impl Clone for FraudProofState {
+    fn clone(&self) -> Self {
+        Self {
+            log: Arc::clone(&self.log),
+        }
+    }
+}
+
+/// Create a new empty fraud proof log.
+pub fn new_fraud_proof_log() -> FraudProofLog {
+    Arc::new(RwLock::new(Vec::new()))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLER: POST /fraud-proof (14C.C.26)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Handle `POST /fraud-proof` — fraud proof submission (placeholder).
+///
+/// Validates all fields, logs the submission, and returns a placeholder response.
+/// **No verification, arbitration, slashing, or challenge resolution is performed.**
+///
+/// ## HTTP Status Codes
+///
+/// | Code | Condition                     |
+/// |------|-------------------------------|
+/// | 200  | Accepted (placeholder)        |
+/// | 400  | Validation error              |
+/// | 500  | Internal lock error           |
+pub async fn handle_fraud_proof_submit(
+    State(state): State<FraudProofState>,
+    Json(body): Json<FraudProofRequest>,
+) -> axum::response::Response {
+    // 1. Validate receipt_hash (64 hex)
+    if let Err(reason) = validate_receipt_hash(&body.receipt_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: format!("invalid receipt_hash: {}", reason),
+            }),
+        )
+            .into_response();
+    }
+
+    // 2. Validate submitter_address (40 hex)
+    if let Err(reason) = validate_address(&body.submitter_address) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: format!("invalid submitter_address: {}", reason),
+            }),
+        )
+            .into_response();
+    }
+
+    // 3. Validate proof_type
+    if let Err(reason) = validate_proof_type(&body.proof_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody { error: reason }),
+        )
+            .into_response();
+    }
+
+    // 4. Validate proof_data non-empty
+    if body.proof_data.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "proof_data must not be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // 5. Lock log, generate ID, push entry, log structured event.
+    let fraud_proof_id;
+    match state.log.write() {
+        Ok(mut log) => {
+            let index = log.len();
+            fraud_proof_id =
+                generate_fraud_proof_id(&body.receipt_hash, &body.submitter_address, index);
+
+            let entry = FraudProofLogEntry {
+                receipt_hash: body.receipt_hash.clone(),
+                proof_type: body.proof_type.clone(),
+                proof_data: body.proof_data.clone(),
+                submitter_address: body.submitter_address.clone(),
+                challenge_id: body.challenge_id.clone(),
+                fraud_proof_id: fraud_proof_id.clone(),
+            };
+
+            log.push(entry);
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: format!("log lock error: {}", err),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    // 6. Structured logging
+    info!(
+        "[FRAUD_PROOF] SUBMITTED receipt={} type={} submitter={}",
+        body.receipt_hash, body.proof_type, body.submitter_address
+    );
+
+    // 7. Return placeholder response. No processing, verification, or arbitration.
+    let resp = FraudProofResponse {
+        accepted: true,
+        fraud_proof_id,
+        message: "fraud proof accepted (placeholder)".to_string(),
+        note: FRAUD_PROOF_PLACEHOLDER_NOTE.to_string(),
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLER: GET /fraud-proofs (14C.C.26)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Handle `GET /fraud-proofs` — list all logged fraud proof submissions.
+///
+/// Returns entries in insertion order (deterministic). Does not mutate state.
+///
+/// ## HTTP Status Codes
+///
+/// | Code | Condition                     |
+/// |------|-------------------------------|
+/// | 200  | Success                       |
+/// | 500  | Internal lock error           |
+pub async fn handle_fraud_proofs_list(
+    State(state): State<FraudProofState>,
+) -> axum::response::Response {
+    match state.log.read() {
+        Ok(log) => {
+            let entries: Vec<FraudProofLogEntry> = log.clone();
+            (StatusCode::OK, Json(entries)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("log lock error: {}", err),
             }),
         )
             .into_response(),
@@ -2153,5 +2447,477 @@ mod tests {
                 assert!(false, "deserialize failed in test: {}", e);
             }
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FRAUD PROOF TEST HELPERS (14C.C.26)
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn make_fraud_state() -> FraudProofState {
+        FraudProofState {
+            log: new_fraud_proof_log(),
+        }
+    }
+
+    fn valid_fraud_request() -> FraudProofRequest {
+        FraudProofRequest {
+            receipt_hash: valid_hash(0xAA),
+            proof_type: "execution_mismatch".to_string(),
+            proof_data: vec![1, 2, 3, 4],
+            submitter_address: valid_address(0xBB),
+            challenge_id: Some("challenge-001".to_string()),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-1: fraud_proof_valid_submission
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_valid_submission() {
+        let state = make_fraud_state();
+        let req = valid_fraud_request();
+        let resp = handle_fraud_proof_submit(State(state), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<FraudProofResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert!(r.accepted);
+                assert!(!r.fraud_proof_id.is_empty());
+                assert_eq!(r.message, "fraud proof accepted (placeholder)");
+                assert_eq!(r.note, FRAUD_PROOF_PLACEHOLDER_NOTE);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-2: fraud_proof_invalid_hash
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_invalid_hash() {
+        let state = make_fraud_state();
+
+        // Too short
+        let mut req = valid_fraud_request();
+        req.receipt_hash = "abcd".to_string();
+        let resp = handle_fraud_proof_submit(State(state.clone()), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Empty
+        let mut req2 = valid_fraud_request();
+        req2.receipt_hash = String::new();
+        let resp2 = handle_fraud_proof_submit(State(state.clone()), Json(req2)).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+
+        // Non-hex
+        let mut req3 = valid_fraud_request();
+        req3.receipt_hash = "g".repeat(64);
+        let resp3 = handle_fraud_proof_submit(State(state), Json(req3)).await;
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-3: fraud_proof_invalid_address
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_invalid_address() {
+        let state = make_fraud_state();
+
+        // Too short
+        let mut req = valid_fraud_request();
+        req.submitter_address = "abc".to_string();
+        let resp = handle_fraud_proof_submit(State(state.clone()), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 0x prefix
+        let mut req2 = valid_fraud_request();
+        req2.submitter_address = format!("0x{}", "a".repeat(40));
+        let resp2 = handle_fraud_proof_submit(State(state.clone()), Json(req2)).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+
+        // Non-hex
+        let mut req3 = valid_fraud_request();
+        req3.submitter_address = "z".repeat(40);
+        let resp3 = handle_fraud_proof_submit(State(state), Json(req3)).await;
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-4: fraud_proof_invalid_type
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_invalid_type() {
+        let state = make_fraud_state();
+
+        let invalid_types = vec![
+            "invalid",
+            "EXECUTION_MISMATCH",
+            "executionMismatch",
+            "",
+            "slash",
+        ];
+
+        for bad_type in invalid_types {
+            let mut req = valid_fraud_request();
+            req.proof_type = bad_type.to_string();
+            let resp = handle_fraud_proof_submit(State(state.clone()), Json(req)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for proof_type: {:?}",
+                bad_type
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-5: fraud_proof_empty_data
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_empty_data() {
+        let state = make_fraud_state();
+        let mut req = valid_fraud_request();
+        req.proof_data = Vec::new();
+        let resp = handle_fraud_proof_submit(State(state), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_string(resp).await;
+        assert!(body.contains("proof_data must not be empty"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-6: fraud_proof_response_placeholder_note
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_response_placeholder_note() {
+        let state = make_fraud_state();
+        let req = valid_fraud_request();
+        let resp = handle_fraud_proof_submit(State(state), Json(req)).await;
+        let body = body_string(resp).await;
+        let parsed: Result<FraudProofResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                // Exact string match per contract
+                assert_eq!(
+                    r.note,
+                    "placeholder \u{2014} not processed until Tahap 18.8"
+                );
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-7: fraud_proof_logged
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_logged() {
+        let state = make_fraud_state();
+        let req = valid_fraud_request();
+        let rh = req.receipt_hash.clone();
+        let sa = req.submitter_address.clone();
+
+        let resp = handle_fraud_proof_submit(State(state.clone()), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify log contains the entry
+        match state.log.read() {
+            Ok(log) => {
+                assert_eq!(log.len(), 1);
+                assert_eq!(log[0].receipt_hash, rh);
+                assert_eq!(log[0].submitter_address, sa);
+                assert_eq!(log[0].proof_type, "execution_mismatch");
+                assert!(!log[0].fraud_proof_id.is_empty());
+            }
+            Err(e) => {
+                assert!(false, "lock error in test: {}", e);
+            }
+        };
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-8: fraud_proof_id_generated
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_id_generated() {
+        let state = make_fraud_state();
+        let req = valid_fraud_request();
+        let resp = handle_fraud_proof_submit(State(state), Json(req)).await;
+        let body = body_string(resp).await;
+        let parsed: Result<FraudProofResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                // Must start with "fp-"
+                assert!(r.fraud_proof_id.starts_with("fp-"));
+                // Must contain receipt hash prefix
+                let rh_prefix = &valid_hash(0xAA)[..8];
+                assert!(r.fraud_proof_id.contains(rh_prefix));
+                // Must be non-empty and have expected format parts
+                let parts: Vec<&str> = r.fraud_proof_id.split('-').collect();
+                assert!(parts.len() >= 4, "expected fp-XX-YY-ZZ format");
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-9: fraud_proofs_query_returns_list
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proofs_query_returns_list() {
+        let state = make_fraud_state();
+
+        // Submit 2 fraud proofs
+        let mut req1 = valid_fraud_request();
+        req1.receipt_hash = valid_hash(0x01);
+        let r1 = handle_fraud_proof_submit(State(state.clone()), Json(req1)).await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let mut req2 = valid_fraud_request();
+        req2.receipt_hash = valid_hash(0x02);
+        let r2 = handle_fraud_proof_submit(State(state.clone()), Json(req2)).await;
+        assert_eq!(r2.status(), StatusCode::OK);
+
+        // Query list
+        let list_resp = handle_fraud_proofs_list(State(state)).await;
+        assert_eq!(list_resp.status(), StatusCode::OK);
+
+        let body = body_string(list_resp).await;
+        let parsed: Result<Vec<FraudProofLogEntry>, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(entries) => {
+                assert_eq!(entries.len(), 2);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-10: fraud_proofs_order_deterministic
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proofs_order_deterministic() {
+        let state = make_fraud_state();
+
+        // Submit A then B
+        let mut req_a = valid_fraud_request();
+        req_a.receipt_hash = valid_hash(0xAA);
+        req_a.proof_type = "execution_mismatch".to_string();
+        let _ = handle_fraud_proof_submit(State(state.clone()), Json(req_a)).await;
+
+        let mut req_b = valid_fraud_request();
+        req_b.receipt_hash = valid_hash(0xBB);
+        req_b.proof_type = "invalid_commitment".to_string();
+        let _ = handle_fraud_proof_submit(State(state.clone()), Json(req_b)).await;
+
+        // Query twice, must be identical
+        let list1 = handle_fraud_proofs_list(State(state.clone())).await;
+        let body1 = body_string(list1).await;
+
+        let list2 = handle_fraud_proofs_list(State(state)).await;
+        let body2 = body_string(list2).await;
+
+        assert_eq!(body1, body2, "deterministic: two calls must produce identical JSON");
+
+        // Verify order: A first, B second
+        let parsed: Result<Vec<FraudProofLogEntry>, _> = serde_json::from_str(&body1);
+        match parsed {
+            Ok(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].receipt_hash, valid_hash(0xAA));
+                assert_eq!(entries[1].receipt_hash, valid_hash(0xBB));
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-11: no_processing_logic_present
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn no_processing_logic_present() {
+        let state = make_fraud_state();
+        let req = valid_fraud_request();
+        let resp = handle_fraud_proof_submit(State(state.clone()), Json(req)).await;
+        let body = body_string(resp).await;
+        let parsed: Result<FraudProofResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                // Placeholder: accepted = true, no verification result
+                assert!(r.accepted);
+                assert_eq!(r.message, "fraud proof accepted (placeholder)");
+                assert!(r.note.contains("placeholder"));
+                assert!(r.note.contains("not processed"));
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+
+        // Verify the log entry exists but has no processed/verified fields
+        // (FraudProofLogEntry only stores submission data, no result fields)
+        match state.log.read() {
+            Ok(log) => {
+                assert_eq!(log.len(), 1);
+                // Only submission fields present — no processing output stored
+                assert_eq!(log[0].proof_type, "execution_mismatch");
+            }
+            Err(e) => {
+                assert!(false, "lock error in test: {}", e);
+            }
+        };
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-12: no_panic_invalid_json
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn no_panic_invalid_json_fraud_proof() {
+        let state = make_fraud_state();
+
+        // All valid except individual fields made invalid
+        let cases: Vec<FraudProofRequest> = vec![
+            // Empty receipt_hash
+            FraudProofRequest {
+                receipt_hash: String::new(),
+                proof_type: "execution_mismatch".to_string(),
+                proof_data: vec![1],
+                submitter_address: valid_address(0x01),
+                challenge_id: None,
+            },
+            // Empty submitter_address
+            FraudProofRequest {
+                receipt_hash: valid_hash(0x01),
+                proof_type: "execution_mismatch".to_string(),
+                proof_data: vec![1],
+                submitter_address: String::new(),
+                challenge_id: None,
+            },
+            // Invalid proof_type
+            FraudProofRequest {
+                receipt_hash: valid_hash(0x01),
+                proof_type: "not_a_real_type".to_string(),
+                proof_data: vec![1],
+                submitter_address: valid_address(0x01),
+                challenge_id: None,
+            },
+            // Empty proof_data
+            FraudProofRequest {
+                receipt_hash: valid_hash(0x01),
+                proof_type: "execution_mismatch".to_string(),
+                proof_data: Vec::new(),
+                submitter_address: valid_address(0x01),
+                challenge_id: None,
+            },
+            // Whitespace in hash
+            FraudProofRequest {
+                receipt_hash: " ".repeat(64),
+                proof_type: "execution_mismatch".to_string(),
+                proof_data: vec![1],
+                submitter_address: valid_address(0x01),
+                challenge_id: None,
+            },
+        ];
+
+        for (i, bad_req) in cases.into_iter().enumerate() {
+            let resp = handle_fraud_proof_submit(State(state.clone()), Json(bad_req)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for test case {}",
+                i
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-13: fraud_proof_all_valid_types
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_all_valid_types() {
+        let state = make_fraud_state();
+        let types = ["execution_mismatch", "invalid_commitment", "resource_inflation"];
+
+        for (i, pt) in types.iter().enumerate() {
+            let mut req = valid_fraud_request();
+            req.proof_type = pt.to_string();
+            req.receipt_hash = valid_hash(i as u8);
+            let resp = handle_fraud_proof_submit(State(state.clone()), Json(req)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "expected 200 for proof_type: {}",
+                pt
+            );
+        }
+
+        // Verify all 3 logged
+        match state.log.read() {
+            Ok(log) => {
+                assert_eq!(log.len(), 3);
+            }
+            Err(e) => {
+                assert!(false, "lock error in test: {}", e);
+            }
+        };
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.26-14: fraud_proof_challenge_id_optional
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn fraud_proof_challenge_id_optional() {
+        let state = make_fraud_state();
+
+        // With challenge_id
+        let mut req1 = valid_fraud_request();
+        req1.challenge_id = Some("ch-999".to_string());
+        let r1 = handle_fraud_proof_submit(State(state.clone()), Json(req1)).await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // Without challenge_id
+        let mut req2 = valid_fraud_request();
+        req2.receipt_hash = valid_hash(0xCC);
+        req2.challenge_id = None;
+        let r2 = handle_fraud_proof_submit(State(state.clone()), Json(req2)).await;
+        assert_eq!(r2.status(), StatusCode::OK);
+
+        // Verify both logged correctly
+        match state.log.read() {
+            Ok(log) => {
+                assert_eq!(log.len(), 2);
+                assert_eq!(log[0].challenge_id, Some("ch-999".to_string()));
+                assert_eq!(log[1].challenge_id, None);
+            }
+            Err(e) => {
+                assert!(false, "lock error in test: {}", e);
+            }
+        };
     }
 }
