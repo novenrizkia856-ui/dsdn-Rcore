@@ -1,6 +1,7 @@
-//! # Receipt Status Query Handlers (14C.C.24)
+//! # Economic Query Handlers (14C.C.24 + 14C.C.25)
 //!
-//! HTTP handlers for querying receipt status from the chain via coordinator.
+//! HTTP handlers for querying receipt status and reward economics from the
+//! chain via coordinator.
 //!
 //! ## Architecture
 //!
@@ -17,6 +18,22 @@
 //!                                  validate_all                    ▼
 //!                                  concurrent query   ReceiptStatusResponse
 //!                                  preserve order
+//!
+//! Client ──GET /rewards/:address──▶ handle_reward_balance ──▶ RewardQueryService
+//!                                        │                           │
+//!                                   validate_address           query_balance
+//!                                        │                           │
+//!                                        ▼                           ▼
+//!                                    400 / 200              ChainRewardInfo
+//!                                                                    │
+//! Client ──GET /rewards/validators──▶ handle_validator_rewards       │
+//!                                        │                           │
+//!                                   list + sort by id     list_validator_rewards
+//!                                        │                           │
+//! Client ──GET /rewards/treasury──▶ handle_treasury_rewards          │
+//!                                        │                    query_treasury
+//!                                        ▼                           │
+//!                                    200 / 500           ChainTreasuryInfo
 //! ```
 //!
 //! ## Endpoints
@@ -25,6 +42,9 @@
 //! |-----------------------|--------|-------------------------------------|
 //! | `/receipt/:hash`      | GET    | Query single receipt status by hash |
 //! | `/receipts/status`    | POST   | Batch query up to 100 receipt hashes|
+//! | `/rewards/:address`   | GET    | Query reward balance by address     |
+//! | `/rewards/validators` | GET    | List all validator reward summaries  |
+//! | `/rewards/treasury`   | GET    | Query treasury reward statistics    |
 //!
 //! ## Status Values
 //!
@@ -41,6 +61,14 @@
 //!
 //! All receipt hashes must be:
 //! - Exactly 64 hex characters (a-f, A-F, 0-9)
+//! - No whitespace
+//! - No `0x` / `0X` prefix
+//! - Not empty
+//!
+//! ## Address Validation (14C.C.25)
+//!
+//! All reward addresses must be:
+//! - Exactly 40 hex characters (a-f, A-F, 0-9)
 //! - No whitespace
 //! - No `0x` / `0X` prefix
 //! - Not empty
@@ -426,6 +454,355 @@ pub async fn handle_batch_receipt_status<S: ReceiptQueryService>(
     }
 
     (StatusCode::OK, Json(responses)).into_response()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CHAIN REWARD DATA MODELS (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Raw reward/balance info returned by chain state query for an address.
+///
+/// Internal data model produced by [`RewardQueryService::query_balance`].
+/// Handlers map it to [`RewardBalanceResponse`] for the wire.
+#[derive(Debug, Clone)]
+pub struct ChainRewardInfo {
+    /// Total balance in smallest denomination.
+    pub balance: u128,
+    /// Pending (unclaimed) rewards.
+    pub pending_rewards: u128,
+    /// Already-claimed rewards.
+    pub claimed_rewards: u128,
+    /// Earnings from node operation.
+    pub node_earnings: u128,
+    /// Whether this address is a registered validator.
+    pub is_validator: bool,
+    /// Whether this address is a registered service node.
+    pub is_node: bool,
+}
+
+/// Raw validator reward info from chain state.
+///
+/// Internal data model produced by [`RewardQueryService::list_validator_rewards`].
+#[derive(Debug, Clone)]
+pub struct ChainValidatorRewardInfo {
+    /// Unique validator identifier (hex).
+    pub validator_id: String,
+    /// Pending (unclaimed) rewards.
+    pub pending_rewards: u128,
+    /// Already-claimed rewards.
+    pub claimed_rewards: u128,
+    /// Total lifetime earnings.
+    pub total_earned: u128,
+}
+
+/// Raw treasury info from chain state.
+///
+/// Internal data model produced by [`RewardQueryService::query_treasury`].
+#[derive(Debug, Clone)]
+pub struct ChainTreasuryInfo {
+    /// Current treasury balance.
+    pub treasury_balance: u128,
+    /// Total rewards distributed across all recipients.
+    pub total_rewards_distributed: u128,
+    /// Total rewards distributed to validators specifically.
+    pub total_validator_rewards: u128,
+    /// Total rewards distributed to service nodes specifically.
+    pub total_node_rewards: u128,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REWARD QUERY SERVICE TRAIT (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Abstraction over reward/balance queries against the chain.
+///
+/// # Implementations
+///
+/// - Production: wraps `CoordinatorClient` RPC call (stub until RPC available)
+/// - Testing: `MockRewardQuery` — deterministic, no network
+///
+/// # Thread Safety
+///
+/// `Send + Sync + 'static` required for use behind `Arc` in async Axum handlers.
+pub trait RewardQueryService: Send + Sync + 'static {
+    /// Query reward balance for a single address.
+    ///
+    /// Returns `Ok(info)` on success (including zero-balance addresses).
+    /// Returns `Err(msg)` only on internal / network errors.
+    fn query_balance(
+        &self,
+        address: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ChainRewardInfo, String>> + Send + '_>>;
+
+    /// List all validator reward summaries.
+    ///
+    /// Returns the full set of validators. Handlers sort by `validator_id`.
+    /// Returns `Err(msg)` only on internal / network errors.
+    fn list_validator_rewards(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ChainValidatorRewardInfo>, String>> + Send + '_>>;
+
+    /// Query treasury reward statistics.
+    ///
+    /// Returns `Err(msg)` only on internal / network errors.
+    fn query_treasury(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ChainTreasuryInfo, String>> + Send + '_>>;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REWARD RESPONSE STRUCTS (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Reward balance response for `GET /rewards/:address`.
+///
+/// All fields are `Serialize` + `Deserialize` for JSON round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RewardBalanceResponse {
+    /// The queried address (hex, 40 chars).
+    pub address: String,
+
+    /// Total balance in smallest denomination.
+    pub balance: u128,
+
+    /// Pending (unclaimed) rewards.
+    pub pending_rewards: u128,
+
+    /// Already-claimed rewards.
+    pub claimed_rewards: u128,
+
+    /// Earnings from node operation.
+    pub node_earnings: u128,
+
+    /// Whether this address is a registered validator.
+    pub is_validator: bool,
+
+    /// Whether this address is a registered service node.
+    pub is_node: bool,
+}
+
+/// Validator reward summary for `GET /rewards/validators`.
+///
+/// Returned as `Vec<ValidatorRewardSummary>` sorted by `validator_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidatorRewardSummary {
+    /// Unique validator identifier.
+    pub validator_id: String,
+
+    /// Pending (unclaimed) rewards.
+    pub pending_rewards: u128,
+
+    /// Already-claimed rewards.
+    pub claimed_rewards: u128,
+
+    /// Total lifetime earnings.
+    pub total_earned: u128,
+}
+
+/// Treasury reward statistics for `GET /rewards/treasury`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreasuryRewardResponse {
+    /// Current treasury balance.
+    pub treasury_balance: u128,
+
+    /// Total rewards distributed across all recipients.
+    pub total_rewards_distributed: u128,
+
+    /// Total rewards distributed to validators specifically.
+    pub total_validator_rewards: u128,
+
+    /// Total rewards distributed to service nodes specifically.
+    pub total_node_rewards: u128,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADDRESS VALIDATION (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Validate a reward address string.
+///
+/// Rules enforced:
+/// 1. Not empty
+/// 2. No whitespace anywhere
+/// 3. No `0x` / `0X` prefix
+/// 4. Exactly 40 characters
+/// 5. All characters valid hex (`0-9`, `a-f`, `A-F`)
+///
+/// Returns `Ok(())` on success, `Err(reason)` on failure.
+pub fn validate_address(address: &str) -> Result<(), String> {
+    if address.is_empty() {
+        return Err("address must not be empty".to_string());
+    }
+
+    if address.chars().any(|c| c.is_whitespace()) {
+        return Err("address must not contain whitespace".to_string());
+    }
+
+    if address.starts_with("0x") || address.starts_with("0X") {
+        return Err("address must not have 0x prefix".to_string());
+    }
+
+    if address.len() != 40 {
+        return Err(format!(
+            "address must be exactly 40 hex characters, got {}",
+            address.len()
+        ));
+    }
+
+    if !address.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("address contains non-hex characters".to_string());
+    }
+
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REWARD STATE (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Shared state for reward handlers.
+///
+/// Generic over `R` to support both production and test implementations.
+/// Manual `Clone` impl — only clones `Arc`, does NOT require `R: Clone`.
+pub struct EconomicRewardState<R: RewardQueryService> {
+    pub service: Arc<R>,
+}
+
+impl<R: RewardQueryService> Clone for EconomicRewardState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            service: Arc::clone(&self.service),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLER: GET /rewards/:address (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Handle `GET /rewards/:address` — single address reward balance query.
+///
+/// ## HTTP Status Codes
+///
+/// | Code | Condition                |
+/// |------|--------------------------|
+/// | 200  | Successful query         |
+/// | 400  | Invalid address format   |
+/// | 500  | Internal query error     |
+pub async fn handle_reward_balance<R: RewardQueryService>(
+    Path(address): Path<String>,
+    State(state): State<EconomicRewardState<R>>,
+) -> axum::response::Response {
+    // 1. Validate address
+    if let Err(reason) = validate_address(&address) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody { error: reason }),
+        )
+            .into_response();
+    }
+
+    // 2. Query chain
+    match state.service.query_balance(&address).await {
+        Ok(info) => {
+            let resp = RewardBalanceResponse {
+                address,
+                balance: info.balance,
+                pending_rewards: info.pending_rewards,
+                claimed_rewards: info.claimed_rewards,
+                node_earnings: info.node_earnings,
+                is_validator: info.is_validator,
+                is_node: info.is_node,
+            };
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("internal query error: {}", err),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLER: GET /rewards/validators (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Handle `GET /rewards/validators` — list all validator reward summaries.
+///
+/// Response is sorted by `validator_id` (lexicographic) for deterministic order.
+///
+/// ## HTTP Status Codes
+///
+/// | Code | Condition                |
+/// |------|--------------------------|
+/// | 200  | Successful query         |
+/// | 500  | Internal query error     |
+pub async fn handle_validator_rewards<R: RewardQueryService>(
+    State(state): State<EconomicRewardState<R>>,
+) -> axum::response::Response {
+    match state.service.list_validator_rewards().await {
+        Ok(mut validators) => {
+            // Sort by validator_id for deterministic output order.
+            validators.sort_by(|a, b| a.validator_id.cmp(&b.validator_id));
+
+            let summaries: Vec<ValidatorRewardSummary> = validators
+                .into_iter()
+                .map(|v| ValidatorRewardSummary {
+                    validator_id: v.validator_id,
+                    pending_rewards: v.pending_rewards,
+                    claimed_rewards: v.claimed_rewards,
+                    total_earned: v.total_earned,
+                })
+                .collect();
+
+            (StatusCode::OK, Json(summaries)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("internal query error: {}", err),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLER: GET /rewards/treasury (14C.C.25)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Handle `GET /rewards/treasury` — treasury reward statistics.
+///
+/// ## HTTP Status Codes
+///
+/// | Code | Condition                |
+/// |------|--------------------------|
+/// | 200  | Successful query         |
+/// | 500  | Internal query error     |
+pub async fn handle_treasury_rewards<R: RewardQueryService>(
+    State(state): State<EconomicRewardState<R>>,
+) -> axum::response::Response {
+    match state.service.query_treasury().await {
+        Ok(info) => {
+            let resp = TreasuryRewardResponse {
+                treasury_balance: info.treasury_balance,
+                total_rewards_distributed: info.total_rewards_distributed,
+                total_validator_rewards: info.total_validator_rewards,
+                total_node_rewards: info.total_node_rewards,
+            };
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("internal query error: {}", err),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1049,5 +1426,732 @@ mod tests {
 
         // Invalid: only spaces (non-empty but all whitespace, len != 64)
         assert!(validate_receipt_hash("   ").is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MOCK REWARD QUERY SERVICE (14C.C.25)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Mock implementation of [`RewardQueryService`].
+    ///
+    /// Deterministic, no network, no SystemTime, no sleep.
+    /// Thread-safe via `Mutex`.
+    struct MockRewardQuery {
+        balances: Mutex<HashMap<String, ChainRewardInfo>>,
+        validators: Mutex<Vec<ChainValidatorRewardInfo>>,
+        treasury: Mutex<Option<ChainTreasuryInfo>>,
+        force_error: Mutex<Option<String>>,
+    }
+
+    impl MockRewardQuery {
+        fn new() -> Self {
+            Self {
+                balances: Mutex::new(HashMap::new()),
+                validators: Mutex::new(Vec::new()),
+                treasury: Mutex::new(None),
+                force_error: Mutex::new(None),
+            }
+        }
+
+        fn insert_balance(&self, address: &str, info: ChainRewardInfo) {
+            if let Ok(mut map) = self.balances.lock() {
+                map.insert(address.to_string(), info);
+            }
+        }
+
+        fn set_validators(&self, vals: Vec<ChainValidatorRewardInfo>) {
+            if let Ok(mut v) = self.validators.lock() {
+                *v = vals;
+            }
+        }
+
+        fn set_treasury(&self, info: ChainTreasuryInfo) {
+            if let Ok(mut t) = self.treasury.lock() {
+                *t = Some(info);
+            }
+        }
+
+        fn set_force_error_reward(&self, err: &str) {
+            if let Ok(mut e) = self.force_error.lock() {
+                *e = Some(err.to_string());
+            }
+        }
+    }
+
+    impl RewardQueryService for MockRewardQuery {
+        fn query_balance(
+            &self,
+            address: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<ChainRewardInfo, String>> + Send + '_>> {
+            let addr = address.to_string();
+            Box::pin(async move {
+                if let Ok(guard) = self.force_error.lock() {
+                    if let Some(ref err) = *guard {
+                        return Err(err.clone());
+                    }
+                }
+                if let Ok(map) = self.balances.lock() {
+                    if let Some(info) = map.get(&addr) {
+                        return Ok(info.clone());
+                    }
+                }
+                // Default: zero balance, not validator, not node
+                Ok(ChainRewardInfo {
+                    balance: 0,
+                    pending_rewards: 0,
+                    claimed_rewards: 0,
+                    node_earnings: 0,
+                    is_validator: false,
+                    is_node: false,
+                })
+            })
+        }
+
+        fn list_validator_rewards(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ChainValidatorRewardInfo>, String>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if let Ok(guard) = self.force_error.lock() {
+                    if let Some(ref err) = *guard {
+                        return Err(err.clone());
+                    }
+                }
+                if let Ok(v) = self.validators.lock() {
+                    return Ok(v.clone());
+                }
+                Ok(Vec::new())
+            })
+        }
+
+        fn query_treasury(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<ChainTreasuryInfo, String>> + Send + '_>> {
+            Box::pin(async move {
+                if let Ok(guard) = self.force_error.lock() {
+                    if let Some(ref err) = *guard {
+                        return Err(err.clone());
+                    }
+                }
+                if let Ok(t) = self.treasury.lock() {
+                    if let Some(ref info) = *t {
+                        return Ok(info.clone());
+                    }
+                }
+                // Default: zero treasury
+                Ok(ChainTreasuryInfo {
+                    treasury_balance: 0,
+                    total_rewards_distributed: 0,
+                    total_validator_rewards: 0,
+                    total_node_rewards: 0,
+                })
+            })
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // REWARD TEST HELPERS
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Generate a valid 40-char hex address from a u8 seed.
+    fn valid_address(seed: u8) -> String {
+        format!("{:0>40x}", seed)
+    }
+
+    fn make_reward_state(mock: Arc<MockRewardQuery>) -> EconomicRewardState<MockRewardQuery> {
+        EconomicRewardState { service: mock }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-1: valid_reward_balance_query
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn valid_reward_balance_query() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0xAB);
+        mock.insert_balance(
+            &addr,
+            ChainRewardInfo {
+                balance: 50000,
+                pending_rewards: 1000,
+                claimed_rewards: 4000,
+                node_earnings: 3000,
+                is_validator: true,
+                is_node: true,
+            },
+        );
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert_eq!(r.address, addr);
+                assert_eq!(r.balance, 50000);
+                assert_eq!(r.pending_rewards, 1000);
+                assert_eq!(r.claimed_rewards, 4000);
+                assert_eq!(r.node_earnings, 3000);
+                assert!(r.is_validator);
+                assert!(r.is_node);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-2: invalid_address_length
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn invalid_address_length() {
+        // Too short
+        assert!(validate_address("abcdef").is_err());
+        // Too long (41 chars)
+        assert!(validate_address(&"a".repeat(41)).is_err());
+        // Empty
+        assert!(validate_address("").is_err());
+        // Exactly 39
+        assert!(validate_address(&"b".repeat(39)).is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-3: invalid_address_hex
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn invalid_address_hex() {
+        // Contains 'g'
+        let with_g = format!("{}g", "a".repeat(39));
+        assert!(validate_address(&with_g).is_err());
+
+        // Contains space
+        let with_space = format!("{} {}", "a".repeat(20), "b".repeat(19));
+        assert!(validate_address(&with_space).is_err());
+
+        // 0x prefix (makes total 42 chars, but prefix check fires first)
+        let with_prefix = format!("0x{}", "a".repeat(40));
+        assert!(validate_address(&with_prefix).is_err());
+
+        // 0X prefix
+        let with_upper_prefix = format!("0X{}", "a".repeat(40));
+        assert!(validate_address(&with_upper_prefix).is_err());
+
+        // Valid: uppercase hex
+        let upper = "A".repeat(40);
+        assert!(validate_address(&upper).is_ok());
+
+        // Valid: mixed hex
+        let mixed = "0123456789abcdefABCD".repeat(2);
+        assert!(validate_address(&mixed).is_ok());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-4: validator_balance_fields_correct
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn validator_balance_fields_correct() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0x01);
+        mock.insert_balance(
+            &addr,
+            ChainRewardInfo {
+                balance: 100_000,
+                pending_rewards: 25_000,
+                claimed_rewards: 75_000,
+                node_earnings: 0,
+                is_validator: true,
+                is_node: false,
+            },
+        );
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert!(r.is_validator);
+                assert!(!r.is_node);
+                assert_eq!(r.pending_rewards, 25_000);
+                assert_eq!(r.claimed_rewards, 75_000);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-5: node_balance_fields_correct
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn node_balance_fields_correct() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0x02);
+        mock.insert_balance(
+            &addr,
+            ChainRewardInfo {
+                balance: 8_000,
+                pending_rewards: 0,
+                claimed_rewards: 0,
+                node_earnings: 8_000,
+                is_validator: false,
+                is_node: true,
+            },
+        );
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert!(!r.is_validator);
+                assert!(r.is_node);
+                assert_eq!(r.node_earnings, 8_000);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-6: non_validator_non_node_balance
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn non_validator_non_node_balance() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0xFF);
+        // Not inserted → default zero balance
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert!(!r.is_validator);
+                assert!(!r.is_node);
+                assert_eq!(r.balance, 0);
+                assert_eq!(r.pending_rewards, 0);
+                assert_eq!(r.claimed_rewards, 0);
+                assert_eq!(r.node_earnings, 0);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-7: validator_list_sorted
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn validator_list_sorted() {
+        let mock = Arc::new(MockRewardQuery::new());
+        // Insert in reverse order: c, a, b
+        mock.set_validators(vec![
+            ChainValidatorRewardInfo {
+                validator_id: "cccc".to_string(),
+                pending_rewards: 300,
+                claimed_rewards: 0,
+                total_earned: 300,
+            },
+            ChainValidatorRewardInfo {
+                validator_id: "aaaa".to_string(),
+                pending_rewards: 100,
+                claimed_rewards: 0,
+                total_earned: 100,
+            },
+            ChainValidatorRewardInfo {
+                validator_id: "bbbb".to_string(),
+                pending_rewards: 200,
+                claimed_rewards: 0,
+                total_earned: 200,
+            },
+        ]);
+
+        let state = make_reward_state(mock);
+        let resp = handle_validator_rewards(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<Vec<ValidatorRewardSummary>, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(list) => {
+                assert_eq!(list.len(), 3);
+                // Must be sorted: aaaa, bbbb, cccc
+                assert_eq!(list[0].validator_id, "aaaa");
+                assert_eq!(list[1].validator_id, "bbbb");
+                assert_eq!(list[2].validator_id, "cccc");
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-8: validator_list_deterministic
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn validator_list_deterministic() {
+        let mock = Arc::new(MockRewardQuery::new());
+        mock.set_validators(vec![
+            ChainValidatorRewardInfo {
+                validator_id: "zzzz".to_string(),
+                pending_rewards: 10,
+                claimed_rewards: 5,
+                total_earned: 15,
+            },
+            ChainValidatorRewardInfo {
+                validator_id: "aaaa".to_string(),
+                pending_rewards: 20,
+                claimed_rewards: 10,
+                total_earned: 30,
+            },
+        ]);
+
+        let state = make_reward_state(mock);
+
+        // Call twice, compare serialized output
+        let resp1 = handle_validator_rewards(State(state.clone())).await;
+        let body1 = body_string(resp1).await;
+
+        let resp2 = handle_validator_rewards(State(state)).await;
+        let body2 = body_string(resp2).await;
+
+        assert_eq!(body1, body2, "deterministic: two calls must produce identical JSON");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-9: treasury_balance_query
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn treasury_balance_query() {
+        let mock = Arc::new(MockRewardQuery::new());
+        mock.set_treasury(ChainTreasuryInfo {
+            treasury_balance: 1_000_000,
+            total_rewards_distributed: 500_000,
+            total_validator_rewards: 300_000,
+            total_node_rewards: 200_000,
+        });
+
+        let state = make_reward_state(mock);
+        let resp = handle_treasury_rewards(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<TreasuryRewardResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(t) => {
+                assert_eq!(t.treasury_balance, 1_000_000);
+                assert_eq!(t.total_rewards_distributed, 500_000);
+                assert_eq!(t.total_validator_rewards, 300_000);
+                assert_eq!(t.total_node_rewards, 200_000);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-10: treasury_statistics_consistent
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn treasury_statistics_consistent() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let val_rewards: u128 = 700_000;
+        let node_rewards: u128 = 300_000;
+        // total_rewards_distributed == total_validator_rewards + total_node_rewards
+        let total_opt = val_rewards.checked_add(node_rewards);
+        assert!(total_opt.is_some(), "overflow in test setup");
+        let total = match total_opt {
+            Some(v) => v,
+            None => return,
+        };
+
+        mock.set_treasury(ChainTreasuryInfo {
+            treasury_balance: 2_000_000,
+            total_rewards_distributed: total,
+            total_validator_rewards: val_rewards,
+            total_node_rewards: node_rewards,
+        });
+
+        let state = make_reward_state(mock);
+        let resp = handle_treasury_rewards(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<TreasuryRewardResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(t) => {
+                // Consistency check: distributed == validator + node
+                let sum_opt = t.total_validator_rewards.checked_add(t.total_node_rewards);
+                assert!(sum_opt.is_some(), "overflow in consistency check");
+                let sum = match sum_opt {
+                    Some(v) => v,
+                    None => return,
+                };
+                assert_eq!(t.total_rewards_distributed, sum);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-11: large_balance_overflow_safe
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn large_balance_overflow_safe() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0xEE);
+        mock.insert_balance(
+            &addr,
+            ChainRewardInfo {
+                balance: u128::MAX,
+                pending_rewards: u128::MAX,
+                claimed_rewards: u128::MAX,
+                node_earnings: u128::MAX,
+                is_validator: true,
+                is_node: true,
+            },
+        );
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert_eq!(r.balance, u128::MAX);
+                assert_eq!(r.pending_rewards, u128::MAX);
+                assert_eq!(r.claimed_rewards, u128::MAX);
+                assert_eq!(r.node_earnings, u128::MAX);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-12: zero_balance_response
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn zero_balance_response() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0x00);
+        // Not inserted → default all-zeros
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(r) => {
+                assert_eq!(r.balance, 0);
+                assert_eq!(r.pending_rewards, 0);
+                assert_eq!(r.claimed_rewards, 0);
+                assert_eq!(r.node_earnings, 0);
+                assert!(!r.is_validator);
+                assert!(!r.is_node);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-13: no_panic_invalid_json
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Test that malformed / edge-case address inputs produce 400, never panic.
+    #[tokio::test]
+    async fn no_panic_invalid_json() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let state = make_reward_state(mock);
+
+        // Various invalid addresses that must NOT panic
+        let bad_addresses: Vec<String> = vec![
+            String::new(),
+            " ".to_string(),
+            "0x".to_string(),
+            format!("0x{}", "a".repeat(40)),
+            "\n".to_string(),
+            "\t".to_string(),
+            "g".repeat(40),
+            "!@#$%^&*()".to_string(),
+            "<script>alert(1)</script>".to_string(),
+        ];
+
+        for bad in &bad_addresses {
+            let resp = handle_reward_balance(
+                Path(bad.clone()),
+                State(state.clone()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for input: {:?}",
+                bad
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-14: deterministic_response_format
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn deterministic_response_format() {
+        let mock = Arc::new(MockRewardQuery::new());
+        let addr = valid_address(0x42);
+        mock.insert_balance(
+            &addr,
+            ChainRewardInfo {
+                balance: 9999,
+                pending_rewards: 111,
+                claimed_rewards: 222,
+                node_earnings: 333,
+                is_validator: false,
+                is_node: true,
+            },
+        );
+
+        let state = make_reward_state(mock);
+
+        // Two identical calls must produce byte-identical JSON
+        let resp1 = handle_reward_balance(Path(addr.clone()), State(state.clone())).await;
+        let body1 = body_string(resp1).await;
+
+        let resp2 = handle_reward_balance(Path(addr.clone()), State(state)).await;
+        let body2 = body_string(resp2).await;
+
+        assert_eq!(body1, body2, "deterministic: two calls must produce identical JSON");
+
+        // Verify round-trip
+        let parsed: Result<RewardBalanceResponse, _> = serde_json::from_str(&body1);
+        match parsed {
+            Ok(r) => {
+                assert_eq!(r.address, addr);
+                assert_eq!(r.balance, 9999);
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-15: reward_internal_error_returns_500
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn reward_internal_error_returns_500() {
+        let mock = Arc::new(MockRewardQuery::new());
+        mock.set_force_error_reward("database unavailable");
+        let addr = valid_address(0xDD);
+
+        let state = make_reward_state(mock);
+        let resp = handle_reward_balance(Path(addr), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-16: treasury_internal_error_returns_500
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn treasury_internal_error_returns_500() {
+        let mock = Arc::new(MockRewardQuery::new());
+        mock.set_force_error_reward("rpc timeout");
+
+        let state = make_reward_state(mock);
+        let resp = handle_treasury_rewards(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-17: address_validation_edge_cases
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn address_validation_edge_cases() {
+        // Valid: all zeros
+        assert!(validate_address(&"0".repeat(40)).is_ok());
+
+        // Valid: all F's
+        assert!(validate_address(&"F".repeat(40)).is_ok());
+
+        // Valid: mixed case (exactly 40 hex chars)
+        assert!(validate_address("aAbBcCdDeEfF0123456789aAbBcCdDeEfF012345").is_ok());
+
+        // Invalid: newline inside
+        let with_nl = format!("{}\n{}", "a".repeat(19), "b".repeat(20));
+        assert!(validate_address(&with_nl).is_err());
+
+        // Invalid: tab inside
+        let with_tab = format!("{}\t{}", "a".repeat(19), "b".repeat(20));
+        assert!(validate_address(&with_tab).is_err());
+
+        // Invalid: 0x prefix with exactly 40 hex after (total 42)
+        assert!(validate_address(&format!("0x{}", "a".repeat(40))).is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14C.C.25-18: validator_list_empty
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn validator_list_empty() {
+        let mock = Arc::new(MockRewardQuery::new());
+        // No validators set → empty list
+
+        let state = make_reward_state(mock);
+        let resp = handle_validator_rewards(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp).await;
+        let parsed: Result<Vec<ValidatorRewardSummary>, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(list) => {
+                assert!(list.is_empty());
+            }
+            Err(e) => {
+                assert!(false, "deserialize failed in test: {}", e);
+            }
+        }
     }
 }

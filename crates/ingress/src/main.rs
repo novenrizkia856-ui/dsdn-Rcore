@@ -77,6 +77,23 @@
 //!
 //! Min 1, max 100 hashes. Response order matches input order.
 //!
+//! ### Reward Balance Endpoints (14C.C.25)
+//!
+//! | Endpoint              | Method | Description                              |
+//! |-----------------------|--------|------------------------------------------|
+//! | `/rewards/:address`   | GET    | Query reward balance by address          |
+//! | `/rewards/validators` | GET    | List all validator reward summaries       |
+//! | `/rewards/treasury`   | GET    | Query treasury reward statistics          |
+//!
+//! #### Address Validation
+//!
+//! Hex-only, exactly 40 chars, no whitespace, no `0x` prefix.
+//! Invalid address → HTTP 400.
+//!
+//! #### Validator List
+//!
+//! Sorted by `validator_id` (lexicographic). Deterministic order guaranteed.
+//!
 //! ## Endpoint Details
 //!
 //! ### GET /health
@@ -203,6 +220,7 @@
 //! | `metrics`        | Observability & Prometheus metrics               |
 //! | `rate_limit`     | Rate limiting middleware                         |
 //! | `economic_handlers` | Receipt status query endpoints (14C.C.24)     |
+//! |                     | Reward balance query endpoints (14C.C.25)     |
 //!
 //! ## DA Integration
 //!
@@ -1024,6 +1042,86 @@ impl economic_handlers::ReceiptQueryService for CoordinatorReceiptQueryStub {
     }
 }
 
+/// Stub implementation of [`economic_handlers::RewardQueryService`] backed
+/// by `CoordinatorClient`.
+///
+/// Returns zero-balance / empty results for all queries until coordinator RPC
+/// exposes real reward-state endpoints.  HTTP routes, validation, and sorting
+/// logic are fully functional regardless.
+#[derive(Clone)]
+struct CoordinatorRewardQueryStub {
+    _coord: Arc<CoordinatorClient>,
+}
+
+impl CoordinatorRewardQueryStub {
+    fn new(coord: Arc<CoordinatorClient>) -> Self {
+        Self { _coord: coord }
+    }
+}
+
+impl economic_handlers::RewardQueryService for CoordinatorRewardQueryStub {
+    fn query_balance(
+        &self,
+        _address: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<economic_handlers::ChainRewardInfo, String>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            // NOTE(14C.C.25): Replace with real coordinator RPC call.
+            Ok(economic_handlers::ChainRewardInfo {
+                balance: 0,
+                pending_rewards: 0,
+                claimed_rewards: 0,
+                node_earnings: 0,
+                is_validator: false,
+                is_node: false,
+            })
+        })
+    }
+
+    fn list_validator_rewards(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<economic_handlers::ChainValidatorRewardInfo>, String>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            // NOTE(14C.C.25): Replace with real coordinator RPC call.
+            Ok(Vec::new())
+        })
+    }
+
+    fn query_treasury(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<economic_handlers::ChainTreasuryInfo, String>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            // NOTE(14C.C.25): Replace with real coordinator RPC call.
+            Ok(economic_handlers::ChainTreasuryInfo {
+                treasury_balance: 0,
+                total_rewards_distributed: 0,
+                total_validator_rewards: 0,
+                total_node_rewards: 0,
+            })
+        })
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════════════════════════════════
@@ -1053,7 +1151,7 @@ async fn main() {
     // Receipt status query routes (14C.C.24)
     // Separate sub-router with its own state type, merged into main router.
     let economic_state = economic_handlers::EconomicState {
-        service: Arc::new(CoordinatorReceiptQueryStub::new(coord)),
+        service: Arc::new(CoordinatorReceiptQueryStub::new(coord.clone())),
     };
     let economic_router = axum::Router::new()
         .route(
@@ -1065,6 +1163,28 @@ async fn main() {
             post(economic_handlers::handle_batch_receipt_status::<CoordinatorReceiptQueryStub>),
         )
         .with_state(economic_state);
+
+    // Reward balance query routes (14C.C.25)
+    // Separate sub-router with its own state type, merged into main router.
+    // NOTE: Static routes (/rewards/validators, /rewards/treasury) registered
+    // BEFORE parameterized route (/rewards/:address) for correct matching.
+    let reward_state = economic_handlers::EconomicRewardState {
+        service: Arc::new(CoordinatorRewardQueryStub::new(coord)),
+    };
+    let reward_router = axum::Router::new()
+        .route(
+            "/rewards/validators",
+            get(economic_handlers::handle_validator_rewards::<CoordinatorRewardQueryStub>),
+        )
+        .route(
+            "/rewards/treasury",
+            get(economic_handlers::handle_treasury_rewards::<CoordinatorRewardQueryStub>),
+        )
+        .route(
+            "/rewards/:address",
+            get(economic_handlers::handle_reward_balance::<CoordinatorRewardQueryStub>),
+        )
+        .with_state(reward_state);
 
     // Create rate limiter with default limits
     let rate_limiter = Arc::new(RateLimiter::with_defaults());
@@ -1081,6 +1201,7 @@ async fn main() {
         .route("/metrics", get(metrics_endpoint))
         .route("/fallback/status", get(fallback_status))
         .merge(economic_router)
+        .merge(reward_router)
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit_middleware,
