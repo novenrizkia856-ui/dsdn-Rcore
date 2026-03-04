@@ -15,7 +15,7 @@
 //! Client ──POST /receipts/status──▶ handle_batch         map_to_response
 //!                                        │                         │
 //!                                  validate_all                    ▼
-//!                                  sequential query    ReceiptStatusResponse
+//!                                  concurrent query   ReceiptStatusResponse
 //!                                  preserve order
 //! ```
 //!
@@ -361,23 +361,57 @@ pub async fn handle_batch_receipt_status<S: ReceiptQueryService>(
         }
     }
 
-    // 4. Query all hashes sequentially, preserving input order.
+    // 4. Query all hashes concurrently via tokio::spawn, preserving input order.
     //
-    //    Sequential execution guarantees:
-    //    - Order preservation (trivially)
-    //    - No race condition
-    //    - No spawn without control
+    //    Each query is spawned as an independent task with its index.
+    //    Results are collected and sorted by original index to guarantee
+    //    response order matches input order.
     //
-    //    NOTE(14C.C.24): When CoordinatorClient exposes a real receipt
-    //    query RPC supporting parallel calls, upgrade to `tokio::JoinSet`
-    //    with indexed results for concurrent execution while preserving
-    //    input order.
-    let mut responses: Vec<ReceiptStatusResponse> = Vec::with_capacity(body.hashes.len());
+    //    Guarantees:
+    //    - Concurrent execution (no sequential blocking)
+    //    - Order preservation (sort by index after collect)
+    //    - No race condition (each task owns its own Arc + hash clone)
+    //    - No wild thread spawn (tokio task pool only)
+    let len = body.hashes.len();
+    let mut handles: Vec<tokio::task::JoinHandle<(usize, String, Result<ChainReceiptInfo, String>)>> =
+        Vec::with_capacity(len);
 
-    for hash in &body.hashes {
-        match state.service.query_receipt(hash).await {
+    for (idx, hash) in body.hashes.into_iter().enumerate() {
+        let svc = Arc::clone(&state.service);
+        handles.push(tokio::spawn(async move {
+            let result = svc.query_receipt(&hash).await;
+            (idx, hash, result)
+        }));
+    }
+
+    // Collect all results. If any task panicked, return 500.
+    let mut indexed: Vec<(usize, String, Result<ChainReceiptInfo, String>)> =
+        Vec::with_capacity(len);
+
+    for handle in handles {
+        match handle.await {
+            Ok(triple) => indexed.push(triple),
+            Err(join_err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("task join error: {}", join_err),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Sort by original index to preserve input order.
+    indexed.sort_by_key(|(idx, _, _)| *idx);
+
+    // Map to response, failing on first query error.
+    let mut responses: Vec<ReceiptStatusResponse> = Vec::with_capacity(len);
+    for (_, hash, result) in indexed {
+        match result {
             Ok(info) => {
-                responses.push(map_to_response(hash, info));
+                responses.push(map_to_response(&hash, info));
             }
             Err(err) => {
                 return (
