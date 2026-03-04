@@ -106,6 +106,18 @@
 //! All submissions are logged but NOT processed. Verification, arbitration,
 //! slashing, and challenge resolution deferred to Tahap 18.8.
 //!
+//! ### Claim Endpoint (14C.C.28)
+//!
+//! | Endpoint              | Method | Description                              |
+//! |-----------------------|--------|------------------------------------------|
+//! | `/claim`              | POST   | Submit reward claim                      |
+//!
+//! ### DA Event Logging (14C.C.28)
+//!
+//! All receipt economic events (claims, fraud proofs) are logged to
+//! [`ReceiptEventLogger`] for DA audit trail. Events are buffered and
+//! flushed through an [`EventPublisher`] (or fallback to file).
+//!
 //! ## Endpoint Details
 //!
 //! ### GET /health
@@ -234,6 +246,8 @@
 //! | `economic_handlers` | Receipt status query endpoints (14C.C.24)     |
 //! |                     | Reward balance query endpoints (14C.C.25)     |
 //! |                     | Fraud proof submission placeholder (14C.C.26) |
+//! |                     | Claim handler + DA event logging (14C.C.28)   |
+//! | `receipt_event_logger` | DA audit logging for receipt events (14C.C.28) |
 //! | `economic_validation` | Validation layer & chain forwarding (14C.C.27) |
 //!
 //! ## DA Integration
@@ -283,6 +297,7 @@ mod fallback_health;
 mod alerting;
 pub mod economic_handlers;
 pub mod economic_validation;
+pub mod receipt_event_logger;
 pub use fallback_health::FallbackHealthInfo;
 pub use alerting::{AlertHandler, AlertDispatcher, LoggingAlertHandler, ReconcileReport};
 
@@ -592,6 +607,8 @@ pub struct AppState {
     pub alert_dispatcher: AlertDispatcher,
     /// Fraud proof submission log (14C.C.26). Thread-safe via `RwLock`.
     pub fraud_proof_log: economic_handlers::FraudProofLog,
+    /// Receipt event logger for DA audit logging (14C.C.28).
+    pub event_logger: Arc<receipt_event_logger::ReceiptEventLogger>,
 }
 
 impl AppState {
@@ -605,6 +622,9 @@ impl AppState {
             metrics: Arc::new(IngressMetrics::new()),
             alert_dispatcher: AlertDispatcher::with_logging(),
             fraud_proof_log: economic_handlers::new_fraud_proof_log(),
+            event_logger: Arc::new(receipt_event_logger::ReceiptEventLogger::without_publisher(
+                "receipt_events.jsonl".to_string(),
+            )),
         }
     }
 
@@ -619,6 +639,9 @@ impl AppState {
             metrics: Arc::new(IngressMetrics::new()),
             alert_dispatcher: AlertDispatcher::with_logging(),
             fraud_proof_log: economic_handlers::new_fraud_proof_log(),
+            event_logger: Arc::new(receipt_event_logger::ReceiptEventLogger::without_publisher(
+                "receipt_events.jsonl".to_string(),
+            )),
         }
     }
 
@@ -633,6 +656,9 @@ impl AppState {
             metrics,
             alert_dispatcher: AlertDispatcher::with_logging(),
             fraud_proof_log: economic_handlers::new_fraud_proof_log(),
+            event_logger: Arc::new(receipt_event_logger::ReceiptEventLogger::without_publisher(
+                "receipt_events.jsonl".to_string(),
+            )),
         }
     }
 
@@ -647,6 +673,9 @@ impl AppState {
             metrics: Arc::new(IngressMetrics::new()),
             alert_dispatcher: dispatcher,
             fraud_proof_log: economic_handlers::new_fraud_proof_log(),
+            event_logger: Arc::new(receipt_event_logger::ReceiptEventLogger::without_publisher(
+                "receipt_events.jsonl".to_string(),
+            )),
         }
     }
 
@@ -1217,6 +1246,7 @@ async fn main() {
     // Uses fraud_proof_log from AppState, wrapped in FraudProofState.
     let fraud_proof_state = economic_handlers::FraudProofState {
         log: app_state.fraud_proof_log.clone(),
+        event_logger: Arc::clone(&app_state.event_logger),
     };
     let fraud_proof_router = axum::Router::new()
         .route(
@@ -1228,6 +1258,22 @@ async fn main() {
             get(economic_handlers::handle_fraud_proofs_list),
         )
         .with_state(fraud_proof_state);
+
+    // Claim reward route (14C.C.28)
+    // Uses ChainForwarder + event logger for DA audit logging.
+    let claim_state = economic_handlers::ClaimState {
+        forwarder: Arc::new(economic_validation::ChainForwarder::new(
+            "http://localhost:26657".to_string(),
+            std::time::Duration::from_secs(10),
+        )),
+        event_logger: Arc::clone(&app_state.event_logger),
+    };
+    let claim_router = axum::Router::new()
+        .route(
+            "/claim",
+            post(economic_handlers::handle_claim_submit),
+        )
+        .with_state(claim_state);
 
     // Create rate limiter with default + economic-specific limits (14C.C.27).
     // Mutation endpoints (claim, fraud-proof): 10 req/min per IP.
@@ -1257,6 +1303,7 @@ async fn main() {
         .merge(economic_router)
         .merge(reward_router)
         .merge(fraud_proof_router)
+        .merge(claim_router)
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state.clone(),
             rate_limit_middleware,

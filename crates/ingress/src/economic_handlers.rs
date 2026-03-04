@@ -85,6 +85,8 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
+use crate::receipt_event_logger::{ReceiptEconomicEvent, ReceiptEventLogger};
+
 // ════════════════════════════════════════════════════════════════════════════
 // RECEIPT STATUS ENUM
 // ════════════════════════════════════════════════════════════════════════════
@@ -901,16 +903,19 @@ fn generate_fraud_proof_id(receipt_hash: &str, submitter: &str, index: usize) ->
 
 /// Shared state for fraud proof handlers.
 ///
-/// Holds thread-safe reference to the fraud proof log.
+/// Holds thread-safe reference to the fraud proof log and event logger.
 /// Manual `Clone` — only clones `Arc`, does NOT require inner `Clone`.
 pub struct FraudProofState {
     pub log: FraudProofLog,
+    /// Receipt event logger for DA audit logging (14C.C.28).
+    pub event_logger: Arc<ReceiptEventLogger>,
 }
 
 impl Clone for FraudProofState {
     fn clone(&self) -> Self {
         Self {
             log: Arc::clone(&self.log),
+            event_logger: Arc::clone(&self.event_logger),
         }
     }
 }
@@ -1018,7 +1023,14 @@ pub async fn handle_fraud_proof_submit(
         body.receipt_hash, body.proof_type, body.submitter_address
     );
 
-    // 7. Return placeholder response. No processing, verification, or arbitration.
+    // 7. Log DA event (14C.C.28).
+    state.event_logger.log_event(ReceiptEconomicEvent::FraudProofReceived {
+        receipt_hash: body.receipt_hash.clone(),
+        proof_type: body.proof_type.clone(),
+        timestamp: crate::receipt_event_logger::current_timestamp_secs(),
+    });
+
+    // 8. Return placeholder response. No processing, verification, or arbitration.
     let resp = FraudProofResponse {
         accepted: true,
         fraud_proof_id,
@@ -1057,6 +1069,132 @@ pub async fn handle_fraud_proofs_list(
             }),
         )
             .into_response(),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CLAIM HANDLER TYPES (14C.C.28)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Response for `POST /claim`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimRewardResponse {
+    /// Whether the claim was accepted by the chain forwarder.
+    pub success: bool,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Shared state for claim handler.
+///
+/// Wraps a [`ChainForwarder`]-compatible service and event logger.
+pub struct ClaimState {
+    /// Chain forwarder for forwarding claim requests.
+    pub forwarder: Arc<crate::economic_validation::ChainForwarder>,
+    /// Receipt event logger for DA audit logging (14C.C.28).
+    pub event_logger: Arc<ReceiptEventLogger>,
+}
+
+impl Clone for ClaimState {
+    fn clone(&self) -> Self {
+        Self {
+            forwarder: Arc::clone(&self.forwarder),
+            event_logger: Arc::clone(&self.event_logger),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HANDLER: POST /claim (14C.C.28)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Handle `POST /claim` — submit a reward claim.
+///
+/// 1. Validate request fields via [`crate::economic_validation::validate_claim_request`].
+/// 2. Log `ClaimSubmitted` event.
+/// 3. Forward to chain via [`ChainForwarder::forward_claim`].
+/// 4. Log `ClaimAccepted` or `ClaimRejected` based on chain response.
+/// 5. Return result.
+///
+/// ## HTTP Status Codes
+///
+/// | Code | Condition                     |
+/// |------|-------------------------------|
+/// | 200  | Claim accepted                |
+/// | 400  | Validation error              |
+/// | 500  | Chain forwarding error        |
+pub async fn handle_claim_submit(
+    State(state): State<ClaimState>,
+    Json(body): Json<crate::economic_validation::ClaimRewardRequest>,
+) -> axum::response::Response {
+    // 1. Validate all fields (sanitize + check).
+    if let Err(err) = crate::economic_validation::validate_claim_request(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: format!("{}", err),
+            }),
+        )
+            .into_response();
+    }
+
+    let ts = crate::receipt_event_logger::current_timestamp_secs();
+
+    // 2. Log ClaimSubmitted event.
+    state.event_logger.log_event(ReceiptEconomicEvent::ClaimSubmitted {
+        receipt_hash: body.receipt_hash.clone(),
+        submitter: body.submitter_address.clone(),
+        timestamp: ts,
+    });
+
+    // 3. Forward to chain.
+    match state.forwarder.forward_claim(&body).await {
+        Ok(chain_resp) => {
+            if chain_resp.success {
+                // 4a. Log ClaimAccepted.
+                state.event_logger.log_event(ReceiptEconomicEvent::ClaimAccepted {
+                    receipt_hash: body.receipt_hash.clone(),
+                    status: "accepted".to_string(),
+                    reward_amount: 0, // Stub — real amount from chain in future.
+                    timestamp: crate::receipt_event_logger::current_timestamp_secs(),
+                });
+
+                let resp = ClaimRewardResponse {
+                    success: true,
+                    message: chain_resp.message,
+                };
+                (StatusCode::OK, Json(resp)).into_response()
+            } else {
+                // 4b. Log ClaimRejected.
+                state.event_logger.log_event(ReceiptEconomicEvent::ClaimRejected {
+                    receipt_hash: body.receipt_hash.clone(),
+                    reason: chain_resp.message.clone(),
+                    timestamp: crate::receipt_event_logger::current_timestamp_secs(),
+                });
+
+                let resp = ClaimRewardResponse {
+                    success: false,
+                    message: chain_resp.message,
+                };
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+        }
+        Err(err) => {
+            // 4c. Log ClaimRejected on error.
+            state.event_logger.log_event(ReceiptEconomicEvent::ClaimRejected {
+                receipt_hash: body.receipt_hash.clone(),
+                reason: err.clone(),
+                timestamp: crate::receipt_event_logger::current_timestamp_secs(),
+            });
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: format!("chain forwarding error: {}", err),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2417,6 +2555,9 @@ mod tests {
     fn make_fraud_state() -> FraudProofState {
         FraudProofState {
             log: new_fraud_proof_log(),
+            event_logger: Arc::new(ReceiptEventLogger::without_publisher(
+                { let mut p = std::env::temp_dir(); p.push("dsdn_test_fraud_events.jsonl"); p.to_string_lossy().to_string() },
+            )),
         }
     }
 
