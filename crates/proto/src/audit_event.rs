@@ -146,22 +146,44 @@ pub enum AuditLogEvent {
     /// Anti-self-dealing violation detected during claim validation.
     ///
     /// Produced by: chain crate (claim validation pipeline).
+    ///
+    /// Fields expanded in Tahap 15.3.
     AntiSelfDealingViolation {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Node that committed the violation.
+        node_id: String,
+        /// Submitter address that matched the node's operator.
+        submitter_address: String,
+        /// SHA3-256 hash of the receipt involved.
+        receipt_hash: [u8; 32],
+        /// Detection method (e.g. `"direct_match"`, `"owner_match"`).
+        detection_type: String,
+        /// Whether a penalty was applied as a result.
+        penalty_applied: bool,
     },
 
     // ── Variant 4 ────────────────────────────────────────────────────────────
     /// User-initiated data deletion request.
     ///
     /// Produced by: ingress crate (user-facing API).
+    ///
+    /// Fields expanded in Tahap 15.3.
     UserControlledDelete {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Hash of the chunk requested for deletion.
+        chunk_hash: String,
+        /// ID of the user requesting deletion.
+        requester_id: String,
+        /// Human-readable reason for deletion.
+        reason: String,
+        /// Whether the deletion was authorized by the system.
+        authorized: bool,
     },
 
     // ── Variant 5 ────────────────────────────────────────────────────────────
@@ -258,12 +280,21 @@ mod tests {
                 epoch: 42,
             },
             AuditLogEvent::AntiSelfDealingViolation {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000003,
+                node_id: "node-asd".to_string(),
+                submitter_address: "submitter-asd".to_string(),
+                receipt_hash: [0xCC; 32],
+                detection_type: "direct_match".to_string(),
+                penalty_applied: true,
             },
             AuditLogEvent::UserControlledDelete {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000004,
+                chunk_hash: "chunk-hash-del".to_string(),
+                requester_id: "user-001".to_string(),
+                reason: "user_request".to_string(),
+                authorized: true,
             },
             AuditLogEvent::DaSyncSequenceUpdate {
                 version: AUDIT_EVENT_SCHEMA_VERSION,
@@ -739,12 +770,298 @@ mod tests {
         };
 
         // Other variants: still only 2 fields (unchanged)
-        let _v3 = AuditLogEvent::AntiSelfDealingViolation { version: 1, timestamp_ms: 0 };
-        let _v4 = AuditLogEvent::UserControlledDelete { version: 1, timestamp_ms: 0 };
+        let _v3 = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1, timestamp_ms: 0,
+            node_id: String::new(), submitter_address: String::new(),
+            receipt_hash: [0u8; 32], detection_type: String::new(),
+            penalty_applied: false,
+        };
+        let _v4 = AuditLogEvent::UserControlledDelete {
+            version: 1, timestamp_ms: 0,
+            chunk_hash: String::new(), requester_id: String::new(),
+            reason: String::new(), authorized: false,
+        };
         let _v5 = AuditLogEvent::DaSyncSequenceUpdate { version: 1, timestamp_ms: 0 };
         let _v6 = AuditLogEvent::GovernanceProposalEvent { version: 1, timestamp_ms: 0 };
         let _v7 = AuditLogEvent::CommitteeRotationEvent { version: 1, timestamp_ms: 0 };
         let _v8 = AuditLogEvent::DaFallbackEvent { version: 1, timestamp_ms: 0 };
         let _v9 = AuditLogEvent::ComputeChallengeEvent { version: 1, timestamp_ms: 0 };
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.3 TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 15: anti_self_dealing_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn anti_self_dealing_fields_exist() {
+        let event = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1,
+            timestamp_ms: 1700000000,
+            node_id: "node-bad".to_string(),
+            submitter_address: "addr-bad".to_string(),
+            receipt_hash: [0xAB; 32],
+            detection_type: "direct_match".to_string(),
+            penalty_applied: true,
+        };
+
+        match &event {
+            AuditLogEvent::AntiSelfDealingViolation {
+                version,
+                timestamp_ms,
+                node_id,
+                submitter_address,
+                receipt_hash,
+                detection_type,
+                penalty_applied,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(node_id, "node-bad");
+                assert_eq!(submitter_address, "addr-bad");
+                assert_eq!(receipt_hash.len(), 32);
+                assert_eq!(receipt_hash[0], 0xAB);
+                assert_eq!(detection_type, "direct_match");
+                assert!(*penalty_applied);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 16: anti_self_dealing_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn anti_self_dealing_serialization_roundtrip() {
+        let event = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1,
+            timestamp_ms: 1700000000,
+            node_id: "node-rt".to_string(),
+            submitter_address: "addr-rt".to_string(),
+            receipt_hash: [0xDE; 32],
+            detection_type: "owner_match".to_string(),
+            penalty_applied: false,
+        };
+
+        let encoded = bincode::serialize(&event);
+        match encoded {
+            Ok(bytes) => {
+                assert!(!bytes.is_empty());
+                let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                match decoded {
+                    Ok(rt) => assert_eq!(event, rt),
+                    Err(e) => assert!(false, "decode failed: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "encode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 17: anti_self_dealing_receipt_hash_length
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn anti_self_dealing_receipt_hash_length() {
+        let event = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1,
+            timestamp_ms: 0,
+            node_id: String::new(),
+            submitter_address: String::new(),
+            receipt_hash: [0u8; 32],
+            detection_type: String::new(),
+            penalty_applied: false,
+        };
+
+        match &event {
+            AuditLogEvent::AntiSelfDealingViolation { receipt_hash, .. } => {
+                assert_eq!(receipt_hash.len(), 32, "receipt_hash must be exactly 32 bytes");
+            }
+            _ => assert!(false, "wrong variant"),
+        }
+
+        // Different hashes produce different events
+        let e_zero = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1, timestamp_ms: 0,
+            node_id: String::new(), submitter_address: String::new(),
+            receipt_hash: [0u8; 32], detection_type: String::new(),
+            penalty_applied: false,
+        };
+        let e_ff = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1, timestamp_ms: 0,
+            node_id: String::new(), submitter_address: String::new(),
+            receipt_hash: [0xFF; 32], detection_type: String::new(),
+            penalty_applied: false,
+        };
+        assert_ne!(e_zero, e_ff);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 18: user_delete_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn user_delete_fields_exist() {
+        let event = AuditLogEvent::UserControlledDelete {
+            version: 1,
+            timestamp_ms: 1700000000,
+            chunk_hash: "chunk-abc".to_string(),
+            requester_id: "user-xyz".to_string(),
+            reason: "gdpr_request".to_string(),
+            authorized: true,
+        };
+
+        match &event {
+            AuditLogEvent::UserControlledDelete {
+                version,
+                timestamp_ms,
+                chunk_hash,
+                requester_id,
+                reason,
+                authorized,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(chunk_hash, "chunk-abc");
+                assert_eq!(requester_id, "user-xyz");
+                assert_eq!(reason, "gdpr_request");
+                assert!(*authorized);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 19: user_delete_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn user_delete_serialization_roundtrip() {
+        let event = AuditLogEvent::UserControlledDelete {
+            version: 1,
+            timestamp_ms: u64::MAX,
+            chunk_hash: "chunk-roundtrip".to_string(),
+            requester_id: "user-roundtrip".to_string(),
+            reason: "test".to_string(),
+            authorized: false,
+        };
+
+        let encoded = bincode::serialize(&event);
+        match encoded {
+            Ok(bytes) => {
+                assert!(!bytes.is_empty());
+                let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                match decoded {
+                    Ok(rt) => assert_eq!(event, rt),
+                    Err(e) => assert!(false, "decode failed: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "encode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 20: user_delete_authorized_flag
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn user_delete_authorized_flag() {
+        let auth = AuditLogEvent::UserControlledDelete {
+            version: 1, timestamp_ms: 0,
+            chunk_hash: "c".to_string(), requester_id: "u".to_string(),
+            reason: "r".to_string(), authorized: true,
+        };
+        let unauth = AuditLogEvent::UserControlledDelete {
+            version: 1, timestamp_ms: 0,
+            chunk_hash: "c".to_string(), requester_id: "u".to_string(),
+            reason: "r".to_string(), authorized: false,
+        };
+
+        // Different authorized flags produce different events
+        assert_ne!(auth, unauth);
+
+        // Both serialize correctly
+        for event in &[auth, unauth] {
+            let encoded = bincode::serialize(event);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(event, &rt),
+                        Err(e) => assert!(false, "decode failed: {}", e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed: {}", e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 21: variant_order_preserved_15_3
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn variant_order_preserved_15_3() {
+        // Verify bincode discriminants for variants 2 and 3.
+        let v2 = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1, timestamp_ms: 0,
+            node_id: String::new(), submitter_address: String::new(),
+            receipt_hash: [0u8; 32], detection_type: String::new(),
+            penalty_applied: false,
+        };
+        let v3 = AuditLogEvent::UserControlledDelete {
+            version: 1, timestamp_ms: 0,
+            chunk_hash: String::new(), requester_id: String::new(),
+            reason: String::new(), authorized: false,
+        };
+
+        let enc2 = bincode::serialize(&v2);
+        let enc3 = bincode::serialize(&v3);
+
+        match (enc2, enc3) {
+            (Ok(b2), Ok(b3)) => {
+                assert!(b2.len() >= 4);
+                assert!(b3.len() >= 4);
+
+                let disc2 = u32::from_le_bytes([b2[0], b2[1], b2[2], b2[3]]);
+                let disc3 = u32::from_le_bytes([b3[0], b3[1], b3[2], b3[3]]);
+
+                assert_eq!(disc2, 2, "AntiSelfDealingViolation must be discriminant 2");
+                assert_eq!(disc3, 3, "UserControlledDelete must be discriminant 3");
+            }
+            _ => assert!(false, "serialization should not fail"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 22: no_extra_fields_15_3
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn no_extra_fields_15_3() {
+        // AntiSelfDealingViolation: exactly 7 fields
+        let _asd = AuditLogEvent::AntiSelfDealingViolation {
+            version: 1,
+            timestamp_ms: 0,
+            node_id: String::new(),
+            submitter_address: String::new(),
+            receipt_hash: [0u8; 32],
+            detection_type: String::new(),
+            penalty_applied: false,
+        };
+
+        // UserControlledDelete: exactly 6 fields
+        let _ucd = AuditLogEvent::UserControlledDelete {
+            version: 1,
+            timestamp_ms: 0,
+            chunk_hash: String::new(),
+            requester_id: String::new(),
+            reason: String::new(),
+            authorized: false,
+        };
     }
 }
