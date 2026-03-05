@@ -28,6 +28,7 @@
 //! - [`reconcile_report`]: ReconcileReport dan related types untuk hasil reconciliation
 //! - [`consistency_report`]: ConsistencyReport dan related types untuk verifikasi konsistensi
 //! - [`tss`]: TSS protocol message types untuk threshold signing
+//! - [`audit_event`]: AuditLogEvent enum untuk audit trail WORM + DA mirror (Tahap 15)
 //!
 //! ## Architecture Overview
 //!
@@ -304,6 +305,20 @@
 //! | `ConsistencyReport` | Laporan verifikasi konsistensi |
 //! | `ConsistencyMismatch` | Detail ketidakkonsistenan |
 //!
+//! ### Audit Log Events (Tahap 15)
+//!
+//! | Variant | Producer | Active |
+//! |---------|----------|--------|
+//! | `SlashingExecuted` | chain | Tahap 15.1+ |
+//! | `StakeUpdated` | chain | Tahap 15.1+ |
+//! | `AntiSelfDealingViolation` | chain | Tahap 15.1+ |
+//! | `UserControlledDelete` | ingress | Tahap 15.1+ |
+//! | `DaSyncSequenceUpdate` | coordinator | Tahap 15.1+ |
+//! | `GovernanceProposalEvent` | chain | Tahap 15.1+ |
+//! | `CommitteeRotationEvent` | coordinator | Tahap 20 |
+//! | `DaFallbackEvent` | coordinator | Tahap 15.1 |
+//! | `ComputeChallengeEvent` | node | Tahap 18.1 |
+//!
 //! ## Version Compatibility
 //!
 //! ### Current Version
@@ -357,6 +372,9 @@ pub mod consistency_report;
 pub mod tss;
 
 pub mod tx;
+
+/// Audit log event schema for WORM + DA mirror (Tahap 15).
+pub mod audit_event;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - DA Core Types
@@ -512,6 +530,15 @@ pub use tss::{
     BLOB_HASH_SIZE,
     NODE_ID_SIZE,
     COMMITTEE_HASH_SIZE,
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - Audit Log Event Types (Tahap 15)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use audit_event::{
+    AuditLogEvent,
+    AUDIT_EVENT_SCHEMA_VERSION,
 };
 
 // ════════════════════════════════════════════════════════════════════════════════

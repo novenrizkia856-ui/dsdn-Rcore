@@ -3,97 +3,55 @@ focus on stage which is being worked on
 
 
 [Active_stage]
-## Tahap 14C.C — TSS Integration, Validator Reward & System Wiring
+## Tahap 15 — Logging & Audit Infrastructure (WORM + DA Mirror Core)
 
-**Tujuan:** Menyambungkan semua komponen: TSS real signing, validator menerima bagian reward,
-agent/ingress routing, dan DA log sinkronisasi.
+**Fokus:** Membangun fondasi logging infrastructure — WORM writer, DA mirror sync, event schema, dan trait/hook interface. Belum integrasi ke service crates.
 
-**Crates terlibat:** `tss`, `validator`, `agent`, `ingress`
+**Perubahan dari blueprint:** Audit log penting harus disimpan lokal sebagai WORM dan dipost ke Celestia DA untuk immutability.
 
-### Scope
+**Deliverables:**
 
-1. **`tss`** — Real threshold signing untuk receipt:
-   - Ganti mock TSS di coordinator dengan real FROST threshold signature.
-   - Coordinator collect partial signatures dari TSS participants.
-   - Threshold tercapai → produce valid `FrostSignature` untuk receipt.
-   - Chain-side verification menggunakan aggregated public key.
-   - Error handling: threshold tidak tercapai, participant timeout, invalid partial sig.
+1. **`proto`** — Definisi `LogEventType` enum dengan semua variant:
+   - Slashing events
+   - Stake updates
+   - Anti-self-dealing violation logs
+   - User-controlled delete
+   - DA-sync sequence number
+   - Governance proposal + delay window
+   - Coordinator committee rotation events (`// Producer: Tahap 20`)
+   - DA fallback activation/deactivation events (`// Producer: Tahap 15.1`)
+   - Compute challenge events (`// Producer: Tahap 18.1`)
 
-2. **`validator`** — Validator menerima reward share:
-   - Validator yang aktif di epoch berhak atas 20% reward dari setiap receipt.
-   - Distribusi ke validator set proporsional (atau equal split — tentukan di sini).
-   - Validator bisa query pending rewards dan claimed rewards.
-   - Pastikan validator reward hanya dari receipt yang sudah finalized
-     (compute: setelah challenge period lewat).
+   Setiap variant memiliki schema struct lengkap dengan field definitions.
 
-> **Catatan Penting (FIX #4):** Pada tahap ini, "finalized" untuk compute receipt berarti challenge timer habis (auto-finalize). Belum ada mekanisme fraud proof yang bisa membatalkan receipt. Fraud proof integration ke reward finalization diimplementasi di Tahap 18.8.
+2. **`common`** — Core logging traits dan utilities:
+   - `AuditLogWriter` trait: accept event → persist ke WORM + DA mirror
+   - `AuditLogHook` trait: interface yang bisa dipanggil producer di tahap mendatang
+   - `WormLogStorage` trait: append-only local persistence abstraction
+   - `DaMirrorSync`: DA layer sync logic (sequence numbering, batch publish)
+   - Deterministic encoding (canonical JSON / protobuf)
+   - Timestamp consistency (Unix epoch)
+   - Error types untuk log failures (no silent failure)
 
-3. **`agent`** — Orchestrasi flow ekonomi end-to-end:
-   - Agent mengelola lifecycle: workload dispatch → execution → receipt → claim.
-   - Monitoring: track receipt status (pending, challenged, finalized, rejected).
-   - Retry logic: jika submission gagal, retry dengan backoff.
-   - Metrics/logging: catat semua economic events untuk observability.
+3. **`storage`** — WORM persistence layer:
+   - `WormFileStorage` implementing `WormLogStorage`
+   - Append-only file backend (no overwrite, no delete)
+   - Rotation / compaction policy (configurable max size)
+   - Integrity verification (hash chain per entry)
+   - Recovery from partial writes
 
-4. **`ingress`** — Routing dan endpoint untuk economic transactions:
-   - Expose RPC/API endpoint untuk `ClaimReward` submission.
-   - Expose endpoint untuk query receipt status dan reward balance.
-   - Expose endpoint untuk fraud proof submission (placeholder — accept dan log, tapi belum process/verify).
-   - Rate limiting dan basic validation sebelum forward ke chain.
+> **Catatan Implementasi (FIX #5):** Untuk setiap log type yang producer-nya belum exist:
+> 1. Definisikan `LogEventType` enum variant dan schema struct di `proto`.
+> 2. Implementasi log writer di `common` yang bisa menerima event dan persist ke WORM + DA.
+> 3. Buat trait/interface hook di `common` yang bisa dipanggil oleh producer di tahap mendatang.
+> 4. Tandai dengan `// Producer: Tahap X` di code.
+> 5. Unit test: pastikan hook callable dan log writer berfungsi (dengan synthetic/mock events).
 
-> **Catatan Penting (FIX #4):** Fraud proof endpoint di ingress pada tahap ini adalah **placeholder only**. Endpoint menerima submission dan menyimpan ke log, tapi tidak memicu arbitration atau slashing. Full fraud proof processing diaktifkan di Tahap 18.8.
+**Selesai jika:**
+- Semua `LogEventType` variants terdefinisi di `proto` dengan schema struct.
+- `AuditLogWriter` + `AuditLogHook` traits terimplementasi di `common`.
+- WORM file storage berfungsi (append-only, integrity-verified).
+- DA mirror sync berfungsi (dengan mock DA publisher).
+- Unit tests: semua schema serializable, semua hooks callable, WORM append-only verified, DA sync 100% match.
 
-### Coordinator Committee Formation (FIX #7)
-
-Karena TSS/FROST membutuhkan committee, tahap ini juga mendefinisikan:
-
-**Committee Formation Protocol:**
-
-- Committee terdiri dari `n` coordinator nodes yang menjalankan TSS key shares.
-- **Minimum quorum:** `t` dari `n` (threshold), dimana `t = ceil(2n/3) + 1`. Untuk bootstrap, `n=3, t=2` sudah cukup.
-- **Formation:** Pada genesis/bootstrap, committee members di-hardcode di genesis config. Pada tahap selanjutnya (post-mainnet), committee membership bisa di-rotate via governance.
-- **Rotation:** Belum aktif pada tahap ini. Rotation events di-log (Tahap 15) tapi actual rotation mechanism diimplementasi setelah governance matang (post Tahap 20).
-- **Failure handling:**
-  - Jika committee member offline saat signing round → timeout → retry tanpa member tersebut.
-  - Jika jumlah online members < threshold `t` → signing gagal → receipt pending → retry saat quorum terpenuhi.
-  - Persistent failure (member offline > 1 epoch) → log alert, tapi belum auto-rotate pada tahap ini.
-
-**Committee struct:**
-
-```rust
-struct CoordinatorCommittee {
-    members: Vec<CommitteeMember>,
-    threshold: u32,          // minimum signatures needed
-    epoch: u64,
-    formation_method: FormationMethod, // Genesis | GovernanceVote (future)
-}
-
-struct CommitteeMember {
-    coordinator_id: PublicKey,
-    tss_key_share_index: u32,
-    status: MemberStatus, // Active | Offline | Rotating
-}
-
-enum FormationMethod {
-    Genesis,          // hardcoded at launch
-    GovernanceVote,   // future: elected by validators
-}
-```
-
-**Crates tambahan terlibat:** `coordinator`, `proto`
-
-### Kriteria Selesai 14C.C
-
-- Receipt di-sign dengan real FROST threshold signature (bukan mock).
-- Chain verify real threshold signature dan distribute reward.
-- Validator menerima 20% share dari finalized receipt.
-- Agent bisa orchestrate full flow tanpa manual intervention.
-- Ingress endpoints bisa menerima ClaimReward dan return status.
-- Ingress fraud proof endpoint menerima submission dan log (placeholder).
-- **Coordinator committee terbentuk dari genesis config dengan minimum 2-of-3 threshold (FIX #7).**
-- **Committee failure handling tested: member offline → signing tetap sukses jika quorum terpenuhi (FIX #7).**
-- Full integration test: node execute → commitment → coordinator TSS sign
-  → submit via ingress → chain validate → reward distribute
-  (70% node, 20% validator, 10% treasury).
-- DA log mencatat semua receipt events.
-- Anti-self-dealing, duplicate rejection, dan challenge period (timer-only)
-  berfungsi di full integrated flow.
+**Crates yang diubah:** `proto`, `common`, `storage`.

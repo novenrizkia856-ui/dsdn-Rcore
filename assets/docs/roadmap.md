@@ -1779,32 +1779,125 @@ enum FormationMethod {
 
 ---
 
-## Tahap 15 --- Logging, Audit, Metrics (WORM + DA Mirror)
+## Tahap 15 — Logging & Audit Infrastructure (WORM + DA Mirror Core)
+
+**Fokus:** Membangun fondasi logging infrastructure — WORM writer, DA mirror sync, event schema, dan trait/hook interface. Belum integrasi ke service crates.
 
 **Perubahan dari blueprint:** Audit log penting harus disimpan lokal sebagai WORM dan dipost ke Celestia DA untuk immutability.
 
-**Tambahan log wajib:**
+**Deliverables:**
 
-- Slashing events.
-- Stake updates.
-- Anti-self-dealing violation logs.
-- User-controlled delete.
-- DA-sync sequence number.
-- Governance proposal + delay window.
-- Coordinator committee rotation events. *(FIX #5: Producer aktif setelah committee rotation diimplementasi post-Tahap 20. Pada tahap ini, definisikan log schema dan hook. Hook akan dipanggil saat rotation mechanism aktif.)*
-- DA fallback activation/deactivation events. *(FIX #5: Producer aktif setelah DA fallback diimplementasi di Tahap 15.1. Pada tahap ini, definisikan log schema dan hook.)*
-- Compute challenge events. *(FIX #5: Producer aktif setelah fraud proof system diimplementasi di Tahap 18.1. Pada tahap ini, definisikan log schema dan hook. Hook menerima event tapi hanya log — belum trigger action.)*
+1. **`proto`** — Definisi `LogEventType` enum dengan semua variant:
+   - Slashing events
+   - Stake updates
+   - Anti-self-dealing violation logs
+   - User-controlled delete
+   - DA-sync sequence number
+   - Governance proposal + delay window
+   - Coordinator committee rotation events (`// Producer: Tahap 20`)
+   - DA fallback activation/deactivation events (`// Producer: Tahap 15.1`)
+   - Compute challenge events (`// Producer: Tahap 18.1`)
 
-> **Catatan Implementasi (FIX #5):** Untuk setiap log type yang producer-nya belum exist, implementasi pada tahap ini meliputi:
-> 1. Definisikan `LogEventType` enum variant dan schema struct.
-> 2. Implementasi log writer yang bisa menerima event dan persist ke WORM + DA.
-> 3. Buat trait/interface hook yang bisa dipanggil oleh producer di tahap mendatang.
+   Setiap variant memiliki schema struct lengkap dengan field definitions.
+
+2. **`common`** — Core logging traits dan utilities:
+   - `AuditLogWriter` trait: accept event → persist ke WORM + DA mirror
+   - `AuditLogHook` trait: interface yang bisa dipanggil producer di tahap mendatang
+   - `WormLogStorage` trait: append-only local persistence abstraction
+   - `DaMirrorSync`: DA layer sync logic (sequence numbering, batch publish)
+   - Deterministic encoding (canonical JSON / protobuf)
+   - Timestamp consistency (Unix epoch)
+   - Error types untuk log failures (no silent failure)
+
+3. **`storage`** — WORM persistence layer:
+   - `WormFileStorage` implementing `WormLogStorage`
+   - Append-only file backend (no overwrite, no delete)
+   - Rotation / compaction policy (configurable max size)
+   - Integrity verification (hash chain per entry)
+   - Recovery from partial writes
+
+> **Catatan Implementasi (FIX #5):** Untuk setiap log type yang producer-nya belum exist:
+> 1. Definisikan `LogEventType` enum variant dan schema struct di `proto`.
+> 2. Implementasi log writer di `common` yang bisa menerima event dan persist ke WORM + DA.
+> 3. Buat trait/interface hook di `common` yang bisa dipanggil oleh producer di tahap mendatang.
 > 4. Tandai dengan `// Producer: Tahap X` di code.
 > 5. Unit test: pastikan hook callable dan log writer berfungsi (dengan synthetic/mock events).
 
-**Selesai jika:** Log--DA sync mirror 100% match. Semua log schema terdefinisi. Hook untuk future producers terimplementasi dan tested dengan mock events.
+**Selesai jika:**
+- Semua `LogEventType` variants terdefinisi di `proto` dengan schema struct.
+- `AuditLogWriter` + `AuditLogHook` traits terimplementasi di `common`.
+- WORM file storage berfungsi (append-only, integrity-verified).
+- DA mirror sync berfungsi (dengan mock DA publisher).
+- Unit tests: semua schema serializable, semua hooks callable, WORM append-only verified, DA sync 100% match.
 
-**Crates yang harus diubah / dilibatkan:** `coordinator`, `storage`, `proto`, `chain`, `node`, `validator`, `agent`, `ingress`, `common`.
+**Crates yang diubah:** `proto`, `common`, `storage`.
+
+---
+
+## Tahap 15.1 — Logging Integration (Service Hook Wiring + DA Fallback Events)
+
+**Fokus:** Mengintegrasikan logging infrastructure dari Tahap 15 ke semua service crates. Memasang hooks, meng-emit real events, dan memastikan log–DA sync mirror 100% match end-to-end.
+
+**Prerequisite:** Tahap 15 selesai (traits, schemas, WORM storage, DA mirror tersedia).
+
+**Deliverables per crate:**
+
+1. **`chain`** — Emit events:
+   - Slashing events (saat slashing terjadi di DPoS consensus)
+   - Stake update events (delegate, undelegate, redelegate)
+   - Governance proposal + delay window events
+   - Treasury burn events
+
+2. **`validator`** — Emit events:
+   - Anti-self-dealing violation logs
+   - Validator reward claim events
+   - Validator set change events
+
+3. **`node`** — Emit events:
+   - Compute challenge events (`// Producer aktif setelah Tahap 18.1, log schema + hook dipasang sekarang`)
+   - Workload completion events
+   - Node registration/deregistration
+
+4. **`coordinator`** — Emit events:
+   - Committee rotation events (`// Producer aktif setelah Tahap 20, hook dipasang sekarang`)
+   - DA fallback activation/deactivation events (**producer aktif di tahap ini**)
+   - Receipt generation events
+   - Workload dispatch events
+
+5. **`agent`** — Emit events:
+   - Economic flow events (forward dari agent subsystem ke audit log)
+   - Retry/failure events dari economic lifecycle
+
+6. **`ingress`** — Emit events:
+   - User-controlled delete events
+   - DA-sync sequence number updates
+   - Claim submission/acceptance/rejection audit trail (bridge dari `ReceiptEventLogger` 14C.C.28 ke WORM + DA mirror)
+
+**Integration requirements:**
+
+- Setiap service crate harus:
+  - Inject `Arc<dyn AuditLogWriter>` via constructor/state
+  - Call appropriate hook pada setiap event occurrence
+  - Handle log failure gracefully (warn, don't crash)
+  - Include structured context (crate name, event source, correlation ID)
+
+- DA fallback events:
+  - `coordinator` adalah **producer aktif** untuk DA fallback activation/deactivation
+  - Events harus di-emit saat fallback state berubah (primary → secondary → emergency dan sebaliknya)
+  - Harus include: timestamp, previous DA source, new DA source, reason
+
+- End-to-end verification:
+  - Integration test: emit event dari service → verify di WORM log → verify di DA mirror
+  - Log–DA sync harus 100% match (no missing events)
+
+**Selesai jika:**
+- Semua 6 service crates terintegrasi dengan audit logging.
+- DA fallback events aktif di-emit oleh `coordinator`.
+- Hook untuk future producers (committee rotation Tahap 20, compute challenge Tahap 18.1) terpasang dan tested dengan mock events.
+- Log–DA sync mirror 100% match (integration test verified).
+- Semua event types yang producer-nya sudah aktif menghasilkan real events.
+
+**Crates yang diubah:** `coordinator`, `chain`, `node`, `validator`, `agent`, `ingress`.
 
 > Audit log pada fase ini belum bersifat compliance-grade untuk publik, dan hanya digunakan untuk internal verification dan forensik.
 
