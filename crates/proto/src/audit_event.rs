@@ -72,6 +72,25 @@ pub enum StakeOperation {
     Redelegate,
 }
 
+/// Governance proposal lifecycle status for [`AuditLogEvent::GovernanceProposalEvent`].
+///
+/// # Thread Safety
+///
+/// `Send + Sync` — all variants are fieldless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GovernanceStatus {
+    /// Proposal submitted, awaiting review.
+    Submitted,
+    /// Proposal approved by governance.
+    Approved,
+    /// Proposal rejected by governance.
+    Rejected,
+    /// Proposal executed on-chain.
+    Executed,
+    /// Proposal expired without action.
+    Expired,
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // AUDIT LOG EVENT ENUM
 // ════════════════════════════════════════════════════════════════════════════════
@@ -190,22 +209,44 @@ pub enum AuditLogEvent {
     /// DA sync sequence number advanced.
     ///
     /// Produced by: coordinator crate (DA sync loop).
+    ///
+    /// Fields expanded in Tahap 15.4.
     DaSyncSequenceUpdate {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// DA source identifier (e.g. `"celestia"`, `"validator_quorum"`, `"emergency"`).
+        da_source: String,
+        /// New sequence number after sync.
+        sequence_number: u64,
+        /// Previous sequence number before sync.
+        previous_sequence: u64,
+        /// Number of blobs processed in this sync batch.
+        blob_count: u64,
     },
 
     // ── Variant 6 ────────────────────────────────────────────────────────────
     /// Governance proposal lifecycle event (submit, approve, reject, execute).
     ///
     /// Produced by: chain crate (governance module).
+    ///
+    /// Fields expanded in Tahap 15.4.
     GovernanceProposalEvent {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Unique proposal identifier.
+        proposal_id: String,
+        /// Address of the proposer.
+        proposer_address: String,
+        /// Type of proposal (e.g. `"parameter_change"`, `"treasury_spend"`).
+        proposal_type: String,
+        /// Delay window in seconds before execution.
+        delay_window_secs: u64,
+        /// Current lifecycle status of the proposal.
+        status: GovernanceStatus,
     },
 
     // ── Variant 7 ────────────────────────────────────────────────────────────
@@ -297,12 +338,21 @@ mod tests {
                 authorized: true,
             },
             AuditLogEvent::DaSyncSequenceUpdate {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000005,
+                da_source: "celestia".to_string(),
+                sequence_number: 100,
+                previous_sequence: 99,
+                blob_count: 5,
             },
             AuditLogEvent::GovernanceProposalEvent {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000006,
+                proposal_id: "prop-001".to_string(),
+                proposer_address: "proposer-001".to_string(),
+                proposal_type: "parameter_change".to_string(),
+                delay_window_secs: 86400,
+                status: GovernanceStatus::Submitted,
             },
             AuditLogEvent::CommitteeRotationEvent {
                 version: AUDIT_EVENT_SCHEMA_VERSION,
@@ -439,6 +489,11 @@ mod tests {
         let event = AuditLogEvent::GovernanceProposalEvent {
             version: 1,
             timestamp_ms: 1700000006,
+            proposal_id: "prop-det".to_string(),
+            proposer_address: "addr-det".to_string(),
+            proposal_type: "test".to_string(),
+            delay_window_secs: 3600,
+            status: GovernanceStatus::Approved,
         };
 
         let enc1 = bincode::serialize(&event);
@@ -781,8 +836,17 @@ mod tests {
             chunk_hash: String::new(), requester_id: String::new(),
             reason: String::new(), authorized: false,
         };
-        let _v5 = AuditLogEvent::DaSyncSequenceUpdate { version: 1, timestamp_ms: 0 };
-        let _v6 = AuditLogEvent::GovernanceProposalEvent { version: 1, timestamp_ms: 0 };
+        let _v5 = AuditLogEvent::DaSyncSequenceUpdate {
+            version: 1, timestamp_ms: 0,
+            da_source: String::new(), sequence_number: 0,
+            previous_sequence: 0, blob_count: 0,
+        };
+        let _v6 = AuditLogEvent::GovernanceProposalEvent {
+            version: 1, timestamp_ms: 0,
+            proposal_id: String::new(), proposer_address: String::new(),
+            proposal_type: String::new(), delay_window_secs: 0,
+            status: GovernanceStatus::Submitted,
+        };
         let _v7 = AuditLogEvent::CommitteeRotationEvent { version: 1, timestamp_ms: 0 };
         let _v8 = AuditLogEvent::DaFallbackEvent { version: 1, timestamp_ms: 0 };
         let _v9 = AuditLogEvent::ComputeChallengeEvent { version: 1, timestamp_ms: 0 };
@@ -1062,6 +1126,274 @@ mod tests {
             requester_id: String::new(),
             reason: String::new(),
             authorized: false,
+        };
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.4 TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 23: da_sync_sequence_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn da_sync_sequence_fields_exist() {
+        let event = AuditLogEvent::DaSyncSequenceUpdate {
+            version: 1,
+            timestamp_ms: 1700000000,
+            da_source: "celestia".to_string(),
+            sequence_number: 500,
+            previous_sequence: 499,
+            blob_count: 12,
+        };
+
+        match &event {
+            AuditLogEvent::DaSyncSequenceUpdate {
+                version,
+                timestamp_ms,
+                da_source,
+                sequence_number,
+                previous_sequence,
+                blob_count,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(da_source, "celestia");
+                assert_eq!(*sequence_number, 500u64);
+                assert_eq!(*previous_sequence, 499u64);
+                assert_eq!(*blob_count, 12u64);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 24: da_sync_sequence_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn da_sync_sequence_serialization_roundtrip() {
+        let sources = ["celestia", "validator_quorum", "emergency"];
+
+        for src in &sources {
+            let event = AuditLogEvent::DaSyncSequenceUpdate {
+                version: 1,
+                timestamp_ms: u64::MAX,
+                da_source: src.to_string(),
+                sequence_number: u64::MAX,
+                previous_sequence: u64::MAX - 1,
+                blob_count: 0,
+            };
+
+            let encoded = bincode::serialize(&event);
+            match encoded {
+                Ok(bytes) => {
+                    assert!(!bytes.is_empty());
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(event, rt),
+                        Err(e) => assert!(false, "decode failed for {}: {}", src, e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed for {}: {}", src, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 25: governance_proposal_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn governance_proposal_fields_exist() {
+        let event = AuditLogEvent::GovernanceProposalEvent {
+            version: 1,
+            timestamp_ms: 1700000000,
+            proposal_id: "prop-123".to_string(),
+            proposer_address: "addr-proposer".to_string(),
+            proposal_type: "parameter_change".to_string(),
+            delay_window_secs: 86400,
+            status: GovernanceStatus::Executed,
+        };
+
+        match &event {
+            AuditLogEvent::GovernanceProposalEvent {
+                version,
+                timestamp_ms,
+                proposal_id,
+                proposer_address,
+                proposal_type,
+                delay_window_secs,
+                status,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(proposal_id, "prop-123");
+                assert_eq!(proposer_address, "addr-proposer");
+                assert_eq!(proposal_type, "parameter_change");
+                assert_eq!(*delay_window_secs, 86400u64);
+                assert_eq!(*status, GovernanceStatus::Executed);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 26: governance_proposal_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn governance_proposal_serialization_roundtrip() {
+        let statuses = [
+            GovernanceStatus::Submitted,
+            GovernanceStatus::Approved,
+            GovernanceStatus::Rejected,
+            GovernanceStatus::Executed,
+            GovernanceStatus::Expired,
+        ];
+
+        for st in &statuses {
+            let event = AuditLogEvent::GovernanceProposalEvent {
+                version: 1,
+                timestamp_ms: 1700000000,
+                proposal_id: "prop-rt".to_string(),
+                proposer_address: "addr-rt".to_string(),
+                proposal_type: "treasury_spend".to_string(),
+                delay_window_secs: 3600,
+                status: st.clone(),
+            };
+
+            let encoded = bincode::serialize(&event);
+            match encoded {
+                Ok(bytes) => {
+                    assert!(!bytes.is_empty());
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(event, rt),
+                        Err(e) => assert!(false, "decode failed for {:?}: {}", st, e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed for {:?}: {}", st, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 27: governance_status_enum_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn governance_status_enum_variants() {
+        let s = GovernanceStatus::Submitted;
+        let a = GovernanceStatus::Approved;
+        let r = GovernanceStatus::Rejected;
+        let e = GovernanceStatus::Executed;
+        let x = GovernanceStatus::Expired;
+
+        // All distinct
+        let all = [&s, &a, &r, &e, &x];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "variants {} and {} must differ", i, j);
+            }
+        }
+
+        // Clone + Eq
+        assert_eq!(s.clone(), GovernanceStatus::Submitted);
+        assert_eq!(x.clone(), GovernanceStatus::Expired);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 28: governance_status_serialization
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn governance_status_serialization() {
+        let statuses = [
+            GovernanceStatus::Submitted,
+            GovernanceStatus::Approved,
+            GovernanceStatus::Rejected,
+            GovernanceStatus::Executed,
+            GovernanceStatus::Expired,
+        ];
+
+        for st in &statuses {
+            let encoded = bincode::serialize(st);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<GovernanceStatus, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(st, &rt),
+                        Err(e) => assert!(false, "GovernanceStatus decode failed: {}", e),
+                    }
+                }
+                Err(e) => assert!(false, "GovernanceStatus encode failed: {}", e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 29: variant_order_preserved_15_4
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn variant_order_preserved_15_4() {
+        let v4 = AuditLogEvent::DaSyncSequenceUpdate {
+            version: 1, timestamp_ms: 0,
+            da_source: String::new(), sequence_number: 0,
+            previous_sequence: 0, blob_count: 0,
+        };
+        let v5 = AuditLogEvent::GovernanceProposalEvent {
+            version: 1, timestamp_ms: 0,
+            proposal_id: String::new(), proposer_address: String::new(),
+            proposal_type: String::new(), delay_window_secs: 0,
+            status: GovernanceStatus::Submitted,
+        };
+
+        let enc4 = bincode::serialize(&v4);
+        let enc5 = bincode::serialize(&v5);
+
+        match (enc4, enc5) {
+            (Ok(b4), Ok(b5)) => {
+                assert!(b4.len() >= 4);
+                assert!(b5.len() >= 4);
+
+                let disc4 = u32::from_le_bytes([b4[0], b4[1], b4[2], b4[3]]);
+                let disc5 = u32::from_le_bytes([b5[0], b5[1], b5[2], b5[3]]);
+
+                assert_eq!(disc4, 4, "DaSyncSequenceUpdate must be discriminant 4");
+                assert_eq!(disc5, 5, "GovernanceProposalEvent must be discriminant 5");
+            }
+            _ => assert!(false, "serialization should not fail"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 30: no_extra_fields_15_4
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn no_extra_fields_15_4() {
+        // DaSyncSequenceUpdate: exactly 6 fields
+        let _ds = AuditLogEvent::DaSyncSequenceUpdate {
+            version: 1,
+            timestamp_ms: 0,
+            da_source: String::new(),
+            sequence_number: 0,
+            previous_sequence: 0,
+            blob_count: 0,
+        };
+
+        // GovernanceProposalEvent: exactly 7 fields
+        let _gp = AuditLogEvent::GovernanceProposalEvent {
+            version: 1,
+            timestamp_ms: 0,
+            proposal_id: String::new(),
+            proposer_address: String::new(),
+            proposal_type: String::new(),
+            delay_window_secs: 0,
+            status: GovernanceStatus::Submitted,
         };
     }
 }
