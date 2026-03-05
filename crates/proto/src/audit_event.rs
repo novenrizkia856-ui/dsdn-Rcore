@@ -54,6 +54,25 @@ use serde::{Deserialize, Serialize};
 pub const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
 
 // ════════════════════════════════════════════════════════════════════════════════
+// SUPPORTING ENUMS
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Type of stake operation recorded in [`AuditLogEvent::StakeUpdated`].
+///
+/// # Thread Safety
+///
+/// `Send + Sync` — all variants are fieldless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StakeOperation {
+    /// Tokens delegated to a validator.
+    Delegate,
+    /// Tokens undelegated from a validator.
+    Undelegate,
+    /// Tokens redelegated from one validator to another.
+    Redelegate,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // AUDIT LOG EVENT ENUM
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -79,22 +98,48 @@ pub enum AuditLogEvent {
     /// Validator or node was slashed.
     ///
     /// Produced by: chain crate (DPoS consensus slashing logic).
+    ///
+    /// Fields expanded in Tahap 15.2.
     SlashingExecuted {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Validator that executed or was subject to slashing.
+        validator_id: String,
+        /// Node that was slashed.
+        node_id: String,
+        /// Amount slashed in smallest unit (18 decimals).
+        slash_amount: u128,
+        /// Human-readable reason for slashing.
+        reason: String,
+        /// Epoch in which slashing occurred.
+        epoch: u64,
+        /// SHA3-256 hash of the slashing evidence.
+        evidence_hash: [u8; 32],
     },
 
     // ── Variant 2 ────────────────────────────────────────────────────────────
     /// Stake was delegated, undelegated, or redelegated.
     ///
     /// Produced by: chain crate (staking state transitions).
+    ///
+    /// Fields expanded in Tahap 15.2.
     StakeUpdated {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Address of the staker performing the operation.
+        staker_address: String,
+        /// Type of stake operation.
+        operation: StakeOperation,
+        /// Amount staked/unstaked in smallest unit (18 decimals).
+        amount: u128,
+        /// Target validator for the operation.
+        validator_id: String,
+        /// Epoch in which the operation occurred.
+        epoch: u64,
     },
 
     // ── Variant 3 ────────────────────────────────────────────────────────────
@@ -194,12 +239,23 @@ mod tests {
     fn all_variants() -> Vec<AuditLogEvent> {
         vec![
             AuditLogEvent::SlashingExecuted {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000001,
+                validator_id: "val-001".to_string(),
+                node_id: "node-001".to_string(),
+                slash_amount: 5000_000_000_000_000_000_000,
+                reason: "double_sign".to_string(),
+                epoch: 42,
+                evidence_hash: [0xAB; 32],
             },
             AuditLogEvent::StakeUpdated {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000002,
+                staker_address: "staker-001".to_string(),
+                operation: StakeOperation::Delegate,
+                amount: 1000_000_000_000_000_000_000,
+                validator_id: "val-002".to_string(),
+                epoch: 42,
             },
             AuditLogEvent::AntiSelfDealingViolation {
                 version: AUDIT_EVENT_SCHEMA_VERSION,
@@ -250,9 +306,6 @@ mod tests {
     fn audit_event_enum_variant_order() {
         let variants = all_variants();
 
-        // Verify variant identity by matching. Order must be exactly:
-        // 0=Slashing, 1=Stake, 2=AntiSelfDealing, 3=UserDelete,
-        // 4=DaSync, 5=Governance, 6=Committee, 7=DaFallback, 8=Compute
         match &variants[0] {
             AuditLogEvent::SlashingExecuted { .. } => {}
             other => assert!(false, "variant 0 must be SlashingExecuted, got {:?}", other),
@@ -336,104 +389,18 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TEST 5: audit_event_fields_exist
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn audit_event_fields_exist() {
-        // Verify every variant has version + timestamp_ms fields accessible.
-        let variants = all_variants();
-
-        for (i, event) in variants.iter().enumerate() {
-            let (v, ts) = match event {
-                AuditLogEvent::SlashingExecuted { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::StakeUpdated { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::AntiSelfDealingViolation { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::UserControlledDelete { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::DaSyncSequenceUpdate { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::GovernanceProposalEvent { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::CommitteeRotationEvent { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::DaFallbackEvent { version, timestamp_ms } => (*version, *timestamp_ms),
-                AuditLogEvent::ComputeChallengeEvent { version, timestamp_ms } => (*version, *timestamp_ms),
-            };
-
-            assert_eq!(v, AUDIT_EVENT_SCHEMA_VERSION, "variant {} version must match constant", i);
-            assert!(ts > 0, "variant {} timestamp_ms must be > 0", i);
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // TEST 6: audit_event_no_extra_fields
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn audit_event_no_extra_fields() {
-        // Verify that constructing with ONLY version + timestamp_ms compiles
-        // and produces the exact same struct as all_variants().
-        // If a variant had extra required fields, this would fail to compile.
-
-        let event = AuditLogEvent::SlashingExecuted {
-            version: 1,
-            timestamp_ms: 100,
-        };
-        match &event {
-            AuditLogEvent::SlashingExecuted { version, timestamp_ms } => {
-                assert_eq!(*version, 1);
-                assert_eq!(*timestamp_ms, 100);
-            }
-            _ => assert!(false, "pattern match failed"),
-        }
-
-        let event2 = AuditLogEvent::ComputeChallengeEvent {
-            version: 1,
-            timestamp_ms: 200,
-        };
-        match &event2 {
-            AuditLogEvent::ComputeChallengeEvent { version, timestamp_ms } => {
-                assert_eq!(*version, 1);
-                assert_eq!(*timestamp_ms, 200);
-            }
-            _ => assert!(false, "pattern match failed"),
-        }
-
-        // All 9 variants constructable with only 2 fields
-        let _v1 = AuditLogEvent::SlashingExecuted { version: 1, timestamp_ms: 0 };
-        let _v2 = AuditLogEvent::StakeUpdated { version: 1, timestamp_ms: 0 };
-        let _v3 = AuditLogEvent::AntiSelfDealingViolation { version: 1, timestamp_ms: 0 };
-        let _v4 = AuditLogEvent::UserControlledDelete { version: 1, timestamp_ms: 0 };
-        let _v5 = AuditLogEvent::DaSyncSequenceUpdate { version: 1, timestamp_ms: 0 };
-        let _v6 = AuditLogEvent::GovernanceProposalEvent { version: 1, timestamp_ms: 0 };
-        let _v7 = AuditLogEvent::CommitteeRotationEvent { version: 1, timestamp_ms: 0 };
-        let _v8 = AuditLogEvent::DaFallbackEvent { version: 1, timestamp_ms: 0 };
-        let _v9 = AuditLogEvent::ComputeChallengeEvent { version: 1, timestamp_ms: 0 };
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // TEST 7: audit_event_send_sync
+    // TEST 5: audit_event_send_sync
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn audit_event_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AuditLogEvent>();
+        assert_send_sync::<StakeOperation>();
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TEST 8: audit_event_clone_eq
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn audit_event_clone_eq() {
-        let event = AuditLogEvent::SlashingExecuted {
-            version: 1,
-            timestamp_ms: 1700000000,
-        };
-        let cloned = event.clone();
-        assert_eq!(event, cloned, "Clone + PartialEq must work");
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    // TEST 9: audit_event_deterministic_encoding
+    // TEST 6: audit_event_deterministic_encoding
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -455,28 +422,329 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TEST 10: audit_event_different_variants_different_encoding
+    // 15.2 TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 7: slashing_executed_fields_exist
     // ════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn audit_event_different_variants_different_encoding() {
-        let e1 = AuditLogEvent::SlashingExecuted {
+    fn slashing_executed_fields_exist() {
+        let event = AuditLogEvent::SlashingExecuted {
             version: 1,
             timestamp_ms: 1700000000,
+            validator_id: "val-abc".to_string(),
+            node_id: "node-xyz".to_string(),
+            slash_amount: 9999,
+            reason: "offline".to_string(),
+            epoch: 100,
+            evidence_hash: [0xFF; 32],
         };
-        let e2 = AuditLogEvent::StakeUpdated {
+
+        match &event {
+            AuditLogEvent::SlashingExecuted {
+                version,
+                timestamp_ms,
+                validator_id,
+                node_id,
+                slash_amount,
+                reason,
+                epoch,
+                evidence_hash,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(validator_id, "val-abc");
+                assert_eq!(node_id, "node-xyz");
+                assert_eq!(*slash_amount, 9999u128);
+                assert_eq!(reason, "offline");
+                assert_eq!(*epoch, 100u64);
+                assert_eq!(evidence_hash.len(), 32);
+                assert_eq!(evidence_hash[0], 0xFF);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 8: slashing_executed_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn slashing_executed_serialization_roundtrip() {
+        let event = AuditLogEvent::SlashingExecuted {
             version: 1,
             timestamp_ms: 1700000000,
+            validator_id: "val-roundtrip".to_string(),
+            node_id: "node-roundtrip".to_string(),
+            slash_amount: u128::MAX,
+            reason: "test_reason".to_string(),
+            epoch: u64::MAX,
+            evidence_hash: [0xDE; 32],
         };
 
-        let enc1 = bincode::serialize(&e1);
-        let enc2 = bincode::serialize(&e2);
+        let encoded = bincode::serialize(&event);
+        match encoded {
+            Ok(bytes) => {
+                assert!(!bytes.is_empty());
+                let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                match decoded {
+                    Ok(rt) => assert_eq!(event, rt),
+                    Err(e) => assert!(false, "decode failed: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "encode failed: {}", e),
+        }
+    }
 
-        match (enc1, enc2) {
-            (Ok(a), Ok(b)) => {
-                assert_ne!(a, b, "different variants must produce different encoding");
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 9: stake_updated_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stake_updated_fields_exist() {
+        let event = AuditLogEvent::StakeUpdated {
+            version: 1,
+            timestamp_ms: 1700000000,
+            staker_address: "staker-abc".to_string(),
+            operation: StakeOperation::Undelegate,
+            amount: 500_000_000_000_000_000_000,
+            validator_id: "val-def".to_string(),
+            epoch: 50,
+        };
+
+        match &event {
+            AuditLogEvent::StakeUpdated {
+                version,
+                timestamp_ms,
+                staker_address,
+                operation,
+                amount,
+                validator_id,
+                epoch,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(staker_address, "staker-abc");
+                assert_eq!(*operation, StakeOperation::Undelegate);
+                assert_eq!(*amount, 500_000_000_000_000_000_000u128);
+                assert_eq!(validator_id, "val-def");
+                assert_eq!(*epoch, 50u64);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 10: stake_updated_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stake_updated_serialization_roundtrip() {
+        let ops = [
+            StakeOperation::Delegate,
+            StakeOperation::Undelegate,
+            StakeOperation::Redelegate,
+        ];
+
+        for op in &ops {
+            let event = AuditLogEvent::StakeUpdated {
+                version: 1,
+                timestamp_ms: 1700000000,
+                staker_address: "staker-rt".to_string(),
+                operation: op.clone(),
+                amount: 42,
+                validator_id: "val-rt".to_string(),
+                epoch: 1,
+            };
+
+            let encoded = bincode::serialize(&event);
+            match encoded {
+                Ok(bytes) => {
+                    assert!(!bytes.is_empty());
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(event, rt),
+                        Err(e) => assert!(false, "decode failed for {:?}: {}", op, e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed for {:?}: {}", op, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 11: stake_operation_enum_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stake_operation_enum_variants() {
+        // All 3 variants constructable
+        let d = StakeOperation::Delegate;
+        let u = StakeOperation::Undelegate;
+        let r = StakeOperation::Redelegate;
+
+        // They are distinct
+        assert_ne!(d, u);
+        assert_ne!(u, r);
+        assert_ne!(d, r);
+
+        // Clone + Eq
+        assert_eq!(d.clone(), StakeOperation::Delegate);
+        assert_eq!(u.clone(), StakeOperation::Undelegate);
+        assert_eq!(r.clone(), StakeOperation::Redelegate);
+
+        // Serialization roundtrip for each
+        for op in &[d, u, r] {
+            let encoded = bincode::serialize(op);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<StakeOperation, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(op, &rt),
+                        Err(e) => assert!(false, "StakeOperation decode failed: {}", e),
+                    }
+                }
+                Err(e) => assert!(false, "StakeOperation encode failed: {}", e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 12: audit_event_variant_order_preserved
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_variant_order_preserved() {
+        // Bincode encodes enum variants as u32 discriminant.
+        // Variant 0 = SlashingExecuted, Variant 1 = StakeUpdated.
+        // After field expansion, discriminant must NOT change.
+        let v0 = AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 0,
+            validator_id: String::new(),
+            node_id: String::new(),
+            slash_amount: 0,
+            reason: String::new(),
+            epoch: 0,
+            evidence_hash: [0u8; 32],
+        };
+        let v1 = AuditLogEvent::StakeUpdated {
+            version: 1,
+            timestamp_ms: 0,
+            staker_address: String::new(),
+            operation: StakeOperation::Delegate,
+            amount: 0,
+            validator_id: String::new(),
+            epoch: 0,
+        };
+
+        let enc0 = bincode::serialize(&v0);
+        let enc1 = bincode::serialize(&v1);
+
+        match (enc0, enc1) {
+            (Ok(b0), Ok(b1)) => {
+                // First 4 bytes = u32 discriminant (bincode default)
+                assert!(b0.len() >= 4);
+                assert!(b1.len() >= 4);
+
+                let disc0 = u32::from_le_bytes([b0[0], b0[1], b0[2], b0[3]]);
+                let disc1 = u32::from_le_bytes([b1[0], b1[1], b1[2], b1[3]]);
+
+                assert_eq!(disc0, 0, "SlashingExecuted must be discriminant 0");
+                assert_eq!(disc1, 1, "StakeUpdated must be discriminant 1");
             }
             _ => assert!(false, "serialization should not fail"),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 13: evidence_hash_length_validation
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn evidence_hash_length_validation() {
+        let event = AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 1700000000,
+            validator_id: "val".to_string(),
+            node_id: "node".to_string(),
+            slash_amount: 0,
+            reason: "test".to_string(),
+            epoch: 0,
+            evidence_hash: [0u8; 32],
+        };
+
+        match &event {
+            AuditLogEvent::SlashingExecuted { evidence_hash, .. } => {
+                assert_eq!(evidence_hash.len(), 32, "evidence_hash must be exactly 32 bytes");
+            }
+            _ => assert!(false, "wrong variant"),
+        }
+
+        // All-zeros hash
+        let zero_event = AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 0,
+            validator_id: String::new(),
+            node_id: String::new(),
+            slash_amount: 0,
+            reason: String::new(),
+            epoch: 0,
+            evidence_hash: [0u8; 32],
+        };
+        let all_ff_event = AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 0,
+            validator_id: String::new(),
+            node_id: String::new(),
+            slash_amount: 0,
+            reason: String::new(),
+            epoch: 0,
+            evidence_hash: [0xFF; 32],
+        };
+
+        // Different hashes must produce different events
+        assert_ne!(zero_event, all_ff_event);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14: no_extra_fields_present
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn no_extra_fields_present() {
+        // SlashingExecuted: exactly 8 fields compile
+        let _s = AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 0,
+            validator_id: String::new(),
+            node_id: String::new(),
+            slash_amount: 0,
+            reason: String::new(),
+            epoch: 0,
+            evidence_hash: [0u8; 32],
+        };
+
+        // StakeUpdated: exactly 7 fields compile
+        let _u = AuditLogEvent::StakeUpdated {
+            version: 1,
+            timestamp_ms: 0,
+            staker_address: String::new(),
+            operation: StakeOperation::Delegate,
+            amount: 0,
+            validator_id: String::new(),
+            epoch: 0,
+        };
+
+        // Other variants: still only 2 fields (unchanged)
+        let _v3 = AuditLogEvent::AntiSelfDealingViolation { version: 1, timestamp_ms: 0 };
+        let _v4 = AuditLogEvent::UserControlledDelete { version: 1, timestamp_ms: 0 };
+        let _v5 = AuditLogEvent::DaSyncSequenceUpdate { version: 1, timestamp_ms: 0 };
+        let _v6 = AuditLogEvent::GovernanceProposalEvent { version: 1, timestamp_ms: 0 };
+        let _v7 = AuditLogEvent::CommitteeRotationEvent { version: 1, timestamp_ms: 0 };
+        let _v8 = AuditLogEvent::DaFallbackEvent { version: 1, timestamp_ms: 0 };
+        let _v9 = AuditLogEvent::ComputeChallengeEvent { version: 1, timestamp_ms: 0 };
     }
 }

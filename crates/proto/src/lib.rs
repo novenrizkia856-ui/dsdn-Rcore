@@ -319,6 +319,31 @@
 //! | `DaFallbackEvent` | coordinator | Tahap 15.1 |
 //! | `ComputeChallengeEvent` | node | Tahap 18.1 |
 //!
+//! #### `SlashingExecuted` Fields (Tahap 15.2)
+//!
+//! | Field | Type | Description |
+//! |-------|------|-------------|
+//! | `version` | `u8` | Schema version |
+//! | `timestamp_ms` | `u64` | Unix timestamp (ms) |
+//! | `validator_id` | `String` | Validator that executed slashing |
+//! | `node_id` | `String` | Node that was slashed |
+//! | `slash_amount` | `u128` | Amount slashed (18 decimals) |
+//! | `reason` | `String` | Human-readable reason |
+//! | `epoch` | `u64` | Epoch of occurrence |
+//! | `evidence_hash` | `[u8; 32]` | SHA3-256 of slashing evidence |
+//!
+//! #### `StakeUpdated` Fields (Tahap 15.2)
+//!
+//! | Field | Type | Description |
+//! |-------|------|-------------|
+//! | `version` | `u8` | Schema version |
+//! | `timestamp_ms` | `u64` | Unix timestamp (ms) |
+//! | `staker_address` | `String` | Staker wallet address |
+//! | `operation` | `StakeOperation` | Delegate / Undelegate / Redelegate |
+//! | `amount` | `u128` | Stake amount (18 decimals) |
+//! | `validator_id` | `String` | Target validator |
+//! | `epoch` | `u64` | Epoch of occurrence |
+//!
 //! ## Version Compatibility
 //!
 //! ### Current Version
@@ -538,6 +563,7 @@ pub use tss::{
 
 pub use audit_event::{
     AuditLogEvent,
+    StakeOperation,
     AUDIT_EVENT_SCHEMA_VERSION,
 };
 
