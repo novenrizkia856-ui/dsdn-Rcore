@@ -118,6 +118,84 @@
 //! [`ReceiptEventLogger`] for DA audit trail. Events are buffered and
 //! flushed through an [`EventPublisher`] (or fallback to file).
 //!
+//! ## Economic Endpoints (14C.C.24–14C.C.29)
+//!
+//! ### Request Flow
+//!
+//! ```text
+//! dispatch → execute → receipt → claim → reward → DA log
+//!
+//! Node executes workload
+//!        │
+//!        ▼
+//! Coordinator generates receipt (TSS-signed)
+//!        │
+//!        ▼
+//! Client submits claim via POST /claim
+//!        │
+//!        ▼
+//! Ingress validates request (economic_validation)
+//!        │
+//!        ▼
+//! ChainForwarder forwards to chain (retry + timeout)
+//!        │
+//!        ▼
+//! Chain verifies receipt → distributes reward
+//!        │    70% node · 20% validator · 10% treasury
+//!        │
+//!        ▼
+//! ReceiptEventLogger records DA audit events
+//! ```
+//!
+//! ### Endpoint Reference
+//!
+//! | Endpoint               | Method | Description                          | Rate Limit       |
+//! |------------------------|--------|--------------------------------------|------------------|
+//! | `POST /claim`          | POST   | Submit reward claim                  | 10 req/min/IP    |
+//! | `GET /receipt/:hash`   | GET    | Query single receipt status          | 60 req/min/IP    |
+//! | `POST /receipts/status`| POST   | Batch query up to 100 hashes         | 60 req/min/IP    |
+//! | `GET /rewards/:address`| GET    | Query reward balance by address      | 60 req/min/IP    |
+//! | `GET /rewards/validators`| GET  | List all validator reward summaries   | 60 req/min/IP    |
+//! | `GET /rewards/treasury`| GET    | Query treasury reward statistics     | 60 req/min/IP    |
+//! | `POST /fraud-proof`    | POST   | Submit fraud proof (placeholder)     | 10 req/min/IP    |
+//! | `GET /fraud-proofs`    | GET    | List all fraud proof submissions     | 60 req/min/IP    |
+//!
+//! ### Rate Limiting
+//!
+//! Mutation endpoints (`/claim`, `/fraud-proof`): **10 req/min per IP**
+//! Query endpoints (all others): **60 req/min per IP**
+//!
+//! ### Fraud Proof Notice
+//!
+//! **The `/fraud-proof` endpoint is a placeholder only.** Submissions are
+//! logged but NOT processed. Full verification, arbitration, slashing, and
+//! challenge resolution will be implemented in **Tahap 18.8**.
+//!
+//! ### Request/Response Schemas
+//!
+//! #### POST /claim
+//!
+//! Request: `{ "receipt_hash": "abc..64hex", "submitter_address": "abc..40hex", "receipt_data": [1,2,3] }`
+//! Response: `{ "success": true, "message": "claim accepted (stub)" }`
+//!
+//! #### GET /receipt/:hash
+//!
+//! Response: `{ "receipt_hash": "...", "status": "finalized", "reward_amount": 1000, ... }`
+//!
+//! #### POST /receipts/status
+//!
+//! Request: `{ "hashes": ["abc..64hex", "def..64hex"] }`
+//! Response: `[{ "receipt_hash": "...", "status": "..." }, ...]`
+//!
+//! #### GET /rewards/:address
+//!
+//! Response: `{ "address": "...", "balance": 0, "pending_rewards": 0, ... }`
+//!
+//! #### POST /fraud-proof
+//!
+//! Request: `{ "receipt_hash": "abc..64hex", "proof_type": "execution_mismatch", "proof_data": [1], "submitter_address": "abc..40hex" }`
+//! Response: `{ "accepted": true, "fraud_proof_id": "fp-...", "message": "...", "note": "placeholder..." }`
+//!
 //! ## Endpoint Details
 //!
 //! ### GET /health
@@ -1681,6 +1759,9 @@ async fn proxy_object(
 // ════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod economic_endpoint_tests;
 
 #[cfg(test)]
 mod tests {

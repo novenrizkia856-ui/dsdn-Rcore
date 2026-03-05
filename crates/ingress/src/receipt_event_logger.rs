@@ -432,9 +432,12 @@ mod tests {
     // HELPERS
     // ────────────────────────────────────────────────────────────────────────
 
+    /// Unique fallback path per call — prevents parallel test file collisions on Windows.
     fn test_fallback_path() -> String {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
-        p.push(format!("dsdn_test_events_{}.jsonl", std::process::id()));
+        p.push(format!("dsdn_test_events_{}_{}.jsonl", std::process::id(), id));
         p.to_string_lossy().to_string()
     }
 
