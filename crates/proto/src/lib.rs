@@ -406,6 +406,15 @@ pub mod audit_event;
 // ════════════════════════════════════════════════════════════════════════════════
 
 pub use da_health::{DAHealthStatus, DAError};
+/// Re-exports all encoding functions including:
+///
+/// **DA Events**: `encode_event`, `decode_event`, `compute_event_hash`, `batch_encode`, `batch_decode`
+///
+/// **Fallback Events**: `encode_fallback_event`, `decode_fallback_event`, `compute_fallback_event_hash`
+///
+/// **Audit Log (Tahap 15.7)**: `encode_audit_event`, `decode_audit_event`,
+/// `compute_audit_event_hash`, `verify_audit_event_hash`, `encode_audit_entry`,
+/// `decode_audit_entry`, `compute_audit_entry_hash`, `batch_encode_audit`, `batch_decode_audit`
 pub use encoding::*;
 
 // ════════════════════════════════════════════════════════════════════════════════

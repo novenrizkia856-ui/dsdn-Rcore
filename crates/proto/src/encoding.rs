@@ -517,6 +517,185 @@ pub fn verify_fallback_event_hash(event: &FallbackEvent, expected: &[u8; 32]) ->
     computed.iter().zip(expected.iter()).fold(true, |acc, (a, b)| acc && (*a == *b))
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+// AUDIT LOG EVENT ENCODING (Tahap 15.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+use crate::audit_event::{AuditLogEvent, AuditLogEntry};
+
+/// Encode `AuditLogEvent` ke bytes dengan format deterministik.
+///
+/// Menggunakan bincode yang IDENTIK dengan `encode_event` dan `encode_fallback_event`.
+///
+/// # Returns
+///
+/// `Vec<u8>` berisi binary representation. Empty Vec jika serialisasi gagal.
+pub fn encode_audit_event(event: &AuditLogEvent) -> Vec<u8> {
+    bincode::serialize(event).unwrap_or_else(|_| Vec::new())
+}
+
+/// Decode bytes ke `AuditLogEvent`.
+///
+/// # Errors
+///
+/// Returns `DecodeError::DecodeFailed` jika input kosong atau invalid.
+pub fn decode_audit_event(bytes: &[u8]) -> Result<AuditLogEvent, DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::DecodeFailed("empty input".to_string()));
+    }
+    bincode::deserialize(bytes)
+        .map_err(|e| DecodeError::DecodeFailed(e.to_string()))
+}
+
+/// Compute SHA3-256 hash dari encoded `AuditLogEvent`.
+///
+/// Hash dihitung dari HASIL `encode_audit_event`, bukan struct langsung.
+pub fn compute_audit_event_hash(event: &AuditLogEvent) -> [u8; 32] {
+    let encoded = encode_audit_event(event);
+    let mut hasher = Sha3_256::new();
+    hasher.update(&encoded);
+    hasher.finalize().into()
+}
+
+/// Verify hash dari `AuditLogEvent` dengan expected hash.
+///
+/// Returns `true` jika computed hash == expected (bitwise).
+pub fn verify_audit_event_hash(event: &AuditLogEvent, expected: &[u8; 32]) -> bool {
+    let computed = compute_audit_event_hash(event);
+    computed.iter().zip(expected.iter()).fold(true, |acc, (a, b)| acc && (*a == *b))
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// AUDIT LOG ENTRY ENCODING (Tahap 15.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Encode `AuditLogEntry` ke bytes dengan format deterministik.
+///
+/// Serializes the ENTIRE entry including `entry_hash`.
+pub fn encode_audit_entry(entry: &AuditLogEntry) -> Vec<u8> {
+    bincode::serialize(entry).unwrap_or_else(|_| Vec::new())
+}
+
+/// Decode bytes ke `AuditLogEntry`.
+///
+/// # Errors
+///
+/// Returns `DecodeError::DecodeFailed` jika input kosong atau invalid.
+pub fn decode_audit_entry(bytes: &[u8]) -> Result<AuditLogEntry, DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::DecodeFailed("empty input".to_string()));
+    }
+    bincode::deserialize(bytes)
+        .map_err(|e| DecodeError::DecodeFailed(e.to_string()))
+}
+
+/// Compute SHA3-256 hash dari encoded `AuditLogEntry`.
+///
+/// Hash dihitung dari FULL encoded entry (semua fields termasuk entry_hash).
+/// Ini berbeda dari `AuditLogEntry::compute_entry_hash()` yang exclude entry_hash.
+pub fn compute_audit_entry_hash(entry: &AuditLogEntry) -> [u8; 32] {
+    let encoded = encode_audit_entry(entry);
+    let mut hasher = Sha3_256::new();
+    hasher.update(&encoded);
+    hasher.finalize().into()
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// AUDIT LOG ENTRY BATCH ENCODING (Tahap 15.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Batch encode `AuditLogEntry` slice.
+///
+/// # Format
+///
+/// ```text
+/// [count:u64 LE][len_1:u64 LE][entry_1_bytes]...[len_N:u64 LE][entry_N_bytes]
+/// ```
+///
+/// Identical to `batch_encode` for `DAEvent`.
+pub fn batch_encode_audit(entries: &[AuditLogEntry]) -> Vec<u8> {
+    let mut result = Vec::new();
+
+    let count = entries.len() as u64;
+    result.extend_from_slice(&count.to_le_bytes());
+
+    for entry in entries {
+        let encoded = encode_audit_entry(entry);
+        let len = encoded.len() as u64;
+        result.extend_from_slice(&len.to_le_bytes());
+        result.extend_from_slice(&encoded);
+    }
+
+    result
+}
+
+/// Batch decode bytes ke `Vec<AuditLogEntry>`.
+///
+/// # Format
+///
+/// ```text
+/// [count:u64 LE][len_1:u64 LE][entry_1_bytes]...[len_N:u64 LE][entry_N_bytes]
+/// ```
+///
+/// # Errors
+///
+/// Returns `DecodeError::DecodeFailed` jika data truncated atau corrupt.
+pub fn batch_decode_audit(bytes: &[u8]) -> Result<Vec<AuditLogEntry>, DecodeError> {
+    if bytes.len() < 8 {
+        return Err(DecodeError::DecodeFailed("batch too short for count".to_string()));
+    }
+
+    let mut cursor = 0;
+
+    // Read count
+    let count_bytes: [u8; 8] = bytes[cursor..cursor + 8]
+        .try_into()
+        .map_err(|_| DecodeError::DecodeFailed("failed to read count".to_string()))?;
+    let count = u64::from_le_bytes(count_bytes) as usize;
+    cursor += 8;
+
+    // Validate count
+    let max_possible = (bytes.len().saturating_sub(8)) / 8;
+    if count > max_possible {
+        return Err(DecodeError::DecodeFailed(
+            format!("invalid entry count {} exceeds maximum possible {}", count, max_possible),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+
+    for i in 0..count {
+        // Read length prefix
+        if cursor + 8 > bytes.len() {
+            return Err(DecodeError::DecodeFailed(
+                format!("batch truncated at entry {} length", i),
+            ));
+        }
+
+        let len_bytes: [u8; 8] = bytes[cursor..cursor + 8]
+            .try_into()
+            .map_err(|_| DecodeError::DecodeFailed(
+                format!("failed to read length for entry {}", i),
+            ))?;
+        let entry_len = u64::from_le_bytes(len_bytes) as usize;
+        cursor += 8;
+
+        // Read entry bytes
+        if cursor + entry_len > bytes.len() {
+            return Err(DecodeError::DecodeFailed(
+                format!("batch truncated at entry {} data", i),
+            ));
+        }
+
+        let entry_bytes = &bytes[cursor..cursor + entry_len];
+        let entry = decode_audit_entry(entry_bytes)?;
+        entries.push(entry);
+        cursor += entry_len;
+    }
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,6 +1744,307 @@ mod tests {
         let function_hash = compute_fallback_event_hash(&fallback_event);
         
         assert_eq!(manual_hash, function_hash, "hash must follow encode → SHA3-256 pipeline");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// AUDIT ENCODING TESTS (Tahap 15.7)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod audit_encoding_tests {
+    use super::*;
+    use crate::audit_event::{
+        AuditLogEvent, AuditLogEntry, StakeOperation, AUDIT_EVENT_SCHEMA_VERSION,
+    };
+
+    fn sample_slashing_event() -> AuditLogEvent {
+        AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 1700000000,
+            validator_id: "val-001".to_string(),
+            node_id: "node-001".to_string(),
+            slash_amount: 5000,
+            reason: "double_sign".to_string(),
+            epoch: 42,
+            evidence_hash: [0xAB; 32],
+        }
+    }
+
+    fn sample_stake_event() -> AuditLogEvent {
+        AuditLogEvent::StakeUpdated {
+            version: 1,
+            timestamp_ms: 1700000001,
+            staker_address: "staker-001".to_string(),
+            operation: StakeOperation::Delegate,
+            amount: 1000,
+            validator_id: "val-002".to_string(),
+            epoch: 43,
+        }
+    }
+
+    fn make_entry(seq: u64, ts: u64, prev: [u8; 32], event: AuditLogEvent) -> AuditLogEntry {
+        let mut entry = AuditLogEntry {
+            sequence: seq,
+            timestamp_ms: ts,
+            prev_hash: prev,
+            event,
+            entry_hash: [0u8; 32],
+        };
+        entry.entry_hash = entry.compute_entry_hash();
+        entry
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 1: audit_event_encode_decode_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_encode_decode_roundtrip() {
+        let events = [sample_slashing_event(), sample_stake_event()];
+        for (i, event) in events.iter().enumerate() {
+            let encoded = encode_audit_event(event);
+            assert!(!encoded.is_empty(), "event {} must encode", i);
+            let decoded = decode_audit_event(&encoded);
+            match decoded {
+                Ok(rt) => assert_eq!(event, &rt, "event {} roundtrip must match", i),
+                Err(e) => assert!(false, "event {} decode failed: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 2: audit_event_hash_deterministic
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_hash_deterministic() {
+        let event = sample_slashing_event();
+        let h1 = compute_audit_event_hash(&event);
+        let h2 = compute_audit_event_hash(&event);
+        assert_eq!(h1, h2, "hash must be deterministic");
+        assert_eq!(h1.len(), 32);
+
+        for _ in 0..100 {
+            assert_eq!(h1, compute_audit_event_hash(&event));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 3: audit_event_hash_changes_when_event_changes
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_hash_changes_when_event_changes() {
+        let h1 = compute_audit_event_hash(&sample_slashing_event());
+        let h2 = compute_audit_event_hash(&sample_stake_event());
+        assert_ne!(h1, h2, "different events must have different hashes");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 4: audit_event_verify_hash_true
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_verify_hash_true() {
+        let event = sample_slashing_event();
+        let hash = compute_audit_event_hash(&event);
+        assert!(verify_audit_event_hash(&event, &hash), "correct hash must verify");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 5: audit_event_verify_hash_false
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_verify_hash_false() {
+        let event = sample_slashing_event();
+        let wrong = [0u8; 32];
+        assert!(!verify_audit_event_hash(&event, &wrong), "wrong hash must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 6: audit_entry_encode_decode_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_encode_decode_roundtrip() {
+        let entry = make_entry(1, 1700000000, [0u8; 32], sample_slashing_event());
+        let encoded = encode_audit_entry(&entry);
+        assert!(!encoded.is_empty());
+        let decoded = decode_audit_entry(&encoded);
+        match decoded {
+            Ok(rt) => assert_eq!(entry, rt, "entry roundtrip must match"),
+            Err(e) => assert!(false, "entry decode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 7: audit_entry_hash_deterministic
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_hash_deterministic() {
+        let entry = make_entry(1, 1700000000, [0u8; 32], sample_slashing_event());
+        let h1 = compute_audit_entry_hash(&entry);
+        let h2 = compute_audit_entry_hash(&entry);
+        assert_eq!(h1, h2, "entry hash must be deterministic");
+        assert_eq!(h1.len(), 32);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 8: audit_entry_hash_changes_when_entry_changes
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_hash_changes_when_entry_changes() {
+        let e1 = make_entry(1, 1700000000, [0u8; 32], sample_slashing_event());
+        let e2 = make_entry(2, 1700000000, [0u8; 32], sample_slashing_event());
+        let h1 = compute_audit_entry_hash(&e1);
+        let h2 = compute_audit_entry_hash(&e2);
+        assert_ne!(h1, h2, "different entries must have different hashes");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 9: batch_encode_decode_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn batch_encode_decode_roundtrip() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_slashing_event());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_stake_event());
+        let e3 = make_entry(3, 300, e2.entry_hash, sample_slashing_event());
+
+        let entries = vec![e1.clone(), e2.clone(), e3.clone()];
+        let encoded = batch_encode_audit(&entries);
+        let decoded = batch_decode_audit(&encoded);
+
+        match decoded {
+            Ok(rt) => {
+                assert_eq!(rt.len(), 3, "batch length must match");
+                assert_eq!(rt[0], e1);
+                assert_eq!(rt[1], e2);
+                assert_eq!(rt[2], e3);
+            }
+            Err(e) => assert!(false, "batch decode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 10: batch_encode_zero_entries
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn batch_encode_zero_entries() {
+        let entries: Vec<AuditLogEntry> = vec![];
+        let encoded = batch_encode_audit(&entries);
+
+        // Should have 8 bytes for count = 0
+        assert_eq!(encoded.len(), 8);
+        let count = u64::from_le_bytes(encoded[0..8].try_into().unwrap_or([0u8; 8]));
+        assert_eq!(count, 0);
+
+        let decoded = batch_decode_audit(&encoded);
+        match decoded {
+            Ok(rt) => assert_eq!(rt.len(), 0, "empty batch must decode to empty vec"),
+            Err(e) => assert!(false, "empty batch decode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 11: batch_decode_invalid_length_error
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn batch_decode_invalid_length_error() {
+        // Too short for count
+        let result = batch_decode_audit(&[0x01, 0x02, 0x03]);
+        assert!(result.is_err(), "truncated count must fail");
+
+        // Count says 1 entry but no length prefix
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&1u64.to_le_bytes());
+        let result2 = batch_decode_audit(&bad);
+        assert!(result2.is_err(), "truncated length must fail");
+
+        // Count says 1, length says 100, but no data
+        let mut bad2 = Vec::new();
+        bad2.extend_from_slice(&1u64.to_le_bytes());
+        bad2.extend_from_slice(&100u64.to_le_bytes());
+        let result3 = batch_decode_audit(&bad2);
+        assert!(result3.is_err(), "truncated data must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 12: batch_decode_corrupted_data_error
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn batch_decode_corrupted_data_error() {
+        // Count says 1, length says 5, data is garbage
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&1u64.to_le_bytes());
+        bad.extend_from_slice(&5u64.to_le_bytes());
+        bad.extend_from_slice(&[0x00, 0x01, 0x02, 0x03, 0x04]);
+        let result = batch_decode_audit(&bad);
+        assert!(result.is_err(), "corrupted entry data must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 13: decode_audit_event_empty_input
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn decode_audit_event_empty_input() {
+        let result = decode_audit_event(&[]);
+        assert!(result.is_err(), "empty input must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 14: decode_audit_entry_empty_input
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn decode_audit_entry_empty_input() {
+        let result = decode_audit_entry(&[]);
+        assert!(result.is_err(), "empty input must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 15: audit_encoding_uses_same_bincode_config
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_encoding_uses_same_bincode_config() {
+        // Verify audit encoding produces valid bincode with same config
+        let event = sample_slashing_event();
+        let encoded = encode_audit_event(&event);
+        assert!(encoded.len() >= 4, "must produce valid bincode");
+
+        // First 4 bytes = u32 discriminant for SlashingExecuted = 0
+        let disc = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+        assert_eq!(disc, 0, "SlashingExecuted discriminant must be 0");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 16: batch_order_preserved
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn batch_order_preserved() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_slashing_event());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_stake_event());
+
+        let encoded = batch_encode_audit(&[e1.clone(), e2.clone()]);
+        let decoded = batch_decode_audit(&encoded);
+
+        match decoded {
+            Ok(rt) => {
+                assert_eq!(rt[0], e1, "order must be preserved");
+                assert_eq!(rt[1], e2, "order must be preserved");
+            }
+            Err(e) => assert!(false, "decode failed: {}", e),
+        }
     }
 }
 
