@@ -91,6 +91,34 @@ pub enum GovernanceStatus {
     Expired,
 }
 
+/// DA fallback action type for [`AuditLogEvent::DaFallbackEvent`].
+///
+/// # Thread Safety
+///
+/// `Send + Sync` — all variants are fieldless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaFallbackAction {
+    /// DA fallback layer was activated (primary unavailable).
+    Activated,
+    /// DA fallback layer was deactivated (primary restored).
+    Deactivated,
+}
+
+/// Compute challenge outcome for [`AuditLogEvent::ComputeChallengeEvent`].
+///
+/// # Thread Safety
+///
+/// `Send + Sync` — all variants are fieldless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChallengeOutcome {
+    /// Challenge issued, awaiting resolution.
+    Pending,
+    /// Challenge resolved — no fraud detected.
+    Cleared,
+    /// Challenge resolved — fraud confirmed.
+    Fraud,
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // AUDIT LOG EVENT ENUM
 // ════════════════════════════════════════════════════════════════════════════════
@@ -254,11 +282,25 @@ pub enum AuditLogEvent {
     ///
     /// Producer: Tahap 20 (committee rotation mechanism).
     /// Hook is defined now; producer will call it when rotation is active.
+    ///
+    /// Fields expanded in Tahap 15.5.
     CommitteeRotationEvent {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Epoch before rotation.
+        old_epoch: u64,
+        /// Epoch after rotation.
+        new_epoch: u64,
+        /// SHA3-256 hash of the old committee.
+        old_committee_hash: [u8; 32],
+        /// SHA3-256 hash of the new committee.
+        new_committee_hash: [u8; 32],
+        /// Number of members in the new committee.
+        member_count: u32,
+        /// Signing threshold of the new committee.
+        threshold: u32,
     },
 
     // ── Variant 8 ────────────────────────────────────────────────────────────
@@ -266,11 +308,23 @@ pub enum AuditLogEvent {
     ///
     /// Producer: Tahap 15.1 integration (coordinator crate).
     /// Emitted when DA source changes (primary ↔ secondary ↔ emergency).
+    ///
+    /// Fields expanded in Tahap 15.5.
     DaFallbackEvent {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// Whether fallback was activated or deactivated.
+        action: DaFallbackAction,
+        /// DA source before the transition.
+        previous_source: String,
+        /// DA source after the transition.
+        new_source: String,
+        /// Human-readable reason for the transition.
+        reason: String,
+        /// Last known Celestia block height before transition.
+        celestia_last_height: u64,
     },
 
     // ── Variant 9 ────────────────────────────────────────────────────────────
@@ -278,11 +332,23 @@ pub enum AuditLogEvent {
     ///
     /// Producer: Tahap 18.1 (fraud proof system).
     /// Hook is defined now; producer will call it when challenge system is active.
+    ///
+    /// Fields expanded in Tahap 15.5.
     ComputeChallengeEvent {
         /// Schema version for forward compatibility.
-        version: u32,
+        version: u8,
         /// Unix timestamp in milliseconds (caller-provided).
         timestamp_ms: u64,
+        /// SHA3-256 hash of the receipt being challenged.
+        receipt_hash: [u8; 32],
+        /// ID of the entity issuing the challenge.
+        challenger_id: String,
+        /// ID of the node being challenged.
+        challenged_node_id: String,
+        /// Type of challenge (e.g. `"execution_mismatch"`, `"resource_inflation"`).
+        challenge_type: String,
+        /// Current outcome of the challenge.
+        outcome: ChallengeOutcome,
     },
 }
 
@@ -355,16 +421,32 @@ mod tests {
                 status: GovernanceStatus::Submitted,
             },
             AuditLogEvent::CommitteeRotationEvent {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000007,
+                old_epoch: 10,
+                new_epoch: 11,
+                old_committee_hash: [0xAA; 32],
+                new_committee_hash: [0xBB; 32],
+                member_count: 5,
+                threshold: 3,
             },
             AuditLogEvent::DaFallbackEvent {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000008,
+                action: DaFallbackAction::Activated,
+                previous_source: "celestia".to_string(),
+                new_source: "validator_quorum".to_string(),
+                reason: "primary_timeout".to_string(),
+                celestia_last_height: 999,
             },
             AuditLogEvent::ComputeChallengeEvent {
-                version: AUDIT_EVENT_SCHEMA_VERSION,
+                version: 1,
                 timestamp_ms: 1700000009,
+                receipt_hash: [0xDD; 32],
+                challenger_id: "challenger-001".to_string(),
+                challenged_node_id: "node-challenged".to_string(),
+                challenge_type: "execution_mismatch".to_string(),
+                outcome: ChallengeOutcome::Pending,
             },
         ]
     }
@@ -847,9 +929,24 @@ mod tests {
             proposal_type: String::new(), delay_window_secs: 0,
             status: GovernanceStatus::Submitted,
         };
-        let _v7 = AuditLogEvent::CommitteeRotationEvent { version: 1, timestamp_ms: 0 };
-        let _v8 = AuditLogEvent::DaFallbackEvent { version: 1, timestamp_ms: 0 };
-        let _v9 = AuditLogEvent::ComputeChallengeEvent { version: 1, timestamp_ms: 0 };
+        let _v7 = AuditLogEvent::CommitteeRotationEvent {
+            version: 1, timestamp_ms: 0,
+            old_epoch: 0, new_epoch: 0,
+            old_committee_hash: [0u8; 32], new_committee_hash: [0u8; 32],
+            member_count: 0, threshold: 0,
+        };
+        let _v8 = AuditLogEvent::DaFallbackEvent {
+            version: 1, timestamp_ms: 0,
+            action: DaFallbackAction::Activated,
+            previous_source: String::new(), new_source: String::new(),
+            reason: String::new(), celestia_last_height: 0,
+        };
+        let _v9 = AuditLogEvent::ComputeChallengeEvent {
+            version: 1, timestamp_ms: 0,
+            receipt_hash: [0u8; 32],
+            challenger_id: String::new(), challenged_node_id: String::new(),
+            challenge_type: String::new(), outcome: ChallengeOutcome::Pending,
+        };
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1395,5 +1492,376 @@ mod tests {
             delay_window_secs: 0,
             status: GovernanceStatus::Submitted,
         };
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.5 TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 31: committee_rotation_event_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn committee_rotation_event_fields_exist() {
+        let event = AuditLogEvent::CommitteeRotationEvent {
+            version: 1,
+            timestamp_ms: 1700000000,
+            old_epoch: 10,
+            new_epoch: 11,
+            old_committee_hash: [0xAA; 32],
+            new_committee_hash: [0xBB; 32],
+            member_count: 7,
+            threshold: 5,
+        };
+
+        match &event {
+            AuditLogEvent::CommitteeRotationEvent {
+                version, timestamp_ms, old_epoch, new_epoch,
+                old_committee_hash, new_committee_hash,
+                member_count, threshold,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(*old_epoch, 10u64);
+                assert_eq!(*new_epoch, 11u64);
+                assert_eq!(old_committee_hash.len(), 32);
+                assert_eq!(old_committee_hash[0], 0xAA);
+                assert_eq!(new_committee_hash.len(), 32);
+                assert_eq!(new_committee_hash[0], 0xBB);
+                assert_eq!(*member_count, 7u32);
+                assert_eq!(*threshold, 5u32);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 32: committee_rotation_event_serialization
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn committee_rotation_event_serialization() {
+        let event = AuditLogEvent::CommitteeRotationEvent {
+            version: 1,
+            timestamp_ms: u64::MAX,
+            old_epoch: u64::MAX,
+            new_epoch: 0,
+            old_committee_hash: [0xFF; 32],
+            new_committee_hash: [0x00; 32],
+            member_count: u32::MAX,
+            threshold: 0,
+        };
+
+        let encoded = bincode::serialize(&event);
+        match encoded {
+            Ok(bytes) => {
+                assert!(!bytes.is_empty());
+                let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                match decoded {
+                    Ok(rt) => assert_eq!(event, rt),
+                    Err(e) => assert!(false, "decode failed: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "encode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 33: da_fallback_event_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn da_fallback_event_fields_exist() {
+        let event = AuditLogEvent::DaFallbackEvent {
+            version: 1,
+            timestamp_ms: 1700000000,
+            action: DaFallbackAction::Activated,
+            previous_source: "celestia".to_string(),
+            new_source: "validator_quorum".to_string(),
+            reason: "timeout".to_string(),
+            celestia_last_height: 12345,
+        };
+
+        match &event {
+            AuditLogEvent::DaFallbackEvent {
+                version, timestamp_ms, action,
+                previous_source, new_source, reason,
+                celestia_last_height,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(*action, DaFallbackAction::Activated);
+                assert_eq!(previous_source, "celestia");
+                assert_eq!(new_source, "validator_quorum");
+                assert_eq!(reason, "timeout");
+                assert_eq!(*celestia_last_height, 12345u64);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 34: da_fallback_action_enum_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn da_fallback_action_enum_variants() {
+        let a = DaFallbackAction::Activated;
+        let d = DaFallbackAction::Deactivated;
+
+        assert_ne!(a, d);
+        assert_eq!(a.clone(), DaFallbackAction::Activated);
+        assert_eq!(d.clone(), DaFallbackAction::Deactivated);
+
+        // Serialization roundtrip
+        for action in &[a, d] {
+            let encoded = bincode::serialize(action);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<DaFallbackAction, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(action, &rt),
+                        Err(e) => assert!(false, "decode failed: {}", e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed: {}", e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 35: da_fallback_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn da_fallback_serialization_roundtrip() {
+        for action in &[DaFallbackAction::Activated, DaFallbackAction::Deactivated] {
+            let event = AuditLogEvent::DaFallbackEvent {
+                version: 1,
+                timestamp_ms: 1700000000,
+                action: action.clone(),
+                previous_source: "src_a".to_string(),
+                new_source: "src_b".to_string(),
+                reason: "test".to_string(),
+                celestia_last_height: u64::MAX,
+            };
+
+            let encoded = bincode::serialize(&event);
+            match encoded {
+                Ok(bytes) => {
+                    assert!(!bytes.is_empty());
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(event, rt),
+                        Err(e) => assert!(false, "decode failed: {}", e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed: {}", e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 36: compute_challenge_event_fields_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn compute_challenge_event_fields_exist() {
+        let event = AuditLogEvent::ComputeChallengeEvent {
+            version: 1,
+            timestamp_ms: 1700000000,
+            receipt_hash: [0xEE; 32],
+            challenger_id: "chal-001".to_string(),
+            challenged_node_id: "node-bad".to_string(),
+            challenge_type: "execution_mismatch".to_string(),
+            outcome: ChallengeOutcome::Fraud,
+        };
+
+        match &event {
+            AuditLogEvent::ComputeChallengeEvent {
+                version, timestamp_ms, receipt_hash,
+                challenger_id, challenged_node_id,
+                challenge_type, outcome,
+            } => {
+                assert_eq!(*version, 1u8);
+                assert_eq!(*timestamp_ms, 1700000000u64);
+                assert_eq!(receipt_hash.len(), 32);
+                assert_eq!(receipt_hash[0], 0xEE);
+                assert_eq!(challenger_id, "chal-001");
+                assert_eq!(challenged_node_id, "node-bad");
+                assert_eq!(challenge_type, "execution_mismatch");
+                assert_eq!(*outcome, ChallengeOutcome::Fraud);
+            }
+            _ => assert!(false, "pattern match failed"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 37: challenge_outcome_enum_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn challenge_outcome_enum_variants() {
+        let p = ChallengeOutcome::Pending;
+        let c = ChallengeOutcome::Cleared;
+        let f = ChallengeOutcome::Fraud;
+
+        assert_ne!(p, c);
+        assert_ne!(c, f);
+        assert_ne!(p, f);
+
+        assert_eq!(p.clone(), ChallengeOutcome::Pending);
+        assert_eq!(c.clone(), ChallengeOutcome::Cleared);
+        assert_eq!(f.clone(), ChallengeOutcome::Fraud);
+
+        // Serialization roundtrip
+        for outcome in &[p, c, f] {
+            let encoded = bincode::serialize(outcome);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<ChallengeOutcome, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(outcome, &rt),
+                        Err(e) => assert!(false, "decode failed: {}", e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed: {}", e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 38: compute_challenge_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn compute_challenge_serialization_roundtrip() {
+        for outcome in &[ChallengeOutcome::Pending, ChallengeOutcome::Cleared, ChallengeOutcome::Fraud] {
+            let event = AuditLogEvent::ComputeChallengeEvent {
+                version: 1,
+                timestamp_ms: 1700000000,
+                receipt_hash: [0xFF; 32],
+                challenger_id: "ch".to_string(),
+                challenged_node_id: "nd".to_string(),
+                challenge_type: "resource_inflation".to_string(),
+                outcome: outcome.clone(),
+            };
+
+            let encoded = bincode::serialize(&event);
+            match encoded {
+                Ok(bytes) => {
+                    assert!(!bytes.is_empty());
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(event, rt),
+                        Err(e) => assert!(false, "decode failed for {:?}: {}", outcome, e),
+                    }
+                }
+                Err(e) => assert!(false, "encode failed for {:?}: {}", outcome, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 39: audit_event_variant_count_is_9
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_variant_count_is_9() {
+        let variants = all_variants();
+        assert_eq!(variants.len(), 9, "must have exactly 9 variants after 15.5");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 40: audit_event_variant_order_preserved_15_5
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_variant_order_preserved_15_5() {
+        // Verify discriminants 6, 7, 8 for the three expanded variants.
+        let v6 = AuditLogEvent::CommitteeRotationEvent {
+            version: 1, timestamp_ms: 0,
+            old_epoch: 0, new_epoch: 0,
+            old_committee_hash: [0u8; 32], new_committee_hash: [0u8; 32],
+            member_count: 0, threshold: 0,
+        };
+        let v7 = AuditLogEvent::DaFallbackEvent {
+            version: 1, timestamp_ms: 0,
+            action: DaFallbackAction::Activated,
+            previous_source: String::new(), new_source: String::new(),
+            reason: String::new(), celestia_last_height: 0,
+        };
+        let v8 = AuditLogEvent::ComputeChallengeEvent {
+            version: 1, timestamp_ms: 0,
+            receipt_hash: [0u8; 32],
+            challenger_id: String::new(), challenged_node_id: String::new(),
+            challenge_type: String::new(), outcome: ChallengeOutcome::Pending,
+        };
+
+        let enc6 = bincode::serialize(&v6);
+        let enc7 = bincode::serialize(&v7);
+        let enc8 = bincode::serialize(&v8);
+
+        match (enc6, enc7, enc8) {
+            (Ok(b6), Ok(b7), Ok(b8)) => {
+                assert!(b6.len() >= 4);
+                assert!(b7.len() >= 4);
+                assert!(b8.len() >= 4);
+
+                let d6 = u32::from_le_bytes([b6[0], b6[1], b6[2], b6[3]]);
+                let d7 = u32::from_le_bytes([b7[0], b7[1], b7[2], b7[3]]);
+                let d8 = u32::from_le_bytes([b8[0], b8[1], b8[2], b8[3]]);
+
+                assert_eq!(d6, 6, "CommitteeRotationEvent must be discriminant 6");
+                assert_eq!(d7, 7, "DaFallbackEvent must be discriminant 7");
+                assert_eq!(d8, 8, "ComputeChallengeEvent must be discriminant 8");
+            }
+            _ => assert!(false, "serialization should not fail"),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 41: all_supporting_enums_exist
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn all_supporting_enums_exist() {
+        // Verify all 4 supporting enums are constructable + Send + Sync
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StakeOperation>();
+        assert_send_sync::<GovernanceStatus>();
+        assert_send_sync::<DaFallbackAction>();
+        assert_send_sync::<ChallengeOutcome>();
+
+        // All constructable
+        let _so = StakeOperation::Delegate;
+        let _gs = GovernanceStatus::Submitted;
+        let _da = DaFallbackAction::Activated;
+        let _co = ChallengeOutcome::Pending;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 42: all_variants_version_u8_after_15_5
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn all_variants_version_u8_after_15_5() {
+        // After 15.5, all 9 variants use version: u8
+        let variants = all_variants();
+        for (i, event) in variants.iter().enumerate() {
+            let v: u8 = match event {
+                AuditLogEvent::SlashingExecuted { version, .. } => *version,
+                AuditLogEvent::StakeUpdated { version, .. } => *version,
+                AuditLogEvent::AntiSelfDealingViolation { version, .. } => *version,
+                AuditLogEvent::UserControlledDelete { version, .. } => *version,
+                AuditLogEvent::DaSyncSequenceUpdate { version, .. } => *version,
+                AuditLogEvent::GovernanceProposalEvent { version, .. } => *version,
+                AuditLogEvent::CommitteeRotationEvent { version, .. } => *version,
+                AuditLogEvent::DaFallbackEvent { version, .. } => *version,
+                AuditLogEvent::ComputeChallengeEvent { version, .. } => *version,
+            };
+            assert_eq!(v, 1u8, "variant {} version must be u8 value 1", i);
+        }
     }
 }
