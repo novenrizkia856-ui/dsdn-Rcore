@@ -2175,4 +2175,286 @@ mod tests {
         assert!(e3.verify_chain(&e2), "e3 → e2 chain valid");
         assert!(!e3.verify_chain(&e1), "e3 → e1 chain must be invalid (skips e2)");
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.8 COMPREHENSIVE TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 55: audit_event_serialize_all_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_serialize_all_variants() {
+        let variants = all_variants();
+        assert_eq!(variants.len(), 9);
+
+        for (i, event) in variants.iter().enumerate() {
+            let encoded = bincode::serialize(event);
+            match encoded {
+                Ok(bytes) => {
+                    assert!(!bytes.is_empty(), "variant {} must serialize to non-empty", i);
+                    assert!(bytes.len() >= 4, "variant {} must have discriminant", i);
+                }
+                Err(e) => assert!(false, "variant {} serialize failed: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 56: audit_event_deserialize_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_deserialize_roundtrip() {
+        let variants = all_variants();
+
+        for (i, original) in variants.iter().enumerate() {
+            let encoded = bincode::serialize(original);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(original, &rt, "variant {} roundtrip", i),
+                        Err(e) => assert!(false, "variant {} deserialize failed: {}", i, e),
+                    }
+                }
+                Err(e) => assert!(false, "variant {} serialize failed: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 57: audit_event_deterministic_encoding_15_8
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_event_deterministic_encoding_15_8() {
+        // Every variant must encode deterministically
+        let variants = all_variants();
+
+        for (i, event) in variants.iter().enumerate() {
+            let enc_a = bincode::serialize(event);
+            let enc_b = bincode::serialize(event);
+            match (enc_a, enc_b) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "variant {} encoding must be deterministic", i);
+                }
+                _ => assert!(false, "variant {} serialization failed", i),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 58: slashing_event_all_fields
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn slashing_event_all_fields() {
+        let event = AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 1700000000,
+            validator_id: "val-full".to_string(),
+            node_id: "node-full".to_string(),
+            slash_amount: u128::MAX,
+            reason: "severe_offense".to_string(),
+            epoch: u64::MAX,
+            evidence_hash: [0xDE; 32],
+        };
+
+        // Serialize roundtrip with all fields populated
+        let encoded = bincode::serialize(&event);
+        match encoded {
+            Ok(bytes) => {
+                let decoded: Result<AuditLogEvent, _> = bincode::deserialize(&bytes);
+                match decoded {
+                    Ok(rt) => {
+                        assert_eq!(event, rt);
+                        // Verify individual fields through pattern match
+                        match rt {
+                            AuditLogEvent::SlashingExecuted {
+                                version, timestamp_ms, validator_id, node_id,
+                                slash_amount, reason, epoch, evidence_hash,
+                            } => {
+                                assert_eq!(version, 1u8);
+                                assert_eq!(timestamp_ms, 1700000000u64);
+                                assert_eq!(validator_id, "val-full");
+                                assert_eq!(node_id, "node-full");
+                                assert_eq!(slash_amount, u128::MAX);
+                                assert_eq!(reason, "severe_offense");
+                                assert_eq!(epoch, u64::MAX);
+                                assert_eq!(evidence_hash, [0xDE; 32]);
+                            }
+                            _ => assert!(false, "wrong variant after roundtrip"),
+                        }
+                    }
+                    Err(e) => assert!(false, "decode failed: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "encode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 59: stake_operation_all_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn stake_operation_all_variants() {
+        let ops = [
+            StakeOperation::Delegate,
+            StakeOperation::Undelegate,
+            StakeOperation::Redelegate,
+        ];
+
+        // All 3 distinct
+        assert_ne!(ops[0], ops[1]);
+        assert_ne!(ops[1], ops[2]);
+        assert_ne!(ops[0], ops[2]);
+
+        // All serialize + roundtrip
+        for (i, op) in ops.iter().enumerate() {
+            let encoded = bincode::serialize(op);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<StakeOperation, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(op, &rt, "StakeOperation {} roundtrip", i),
+                        Err(e) => assert!(false, "StakeOperation {} decode: {}", i, e),
+                    }
+                }
+                Err(e) => assert!(false, "StakeOperation {} encode: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 60: governance_status_all_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn governance_status_all_variants() {
+        let statuses = [
+            GovernanceStatus::Submitted,
+            GovernanceStatus::Approved,
+            GovernanceStatus::Rejected,
+            GovernanceStatus::Executed,
+            GovernanceStatus::Expired,
+        ];
+
+        // All 5 distinct
+        for i in 0..statuses.len() {
+            for j in (i + 1)..statuses.len() {
+                assert_ne!(statuses[i], statuses[j], "status {} and {} must differ", i, j);
+            }
+        }
+
+        // All serialize + roundtrip
+        for (i, st) in statuses.iter().enumerate() {
+            let encoded = bincode::serialize(st);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<GovernanceStatus, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(st, &rt, "GovernanceStatus {} roundtrip", i),
+                        Err(e) => assert!(false, "GovernanceStatus {} decode: {}", i, e),
+                    }
+                }
+                Err(e) => assert!(false, "GovernanceStatus {} encode: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 61: challenge_outcome_all_variants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn challenge_outcome_all_variants() {
+        let outcomes = [
+            ChallengeOutcome::Pending,
+            ChallengeOutcome::Cleared,
+            ChallengeOutcome::Fraud,
+        ];
+
+        // All 3 distinct
+        assert_ne!(outcomes[0], outcomes[1]);
+        assert_ne!(outcomes[1], outcomes[2]);
+        assert_ne!(outcomes[0], outcomes[2]);
+
+        // All serialize + roundtrip
+        for (i, co) in outcomes.iter().enumerate() {
+            let encoded = bincode::serialize(co);
+            match encoded {
+                Ok(bytes) => {
+                    let decoded: Result<ChallengeOutcome, _> = bincode::deserialize(&bytes);
+                    match decoded {
+                        Ok(rt) => assert_eq!(co, &rt, "ChallengeOutcome {} roundtrip", i),
+                        Err(e) => assert!(false, "ChallengeOutcome {} decode: {}", i, e),
+                    }
+                }
+                Err(e) => assert!(false, "ChallengeOutcome {} encode: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 62: audit_entry_hash_chain_valid
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_hash_chain_valid() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_event_1());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_event_2());
+
+        assert!(e2.verify_chain(&e1), "valid chain must return true");
+        assert_eq!(e2.prev_hash, e1.entry_hash, "prev_hash must match");
+        assert_eq!(e2.sequence, e1.sequence + 1, "sequence must increment by 1");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 63: audit_entry_hash_chain_tampered
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_hash_chain_tampered() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_event_1());
+
+        // Tamper: wrong prev_hash
+        let e2_bad_hash = make_entry(2, 200, [0xFF; 32], sample_event_2());
+        assert!(!e2_bad_hash.verify_chain(&e1), "tampered prev_hash must fail");
+
+        // Tamper: wrong sequence
+        let e2_bad_seq = make_entry(3, 200, e1.entry_hash, sample_event_2());
+        assert!(!e2_bad_seq.verify_chain(&e1), "wrong sequence must fail");
+
+        // Tamper: both wrong
+        let e2_both_bad = make_entry(5, 200, [0xAA; 32], sample_event_2());
+        assert!(!e2_both_bad.verify_chain(&e1), "both tampered must fail");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 64: audit_entry_sequence_monotonic
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_sequence_monotonic() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_event_1());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_event_2());
+        let e3 = make_entry(3, 300, e2.entry_hash, sample_event_1());
+        let e4 = make_entry(4, 400, e3.entry_hash, sample_event_2());
+
+        assert_eq!(e1.sequence, 1);
+        assert_eq!(e2.sequence, 2);
+        assert_eq!(e3.sequence, 3);
+        assert_eq!(e4.sequence, 4);
+
+        assert!(e2.verify_chain(&e1));
+        assert!(e3.verify_chain(&e2));
+        assert!(e4.verify_chain(&e3));
+
+        // Non-adjacent must fail
+        assert!(!e3.verify_chain(&e1));
+        assert!(!e4.verify_chain(&e2));
+    }
 }

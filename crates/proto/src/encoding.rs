@@ -2046,6 +2046,214 @@ mod audit_encoding_tests {
             Err(e) => assert!(false, "decode failed: {}", e),
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.8 COMPREHENSIVE ENCODING TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 17: encode_decode_audit_event_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn encode_decode_audit_event_roundtrip() {
+        // Test all 9 variant types through encoding pipeline
+        let events: Vec<AuditLogEvent> = vec![
+            sample_slashing_event(),
+            sample_stake_event(),
+            AuditLogEvent::AntiSelfDealingViolation {
+                version: 1, timestamp_ms: 100,
+                node_id: "n".to_string(), submitter_address: "s".to_string(),
+                receipt_hash: [0xCC; 32], detection_type: "direct_match".to_string(),
+                penalty_applied: true,
+            },
+            AuditLogEvent::UserControlledDelete {
+                version: 1, timestamp_ms: 200,
+                chunk_hash: "ch".to_string(), requester_id: "u".to_string(),
+                reason: "gdpr".to_string(), authorized: false,
+            },
+            AuditLogEvent::DaSyncSequenceUpdate {
+                version: 1, timestamp_ms: 300,
+                da_source: "celestia".to_string(), sequence_number: 99,
+                previous_sequence: 98, blob_count: 5,
+            },
+            AuditLogEvent::GovernanceProposalEvent {
+                version: 1, timestamp_ms: 400,
+                proposal_id: "p".to_string(), proposer_address: "a".to_string(),
+                proposal_type: "t".to_string(), delay_window_secs: 3600,
+                status: crate::audit_event::GovernanceStatus::Submitted,
+            },
+            AuditLogEvent::CommitteeRotationEvent {
+                version: 1, timestamp_ms: 500,
+                old_epoch: 1, new_epoch: 2,
+                old_committee_hash: [0xAA; 32], new_committee_hash: [0xBB; 32],
+                member_count: 5, threshold: 3,
+            },
+            AuditLogEvent::DaFallbackEvent {
+                version: 1, timestamp_ms: 600,
+                action: crate::audit_event::DaFallbackAction::Activated,
+                previous_source: "celestia".to_string(),
+                new_source: "quorum".to_string(),
+                reason: "timeout".to_string(), celestia_last_height: 999,
+            },
+            AuditLogEvent::ComputeChallengeEvent {
+                version: 1, timestamp_ms: 700,
+                receipt_hash: [0xDD; 32], challenger_id: "c".to_string(),
+                challenged_node_id: "cn".to_string(),
+                challenge_type: "exec".to_string(),
+                outcome: crate::audit_event::ChallengeOutcome::Pending,
+            },
+        ];
+
+        for (i, event) in events.iter().enumerate() {
+            let encoded = encode_audit_event(event);
+            assert!(!encoded.is_empty(), "event {} must encode", i);
+            let decoded = decode_audit_event(&encoded);
+            match decoded {
+                Ok(rt) => assert_eq!(event, &rt, "event {} roundtrip via encoding pipeline", i),
+                Err(e) => assert!(false, "event {} decode failed: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 18: encode_decode_audit_entry_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn encode_decode_audit_entry_roundtrip_15_8() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_slashing_event());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_stake_event());
+
+        for (i, entry) in [&e1, &e2].iter().enumerate() {
+            let encoded = encode_audit_entry(entry);
+            assert!(!encoded.is_empty(), "entry {} must encode", i);
+            let decoded = decode_audit_entry(&encoded);
+            match decoded {
+                Ok(rt) => {
+                    assert_eq!(*entry, &rt, "entry {} roundtrip", i);
+                    // Verify hash preserved
+                    assert_eq!(entry.entry_hash, rt.entry_hash, "entry {} hash preserved", i);
+                }
+                Err(e) => assert!(false, "entry {} decode failed: {}", i, e),
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 19: batch_encode_decode_audit_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn batch_encode_decode_audit_roundtrip_15_8() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_slashing_event());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_stake_event());
+        let e3 = make_entry(3, 300, e2.entry_hash, sample_slashing_event());
+        let e4 = make_entry(4, 400, e3.entry_hash, sample_stake_event());
+
+        let entries = vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()];
+        let encoded = batch_encode_audit(&entries);
+        let decoded = batch_decode_audit(&encoded);
+
+        match decoded {
+            Ok(rt) => {
+                assert_eq!(rt.len(), 4, "batch length must match");
+                for (i, (orig, dec)) in entries.iter().zip(rt.iter()).enumerate() {
+                    assert_eq!(orig, dec, "batch entry {} must match", i);
+                }
+            }
+            Err(e) => assert!(false, "batch decode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 20: audit_hash_determinism_100_iterations
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_hash_determinism_100_iterations() {
+        let event = sample_slashing_event();
+        let reference = compute_audit_event_hash(&event);
+
+        for i in 0..100 {
+            let hash = compute_audit_event_hash(&event);
+            assert_eq!(
+                reference, hash,
+                "audit event hash must be deterministic at iteration {}",
+                i
+            );
+        }
+
+        let entry = make_entry(1, 1700000000, [0u8; 32], sample_slashing_event());
+        let ref_entry = compute_audit_entry_hash(&entry);
+
+        for i in 0..100 {
+            let hash = compute_audit_entry_hash(&entry);
+            assert_eq!(
+                ref_entry, hash,
+                "audit entry hash must be deterministic at iteration {}",
+                i
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 21: audit_entry_hash_differs_per_event
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_entry_hash_differs_per_event() {
+        let e1 = make_entry(1, 1700000000, [0u8; 32], sample_slashing_event());
+        let e2 = make_entry(1, 1700000000, [0u8; 32], sample_stake_event());
+
+        let h1 = compute_audit_entry_hash(&e1);
+        let h2 = compute_audit_entry_hash(&e2);
+
+        assert_ne!(h1, h2, "entries with different events must have different hashes");
+
+        // Also verify via entry_hash field
+        assert_ne!(e1.entry_hash, e2.entry_hash, "entry_hash fields must differ");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 22: cross_compatibility_same_bincode_config
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn cross_compatibility_same_bincode_config() {
+        let event = sample_slashing_event();
+
+        // Method 1: direct bincode::serialize
+        let direct = bincode::serialize(&event);
+
+        // Method 2: via encode_audit_event
+        let via_fn = encode_audit_event(&event);
+
+        match direct {
+            Ok(direct_bytes) => {
+                assert_eq!(
+                    direct_bytes, via_fn,
+                    "direct serialize and encode_audit_event must produce identical bytes"
+                );
+            }
+            Err(e) => assert!(false, "direct serialize failed: {}", e),
+        }
+
+        // Same for entry
+        let entry = make_entry(1, 100, [0u8; 32], sample_slashing_event());
+        let direct_entry = bincode::serialize(&entry);
+        let via_fn_entry = encode_audit_entry(&entry);
+
+        match direct_entry {
+            Ok(de) => {
+                assert_eq!(
+                    de, via_fn_entry,
+                    "direct entry serialize and encode_audit_entry must produce identical bytes"
+                );
+            }
+            Err(e) => assert!(false, "direct entry serialize failed: {}", e),
+        }
+    }
 }
 
 #[cfg(test)]

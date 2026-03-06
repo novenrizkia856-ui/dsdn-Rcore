@@ -307,17 +307,48 @@
 //!
 //! ### Audit Log Events (Tahap 15)
 //!
-//! | Variant | Producer | Active |
-//! |---------|----------|--------|
-//! | `SlashingExecuted` | chain | Tahap 15.1+ |
-//! | `StakeUpdated` | chain | Tahap 15.1+ |
-//! | `AntiSelfDealingViolation` | chain | Tahap 15.1+ |
-//! | `UserControlledDelete` | ingress | Tahap 15.1+ |
-//! | `DaSyncSequenceUpdate` | coordinator | Tahap 15.1+ |
-//! | `GovernanceProposalEvent` | chain | Tahap 15.1+ |
-//! | `CommitteeRotationEvent` | coordinator | Tahap 20 |
-//! | `DaFallbackEvent` | coordinator | Tahap 15.1 |
-//! | `ComputeChallengeEvent` | node | Tahap 18.1 |
+//! `AuditLogEvent` is the core audit trail enum for DSDN. Every significant
+//! system event (slashing, staking, governance, DA sync, fraud challenges)
+//! is recorded as an `AuditLogEvent` wrapped in an `AuditLogEntry` with
+//! hash-chain integrity. Events are persisted to WORM storage and mirrored
+//! to the DA layer for immutability.
+//!
+//! #### Variant → Producer → Tahap
+//!
+//! | Variant                    | Producer                  | Tahap    |
+//! |----------------------------|---------------------------|----------|
+//! | `SlashingExecuted`         | validator slashing module | Tahap 17 |
+//! | `StakeUpdated`             | staking module            | Tahap 17 |
+//! | `AntiSelfDealingViolation` | receipt validation        | Tahap 18 |
+//! | `UserControlledDelete`     | storage layer             | Tahap 13 |
+//! | `DaSyncSequenceUpdate`     | DA sync module            | Tahap 15 |
+//! | `GovernanceProposalEvent`  | governance system         | Tahap 19 |
+//! | `CommitteeRotationEvent`   | committee rotation        | Tahap 20 |
+//! | `DaFallbackEvent`          | DA fallback controller    | Tahap 15 |
+//! | `ComputeChallengeEvent`    | compute challenge module  | Tahap 18 |
+//!
+//! #### Encoding Pipeline
+//!
+//! ```text
+//! AuditLogEvent → bincode::serialize → SHA3-256 → [u8; 32]
+//! ```
+//!
+//! #### Hash Chain (AuditLogEntry)
+//!
+//! ```text
+//! Entry N: entry_hash = SHA3-256(bincode(seq, ts, prev_hash, event))
+//!          prev_hash  = Entry(N-1).entry_hash
+//!          sequence   = N (monotonic, 1-based)
+//! ```
+//!
+//! #### Supporting Enums
+//!
+//! | Enum | Variants | Used By |
+//! |------|----------|---------|
+//! | `StakeOperation` | Delegate, Undelegate, Redelegate | `StakeUpdated` |
+//! | `GovernanceStatus` | Submitted, Approved, Rejected, Executed, Expired | `GovernanceProposalEvent` |
+//! | `DaFallbackAction` | Activated, Deactivated | `DaFallbackEvent` |
+//! | `ChallengeOutcome` | Pending, Cleared, Fraud | `ComputeChallengeEvent` |
 //!
 //! #### `SlashingExecuted` Fields (Tahap 15.2)
 //!
@@ -574,6 +605,9 @@ pub use audit_event::{
     AuditLogEvent,
     AuditLogEntry,
     StakeOperation,
+    GovernanceStatus,
+    DaFallbackAction,
+    ChallengeOutcome,
     AUDIT_EVENT_SCHEMA_VERSION,
 };
 
