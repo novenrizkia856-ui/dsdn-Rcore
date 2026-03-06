@@ -42,6 +42,7 @@
 //! No auto-generated timestamps. No default values in production.
 
 use serde::{Deserialize, Serialize};
+use sha3::{Sha3_256, Digest};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -350,6 +351,102 @@ pub enum AuditLogEvent {
         /// Current outcome of the challenge.
         outcome: ChallengeOutcome,
     },
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// AUDIT LOG ENTRY (Tahap 15.6)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Hash-chained audit log entry wrapping an [`AuditLogEvent`].
+///
+/// Forms a tamper-evident linked list: each entry's `prev_hash` points to the
+/// preceding entry's `entry_hash`, and `sequence` increments monotonically.
+///
+/// ## Hash Chain
+///
+/// ```text
+/// Entry 1          Entry 2          Entry 3
+/// ┌──────────┐     ┌──────────┐     ┌──────────┐
+/// │ seq=1    │     │ seq=2    │     │ seq=3    │
+/// │ prev=[0] │────▶│ prev=H1  │────▶│ prev=H2  │
+/// │ event=E1 │     │ event=E2 │     │ event=E3 │
+/// │ hash=H1  │     │ hash=H2  │     │ hash=H3  │
+/// └──────────┘     └──────────┘     └──────────┘
+/// ```
+///
+/// ## Hash Formula
+///
+/// `entry_hash = SHA3-256(bincode(sequence, timestamp_ms, prev_hash, event))`
+///
+/// The `entry_hash` field itself is **excluded** from the hash input.
+///
+/// ## Thread Safety
+///
+/// `Send + Sync` — all fields are owned, no interior mutability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    /// Global monotonic sequence number (1-based).
+    pub sequence: u64,
+    /// Entry creation timestamp in Unix milliseconds (caller-provided).
+    pub timestamp_ms: u64,
+    /// SHA3-256 hash of the previous entry. Zero ([0u8; 32]) for the first entry.
+    pub prev_hash: [u8; 32],
+    /// The audit event payload.
+    pub event: AuditLogEvent,
+    /// SHA3-256 hash of (sequence, timestamp_ms, prev_hash, event).
+    pub entry_hash: [u8; 32],
+}
+
+/// Internal struct for computing entry hash.
+/// Contains all fields EXCEPT entry_hash.
+#[derive(Serialize)]
+struct AuditLogEntryHashInput<'a> {
+    sequence: u64,
+    timestamp_ms: u64,
+    prev_hash: &'a [u8; 32],
+    event: &'a AuditLogEvent,
+}
+
+impl AuditLogEntry {
+    /// Compute the entry hash from (sequence, timestamp_ms, prev_hash, event).
+    ///
+    /// The `entry_hash` field is **excluded** from the hash input.
+    ///
+    /// ## Hash Pipeline
+    ///
+    /// 1. Build `(sequence, timestamp_ms, prev_hash, event)` tuple
+    /// 2. Serialize via `bincode` (deterministic, little-endian)
+    /// 3. Hash via SHA3-256
+    ///
+    /// Returns `[u8; 32]`. If serialization fails (should not happen for
+    /// valid `AuditLogEvent`), returns hash of empty bytes.
+    pub fn compute_entry_hash(&self) -> [u8; 32] {
+        let input = AuditLogEntryHashInput {
+            sequence: self.sequence,
+            timestamp_ms: self.timestamp_ms,
+            prev_hash: &self.prev_hash,
+            event: &self.event,
+        };
+        let encoded = bincode::serialize(&input).unwrap_or_default();
+        let mut hasher = Sha3_256::new();
+        hasher.update(&encoded);
+        hasher.finalize().into()
+    }
+
+    /// Verify this entry's chain link to the previous entry.
+    ///
+    /// Returns `true` if and only if:
+    /// 1. `self.prev_hash == prev.entry_hash`
+    /// 2. `self.sequence == prev.sequence + 1` (overflow-safe)
+    ///
+    /// Deterministic, no panic, no side effects.
+    pub fn verify_chain(&self, prev: &AuditLogEntry) -> bool {
+        let hash_matches = self.prev_hash == prev.entry_hash;
+        let seq_matches = prev.sequence.checked_add(1).map_or(false, |expected| {
+            self.sequence == expected
+        });
+        hash_matches && seq_matches
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1863,5 +1960,219 @@ mod tests {
             };
             assert_eq!(v, 1u8, "variant {} version must be u8 value 1", i);
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.6 TESTS — AuditLogEntry
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn make_entry(seq: u64, ts: u64, prev: [u8; 32], event: AuditLogEvent) -> AuditLogEntry {
+        let mut entry = AuditLogEntry {
+            sequence: seq,
+            timestamp_ms: ts,
+            prev_hash: prev,
+            event,
+            entry_hash: [0u8; 32],
+        };
+        entry.entry_hash = entry.compute_entry_hash();
+        entry
+    }
+
+    fn sample_event_1() -> AuditLogEvent {
+        AuditLogEvent::SlashingExecuted {
+            version: 1,
+            timestamp_ms: 1700000000,
+            validator_id: "val-001".to_string(),
+            node_id: "node-001".to_string(),
+            slash_amount: 1000,
+            reason: "test".to_string(),
+            epoch: 1,
+            evidence_hash: [0xAA; 32],
+        }
+    }
+
+    fn sample_event_2() -> AuditLogEvent {
+        AuditLogEvent::StakeUpdated {
+            version: 1,
+            timestamp_ms: 1700000001,
+            staker_address: "staker".to_string(),
+            operation: StakeOperation::Delegate,
+            amount: 500,
+            validator_id: "val".to_string(),
+            epoch: 2,
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 43: audit_log_entry_hash_deterministic
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_hash_deterministic() {
+        let entry = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+
+        let h1 = entry.compute_entry_hash();
+        let h2 = entry.compute_entry_hash();
+        let h3 = entry.compute_entry_hash();
+
+        assert_eq!(h1, h2, "hash must be deterministic (1 vs 2)");
+        assert_eq!(h2, h3, "hash must be deterministic (2 vs 3)");
+        assert_eq!(h1.len(), 32);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 44: audit_log_entry_hash_changes_on_event_change
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_hash_changes_on_event_change() {
+        let e1 = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+        let e2 = make_entry(1, 1700000000, [0u8; 32], sample_event_2());
+
+        assert_ne!(e1.entry_hash, e2.entry_hash, "different events must produce different hashes");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 45: audit_log_entry_hash_changes_on_sequence_change
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_hash_changes_on_sequence_change() {
+        let e1 = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+        let e2 = make_entry(2, 1700000000, [0u8; 32], sample_event_1());
+
+        assert_ne!(e1.entry_hash, e2.entry_hash, "different sequence must produce different hashes");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 46: audit_log_entry_hash_changes_on_prev_hash_change
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_hash_changes_on_prev_hash_change() {
+        let e1 = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+        let e2 = make_entry(1, 1700000000, [0xFF; 32], sample_event_1());
+
+        assert_ne!(e1.entry_hash, e2.entry_hash, "different prev_hash must produce different hashes");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 47: audit_log_entry_chain_valid
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_chain_valid() {
+        let entry1 = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+        let entry2 = make_entry(2, 1700000001, entry1.entry_hash, sample_event_2());
+
+        assert!(entry2.verify_chain(&entry1), "valid chain link must return true");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 48: audit_log_entry_chain_invalid_sequence
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_chain_invalid_sequence() {
+        let entry1 = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+        // Sequence gap: 1 → 3 (should be 2)
+        let entry3 = make_entry(3, 1700000002, entry1.entry_hash, sample_event_2());
+
+        assert!(!entry3.verify_chain(&entry1), "sequence gap must return false");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 49: audit_log_entry_chain_invalid_prev_hash
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_chain_invalid_prev_hash() {
+        let entry1 = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+        // Wrong prev_hash
+        let entry2 = make_entry(2, 1700000001, [0xFF; 32], sample_event_2());
+
+        assert!(!entry2.verify_chain(&entry1), "wrong prev_hash must return false");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 50: audit_log_entry_serialization_roundtrip
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_serialization_roundtrip() {
+        let entry = make_entry(42, 1700000000, [0xDE; 32], sample_event_1());
+
+        let encoded = bincode::serialize(&entry);
+        match encoded {
+            Ok(bytes) => {
+                assert!(!bytes.is_empty());
+                let decoded: Result<AuditLogEntry, _> = bincode::deserialize(&bytes);
+                match decoded {
+                    Ok(rt) => assert_eq!(entry, rt, "roundtrip must preserve entry"),
+                    Err(e) => assert!(false, "decode failed: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "encode failed: {}", e),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 51: audit_log_entry_first_entry_zero_prev_hash
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_first_entry_zero_prev_hash() {
+        let first = make_entry(1, 1700000000, [0u8; 32], sample_event_1());
+
+        // First entry has zero prev_hash
+        assert_eq!(first.prev_hash, [0u8; 32], "first entry must have zero prev_hash");
+        // Hash is still computed (not zero)
+        assert_ne!(first.entry_hash, [0u8; 32], "entry_hash must not be zero");
+        // Sequence is 1
+        assert_eq!(first.sequence, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 52: audit_log_entry_hash_matches_compute_method
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_hash_matches_compute_method() {
+        let entry = make_entry(10, 1700000000, [0xAB; 32], sample_event_2());
+
+        // entry_hash set by make_entry should match compute_entry_hash
+        let recomputed = entry.compute_entry_hash();
+        assert_eq!(entry.entry_hash, recomputed, "stored hash must match recomputed hash");
+
+        // Tamper with entry_hash — recompute should still produce original
+        let mut tampered = entry.clone();
+        tampered.entry_hash = [0xFF; 32];
+        let recomputed2 = tampered.compute_entry_hash();
+        assert_eq!(entry.entry_hash, recomputed2, "entry_hash field must not affect hash computation");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 53: audit_log_entry_send_sync
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AuditLogEntry>();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 54: audit_log_entry_three_link_chain
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn audit_log_entry_three_link_chain() {
+        let e1 = make_entry(1, 100, [0u8; 32], sample_event_1());
+        let e2 = make_entry(2, 200, e1.entry_hash, sample_event_2());
+        let e3 = make_entry(3, 300, e2.entry_hash, sample_event_1());
+
+        assert!(e2.verify_chain(&e1), "e2 → e1 chain valid");
+        assert!(e3.verify_chain(&e2), "e3 → e2 chain valid");
+        assert!(!e3.verify_chain(&e1), "e3 → e1 chain must be invalid (skips e2)");
     }
 }

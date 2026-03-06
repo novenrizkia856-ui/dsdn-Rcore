@@ -563,6 +563,7 @@ pub use tss::{
 
 pub use audit_event::{
     AuditLogEvent,
+    AuditLogEntry,
     StakeOperation,
     AUDIT_EVENT_SCHEMA_VERSION,
 };
