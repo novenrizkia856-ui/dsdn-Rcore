@@ -190,6 +190,7 @@
 //! | `consistent_hash` | Consistent hashing for placement |
 //! | `coordinator` | Multi-coordinator committee management dengan TSS |
 //! | `gating` | Stake & identity gating system (14B) |
+//! | `audit_log_error` | Error types for audit log operations (Tahap 15.9) |
 //!
 //! ## Gating System (14B)
 //!
@@ -713,6 +714,9 @@ pub mod receipt_dedup;
 // Proto ↔ Native conversion layer (C.9)
 pub mod receipt_v1_convert;
 
+// Audit log error types (Tahap 15.9)
+pub mod audit_log_error;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -788,6 +792,12 @@ pub use receipt_v1_convert::{
     compute_receipt_hash_proto_compatible,
     compute_receipt_hash_from_proto,
 };
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PUBLIC EXPORTS - Audit Log Error (Tahap 15.9)
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub use audit_log_error::AuditLogError;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
