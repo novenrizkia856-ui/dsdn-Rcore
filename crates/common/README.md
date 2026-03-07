@@ -209,10 +209,96 @@ let ns = da.namespace();
 | `da` | DALayer trait dan types (BlobRef, Blob, DAError, DAConfig) |
 | `celestia_da` | Celestia DA implementation |
 | `mock_da` | Mock DA untuk testing |
+| `da_health_monitor` | Thread-safe DA health monitoring |
+| `da_router` | DA routing dengan fallback hierarchy |
 | `crypto` | Cryptographic utilities |
 | `cid` | Content ID helpers |
 | `config` | Configuration management |
 | `consistent_hash` | Consistent hashing implementation |
+| `coordinator` | Multi-coordinator committee management dengan TSS |
+| `gating` | Stake & identity gating system |
+| `audit_event` | AuditLogEvent + AuditLogEntry hash-chain types |
+| `audit_log_error` | AuditLogError — 8 non-overlapping error variants |
+| `worm_log` | WormLogStorage trait — append-only storage |
+| `audit_hook` | AuditLogHook trait — event producer interface |
+| `da_mirror` | DaMirrorPublisher trait + DaMirrorSync buffer |
+| `audit_writer` | AuditLogWriter trait — high-level writer |
+| `default_audit_writer` | DefaultAuditLogWriter production implementation |
+| `mock_audit` | MockWormStorage, MockDaMirrorPublisher, MockAuditLogWriter |
+
+## Audit Log System (Tahap 15)
+
+The audit log system provides tamper-evident, append-only logging for all significant DSDN events.
+
+### Architecture
+
+```text
+┌──────────────────────────────────────────────────┐
+│                Event Producers                    │
+│  (slashing, staking, governance, DA sync, etc.)  │
+└───────────────────────┬──────────────────────────┘
+                        │ AuditLogEvent
+                        ▼
+┌──────────────────────────────────────────────────┐
+│            AuditLogHook::on_event()              │
+└───────────────────────┬──────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────┐
+│          DefaultAuditLogWriter                    │
+│  Build AuditLogEntry with hash chain             │
+│  Encode → WORM append → DA mirror buffer         │
+└──────────┬───────────────────────┬───────────────┘
+           ▼                       ▼
+┌─────────────────────┐  ┌────────────────────┐
+│  WormLogStorage     │  │  DaMirrorSync      │
+│  (append-only)      │  │  (→ DA publish)    │
+└─────────────────────┘  └────────────────────┘
+```
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| `AuditLogEvent` | 9-variant enum covering all auditable events |
+| `AuditLogEntry` | Hash-chained wrapper (sequence, prev_hash, entry_hash) |
+| `AuditLogHook` | Trait — entry point for event producers |
+| `AuditLogWriter` | Trait — high-level writer (WORM + DA + chain) |
+| `DefaultAuditLogWriter` | Production impl with Mutex hash chain + AtomicU64 sequence |
+| `WormLogStorage` | Trait — append-only storage (implemented by storage crate) |
+| `DaMirrorSync` | Buffers entries, flushes to DA publisher in batches |
+| `AuditLogError` | 8 error variants: WriteFailed, EncodingFailed, HashChainBroken, etc. |
+
+### Hash Chain
+
+Every entry contains `prev_hash` (previous entry's hash) and `entry_hash` (SHA3-256 of sequence + timestamp + prev_hash + event). Tampering any entry invalidates all subsequent hashes.
+
+### Thread Safety
+
+- Hash chain protected by `Mutex<[u8; 32]>`
+- Sequence counter is `AtomicU64`
+- All traits require `Send + Sync + 'static`
+- Multi-threaded producers share `Arc<dyn AuditLogHook>`
+
+### Usage
+
+```rust
+use std::sync::Arc;
+use dsdn_common::{
+    MockWormStorage, DaMirrorSync, DefaultAuditLogWriter,
+    AuditLogHook, AuditLogEvent,
+};
+
+let worm = Arc::new(MockWormStorage::new());
+let da = Arc::new(DaMirrorSync::new(None));
+let writer = DefaultAuditLogWriter::new(worm, da, 0, [0u8; 32]);
+
+// Send event
+let event = AuditLogEvent::SlashingExecuted { /* ... */ };
+writer.on_event(event);
+
+// Flush to DA
+writer.flush();
+```
 
 ## Error Handling
 

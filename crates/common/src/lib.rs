@@ -199,6 +199,138 @@
 //! | `default_audit_writer` | DefaultAuditLogWriter production impl (Tahap 15.14) |
 //! | `mock_audit` | Mock implementations for testing (Tahap 15.15) |
 //!
+//! ## Audit Log System (Tahap 15)
+//!
+//! The audit log system provides tamper-evident, append-only logging for all
+//! significant DSDN events. Every audit event is wrapped in a hash-chained
+//! entry and persisted to WORM storage with DA layer mirroring.
+//!
+//! ### Architecture Overview
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │                   Event Producers                           │
+//! │  (slashing, staking, governance, DA sync, fraud challenge)  │
+//! └────────────────────────┬─────────────────────────────────────┘
+//!                          │ AuditLogEvent
+//!                          ▼
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │               AuditLogHook::on_event()                      │
+//! │         (entry point for all producers)                     │
+//! └────────────────────────┬─────────────────────────────────────┘
+//!                          │
+//!                          ▼
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │            DefaultAuditLogWriter                             │
+//! │  1. Lock hash chain (Mutex)                                 │
+//! │  2. Build AuditLogEntry { seq, ts, prev_hash, event }       │
+//! │  3. Compute entry_hash = SHA3-256(bincode(seq,ts,prev,evt)) │
+//! │  4. Encode entry to bytes (bincode)                         │
+//! │  5. Append to WORM storage                                  │
+//! │  6. Buffer to DA mirror                                     │
+//! │  7. Update hash chain + sequence                            │
+//! └─────────┬────────────────────────────┬───────────────────────┘
+//!           │                            │
+//!           ▼                            ▼
+//! ┌─────────────────────┐    ┌───────────────────────────┐
+//! │  WormLogStorage     │    │  DaMirrorSync             │
+//! │  (append-only WORM) │    │  (buffer → DA publish)    │
+//! │  - No delete        │    │  - batch publish          │
+//! │  - No overwrite     │    │  - failure retains buffer │
+//! │  - CRC32 checksum   │    │  - optional publisher     │
+//! └─────────────────────┘    └───────────────────────────┘
+//! ```
+//!
+//! ### Trait Catalog
+//!
+//! | Trait | Responsibility | Implemented By |
+//! |-------|---------------|----------------|
+//! | `AuditLogHook` | Entry point for producer events | `DefaultAuditLogWriter` |
+//! | `AuditLogWriter` | High-level writer (WORM + DA + chain) | `DefaultAuditLogWriter` |
+//! | `WormLogStorage` | Append-only storage abstraction | `WormFileStorage` (storage crate) |
+//! | `DaMirrorPublisher` | Publish audit entries to DA layer | DA publisher implementation |
+//!
+//! ### Module Catalog (Audit)
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | `audit_event` | `AuditLogEvent` enum + `AuditLogEntry` hash-chain struct |
+//! | `audit_log_error` | `AuditLogError` — 8 non-overlapping error variants |
+//! | `worm_log` | `WormLogStorage` trait — append-only storage contract |
+//! | `audit_hook` | `AuditLogHook` trait — event producer interface |
+//! | `da_mirror` | `DaMirrorPublisher` trait + `DaMirrorSync` buffer |
+//! | `audit_writer` | `AuditLogWriter` trait — high-level writer contract |
+//! | `default_audit_writer` | `DefaultAuditLogWriter` production implementation |
+//! | `mock_audit` | `MockWormStorage`, `MockDaMirrorPublisher`, `MockAuditLogWriter` |
+//!
+//! ### Hash Chain
+//!
+//! Every `AuditLogEntry` contains:
+//!
+//! - `prev_hash: [u8; 32]` — SHA3-256 hash of the previous entry (zero for first)
+//! - `entry_hash: [u8; 32]` — SHA3-256 of `bincode(sequence, timestamp_ms, prev_hash, event)`
+//!
+//! The `entry_hash` field is **excluded** from its own hash input. This forms
+//! a linked chain where tampering any entry invalidates all subsequent hashes.
+//!
+//! ```text
+//! Entry 1          Entry 2          Entry 3
+//! ┌──────────┐     ┌──────────┐     ┌──────────┐
+//! │ seq=1    │     │ seq=2    │     │ seq=3    │
+//! │ prev=[0] │────▶│ prev=H1  │────▶│ prev=H2  │
+//! │ hash=H1  │     │ hash=H2  │     │ hash=H3  │
+//! └──────────┘     └──────────┘     └──────────┘
+//! ```
+//!
+//! ### Sequence Numbering
+//!
+//! - **Global**: One sequence counter per writer instance.
+//! - **Monotonic**: Strictly increasing, starting at 1.
+//! - **Append-only**: No gaps, no reuse, no rollback.
+//! - `last_sequence() == 0` means no entries written.
+//! - Used for ordering, replay, and gap detection.
+//!
+//! ### Thread Safety
+//!
+//! - `last_hash: Mutex<[u8; 32]>` — serializes hash chain updates.
+//! - `current_sequence: AtomicU64` — lock-free sequence reads.
+//! - `worm` + `da_mirror`: `Arc` — safe shared ownership.
+//! - All traits require `Send + Sync + 'static`.
+//! - Multi-threaded producers can share `Arc<dyn AuditLogHook>`.
+//!
+//! ### Usage Example
+//!
+//! ```rust,ignore
+//! use std::sync::Arc;
+//! use dsdn_common::{
+//!     MockWormStorage, DaMirrorSync, DefaultAuditLogWriter,
+//!     AuditLogHook, AuditLogEvent,
+//! };
+//!
+//! // 1. Create storage + DA mirror
+//! let worm = Arc::new(MockWormStorage::new());
+//! let da_mirror = Arc::new(DaMirrorSync::new(None)); // no DA publisher
+//!
+//! // 2. Create writer (sequence=0, prev_hash=zero)
+//! let writer = DefaultAuditLogWriter::new(worm, da_mirror, 0, [0u8; 32]);
+//!
+//! // 3. Send event via hook interface
+//! let event = AuditLogEvent::SlashingExecuted {
+//!     version: 1,
+//!     timestamp_ms: 1700000000,
+//!     validator_id: "val-001".to_string(),
+//!     node_id: "node-001".to_string(),
+//!     slash_amount: 5000,
+//!     reason: "double_sign".to_string(),
+//!     epoch: 42,
+//!     evidence_hash: [0u8; 32],
+//! };
+//! writer.on_event(event); // returns Result<(), AuditLogError>
+//!
+//! // 4. Flush buffered entries to DA
+//! writer.flush(); // returns Result<usize, AuditLogError>
+//! ```
+//!
 //! ## Gating System (14B)
 //!
 //! The gating system ensures that only qualified, staked, and identity-verified
