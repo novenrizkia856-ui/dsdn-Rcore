@@ -39,7 +39,7 @@ pub trait AuditLogWriter: Send + Sync + 'static {
     /// Returns `AuditLogError` on encoding, write, or buffer failure.
     fn write_event(
         &self,
-        event: dsdn_proto::audit_event::AuditLogEvent,
+        event: crate::audit_event::AuditLogEvent,
     ) -> Result<u64, AuditLogError>;
 
     /// Flush DA mirror buffer to DA layer.

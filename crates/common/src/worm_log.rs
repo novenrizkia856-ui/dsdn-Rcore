@@ -262,17 +262,15 @@ mod tests {
 
         // append returns Result<u64, AuditLogError>
         let seq1: Result<u64, AuditLogError> = storage.append(b"entry1");
-        match seq1 {
-            Ok(s) => assert!(s >= 1, "first sequence must be >= 1"),
-            Err(e) => assert!(false, "append failed: {}", e),
-        }
-
         let seq2: Result<u64, AuditLogError> = storage.append(b"entry2");
-        match (seq1, seq2) {
+
+        match (&seq1, &seq2) {
             (Ok(s1), Ok(s2)) => {
-                assert_eq!(s2, s1 + 1, "sequence must be monotonically increasing");
+                assert!(*s1 >= 1, "first sequence must be >= 1");
+                assert_eq!(*s2, *s1 + 1, "sequence must be monotonically increasing");
             }
-            _ => assert!(false, "append should not fail"),
+            (Err(e), _) => assert!(false, "first append failed: {}", e),
+            (_, Err(e)) => assert!(false, "second append failed: {}", e),
         }
     }
 

@@ -67,7 +67,7 @@ pub trait AuditLogHook: Send + Sync + 'static {
     /// Returns `AuditLogError` if the event cannot be persisted.
     fn on_event(
         &self,
-        event: dsdn_proto::audit_event::AuditLogEvent,
+        event: crate::audit_event::AuditLogEvent,
     ) -> Result<(), AuditLogError>;
 
     /// Flush all buffered events to the DA mirror / storage backend.
@@ -96,7 +96,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
 
     struct MockAuditHook {
-        events: Mutex<Vec<dsdn_proto::audit_event::AuditLogEvent>>,
+        events: Mutex<Vec<crate::audit_event::AuditLogEvent>>,
         flush_count: AtomicUsize,
         force_error: bool,
     }
@@ -129,7 +129,7 @@ mod tests {
     impl AuditLogHook for MockAuditHook {
         fn on_event(
             &self,
-            event: dsdn_proto::audit_event::AuditLogEvent,
+            event: crate::audit_event::AuditLogEvent,
         ) -> Result<(), AuditLogError> {
             if self.force_error {
                 return Err(AuditLogError::WriteFailed {
@@ -174,8 +174,8 @@ mod tests {
     // Helper
     // ────────────────────────────────────────────────────────────────────────
 
-    fn sample_event() -> dsdn_proto::audit_event::AuditLogEvent {
-        dsdn_proto::audit_event::AuditLogEvent::DaSyncSequenceUpdate {
+    fn sample_event() -> crate::audit_event::AuditLogEvent {
+        crate::audit_event::AuditLogEvent::DaSyncSequenceUpdate {
             version: 1,
             timestamp_ms: 1700000000,
             da_source: "celestia".to_string(),

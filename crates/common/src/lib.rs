@@ -190,6 +190,7 @@
 //! | `consistent_hash` | Consistent hashing for placement |
 //! | `coordinator` | Multi-coordinator committee management dengan TSS |
 //! | `gating` | Stake & identity gating system (14B) |
+//! | `audit_event` | AuditLogEvent + AuditLogEntry types (Tahap 15) |
 //! | `audit_log_error` | Error types for audit log operations (Tahap 15.9) |
 //! | `worm_log` | WormLogStorage trait — append-only storage (Tahap 15.10) |
 //! | `audit_hook` | AuditLogHook trait for event producers (Tahap 15.11) |
@@ -720,6 +721,9 @@ pub mod receipt_dedup;
 // Proto ↔ Native conversion layer (C.9)
 pub mod receipt_v1_convert;
 
+// Audit log event types (moved from proto to avoid circular dep, Tahap 15)
+pub mod audit_event;
+
 // Audit log error types (Tahap 15.9)
 pub mod audit_log_error;
 
@@ -820,6 +824,17 @@ pub use receipt_v1_convert::{
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - Audit Log Error (Tahap 15.9)
 // ════════════════════════════════════════════════════════════════════════════════
+
+// Audit log event types (Tahap 15)
+pub use audit_event::{
+    AuditLogEvent,
+    AuditLogEntry,
+    StakeOperation,
+    GovernanceStatus,
+    DaFallbackAction,
+    ChallengeOutcome,
+    AUDIT_EVENT_SCHEMA_VERSION,
+};
 
 pub use audit_log_error::AuditLogError;
 

@@ -21,14 +21,34 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dsdn_proto::audit_event::{AuditLogEntry, AuditLogEvent};
-use dsdn_proto::encoding::{encode_audit_entry, decode_audit_entry};
+use crate::audit_event::{AuditLogEntry, AuditLogEvent};
 
 use crate::audit_log_error::AuditLogError;
 use crate::audit_hook::AuditLogHook;
 use crate::audit_writer::AuditLogWriter;
 use crate::da_mirror::DaMirrorSync;
 use crate::worm_log::WormLogStorage;
+
+// ════════════════════════════════════════════════════════════════════════════════
+// LOCAL ENCODING HELPERS (avoid circular dependency on proto)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Encode `AuditLogEntry` to bytes via bincode. Returns empty Vec on failure.
+fn encode_audit_entry(entry: &AuditLogEntry) -> Vec<u8> {
+    bincode::serialize(entry).unwrap_or_default()
+}
+
+/// Decode bytes to `AuditLogEntry` via bincode.
+fn decode_audit_entry(bytes: &[u8]) -> Result<AuditLogEntry, AuditLogError> {
+    if bytes.is_empty() {
+        return Err(AuditLogError::EncodingFailed {
+            reason: "empty input".to_string(),
+        });
+    }
+    bincode::deserialize(bytes).map_err(|e| AuditLogError::EncodingFailed {
+        reason: format!("bincode decode: {}", e),
+    })
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // DEFAULT AUDIT LOG WRITER
@@ -147,12 +167,8 @@ impl AuditLogWriter for DefaultAuditLogWriter {
 
         let mut prev_entry: Option<AuditLogEntry> = None;
 
-        for (i, raw) in raw_entries.iter().enumerate() {
-            let entry = decode_audit_entry(raw).map_err(|e| {
-                AuditLogError::EncodingFailed {
-                    reason: format!("decode entry at offset {}: {}", i, e),
-                }
-            })?;
+        for raw in raw_entries.iter() {
+            let entry = decode_audit_entry(raw)?;
 
             // Verify entry_hash matches recomputed hash
             let recomputed = entry.compute_entry_hash();
