@@ -15,6 +15,7 @@
 //! - `metrics`: Storage health metrics
 //! - `events`: Storage event emission
 //! - `fallback_cache`: Fallback blob caching for Multi-DA support (14A.1A.51)
+//! - `worm_file`: WORM file storage backend for audit log (Tahap 15.18)
 //!
 //! # Architecture Overview
 //!
@@ -281,3 +282,8 @@ pub use crate::fallback_cache::{
     ValidationReport,
 };
 pub use crate::fallback_cache::persistence::PersistentFallbackCache;
+
+// WORM file storage for audit log (Tahap 15.18)
+pub mod worm_file;
+
+pub use crate::worm_file::{WormFileConfig, WormFileStorage};

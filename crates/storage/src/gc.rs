@@ -572,6 +572,16 @@ mod tests {
         fn has_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
             Ok(self.chunks.read().contains_key(hash))
         }
+
+        fn delete_chunk(&self, hash: &str) -> dsdn_common::Result<bool> {
+            Ok(self.chunks.write().remove(hash).is_some())
+        }
+
+        fn list_chunks(&self) -> dsdn_common::Result<Vec<(String, u64)>> {
+            Ok(self.chunks.read().iter()
+                .map(|(k, v)| (k.clone(), v.len() as u64))
+                .collect())
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
