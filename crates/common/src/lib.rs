@@ -191,6 +191,12 @@
 //! | `coordinator` | Multi-coordinator committee management dengan TSS |
 //! | `gating` | Stake & identity gating system (14B) |
 //! | `audit_log_error` | Error types for audit log operations (Tahap 15.9) |
+//! | `worm_log` | WormLogStorage trait — append-only storage (Tahap 15.10) |
+//! | `audit_hook` | AuditLogHook trait for event producers (Tahap 15.11) |
+//! | `da_mirror` | DaMirrorPublisher trait + DaMirrorSync (Tahap 15.12) |
+//! | `audit_writer` | AuditLogWriter trait — high-level writer (Tahap 15.13) |
+//! | `default_audit_writer` | DefaultAuditLogWriter production impl (Tahap 15.14) |
+//! | `mock_audit` | Mock implementations for testing (Tahap 15.15) |
 //!
 //! ## Gating System (14B)
 //!
@@ -717,6 +723,24 @@ pub mod receipt_v1_convert;
 // Audit log error types (Tahap 15.9)
 pub mod audit_log_error;
 
+// WORM log storage trait (Tahap 15.10)
+pub mod worm_log;
+
+// Audit log hook trait (Tahap 15.11)
+pub mod audit_hook;
+
+// DA mirror publisher + sync (Tahap 15.12)
+pub mod da_mirror;
+
+// Audit log writer trait (Tahap 15.13)
+pub mod audit_writer;
+
+// Default audit log writer implementation (Tahap 15.14)
+pub mod default_audit_writer;
+
+// Mock audit implementations for testing (Tahap 15.15)
+pub mod mock_audit;
+
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC API EXPORTS
 // ════════════════════════════════════════════════════════════════════════════════
@@ -798,6 +822,24 @@ pub use receipt_v1_convert::{
 // ════════════════════════════════════════════════════════════════════════════════
 
 pub use audit_log_error::AuditLogError;
+
+// WORM log storage trait (Tahap 15.10)
+pub use worm_log::WormLogStorage;
+
+// Audit log hook trait (Tahap 15.11)
+pub use audit_hook::AuditLogHook;
+
+// DA mirror publisher + sync (Tahap 15.12)
+pub use da_mirror::{DaMirrorPublisher, DaMirrorSync};
+
+// Audit log writer trait (Tahap 15.13)
+pub use audit_writer::AuditLogWriter;
+
+// Default audit log writer (Tahap 15.14)
+pub use default_audit_writer::DefaultAuditLogWriter;
+
+// Mock audit implementations (Tahap 15.15)
+pub use mock_audit::{MockWormStorage, MockDaMirrorPublisher, MockAuditLogWriter};
 
 // ════════════════════════════════════════════════════════════════════════════════
 // COMMON TYPES
