@@ -869,3 +869,6 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod audit_log_tests;
