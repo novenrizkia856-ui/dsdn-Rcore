@@ -27,8 +27,9 @@
 //! - [`pending_blob`]: PendingBlob struct untuk blobs menunggu reconciliation
 //! - [`reconcile_report`]: ReconcileReport dan related types untuk hasil reconciliation
 //! - [`consistency_report`]: ConsistencyReport dan related types untuk verifikasi konsistensi
-//! - [`tss`]: TSS protocol message types untuk threshold signing
+//! - [`/tss`]: TSS protocol message types untuk threshold signing
 //! - [`audit_event`]: AuditLogEvent enum untuk audit trail WORM + DA mirror (Tahap 15)
+//! - [`/tx`]: Module ini menyediakan transaction message types untuk DSDN chain.
 //!
 //! ## Architecture Overview
 //!
