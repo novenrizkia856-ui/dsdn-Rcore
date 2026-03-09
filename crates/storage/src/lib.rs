@@ -200,6 +200,42 @@
 //! - Events TIDAK authoritative, TIDAK mempengaruhi correctness
 //! - Events TIDAK mengubah perilaku sistem
 //!
+//! ## WORM Audit Log Storage (Tahap 15)
+//!
+//! `WormFileStorage` provides file-based append-only (WORM) storage for the
+//! audit log subsystem. Implements `dsdn_common::WormLogStorage` trait.
+//!
+//! ### Design
+//!
+//! - **Append-only**: Entries written once, never modified or deleted.
+//! - **File rotation**: New file created when size exceeds `max_file_size_bytes`.
+//! - **CRC32 checksum**: Each entry has CRC32 IEEE integrity check.
+//! - **Crash recovery**: Partial writes detected and skipped on restart.
+//! - **Sequential reads**: Entries read in sequence across rotated files.
+//!
+//! ### Entry Format
+//!
+//! ```text
+//! [8 bytes: entry length (u64 LE)]
+//! [N bytes: entry data]
+//! [4 bytes: CRC32 IEEE checksum (u32 LE)]
+//! ```
+//!
+//! ### File Layout
+//!
+//! ```text
+//! base_dir/
+//!   audit_log_0000000000000001.worm   ← first file
+//!   audit_log_0000000000000512.worm   ← after rotation
+//!   audit_log_0000000000001024.worm   ← after rotation
+//! ```
+//!
+//! ### Recovery
+//!
+//! `recover()` scans all `.worm` files read-only, validates each entry,
+//! detects partial writes, and updates the internal sequence counter.
+//! No files are modified or deleted during recovery.
+//!
 //! ### Fallback Events (14A.1A.59)
 //!
 //! Event tambahan untuk fallback awareness:
@@ -287,3 +323,4 @@ pub use crate::fallback_cache::persistence::PersistentFallbackCache;
 pub mod worm_file;
 
 pub use crate::worm_file::{WormFileConfig, WormFileStorage};
+pub use crate::worm_file::RecoveryReport as WormRecoveryReport;

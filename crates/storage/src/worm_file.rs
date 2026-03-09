@@ -1444,11 +1444,15 @@ mod tests {
         let result = WormFileStorage::new(cfg);
         match result {
             Ok(storage) => {
-                // First entry (22 bytes) → fits in file
+                // Entry 1 (22 bytes): check(0<40)→pass, size=22
                 let _ = storage.append(b"0123456789");
                 assert_eq!(count_worm_files(&dir), 1);
 
-                // Second entry (22 bytes) → total 44 >= 40, rotation triggers
+                // Entry 2 (22 bytes): check(22<40)→pass, size=44
+                let _ = storage.append(b"0123456789");
+                assert_eq!(count_worm_files(&dir), 1, "not yet rotated");
+
+                // Entry 3: check(44>=40)→ROTATE, new file, size=22
                 let _ = storage.append(b"0123456789");
                 assert!(count_worm_files(&dir) >= 2, "rotation must create new file");
             }
@@ -1471,10 +1475,11 @@ mod tests {
         let result = WormFileStorage::new(cfg);
         match result {
             Ok(storage) => {
-                let _ = storage.append(b"entry_one__"); // 8+11+4 = 23 bytes
+                let _ = storage.append(b"entry_one__"); // 8+11+4=23, check(0<30)→pass, size=23
+                let _ = storage.append(b"entry_two__"); // check(23<30)→pass, size=46
                 let before = count_worm_files(&dir);
 
-                let _ = storage.append(b"entry_two__"); // triggers rotation
+                let _ = storage.append(b"entry_three"); // check(46>=30)→ROTATE
                 let after = count_worm_files(&dir);
 
                 assert!(after > before, "new file must be created: before={}, after={}", before, after);
@@ -1531,17 +1536,18 @@ mod tests {
         let result = WormFileStorage::new(cfg);
         match result {
             Ok(storage) => {
-                let _ = storage.append(b"entry_one__"); // 23 bytes
-                let size_before = storage.current_file_size();
-                assert!(size_before > 0);
+                let _ = storage.append(b"entry_one__"); // size=23
+                let _ = storage.append(b"entry_two__"); // size=46 (exceeds 30)
+                let size_before_rotation = storage.current_file_size();
+                assert!(size_before_rotation >= 30, "must exceed max before rotation triggers");
 
-                let _ = storage.append(b"entry_two__"); // rotation → reset → then write 23
+                // Entry 3 triggers rotation at start → reset size → write 23
+                let _ = storage.append(b"entry_three");
                 let size_after = storage.current_file_size();
 
-                // After rotation, size should be just the new entry (23),
-                // NOT the old + new (46)
-                assert!(size_after < size_before + 23,
-                    "file size must reset after rotation: before={}, after={}", size_before, size_after);
+                // After rotation, size should be just the new entry (23), not 46+23
+                assert!(size_after < size_before_rotation,
+                    "file size must reset after rotation: before={}, after={}", size_before_rotation, size_after);
             }
             Err(e) => assert!(false, "new: {}", e),
         }
@@ -1562,8 +1568,9 @@ mod tests {
         let result = WormFileStorage::new(cfg);
         match result {
             Ok(storage) => {
-                let _ = storage.append(b"AAAAAAAAAA"); // file 1
-                let _ = storage.append(b"BBBBBBBBBB"); // rotation → file 2
+                let _ = storage.append(b"AAAAAAAAAA"); // size=22
+                let _ = storage.append(b"AAAAAAAAAA"); // size=44 (exceeds 30)
+                let _ = storage.append(b"BBBBBBBBBB"); // check(44>=30)→ROTATE, B goes to new file
 
                 let names = get_worm_filenames(&dir);
                 assert!(names.len() >= 2, "must have at least 2 files");
@@ -1574,7 +1581,7 @@ mod tests {
                 match entries {
                     Ok(e) => {
                         assert!(!e.is_empty(), "new file must have entries");
-                        assert_eq!(e[0], b"BBBBBBBBBB", "new file must contain second entry");
+                        assert_eq!(e[0], b"BBBBBBBBBB", "new file must contain rotated entry");
                     }
                     Err(e) => assert!(false, "read: {}", e),
                 }
@@ -1598,19 +1605,22 @@ mod tests {
         let result = WormFileStorage::new(cfg);
         match result {
             Ok(storage) => {
-                let _ = storage.append(b"first_data");
+                // Fill first file past max (rotation hasn't triggered yet)
+                let _ = storage.append(b"first_data");  // size=22
+                let _ = storage.append(b"second_dat");  // size=44 (exceeds 30)
 
+                // Snapshot the first file BEFORE rotation
                 let names = get_worm_filenames(&dir);
-                assert_eq!(names.len(), 1);
+                assert_eq!(names.len(), 1, "still 1 file before rotation triggers");
                 let first_file = dir.join(&names[0]);
                 let size_before = fs::metadata(&first_file).map(|m| m.len()).unwrap_or(0);
                 let content_before = fs::read(&first_file).unwrap_or_default();
 
-                // Trigger rotation with more appends
-                let _ = storage.append(b"second_dat");
+                // Trigger rotation with 3rd append
                 let _ = storage.append(b"third_data");
+                let _ = storage.append(b"fourth_dat");
 
-                // Old file must NOT have changed
+                // Old file must NOT have changed after rotation
                 let size_after = fs::metadata(&first_file).map(|m| m.len()).unwrap_or(0);
                 let content_after = fs::read(&first_file).unwrap_or_default();
 
@@ -2615,6 +2625,581 @@ mod tests {
                     Ok(Some(data)) => assert_eq!(data, b"entry_0025".to_vec()),
                     Ok(None) => assert!(false, "entry 25 must exist"),
                     Err(e) => assert!(false, "read 25: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 15.24 COMPREHENSIVE TEST SUITE
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 52: worm_create_base_dir
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_create_base_dir() {
+        let dir = temp_dir().join("nested").join("deep");
+        assert!(!dir.exists());
+
+        let cfg = WormFileConfig::new(dir.clone());
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(_) => assert!(dir.exists() && dir.is_dir(), "nested dir must be created"),
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 53: worm_append_single_entry_15_24
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_append_single_entry_15_24() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                let seq = storage.append(b"comprehensive_test_data");
+                match seq {
+                    Ok(s) => {
+                        assert_eq!(s, 1);
+                        // Verify it's persisted and readable
+                        let read = storage.read_entry(1);
+                        match read {
+                            Ok(Some(data)) => assert_eq!(data, b"comprehensive_test_data"),
+                            Ok(None) => assert!(false, "entry must exist"),
+                            Err(e) => assert!(false, "read: {}", e),
+                        }
+                    }
+                    Err(e) => assert!(false, "append: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 54: worm_append_multiple_entries_15_24
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_append_multiple_entries_15_24() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                for i in 1u64..=20 {
+                    let data = format!("multi_entry_{:04}", i);
+                    let seq = storage.append(data.as_bytes());
+                    match seq {
+                        Ok(s) => assert_eq!(s, i),
+                        Err(e) => assert!(false, "append {}: {}", i, e),
+                    }
+                }
+
+                assert_eq!(storage.current_sequence(), 20);
+
+                // Verify all readable
+                let all = storage.read_range(1, 21);
+                match all {
+                    Ok(entries) => {
+                        assert_eq!(entries.len(), 20);
+                        for (i, entry) in entries.iter().enumerate() {
+                            let expected = format!("multi_entry_{:04}", i + 1);
+                            assert_eq!(entry.as_slice(), expected.as_bytes());
+                        }
+                    }
+                    Err(e) => assert!(false, "read_range: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 55: worm_read_entry_by_sequence
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_read_entry_by_sequence() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                let _ = storage.append(b"first");
+                let _ = storage.append(b"second");
+                let _ = storage.append(b"third");
+
+                // Read each by sequence
+                for (seq, expected) in [(1u64, b"first" as &[u8]), (2, b"second"), (3, b"third")] {
+                    let entry = storage.read_entry(seq);
+                    match entry {
+                        Ok(Some(data)) => assert_eq!(data, expected, "seq {} mismatch", seq),
+                        Ok(None) => assert!(false, "seq {} must exist", seq),
+                        Err(e) => assert!(false, "read seq {}: {}", seq, e),
+                    }
+                }
+
+                // Non-existent
+                let none = storage.read_entry(99);
+                match none {
+                    Ok(opt) => assert!(opt.is_none()),
+                    Err(e) => assert!(false, "read 99: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 56: worm_read_range_15_24
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_read_range_15_24() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                for i in 1u64..=10 {
+                    let _ = storage.append(format!("r_{}", i).as_bytes());
+                }
+
+                // [3, 7) → entries 3,4,5,6
+                let range = storage.read_range(3, 7);
+                match range {
+                    Ok(entries) => {
+                        assert_eq!(entries.len(), 4);
+                        assert_eq!(entries[0], b"r_3");
+                        assert_eq!(entries[3], b"r_6");
+                    }
+                    Err(e) => assert!(false, "read_range: {}", e),
+                }
+
+                // Empty range
+                let empty = storage.read_range(5, 5);
+                match empty {
+                    Ok(v) => assert!(v.is_empty()),
+                    Err(e) => assert!(false, "empty range: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 57: worm_sequence_monotonic_15_24
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_sequence_monotonic_15_24() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                let mut prev = 0u64;
+                for _ in 0..30 {
+                    let seq = storage.append(b"mono");
+                    match seq {
+                        Ok(s) => {
+                            assert!(s > prev, "must be strictly increasing: {} > {}", s, prev);
+                            assert_eq!(s, prev + 1, "must increment by exactly 1");
+                            prev = s;
+                        }
+                        Err(e) => assert!(false, "append: {}", e),
+                    }
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 58: worm_append_only_no_overwrite
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_append_only_no_overwrite() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                let _ = storage.append(b"aaa");
+                let size1 = storage.current_file_size();
+
+                let _ = storage.append(b"bbb");
+                let size2 = storage.current_file_size();
+
+                let _ = storage.append(b"ccc");
+                let size3 = storage.current_file_size();
+
+                assert!(size2 > size1, "file must grow");
+                assert!(size3 > size2, "file must keep growing");
+
+                // All three entries readable in order
+                let all = storage.read_range(1, 4);
+                match all {
+                    Ok(entries) => {
+                        assert_eq!(entries.len(), 3);
+                        assert_eq!(entries[0], b"aaa");
+                        assert_eq!(entries[1], b"bbb");
+                        assert_eq!(entries[2], b"ccc");
+                    }
+                    Err(e) => assert!(false, "range: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 59: worm_crc32_checksum_valid
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_crc32_checksum_valid() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                let test_data = b"crc_validation_test_data";
+                let _ = storage.append(test_data);
+
+                // Read raw file and verify CRC
+                let files = storage.list_log_files();
+                match files {
+                    Ok(paths) => {
+                        if let Some(path) = paths.first() {
+                            let raw = fs::read(path).unwrap_or_default();
+                            // entry: [8 len][N data][4 crc]
+                            let data_start = 8;
+                            let data_end = data_start + test_data.len();
+                            let crc_start = data_end;
+
+                            if raw.len() >= crc_start + 4 {
+                                let stored_data = &raw[data_start..data_end];
+                                assert_eq!(stored_data, test_data, "stored data must match");
+
+                                let crc_bytes: [u8; 4] = [
+                                    raw[crc_start], raw[crc_start + 1],
+                                    raw[crc_start + 2], raw[crc_start + 3],
+                                ];
+                                let stored_crc = u32::from_le_bytes(crc_bytes);
+                                let computed_crc = crc32_ieee(test_data);
+                                assert_eq!(stored_crc, computed_crc, "CRC must match");
+                            }
+                        }
+                    }
+                    Err(e) => assert!(false, "list: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 60: worm_crc32_detects_corruption
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_crc32_detects_corruption() {
+        let dir = temp_dir();
+        let _ = fs::create_dir_all(&dir);
+
+        let file_path = dir.join("audit_log_0000000000000001.worm");
+
+        // Write valid entry
+        write_raw_entry(&file_path, b"good_data");
+
+        // Write corrupted entry (data + wrong CRC)
+        let bad_data = b"corrupted__";
+        let len_bytes = (bad_data.len() as u64).to_le_bytes();
+        let wrong_crc = 0x12345678u32.to_le_bytes();
+        append_raw_bytes(&file_path, &len_bytes);
+        append_raw_bytes(&file_path, bad_data);
+        append_raw_bytes(&file_path, &wrong_crc);
+
+        let cfg = WormFileConfig::new(dir.clone());
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                let report = storage.recover();
+                match report {
+                    Ok(r) => {
+                        assert_eq!(r.valid_entries, 1, "only first entry valid");
+                        assert_eq!(r.partial_entries, 1, "corrupted entry detected");
+                    }
+                    Err(e) => assert!(false, "recover: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 61: worm_file_rotation_on_size
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_file_rotation_on_size() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.max_file_size_bytes = 40;
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                // entry = 8 + 10 + 4 = 22 bytes
+                let _ = storage.append(b"0123456789");
+                assert_eq!(count_worm_files(&dir), 1);
+
+                // 22+22 = 44 >= 40 → rotation
+                let _ = storage.append(b"0123456789");
+                let _ = storage.append(b"0123456789");
+
+                let file_count = count_worm_files(&dir);
+                assert!(file_count >= 2, "rotation must create multiple files, got {}", file_count);
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 62: worm_rotation_preserves_data
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_rotation_preserves_data() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.max_file_size_bytes = 30;
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                for i in 1u64..=15 {
+                    let data = format!("preserved_{:02}", i);
+                    let _ = storage.append(data.as_bytes());
+                }
+
+                assert!(count_worm_files(&dir) > 1, "must have rotated");
+
+                // ALL entries must be readable across file boundaries
+                let all = storage.read_range(1, 16);
+                match all {
+                    Ok(entries) => {
+                        assert_eq!(entries.len(), 15);
+                        for (i, entry) in entries.iter().enumerate() {
+                            let expected = format!("preserved_{:02}", i + 1);
+                            assert_eq!(entry.as_slice(), expected.as_bytes(),
+                                "entry {} must survive rotation", i + 1);
+                        }
+                    }
+                    Err(e) => assert!(false, "read_range: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 63: worm_recovery_partial_write
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_recovery_partial_write() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        // Write 3 valid entries via storage
+        let result = WormFileStorage::new(cfg.clone());
+        match result {
+            Ok(storage) => {
+                let _ = storage.append(b"entry_1");
+                let _ = storage.append(b"entry_2");
+                let _ = storage.append(b"entry_3");
+            }
+            Err(e) => {
+                assert!(false, "new: {}", e);
+                return;
+            }
+        }
+
+        // Simulate crash: append partial data
+        let files: Vec<_> = fs::read_dir(&dir)
+            .map(|rd| rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "worm"))
+                .map(|e| e.path())
+                .collect())
+            .unwrap_or_default();
+
+        if let Some(last) = files.last() {
+            // Partial header only
+            append_raw_bytes(last, &42u64.to_le_bytes());
+        }
+
+        // Recover
+        let storage2 = WormFileStorage::new(cfg);
+        match storage2 {
+            Ok(s2) => {
+                let report = s2.recover();
+                match report {
+                    Ok(r) => {
+                        assert_eq!(r.valid_entries, 3, "3 valid before crash");
+                        assert_eq!(r.partial_entries, 1, "1 partial after crash");
+                        assert_eq!(r.last_valid_sequence, 3);
+                        assert_eq!(s2.current_sequence(), 3);
+                    }
+                    Err(e) => assert!(false, "recover: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new2: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 64: worm_recovery_clean_log
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_recovery_clean_log() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg.clone());
+        match result {
+            Ok(storage) => {
+                for _ in 0..5 {
+                    let _ = storage.append(b"clean_data");
+                }
+            }
+            Err(e) => {
+                assert!(false, "new: {}", e);
+                return;
+            }
+        }
+
+        // Recover on clean log — should find all entries, no partials
+        let storage2 = WormFileStorage::new(cfg);
+        match storage2 {
+            Ok(s2) => {
+                let report = s2.recover();
+                match report {
+                    Ok(r) => {
+                        assert_eq!(r.valid_entries, 5);
+                        assert_eq!(r.partial_entries, 0);
+                        assert_eq!(r.last_valid_sequence, 5);
+                    }
+                    Err(e) => assert!(false, "recover: {}", e),
+                }
+            }
+            Err(e) => assert!(false, "new2: {}", e),
+        }
+        cleanup(&dir);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TEST 65: worm_verify_integrity_valid_chain
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn worm_verify_integrity_valid_chain() {
+        let dir = temp_dir();
+        let mut cfg = WormFileConfig::new(dir.clone());
+        cfg.max_file_size_bytes = 50;
+        cfg.sync_on_write = false;
+
+        let result = WormFileStorage::new(cfg);
+        match result {
+            Ok(storage) => {
+                // Write 30 entries across multiple files
+                for i in 1u64..=30 {
+                    let data = format!("chain_{:04}", i);
+                    let _ = storage.append(data.as_bytes());
+                }
+
+                assert!(count_worm_files(&dir) > 3, "many files for chain test");
+                assert_eq!(storage.current_sequence(), 30);
+
+                // Read entire chain and verify sequential integrity
+                let all = storage.read_range(1, 31);
+                match all {
+                    Ok(entries) => {
+                        assert_eq!(entries.len(), 30, "all 30 entries readable");
+
+                        // Verify each entry has correct content
+                        for (i, entry) in entries.iter().enumerate() {
+                            let expected = format!("chain_{:04}", i + 1);
+                            assert_eq!(entry.as_slice(), expected.as_bytes(),
+                                "chain entry {} content correct", i + 1);
+                        }
+
+                        // Verify individual reads match range reads
+                        for i in 1u64..=30 {
+                            let single = storage.read_entry(i);
+                            match single {
+                                Ok(Some(data)) => {
+                                    let idx = (i as usize) - 1;
+                                    assert_eq!(data, entries[idx],
+                                        "single read {} must match range read", i);
+                                }
+                                Ok(None) => assert!(false, "entry {} must exist", i),
+                                Err(e) => assert!(false, "read {}: {}", i, e),
+                            }
+                        }
+                    }
+                    Err(e) => assert!(false, "read_range: {}", e),
+                }
+
+                // Recovery should confirm all valid
+                let report = storage.recover();
+                match report {
+                    Ok(r) => {
+                        assert_eq!(r.valid_entries, 30);
+                        assert_eq!(r.partial_entries, 0);
+                    }
+                    Err(e) => assert!(false, "recover: {}", e),
                 }
             }
             Err(e) => assert!(false, "new: {}", e),

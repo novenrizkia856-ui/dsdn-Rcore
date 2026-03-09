@@ -957,4 +957,59 @@ Tests yang tersedia:
 
 ## Version
 
-Tahap: 14A
+Tahap: 14A + 15 (WORM Audit Log)
+
+## WORM Audit Log Storage (Tahap 15)
+
+`WormFileStorage` provides file-based, append-only (Write Once Read Many) storage for the DSDN audit log subsystem. Implements `dsdn_common::WormLogStorage` trait.
+
+### File Layout
+
+```text
+base_dir/
+  audit_log_0000000000000001.worm   <- entries 1..N
+  audit_log_0000000000000512.worm   <- after rotation
+  audit_log_0000000000001024.worm   <- after rotation
+```
+
+### Entry Format
+
+```text
+[8 bytes: entry length (u64 LE)]
+[N bytes: entry data]
+[4 bytes: CRC32 IEEE checksum (u32 LE)]
+```
+
+### Append-Only Design
+
+- Files opened with `OpenOptions::append(true)` — no seek, no truncate
+- No overwrite, no delete, no modification of existing data
+- Sequence numbers strictly increasing, starting at 1
+
+### File Rotation
+
+When `current_file_size >= max_file_size_bytes`, rotation triggers on the **next** append call:
+
+1. Flush and sync old file
+2. Create new `.worm` file with next sequence as start
+3. Reset file size counter
+4. Write entry to new file
+
+Old files remain immutable (WORM guarantee).
+
+### Crash Recovery
+
+`recover()` scans all `.worm` files read-only:
+
+1. Validates each entry: length header, data, CRC32
+2. Stops at first partial/corrupted entry per file
+3. Updates sequence counter to last valid entry
+4. Returns `RecoveryReport` with counts
+
+Recovery does NOT modify or delete files. Handles: incomplete header, truncated data, missing CRC, CRC mismatch.
+
+### Thread Safety
+
+- `Mutex` protects file handle for serialized writes
+- `AtomicU64` for lock-free sequence/size reads
+- `Send + Sync` safe
