@@ -521,7 +521,7 @@ pub fn verify_fallback_event_hash(event: &FallbackEvent, expected: &[u8; 32]) ->
 // AUDIT LOG EVENT ENCODING (Tahap 15.7)
 // ════════════════════════════════════════════════════════════════════════════════
 
-use crate::audit_event::{AuditLogEvent, AuditLogEntry};
+use crate::proto_audit_event_reexport::{AuditLogEvent, AuditLogEntry};
 
 /// Encode `AuditLogEvent` ke bytes dengan format deterministik.
 ///

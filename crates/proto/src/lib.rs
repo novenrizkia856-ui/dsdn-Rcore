@@ -431,7 +431,7 @@ pub mod tss;
 pub mod tx;
 
 /// Audit log event schema for WORM + DA mirror (Tahap 15).
-pub mod audit_event;
+pub mod proto_audit_event_reexport;
 
 // ════════════════════════════════════════════════════════════════════════════════
 // PUBLIC EXPORTS - DA Core Types
@@ -602,7 +602,7 @@ pub use tss::{
 // PUBLIC EXPORTS - Audit Log Event Types (Tahap 15)
 // ════════════════════════════════════════════════════════════════════════════════
 
-pub use audit_event::{
+pub use proto_audit_event_reexport::{
     AuditLogEvent,
     AuditLogEntry,
     StakeOperation,

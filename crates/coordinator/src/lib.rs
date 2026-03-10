@@ -485,6 +485,7 @@
 //! - **reconciliation**: Fallback blob reconciliation to Celestia (14A.1A.31-34)
 //! - **multi**: Multi-coordinator consensus with threshold signing (14A.2B.2.11–20)
 //! - **gatekeeper**: Service node admission gating (14B.31–40)
+//! - **audit_logging**: Audit event emit helpers for coordinator (Tahap 15.1)
 //!
 //! ## Key Invariant
 //!
@@ -534,6 +535,9 @@ pub mod execution;
 
 // Receipt DA publication (CO.6)
 pub mod receipt_publisher;
+
+// Audit event emission helpers (Tahap 15.1)
+pub mod audit_logging;
 
 pub use scheduler::{NodeStats, Workload, Scheduler};
 pub use da_consumer::{DAConsumer, DADerivedState, ChunkMeta, ReplicaInfo};
